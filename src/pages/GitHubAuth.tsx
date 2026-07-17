@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { Copy, CheckCircle2, Loader2, ExternalLink } from "lucide-react";
+import { Copy, CheckCircle2, Loader2, ExternalLink, Terminal, Trash2 } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
+import { Modal } from "../components/Modal";
 import * as api from "../lib/api";
 
 type AuthStep = "idle" | "waiting" | "success" | "error";
@@ -15,13 +16,55 @@ export function GitHubAuth() {
   const [user, setUser] = useState<api.GitHubUser | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [ghAccounts, setGhAccounts] = useState<string[]>([]);
+  const [ghBusy, setGhBusy] = useState<string | null>(null);
+  const [removeTarget, setRemoveTarget] = useState<string | null>(null);
+  const [removing, setRemoving] = useState(false);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  function loadGhAccounts() {
+    api.ghListAccounts().then(setGhAccounts).catch(() => setGhAccounts([]));
+  }
+
   useEffect(() => {
+    // Best-effort: populate accounts from the local gh CLI if it's available.
+    loadGhAccounts();
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current);
     };
   }, []);
+
+  async function handleRemoveAccount() {
+    if (!removeTarget) return;
+    setRemoving(true);
+    setError(null);
+    try {
+      await api.ghLogout(removeTarget);
+      setRemoveTarget(null);
+      loadGhAccounts();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRemoving(false);
+    }
+  }
+
+  async function signInWithGh(account: string) {
+    setError(null);
+    setGhBusy(account);
+    try {
+      const token = await api.ghGetToken(account);
+      const ghUser = await api.verifyGithubToken(token);
+      setUser(ghUser);
+      await api.storeGithubToken(`__gh_${account}__`, token);
+      setStep("success");
+    } catch (e) {
+      setError(String(e));
+      setStep("error");
+    } finally {
+      setGhBusy(null);
+    }
+  }
 
   async function startDeviceFlow() {
     try {
@@ -109,6 +152,100 @@ export function GitHubAuth() {
             Sign in with GitHub
           </Button>
         </Card>
+
+        {ghAccounts.length > 0 && (
+          <Card>
+            <div className="flex items-center gap-2 mb-1">
+              <Terminal size={18} className="text-emerald-400" />
+              <h3 className="text-lg font-medium text-zinc-200">
+                Use GitHub CLI
+              </h3>
+            </div>
+            <p className="text-sm text-zinc-500 mb-4">
+              You're already signed in to these accounts via <span className="font-mono text-zinc-400">gh</span>.
+              Pick one to use instantly — no code needed.
+            </p>
+            <div className="space-y-1.5">
+              {ghAccounts.map((acct) => (
+                <div
+                  key={acct}
+                  className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-zinc-800/70 border border-zinc-700/50"
+                >
+                  <span className="text-sm text-zinc-200 font-mono truncate">
+                    {acct}
+                  </span>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => signInWithGh(acct)}
+                      disabled={ghBusy !== null}
+                    >
+                      {ghBusy === acct ? (
+                        <>
+                          <Loader2 size={14} className="animate-spin" />
+                          Signing in...
+                        </>
+                      ) : (
+                        "Use this account"
+                      )}
+                    </Button>
+                    <button
+                      onClick={() => setRemoveTarget(acct)}
+                      title="Remove this account from the GitHub CLI"
+                      className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
+
+        <Modal
+          open={removeTarget !== null}
+          onClose={() => setRemoveTarget(null)}
+          title="Remove GitHub Account?"
+        >
+          <p className="text-sm text-zinc-400 mb-2">
+            This logs{" "}
+            <span className="font-mono text-zinc-200">{removeTarget}</span> out
+            of the GitHub CLI (<span className="font-mono">gh</span>) on this
+            machine.
+          </p>
+          <p className="text-xs text-zinc-500 mb-4">
+            Your SSH keys and GitSwitch profiles are not affected. You can sign
+            back in anytime with <span className="font-mono">gh auth login</span>.
+          </p>
+          <div className="flex justify-end gap-3">
+            <Button
+              variant="secondary"
+              onClick={() => setRemoveTarget(null)}
+              disabled={removing}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              onClick={handleRemoveAccount}
+              disabled={removing}
+            >
+              {removing ? (
+                <>
+                  <Loader2 size={16} className="animate-spin" />
+                  Removing...
+                </>
+              ) : (
+                <>
+                  <Trash2 size={16} />
+                  Remove Account
+                </>
+              )}
+            </Button>
+          </div>
+        </Modal>
       </div>
     );
   }
@@ -132,7 +269,7 @@ export function GitHubAuth() {
               </span>
               <button
                 onClick={copyCode}
-                className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors"
+                className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
               >
                 {copied ? <CheckCircle2 size={20} className="text-emerald-400" /> : <Copy size={20} />}
               </button>

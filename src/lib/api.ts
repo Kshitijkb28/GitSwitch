@@ -64,6 +64,50 @@ export async function listSshKeys(): Promise<string[]> {
   return invoke("list_ssh_keys");
 }
 
+export async function deleteSshKey(keyPath: string): Promise<void> {
+  return invoke("delete_ssh_key", { keyPath });
+}
+
+export async function ghListAccounts(): Promise<string[]> {
+  return invoke("gh_list_accounts");
+}
+
+export async function ghGetToken(account: string): Promise<string> {
+  return invoke("gh_get_token", { account });
+}
+
+export async function ghLogout(account: string): Promise<string> {
+  return invoke("gh_logout", { account });
+}
+
+export async function ghRegisterSshKey(
+  account: string,
+  keyPath: string,
+  title: string
+): Promise<string> {
+  return invoke("gh_register_ssh_key", { account, keyPath, title });
+}
+
+export async function resolveKeyAccount(
+  keyPath: string
+): Promise<string | null> {
+  return invoke("resolve_key_account", { keyPath });
+}
+
+export interface RemoteChange {
+  repo: string;
+  old_url: string;
+  new_url: string;
+  changed: boolean;
+  note: string;
+}
+
+export async function convertReposToSsh(
+  directory: string
+): Promise<RemoteChange[]> {
+  return invoke("convert_repos_to_ssh", { directory });
+}
+
 export async function storeGithubToken(
   profileId: string,
   token: string

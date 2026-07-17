@@ -22,7 +22,12 @@ export function Settings() {
       const config = await api.getCurrentGitConfig();
       setGitConfig(config);
     } catch (e) {
-      setGitConfig(`Error loading config: ${e}`);
+      const msg = String(e);
+      if (msg.includes("Tauri runtime not available")) {
+        setGitConfig("No managed config yet. Create a profile and assign directories to generate config.");
+      } else {
+        setGitConfig(`Error loading config: ${e}`);
+      }
     }
   }
 
@@ -35,7 +40,12 @@ export function Settings() {
       setMessage("Git config applied successfully!");
       setTimeout(() => setMessage(null), 3000);
     } catch (e) {
-      setMessage(`Error: ${e}`);
+      const msg = String(e);
+      if (msg.includes("Tauri runtime not available")) {
+        setMessage("This action requires the desktop app.");
+      } else {
+        setMessage(`Error: ${e}`);
+      }
     } finally {
       setLoading(false);
     }
@@ -74,7 +84,12 @@ export function Settings() {
         setTimeout(() => setUpdateStatus(null), 3000);
       }
     } catch (e) {
-      setUpdateStatus(`Update check failed: ${e}`);
+      const msg = String(e);
+      if (msg.includes("__TAURI") || msg.includes("not a function") || msg.includes("undefined")) {
+        setUpdateStatus("Update check requires the desktop app.");
+      } else {
+        setUpdateStatus(`Update check failed: ${e}`);
+      }
     } finally {
       setChecking(false);
     }

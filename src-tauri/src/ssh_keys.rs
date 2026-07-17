@@ -61,10 +61,11 @@ pub fn get_public_key(private_key_path: &str) -> Result<String, AppError> {
     }
 }
 
-pub fn test_ssh_connection() -> Result<String, AppError> {
-    let output = Command::new("ssh")
+pub async fn test_ssh_connection() -> Result<String, AppError> {
+    let output = tokio::process::Command::new("ssh")
         .args(["-T", "git@github.com", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"])
         .output()
+        .await
         .map_err(|e| AppError::Command(format!("Failed to run ssh: {}", e)))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -81,8 +82,8 @@ pub fn test_ssh_connection() -> Result<String, AppError> {
     }
 }
 
-pub fn test_ssh_connection_with_key(key_path: &str) -> Result<String, AppError> {
-    let output = Command::new("ssh")
+pub async fn test_ssh_connection_with_key(key_path: &str) -> Result<String, AppError> {
+    let output = tokio::process::Command::new("ssh")
         .args([
             "-T", "git@github.com",
             "-i", key_path,
@@ -91,6 +92,7 @@ pub fn test_ssh_connection_with_key(key_path: &str) -> Result<String, AppError> 
             "-o", "ConnectTimeout=10",
         ])
         .output()
+        .await
         .map_err(|e| AppError::Command(format!("Failed to run ssh: {}", e)))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -104,6 +106,61 @@ pub fn test_ssh_connection_with_key(key_path: &str) -> Result<String, AppError> 
     } else {
         Ok(combined)
     }
+}
+
+/// Which GitHub account does this key actually authenticate as?
+/// Bypasses ~/.ssh/config (-F /dev/null) so we test the key itself, not a forced identity.
+pub async fn resolve_key_account(key_path: &str) -> Result<Option<String>, AppError> {
+    // Bypass the user's ssh config with the platform's null device.
+    let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let output = tokio::process::Command::new("ssh")
+        .args([
+            "-F", null_config,
+            "-i", key_path,
+            "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10",
+            "-T", "git@github.com",
+        ])
+        .output()
+        .await
+        .map_err(|e| AppError::Command(format!("Failed to run ssh: {}", e)))?;
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // GitHub greets successful auth with "Hi <username>!"
+    if let Some(idx) = combined.find("Hi ") {
+        let rest = &combined[idx + 3..];
+        if let Some(end) = rest.find('!') {
+            return Ok(Some(rest[..end].trim().to_string()));
+        }
+    }
+    Ok(None)
+}
+
+pub fn delete_ssh_key(key_path: &str) -> Result<(), AppError> {
+    let ssh_dir = get_ssh_dir()?;
+    let path = PathBuf::from(key_path);
+
+    // Safety: only allow deleting keys that live directly inside ~/.ssh
+    if path.parent() != Some(ssh_dir.as_path()) {
+        return Err(AppError::Ssh(
+            "Refusing to delete a key outside of ~/.ssh".into(),
+        ));
+    }
+
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    let pub_path = PathBuf::from(format!("{}.pub", key_path));
+    if pub_path.exists() {
+        fs::remove_file(&pub_path)?;
+    }
+    Ok(())
 }
 
 pub fn list_ssh_keys() -> Result<Vec<String>, AppError> {

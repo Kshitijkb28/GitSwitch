@@ -8,6 +8,7 @@ import {
   GitBranch,
   Trash2,
   Pencil,
+  RefreshCw,
 } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import type { Profile } from "../types/profile";
@@ -23,6 +24,18 @@ export function Dashboard() {
   const { profiles, loading, error, refresh } = useProfiles();
   const [deleteTarget, setDeleteTarget] = useState<Profile | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  async function handleRefresh() {
+    setRefreshing(true);
+    setActionError(null);
+    try {
+      await refresh();
+    } finally {
+      // brief spin so the click registers visually even on a fast reload
+      setTimeout(() => setRefreshing(false), 400);
+    }
+  }
 
   async function handleSetDefault(id: string) {
     try {
@@ -63,10 +76,23 @@ export function Dashboard() {
             Manage your GitHub identities
           </p>
         </div>
-        <Button onClick={() => navigate("/profile/new")}>
-          <Plus size={16} />
-          Add Profile
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            onClick={handleRefresh}
+            title="Reload profiles from disk"
+          >
+            <RefreshCw
+              size={16}
+              className={refreshing ? "animate-spin" : ""}
+            />
+            Refresh
+          </Button>
+          <Button onClick={() => navigate("/profile/new")}>
+            <Plus size={16} />
+            Add Profile
+          </Button>
+        </div>
       </div>
 
       {(error || actionError) && (
@@ -133,7 +159,7 @@ export function Dashboard() {
                     <button
                       onClick={() => handleSetDefault(profile.id)}
                       title="Set as default"
-                      className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-amber-400 transition-colors"
+                      className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-amber-400 transition-colors cursor-pointer"
                     >
                       <Star size={16} />
                     </button>
@@ -141,14 +167,14 @@ export function Dashboard() {
                   <button
                     onClick={() => navigate(`/profile/${profile.id}/edit`)}
                     title="Edit"
-                    className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors"
+                    className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
                   >
                     <Pencil size={16} />
                   </button>
                   <button
                     onClick={() => setDeleteTarget(profile)}
                     title="Delete"
-                    className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-red-400 transition-colors"
+                    className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-red-400 transition-colors cursor-pointer"
                   >
                     <Trash2 size={16} />
                   </button>

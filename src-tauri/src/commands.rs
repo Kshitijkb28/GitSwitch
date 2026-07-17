@@ -1,6 +1,8 @@
 use crate::credentials;
 use crate::error::AppError;
+use crate::gh_cli;
 use crate::git_config;
+use crate::git_remote::{self, RemoteChange};
 use crate::github::{self, GitHubKey, GitHubUser};
 use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
 use crate::profiles::{self, Profile};
@@ -65,18 +67,72 @@ pub fn get_public_key(private_key_path: String) -> Result<String, AppError> {
 }
 
 #[tauri::command]
-pub fn test_connection() -> Result<String, AppError> {
-    ssh_keys::test_ssh_connection()
+pub async fn test_connection() -> Result<String, AppError> {
+    ssh_keys::test_ssh_connection().await
 }
 
 #[tauri::command]
-pub fn test_connection_with_key(key_path: String) -> Result<String, AppError> {
-    ssh_keys::test_ssh_connection_with_key(&key_path)
+pub async fn test_connection_with_key(key_path: String) -> Result<String, AppError> {
+    ssh_keys::test_ssh_connection_with_key(&key_path).await
 }
 
 #[tauri::command]
 pub fn list_ssh_keys() -> Result<Vec<String>, AppError> {
     ssh_keys::list_ssh_keys()
+}
+
+#[tauri::command]
+pub fn delete_ssh_key(key_path: String) -> Result<(), AppError> {
+    ssh_keys::delete_ssh_key(&key_path)
+}
+
+#[tauri::command]
+pub async fn gh_list_accounts() -> Result<Vec<String>, AppError> {
+    gh_cli::gh_list_accounts().await
+}
+
+#[tauri::command]
+pub async fn gh_get_token(account: String) -> Result<String, AppError> {
+    gh_cli::gh_get_token(&account).await
+}
+
+#[tauri::command]
+pub async fn gh_logout(account: String) -> Result<String, AppError> {
+    gh_cli::gh_logout(&account).await
+}
+
+/// Automate "Step 2": register a local key's public half on a specific gh account.
+/// `key_path` is the PRIVATE key path; we read `<key_path>.pub`.
+#[tauri::command]
+pub async fn gh_register_ssh_key(
+    account: String,
+    key_path: String,
+    title: String,
+) -> Result<String, AppError> {
+    let token = gh_cli::gh_get_token(&account).await?;
+    let public_key = ssh_keys::get_public_key(&key_path)?;
+
+    match github::upload_ssh_key(&token, &title, &public_key).await {
+        Ok(k) => Ok(format!("Registered '{}' on {}", k.title, account)),
+        Err(AppError::Command(msg))
+            if msg.contains("already in use") || msg.contains("key is already") =>
+        {
+            Ok(format!("Key already registered on {}", account))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Automate "Step 5": which GitHub account does this key authenticate as?
+#[tauri::command]
+pub async fn resolve_key_account(key_path: String) -> Result<Option<String>, AppError> {
+    ssh_keys::resolve_key_account(&key_path).await
+}
+
+/// Automate "Step 4": convert HTTPS (incl. token) remotes to SSH for all repos under a folder.
+#[tauri::command]
+pub fn convert_repos_to_ssh(directory: String) -> Result<Vec<RemoteChange>, AppError> {
+    git_remote::convert_repos_in_dir(&directory)
 }
 
 #[tauri::command]

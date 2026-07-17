@@ -32,6 +32,24 @@ impl ProfileStore {
     }
 }
 
+/// Normalize a directory path for comparison (trim trailing slashes).
+fn norm_dir(d: &str) -> String {
+    d.trim_end_matches('/').to_string()
+}
+
+/// Remove `dirs` from every profile EXCEPT `keep_id`, so a folder can belong to
+/// only one profile at a time (git's includeIf is "last match wins", which would
+/// otherwise let a stale mapping silently override the intended one).
+fn dedupe_directories(store: &mut ProfileStore, keep_id: &str, dirs: &[String]) {
+    let claimed: Vec<String> = dirs.iter().map(|d| norm_dir(d)).collect();
+    for p in store.profiles.iter_mut() {
+        if p.id == keep_id {
+            continue;
+        }
+        p.directories.retain(|d| !claimed.contains(&norm_dir(d)));
+    }
+}
+
 fn get_store_path() -> Result<PathBuf, AppError> {
     let data_dir = dirs::data_dir().ok_or(AppError::Config("Cannot find app data directory".into()))?;
     let app_dir = data_dir.join("com.gitswitch.app");
@@ -83,6 +101,9 @@ pub fn create_profile(
         updated_at: now,
     };
 
+    // A folder belongs to exactly one profile — strip it from any others.
+    dedupe_directories(&mut store, &profile.id, &profile.directories);
+
     store.profiles.push(profile.clone());
     save_profiles(&store)?;
     Ok(profile)
@@ -122,6 +143,10 @@ pub fn update_profile(
     profile.updated_at = Utc::now();
 
     let updated = profile.clone();
+
+    // A folder belongs to exactly one profile — strip these dirs from any others.
+    dedupe_directories(&mut store, &updated.id, &updated.directories);
+
     save_profiles(&store)?;
     Ok(updated)
 }

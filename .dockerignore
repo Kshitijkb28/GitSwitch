@@ -1,0 +1,9 @@
+node_modules
+dist
+dist-linux
+src-tauri/target
+.git
+.vscode
+*.dmg
+*.app
+**/.DS_Store

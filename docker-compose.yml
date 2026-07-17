@@ -1,0 +1,14 @@
+# Build the Linux installers with one command:
+#   docker compose run --rm builder
+#
+# Output installers appear in ./dist-linux on your host.
+# This only builds an image and runs a one-shot container that exits — it does
+# NOT create long-running services and does not touch any other containers.
+services:
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gitswitch-builder
+    volumes:
+      - ./dist-linux:/out

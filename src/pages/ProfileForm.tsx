@@ -1,13 +1,16 @@
 import { useState, useEffect } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ArrowLeft, FolderPlus, X, Key } from "lucide-react";
+import { ArrowLeft, FolderPlus, X, Key, FolderOpen, Link2, Loader2, CheckCircle2 } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { Button } from "../components/Button";
 import { Input } from "../components/Input";
 import { Card } from "../components/Card";
+import { useToast } from "../components/Toast";
 import * as api from "../lib/api";
 
 export function ProfileForm() {
   const navigate = useNavigate();
+  const toast = useToast();
   const { id } = useParams<{ id: string }>();
   const [searchParams] = useSearchParams();
   const isEdit = !!id;
@@ -21,6 +24,8 @@ export function ProfileForm() {
   const [sshKeys, setSshKeys] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [converting, setConverting] = useState(false);
+  const [convertResults, setConvertResults] = useState<api.RemoteChange[] | null>(null);
 
   useEffect(() => {
     api.listSshKeys().then(setSshKeys).catch(() => {});
@@ -54,6 +59,7 @@ export function ProfileForm() {
           sshKeyPath: sshKeyPath || null,
           directories,
         });
+        toast.success(`Profile "${name}" updated successfully`);
       } else {
         await api.createProfile({
           name,
@@ -62,6 +68,7 @@ export function ProfileForm() {
           sshKeyPath: sshKeyPath || null,
           directories,
         });
+        toast.success(`Profile "${name}" created successfully`);
       }
       navigate("/");
     } catch (e) {
@@ -76,6 +83,24 @@ export function ProfileForm() {
     if (dir && !directories.includes(dir)) {
       setDirectories([...directories, dir]);
       setDirInput("");
+      toast.success("Folder added");
+    }
+  }
+
+  async function browseDirectory() {
+    setError(null);
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Select a folder for this profile",
+      });
+      if (typeof selected === "string" && !directories.includes(selected)) {
+        setDirectories([...directories, selected]);
+        toast.success("Folder added");
+      }
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -83,12 +108,36 @@ export function ProfileForm() {
     setDirectories(directories.filter((d) => d !== dir));
   }
 
+  async function convertRepos() {
+    setConverting(true);
+    setConvertResults(null);
+    setError(null);
+    try {
+      const all: api.RemoteChange[] = [];
+      for (const dir of directories) {
+        const res = await api.convertReposToSsh(dir);
+        all.push(...res);
+      }
+      setConvertResults(all);
+      const changed = all.filter((r) => r.changed).length;
+      toast.success(
+        changed > 0
+          ? `Converted ${changed} repo${changed === 1 ? "" : "s"} to SSH`
+          : "No repos needed converting"
+      );
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setConverting(false);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-3">
         <button
           onClick={() => navigate("/")}
-          className="p-2 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors"
+          className="p-2 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
         >
           <ArrowLeft size={20} />
         </button>
@@ -176,9 +225,18 @@ export function ProfileForm() {
             Assign directories where this profile should be used automatically.
             Git will use this identity for any repo inside these directories.
           </p>
+          <Button
+            type="button"
+            variant="secondary"
+            onClick={browseDirectory}
+            className="mb-3"
+          >
+            <FolderOpen size={16} />
+            Browse for folder…
+          </Button>
           <div className="flex gap-2 mb-3">
             <Input
-              placeholder="~/projects/work"
+              placeholder="…or type a path, e.g. ~/projects/work"
               value={dirInput}
               onChange={(e) => setDirInput(e.target.value)}
               onKeyDown={(e) => {
@@ -207,12 +265,75 @@ export function ProfileForm() {
                   <button
                     type="button"
                     onClick={() => removeDirectory(dir)}
-                    className="p-1 rounded hover:bg-zinc-700 text-zinc-500 hover:text-red-400 transition-colors"
+                    className="p-1 rounded hover:bg-zinc-700 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer"
                   >
                     <X size={14} />
                   </button>
                 </div>
               ))}
+            </div>
+          )}
+
+          {directories.length > 0 && (
+            <div className="mt-4 pt-4 border-t border-zinc-800">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-xs text-zinc-500">
+                  Make every repo in these folders push over SSH (removes any
+                  embedded HTTPS tokens).
+                </p>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={convertRepos}
+                  disabled={converting}
+                >
+                  {converting ? (
+                    <>
+                      <Loader2 size={14} className="animate-spin" />
+                      Converting…
+                    </>
+                  ) : (
+                    <>
+                      <Link2 size={14} />
+                      Convert repos to SSH
+                    </>
+                  )}
+                </Button>
+              </div>
+              {convertResults && (
+                <div className="mt-3 space-y-1.5">
+                  {convertResults.length === 0 ? (
+                    <p className="text-xs text-zinc-500">
+                      No git repositories found in these folders.
+                    </p>
+                  ) : (
+                    convertResults.map((r) => (
+                      <div
+                        key={r.repo}
+                        className="flex items-start gap-2 text-xs px-3 py-2 rounded-lg bg-zinc-800/50 border border-zinc-700/40"
+                      >
+                        {r.changed ? (
+                          <CheckCircle2
+                            size={14}
+                            className="text-emerald-400 mt-0.5 shrink-0"
+                          />
+                        ) : (
+                          <span className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                        )}
+                        <div className="min-w-0">
+                          <p className="text-zinc-300 font-mono truncate">
+                            {r.repo.split("/").pop()}
+                          </p>
+                          <p className="text-zinc-500 font-mono break-all">
+                            {r.changed ? r.new_url : r.note}
+                          </p>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
             </div>
           )}
         </Card>

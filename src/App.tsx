@@ -1,4 +1,4 @@
-import { Routes, Route, NavLink } from "react-router-dom";
+import { Routes, Route, NavLink, useLocation } from "react-router-dom";
 import { LayoutDashboard, Key, Settings as SettingsIcon } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
@@ -8,6 +8,8 @@ import { Settings } from "./pages/Settings";
 import { GitHubAuth } from "./pages/GitHubAuth";
 
 function App() {
+  const location = useLocation();
+
   return (
     <div className="flex h-screen bg-zinc-900 text-zinc-100">
       <nav className="w-56 border-r border-zinc-800 flex flex-col">
@@ -17,7 +19,11 @@ function App() {
           </h1>
         </div>
         <div className="flex-1 p-3 space-y-1">
-          <SidebarLink to="/" icon={<LayoutDashboard size={18} />}>
+          <SidebarLink
+            to="/"
+            icon={<LayoutDashboard size={18} />}
+            active={location.pathname === "/" || location.pathname.startsWith("/profile")}
+          >
             Profiles
           </SidebarLink>
           <SidebarLink to="/ssh" icon={<Key size={18} />}>
@@ -53,22 +59,25 @@ function SidebarLink({
   to,
   icon,
   children,
+  active,
 }: {
   to: string;
   icon: React.ReactNode;
   children: React.ReactNode;
+  active?: boolean;
 }) {
   return (
     <NavLink
       to={to}
       end
-      className={({ isActive }) =>
-        `flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
-          isActive
+      className={({ isActive }) => {
+        const highlighted = active !== undefined ? active : isActive;
+        return `flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+          highlighted
             ? "bg-zinc-800 text-emerald-400"
             : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50"
-        }`
-      }
+        }`;
+      }}
     >
       {icon}
       {children}
