@@ -1,21 +1,37 @@
 import { useState, useEffect } from "react";
-import { RefreshCw, Info, Download } from "lucide-react";
+import { RefreshCw, Info, Download, ExternalLink } from "lucide-react";
+import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
+import { Input } from "../components/Input";
+import { useToast } from "../components/Toast";
+import { getCustomClientId, setOAuthClientId } from "../lib/oauth";
 import * as api from "../lib/api";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
 export function Settings() {
+  const toast = useToast();
   const [gitConfig, setGitConfig] = useState("");
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
+  const [clientId, setClientId] = useState("");
 
   useEffect(() => {
     loadConfig();
+    setClientId(getCustomClientId() ?? "");
   }, []);
+
+  function saveClientId() {
+    setOAuthClientId(clientId);
+    toast.success(
+      clientId.trim()
+        ? "GitHub OAuth Client ID saved"
+        : "OAuth Client ID cleared"
+    );
+  }
 
   async function loadConfig() {
     try {
@@ -157,6 +173,45 @@ export function Settings() {
               Backups are created before any modification to your system config.
             </p>
           </div>
+        </div>
+      </Card>
+
+      <Card>
+        <div className="flex items-center gap-2 mb-2">
+          <GitHubIcon size={16} className="text-zinc-300" />
+          <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">
+            GitHub Sign-in (OAuth device flow)
+          </h2>
+        </div>
+        <p className="text-xs text-zinc-500 mb-3">
+          The "Sign in with GitHub" button works out of the box with a built-in
+          OAuth App. You only need this if you want to use your <strong>own</strong>{" "}
+          OAuth App instead — leave it blank to use the default.
+        </p>
+        <ol className="text-xs text-zinc-400 list-decimal pl-5 space-y-1 mb-3">
+          <li>
+            Create a free OAuth App and <strong>enable "Device Flow"</strong>{" "}
+            <a
+              href="https://github.com/settings/developers"
+              target="_blank"
+              rel="noreferrer"
+              className="text-emerald-400 inline-flex items-center gap-1 hover:underline"
+            >
+              github.com/settings/developers <ExternalLink size={11} />
+            </a>
+          </li>
+          <li>Copy its <strong>Client ID</strong> (<span className="font-mono">Ov23li…</span>) and paste it below to override the default.</li>
+        </ol>
+        <div className="flex gap-2">
+          <Input
+            placeholder="Ov23li…  (your OAuth App Client ID)"
+            value={clientId}
+            onChange={(e) => setClientId(e.target.value)}
+            className="flex-1 font-mono"
+          />
+          <Button variant="secondary" onClick={saveClientId}>
+            Save
+          </Button>
         </div>
       </Card>
 

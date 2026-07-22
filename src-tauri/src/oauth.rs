@@ -2,7 +2,9 @@ use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 
 // https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow
-const GITHUB_CLIENT_ID: &str = "Ov23li0000000000000";
+// GitSwitch OAuth App (Device Flow enabled). Frontend passes this explicitly;
+// kept here as the fallback default too.
+const GITHUB_CLIENT_ID: &str = "Ov23lieKPekuiZoTUNvb";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeviceCodeResponse {

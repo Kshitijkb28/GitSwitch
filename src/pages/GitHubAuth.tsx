@@ -5,6 +5,7 @@ import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { Modal } from "../components/Modal";
+import { getEffectiveClientId } from "../lib/oauth";
 import * as api from "../lib/api";
 
 type AuthStep = "idle" | "waiting" | "success" | "error";
@@ -20,7 +21,8 @@ export function GitHubAuth() {
   const [ghBusy, setGhBusy] = useState<string | null>(null);
   const [removeTarget, setRemoveTarget] = useState<string | null>(null);
   const [removing, setRemoving] = useState(false);
-  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollGenRef = useRef(0);
 
   function loadGhAccounts() {
     api.ghListAccounts().then(setGhAccounts).catch(() => setGhAccounts([]));
@@ -30,7 +32,7 @@ export function GitHubAuth() {
     // Best-effort: populate accounts from the local gh CLI if it's available.
     loadGhAccounts();
     return () => {
-      if (pollingRef.current) clearInterval(pollingRef.current);
+      if (pollTimeoutRef.current) clearTimeout(pollTimeoutRef.current);
     };
   }, []);
 
@@ -66,50 +68,96 @@ export function GitHubAuth() {
     }
   }
 
-  async function startDeviceFlow() {
-    try {
-      setError(null);
-      setStep("waiting");
-      const code = await api.githubDeviceCode();
-      setDeviceCode(code);
-      startPolling(code);
-    } catch (e) {
-      setError(String(e));
-      setStep("error");
+  function stopPolling() {
+    pollGenRef.current++; // invalidate any in-flight poll loop
+    if (pollTimeoutRef.current) {
+      clearTimeout(pollTimeoutRef.current);
+      pollTimeoutRef.current = null;
     }
   }
 
-  function startPolling(code: api.DeviceCodeResponse) {
-    const interval = (code.interval || 5) * 1000;
-    const deadline = Date.now() + code.expires_in * 1000;
+  async function startDeviceFlow() {
+    stopPolling(); // kill any poller from a previous attempt so it can't hijack the UI
+    const clientId = getEffectiveClientId();
+    setError(null);
+    setStep("waiting");
+    setDeviceCode(null);
 
-    pollingRef.current = setInterval(async () => {
+    // The very first network request from the app can cold-start-fail; retry a
+    // couple times before surfacing an error so users don't see a spurious "Try again".
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const code = await api.githubDeviceCode(clientId);
+        setDeviceCode(code);
+        startPolling(code, clientId);
+        return;
+      } catch (e) {
+        lastErr = e;
+        await new Promise((r) => setTimeout(r, 700));
+      }
+    }
+    setError(String(lastErr));
+    setStep("error");
+  }
+
+  function startPolling(code: api.DeviceCodeResponse, clientId: string) {
+    // GitHub's device flow REQUIRES honoring the interval and backing off on
+    // "slow_down". A fixed setInterval that ignores slow_down gets throttled and
+    // never receives the token — the classic "stuck on Waiting forever" bug.
+    // So: recursive setTimeout, one request at a time, interval grows on slow_down.
+    const deadline = Date.now() + code.expires_in * 1000;
+    let delay = (code.interval || 5) * 1000;
+    pollGenRef.current++;
+    const myGen = pollGenRef.current;
+
+    const schedule = () => {
+      pollTimeoutRef.current = setTimeout(tick, delay);
+    };
+
+    const tick = async () => {
+      if (pollGenRef.current !== myGen) return; // superseded/cancelled
       if (Date.now() > deadline) {
-        if (pollingRef.current) clearInterval(pollingRef.current);
-        setError("Authorization timed out. Please try again.");
+        setError("The code expired before you authorized. Click Sign in for a fresh code.");
         setStep("error");
         return;
       }
-
       try {
-        const token = await api.githubPollToken(code.device_code);
-        if (pollingRef.current) clearInterval(pollingRef.current);
-
+        const token = await api.githubPollToken(code.device_code, clientId);
+        if (pollGenRef.current !== myGen) return;
         const ghUser = await api.verifyGithubToken(token.access_token);
+        if (pollGenRef.current !== myGen) return;
         setUser(ghUser);
-
         await api.storeGithubToken("__oauth_default__", token.access_token);
         setStep("success");
+        return; // done — stop the loop
       } catch (e) {
+        if (pollGenRef.current !== myGen) return;
         const msg = String(e);
-        if (msg.includes("authorization_pending") || msg.includes("slow_down")) {
+        if (msg.includes("slow_down")) {
+          delay += 5000; // GitHub told us to back off — obey it
+          schedule();
           return;
         }
-        if (pollingRef.current) clearInterval(pollingRef.current);
-        setError(msg);
+        if (msg.includes("authorization_pending")) {
+          schedule(); // keep waiting at the same interval
+          return;
+        }
+        // terminal errors
+        if (msg.includes("access_denied")) {
+          setError(
+            "Authorization was denied or blocked. If GitHub showed an organization / third-party error, that account's org restricts OAuth apps — use \"Use GitHub CLI\" below instead."
+          );
+        } else if (msg.includes("expired_token")) {
+          setError("The code expired. Click Sign in to get a fresh code.");
+        } else {
+          setError(msg);
+        }
         setStep("error");
       }
-    }, interval);
+    };
+
+    schedule();
   }
 
   async function copyCode() {
@@ -250,6 +298,22 @@ export function GitHubAuth() {
     );
   }
 
+  if (step === "waiting" && !deviceCode) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold text-zinc-100">Sign in with GitHub</h1>
+        </div>
+        <Card className="text-center py-12">
+          <Loader2 size={22} className="animate-spin mx-auto text-emerald-400 mb-3" />
+          <p className="text-sm text-zinc-400">
+            Requesting a sign-in code from GitHub…
+          </p>
+        </Card>
+      </div>
+    );
+  }
+
   if (step === "waiting" && deviceCode) {
     return (
       <div className="space-y-6">
@@ -289,6 +353,23 @@ export function GitHubAuth() {
           <div className="mt-8 flex items-center justify-center gap-2 text-sm text-zinc-500">
             <Loader2 size={16} className="animate-spin" />
             Waiting for authorization...
+          </div>
+          <p className="text-xs text-zinc-600 text-center mt-3 max-w-sm mx-auto">
+            This completes automatically once you authorize on GitHub. If GitHub
+            shows a third-party / organization error there, that account blocks
+            OAuth apps — cancel and use <span className="text-zinc-400">"Use GitHub CLI"</span> instead.
+          </p>
+          <div className="flex justify-center mt-4">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                stopPolling();
+                setStep("idle");
+              }}
+            >
+              Cancel
+            </Button>
           </div>
         </Card>
       </div>
@@ -335,21 +416,27 @@ export function GitHubAuth() {
     );
   }
 
-  return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-zinc-100">Sign in with GitHub</h1>
-      </div>
-
-      <Card className="text-center py-8">
-        <div className="text-red-400 mb-4">
-          <p className="font-medium">Authentication failed</p>
-          <p className="text-sm text-zinc-500 mt-1">{error}</p>
+  if (step === "error") {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold text-zinc-100">Sign in with GitHub</h1>
         </div>
-        <Button onClick={() => { setStep("idle"); setError(null); }}>
-          Try Again
-        </Button>
-      </Card>
-    </div>
-  );
+
+        <Card className="text-center py-8">
+          <div className="text-red-400 mb-4">
+            <p className="font-medium">Authentication failed</p>
+            {error && <p className="text-sm text-zinc-500 mt-1">{error}</p>}
+          </div>
+          <Button onClick={() => { stopPolling(); setStep("idle"); setError(null); }}>
+            Try Again
+          </Button>
+        </Card>
+      </div>
+    );
+  }
+
+  // Fallback (e.g. step === "waiting" before the code arrives): render nothing
+  // instead of the error screen. The dedicated waiting branch below handles it.
+  return null;
 }
