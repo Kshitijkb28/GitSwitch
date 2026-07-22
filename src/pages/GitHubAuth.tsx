@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { Copy, CheckCircle2, Loader2, ExternalLink, Terminal, Trash2 } from "lucide-react";
+import { Copy, CheckCircle2, Loader2, ExternalLink, Terminal, Trash2, RefreshCw } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
@@ -24,8 +24,22 @@ export function GitHubAuth() {
   const pollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollGenRef = useRef(0);
 
+  const [ghRefreshing, setGhRefreshing] = useState(false);
+
   function loadGhAccounts() {
     api.ghListAccounts().then(setGhAccounts).catch(() => setGhAccounts([]));
+  }
+
+  async function refreshGhAccounts() {
+    setGhRefreshing(true);
+    try {
+      const accts = await api.ghListAccounts();
+      setGhAccounts(accts);
+    } catch {
+      setGhAccounts([]);
+    } finally {
+      setTimeout(() => setGhRefreshing(false), 400);
+    }
   }
 
   useEffect(() => {
@@ -201,18 +215,35 @@ export function GitHubAuth() {
           </Button>
         </Card>
 
-        {ghAccounts.length > 0 && (
-          <Card>
-            <div className="flex items-center gap-2 mb-1">
-              <Terminal size={18} className="text-emerald-400" />
-              <h3 className="text-lg font-medium text-zinc-200">
-                Use GitHub CLI
-              </h3>
+        <Card>
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-2">
+                <Terminal size={18} className="text-emerald-400" />
+                <h3 className="text-lg font-medium text-zinc-200">
+                  Use GitHub CLI
+                </h3>
+              </div>
+              <button
+                onClick={refreshGhAccounts}
+                disabled={ghRefreshing}
+                title="Re-check gh accounts"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw size={14} className={ghRefreshing ? "animate-spin" : ""} />
+                Refresh
+              </button>
             </div>
             <p className="text-sm text-zinc-500 mb-4">
               You're already signed in to these accounts via <span className="font-mono text-zinc-400">gh</span>.
               Pick one to use instantly — no code needed.
             </p>
+            {ghAccounts.length === 0 ? (
+              <p className="text-sm text-zinc-500 px-3 py-4 rounded-lg bg-zinc-800/40 border border-zinc-700/40 text-center">
+                No <span className="font-mono">gh</span> accounts found. Run{" "}
+                <span className="font-mono text-zinc-400">gh auth login</span> in
+                a terminal, then click <span className="text-zinc-300">Refresh</span>.
+              </p>
+            ) : (
             <div className="space-y-1.5">
               {ghAccounts.map((acct) => (
                 <div
@@ -249,8 +280,8 @@ export function GitHubAuth() {
                 </div>
               ))}
             </div>
+            )}
           </Card>
-        )}
 
         <Modal
           open={removeTarget !== null}
