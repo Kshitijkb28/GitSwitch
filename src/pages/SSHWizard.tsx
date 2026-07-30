@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, type SubmitEvent } from "react";
 import {
   Key,
   Copy,
@@ -12,6 +12,8 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { Input } from "../components/Input";
 import { Modal } from "../components/Modal";
+import { Select } from "../components/Select";
+import { GitHubIcon } from "../components/GitHubIcon";
 import * as api from "../lib/api";
 
 type Step = "generate" | "pubkey" | "test";
@@ -82,7 +84,7 @@ export function SSHWizard() {
     }
   }
 
-  async function handleGenerate(e: React.FormEvent) {
+  async function handleGenerate(e: SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     setGenerating(true);
     setError(null);
@@ -264,18 +266,14 @@ export function SSHWizard() {
                 copy-paste needed. A key can belong to only one account.
               </p>
               <div className="flex gap-2">
-                <select
+                <Select
                   value={registerAccount}
-                  onChange={(e) => setRegisterAccount(e.target.value)}
-                  className="flex-1 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-100 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
-                >
-                  <option value="">Select an account…</option>
-                  {ghAccounts.map((a) => (
-                    <option key={a} value={a}>
-                      {a}
-                    </option>
-                  ))}
-                </select>
+                  onChange={setRegisterAccount}
+                  placeholder="Select an account…"
+                  optionIcon={<GitHubIcon size={14} />}
+                  options={ghAccounts.map((a) => ({ value: a, label: a }))}
+                  className="flex-1"
+                />
                 <Button
                   type="button"
                   onClick={handleRegister}

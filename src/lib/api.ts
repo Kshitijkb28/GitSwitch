@@ -130,6 +130,7 @@ export async function getCurrentGitConfig(): Promise<string> {
 }
 
 export interface GitHubUser {
+  id: number;
   login: string;
   name: string | null;
   email: string | null;

@@ -170,10 +170,27 @@ pub fn list_ssh_keys() -> Result<Vec<String>, AppError> {
     if let Ok(entries) = fs::read_dir(&ssh_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("id_") && !name.ends_with(".pub") {
-                    keys.push(path.to_string_lossy().to_string());
-                }
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".pub") {
+                continue;
+            }
+            // Skip well-known non-key files.
+            if matches!(
+                name,
+                "config" | "known_hosts" | "known_hosts.old" | "authorized_keys" | "environment"
+            ) || name.contains("backup")
+            {
+                continue;
+            }
+            // A private key: conventional id_* name, or any file with a .pub sibling.
+            let has_pub_sibling = ssh_dir.join(format!("{}.pub", name)).exists();
+            if name.starts_with("id_") || has_pub_sibling {
+                keys.push(path.to_string_lossy().to_string());
             }
         }
     }

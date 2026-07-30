@@ -4,7 +4,6 @@ export interface Profile {
   git_name: string;
   git_email: string;
   ssh_key_path: string | null;
-  github_token: string | null;
   is_default: boolean;
   directories: string[];
   created_at: string;

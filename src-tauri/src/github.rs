@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GitHubUser {
+    pub id: u64,
     pub login: String,
     pub name: Option<String>,
     pub email: Option<String>,

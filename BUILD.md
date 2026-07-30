@@ -110,3 +110,26 @@ parallel. Two ways to trigger it:
 
 This is the recommended path, because macOS installers can only be built on
 macOS and Windows installers on Windows.
+
+## 4. macOS: build + install in one step
+
+```bash
+./scripts/install-mac.sh                # build, install to /Applications, clean up
+./scripts/install-mac.sh --skip-build   # reinstall the last build
+```
+
+This also removes the build-folder `.app`, ejects stray DMG mounts, and fixes
+Launch Services registrations so you never end up with "two GitSwitch apps."
+
+## 5. Auto-updater releases (optional)
+
+The updater's public key lives in `tauri.conf.json`; the matching **private
+key** is at `~/.tauri/gitswitch_updater.key` (never commit it — losing it means
+you can't sign future updates).
+
+To ship signed updates from CI:
+1. Add repo secrets: `TAURI_SIGNING_PRIVATE_KEY` (file contents) and
+   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (empty if none).
+2. Set `"createUpdaterArtifacts": true` under `bundle` in `tauri.conf.json`.
+3. Tag a release — the workflow uploads the updater artifacts + `latest.json`
+   that the in-app "Check for Updates" consumes.

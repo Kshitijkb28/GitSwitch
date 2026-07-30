@@ -105,6 +105,45 @@ fn mask_token(url: &str) -> String {
     url.to_string()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_plain_https() {
+        assert_eq!(
+            https_to_ssh("https://github.com/owner/repo.git").as_deref(),
+            Some("git@github.com:owner/repo.git")
+        );
+        // .git suffix is added when missing
+        assert_eq!(
+            https_to_ssh("https://github.com/owner/repo").as_deref(),
+            Some("git@github.com:owner/repo.git")
+        );
+    }
+
+    #[test]
+    fn strips_embedded_credentials() {
+        assert_eq!(
+            https_to_ssh("https://user:ghp_secret123@github.com/owner/repo.git").as_deref(),
+            Some("git@github.com:owner/repo.git")
+        );
+    }
+
+    #[test]
+    fn leaves_ssh_and_non_github_alone() {
+        assert_eq!(https_to_ssh("git@github.com:owner/repo.git"), None);
+        assert_eq!(https_to_ssh("https://gitlab.com/owner/repo.git"), None);
+    }
+
+    #[test]
+    fn mask_token_hides_secret() {
+        let masked = mask_token("https://user:ghp_secret123@github.com/o/r.git");
+        assert!(!masked.contains("ghp_secret123"));
+        assert!(masked.contains("user:***@"));
+    }
+}
+
 /// Find git repos within `root` (up to a few levels deep) and convert their origin to SSH.
 pub fn convert_repos_in_dir(root: &str) -> Result<Vec<RemoteChange>, AppError> {
     let root_path = PathBuf::from(root);

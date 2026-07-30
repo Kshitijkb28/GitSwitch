@@ -1,10 +1,12 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, type SubmitEvent } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ArrowLeft, FolderPlus, X, Key, FolderOpen, Link2, Loader2, CheckCircle2 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Input } from "../components/Input";
 import { Card } from "../components/Card";
+import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import * as api from "../lib/api";
 
@@ -26,9 +28,35 @@ export function ProfileForm() {
   const [error, setError] = useState<string | null>(null);
   const [converting, setConverting] = useState(false);
   const [convertResults, setConvertResults] = useState<api.RemoteChange[] | null>(null);
+  const [ghAccounts, setGhAccounts] = useState<string[]>([]);
+  const [autofillAccount, setAutofillAccount] = useState("");
+  const [autofilling, setAutofilling] = useState(false);
+
+  async function autofillFromAccount(account: string) {
+    setAutofillAccount(account);
+    if (!account) return;
+    setAutofilling(true);
+    setError(null);
+    try {
+      const token = await api.ghGetToken(account);
+      const u = await api.verifyGithubToken(token);
+      // Git identity: real name if set, else the login handle.
+      setGitName(u.name || u.login);
+      // Email: public email if available, else GitHub's noreply address.
+      setGitEmail(u.email || `${u.id}+${u.login}@users.noreply.github.com`);
+      // Friendly profile name — only fill if the user hasn't typed one.
+      setName((prev) => prev || u.login);
+      toast.success(`Filled in details for ${u.login}`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setAutofilling(false);
+    }
+  }
 
   useEffect(() => {
     api.listSshKeys().then(setSshKeys).catch(() => {});
+    api.ghListAccounts().then(setGhAccounts).catch(() => setGhAccounts([]));
 
     if (isEdit) {
       api.getProfiles().then((profiles) => {
@@ -44,7 +72,7 @@ export function ProfileForm() {
     }
   }, [id, isEdit]);
 
-  async function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     setLoading(true);
     setError(null);
@@ -56,7 +84,8 @@ export function ProfileForm() {
           name,
           gitName,
           gitEmail,
-          sshKeyPath: sshKeyPath || null,
+          // "" = clear the key (backend treats empty string as "No SSH key")
+          sshKeyPath: sshKeyPath,
           directories,
         });
         toast.success(`Profile "${name}" updated successfully`);
@@ -65,7 +94,7 @@ export function ProfileForm() {
           name,
           gitName,
           gitEmail,
-          sshKeyPath: sshKeyPath || null,
+          sshKeyPath: sshKeyPath,
           directories,
         });
         toast.success(`Profile "${name}" created successfully`);
@@ -153,6 +182,35 @@ export function ProfileForm() {
       )}
 
       <form onSubmit={handleSubmit} className="space-y-6">
+        {ghAccounts.length > 0 && (
+          <Card>
+            <div className="flex items-center gap-2 mb-1">
+              <GitHubIcon size={16} className="text-emerald-400" />
+              <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">
+                Autofill from GitHub
+              </h2>
+            </div>
+            <p className="text-xs text-zinc-500 mb-3">
+              Pick a GitHub account (from your <span className="font-mono">gh</span>{" "}
+              logins) to fill in the git name &amp; email automatically.
+            </p>
+            <div className="flex items-center gap-2">
+              <Select
+                value={autofillAccount}
+                onChange={(v) => autofillFromAccount(v)}
+                disabled={autofilling}
+                placeholder="Select a GitHub account…"
+                optionIcon={<GitHubIcon size={14} />}
+                options={ghAccounts.map((a) => ({ value: a, label: a }))}
+                className="flex-1"
+              />
+              {autofilling && (
+                <Loader2 size={18} className="animate-spin text-emerald-400 shrink-0" />
+              )}
+            </div>
+          </Card>
+        )}
+
         <Card>
           <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider mb-4">
             Basic Information
@@ -192,18 +250,19 @@ export function ProfileForm() {
               <label className="block text-sm font-medium text-zinc-300">
                 SSH Key
               </label>
-              <select
+              <Select
                 value={sshKeyPath}
-                onChange={(e) => setSshKeyPath(e.target.value)}
-                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-zinc-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500"
-              >
-                <option value="">No SSH key</option>
-                {sshKeys.map((key) => (
-                  <option key={key} value={key}>
-                    {key}
-                  </option>
-                ))}
-              </select>
+                onChange={setSshKeyPath}
+                placeholder="No SSH key"
+                optionIcon={<Key size={14} />}
+                options={[
+                  { value: "", label: "No SSH key" },
+                  ...sshKeys.map((key) => ({
+                    value: key,
+                    label: key.split("/").pop() || key,
+                  })),
+                ]}
+              />
             </div>
             <Button
               type="button"

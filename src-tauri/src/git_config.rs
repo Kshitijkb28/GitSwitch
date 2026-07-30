@@ -8,34 +8,60 @@ fn get_gitconfig_path() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(".gitconfig")
 }
 
+const MAX_BACKUPS: usize = 5;
+
 fn backup_file(path: &PathBuf) -> Result<(), AppError> {
     if path.exists() {
         let timestamp = Utc::now().format("%Y%m%d%H%M%S");
         let backup_path = path.with_extension(format!("backup.{}", timestamp));
         fs::copy(path, &backup_path)?;
+        prune_backups(path);
     }
     Ok(())
+}
+
+/// Keep only the newest MAX_BACKUPS `<file>.backup.<timestamp>` siblings.
+/// Timestamps are fixed-width, so lexicographic order == chronological order.
+fn prune_backups(path: &PathBuf) {
+    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let prefix = format!("{}.backup.", file_name);
+
+    let Ok(entries) = fs::read_dir(parent) else { return };
+    let mut backups: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect();
+
+    backups.sort();
+    if backups.len() > MAX_BACKUPS {
+        for old in &backups[..backups.len() - MAX_BACKUPS] {
+            let _ = fs::remove_file(old);
+        }
+    }
 }
 
 fn generate_includeif_block(profile: &Profile) -> String {
     let mut blocks = String::new();
 
     for dir in &profile.directories {
+        // Trailing slash makes the gitdir match recursive over every repo inside.
         let dir_path = if dir.ends_with('/') {
             dir.clone()
         } else {
             format!("{}/", dir)
         };
 
-        let expanded = if dir_path.starts_with('~') {
-            dir_path.clone()
-        } else {
-            dir_path.clone()
-        };
-
         blocks.push_str(&format!(
             "[includeIf \"gitdir:{}\"]\n\tpath = {}\n\n",
-            expanded,
+            dir_path,
             get_profile_gitconfig_path(profile)
         ));
     }
@@ -105,7 +131,35 @@ pub fn apply_git_config() -> Result<(), AppError> {
     new_content.push_str("# <<< GitSwitch managed (DO NOT EDIT) <<<\n");
 
     fs::write(&gitconfig_path, new_content)?;
+
+    // Remove per-profile config files that no longer belong to a live profile
+    // (e.g. after a profile is deleted), so the app-managed dir never collects orphans.
+    cleanup_orphan_gitconfigs(&store);
+
     Ok(())
+}
+
+fn cleanup_orphan_gitconfigs(store: &crate::profiles::ProfileStore) {
+    let Some(data_dir) = dirs::data_dir() else { return };
+    let config_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
+    let Ok(entries) = fs::read_dir(&config_dir) else { return };
+
+    let live: Vec<String> = store
+        .profiles
+        .iter()
+        .map(|p| format!("{}.gitconfig", p.id))
+        .collect();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let keep = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| live.iter().any(|l| l == n));
+        if !keep {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 fn remove_gitswitch_sections(content: &str) -> String {
@@ -136,5 +190,52 @@ pub fn get_current_git_config() -> Result<String, AppError> {
         Ok(fs::read_to_string(&gitconfig_path)?)
     } else {
         Ok(String::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removes_managed_section_and_keeps_user_content() {
+        let content = "\
+[user]\n\tname = mine\n\n\
+# >>> GitSwitch managed (DO NOT EDIT) >>>\n\
+[user]\n\tname = managed\n\
+# <<< GitSwitch managed (DO NOT EDIT) <<<\n\
+[alias]\n\tco = checkout";
+        let cleaned = remove_gitswitch_sections(content);
+        assert!(cleaned.contains("name = mine"));
+        assert!(cleaned.contains("co = checkout"));
+        assert!(!cleaned.contains("managed"));
+        assert!(!cleaned.contains(">>>"));
+    }
+
+    #[test]
+    fn no_managed_section_is_a_noop() {
+        let content = "[user]\n\tname = mine";
+        assert_eq!(remove_gitswitch_sections(content), content);
+    }
+
+    #[test]
+    fn includeif_block_appends_trailing_slash_for_recursive_match() {
+        use crate::profiles::Profile;
+        use chrono::Utc;
+        let p = Profile {
+            id: "test-id".into(),
+            name: "t".into(),
+            git_name: "n".into(),
+            git_email: "e".into(),
+            ssh_key_path: None,
+            is_default: false,
+            directories: vec!["/a/work".into(), "/b/personal/".into()],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let block = generate_includeif_block(&p);
+        assert!(block.contains("gitdir:/a/work/"));
+        assert!(block.contains("gitdir:/b/personal/"));
+        assert!(!block.contains("personal//"));
     }
 }

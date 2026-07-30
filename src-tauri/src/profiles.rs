@@ -12,7 +12,8 @@ pub struct Profile {
     pub git_name: String,
     pub git_email: String,
     pub ssh_key_path: Option<String>,
-    pub github_token: Option<String>,
+    // NOTE: GitHub tokens are stored in the OS keyring (see credentials.rs),
+    // never in this plaintext JSON store.
     pub is_default: bool,
     pub directories: Vec<String>,
     pub created_at: DateTime<Utc>,
@@ -93,8 +94,8 @@ pub fn create_profile(
         name,
         git_name,
         git_email,
-        ssh_key_path,
-        github_token: None,
+        // Normalize "" to None so an empty picker never stores an empty path.
+        ssh_key_path: ssh_key_path.filter(|k| !k.is_empty()),
         is_default,
         directories,
         created_at: now,
@@ -135,7 +136,8 @@ pub fn update_profile(
         profile.git_email = e;
     }
     if let Some(k) = ssh_key_path {
-        profile.ssh_key_path = Some(k);
+        // "" means the user chose "No SSH key" — clear it. (None = not provided.)
+        profile.ssh_key_path = if k.is_empty() { None } else { Some(k) };
     }
     if let Some(d) = directories {
         profile.directories = d;
@@ -184,4 +186,55 @@ pub fn set_default_profile(id: String) -> Result<Profile, AppError> {
     let profile = store.profiles.iter().find(|p| p.id == id).unwrap().clone();
     save_profiles(&store)?;
     Ok(profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk(id: &str, dirs: &[&str]) -> Profile {
+        Profile {
+            id: id.into(),
+            name: id.into(),
+            git_name: "n".into(),
+            git_email: "e".into(),
+            ssh_key_path: None,
+            is_default: false,
+            directories: dirs.iter().map(|s| s.to_string()).collect(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn folder_belongs_to_exactly_one_profile() {
+        let mut store = ProfileStore {
+            profiles: vec![mk("A", &["/x/carpool", "/x/other"]), mk("B", &["/x/foo"])],
+        };
+        // Assign /x/carpool (trailing-slash variant) to B — must vanish from A.
+        dedupe_directories(&mut store, "B", &["/x/carpool/".to_string()]);
+
+        let a = store.profiles.iter().find(|p| p.id == "A").unwrap();
+        assert_eq!(a.directories, vec!["/x/other".to_string()]);
+        let b = store.profiles.iter().find(|p| p.id == "B").unwrap();
+        assert_eq!(b.directories, vec!["/x/foo".to_string()]);
+    }
+
+    #[test]
+    fn norm_dir_strips_trailing_slashes() {
+        assert_eq!(norm_dir("/a/b/"), "/a/b");
+        assert_eq!(norm_dir("/a/b"), "/a/b");
+        assert_eq!(norm_dir("/a/b//"), "/a/b");
+    }
+
+    #[test]
+    fn old_store_json_with_github_token_still_loads() {
+        // Profiles saved by older versions carry a github_token field; serde
+        // must ignore it rather than fail deserialization.
+        let json = r#"{"profiles":[{"id":"1","name":"p","git_name":"n","git_email":"e",
+            "ssh_key_path":null,"github_token":null,"is_default":true,"directories":[],
+            "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]}"#;
+        let store: ProfileStore = serde_json::from_str(json).unwrap();
+        assert_eq!(store.profiles.len(), 1);
+    }
 }

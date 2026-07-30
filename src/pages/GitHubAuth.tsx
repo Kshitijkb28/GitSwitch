@@ -72,7 +72,8 @@ export function GitHubAuth() {
       const token = await api.ghGetToken(account);
       const ghUser = await api.verifyGithubToken(token);
       setUser(ghUser);
-      await api.storeGithubToken(`__gh_${account}__`, token);
+      // Note: tokens are not persisted here — gh already stores them securely,
+      // and nothing in the app reads a per-account copy.
       setStep("success");
     } catch (e) {
       setError(String(e));
@@ -142,7 +143,6 @@ export function GitHubAuth() {
         const ghUser = await api.verifyGithubToken(token.access_token);
         if (pollGenRef.current !== myGen) return;
         setUser(ghUser);
-        await api.storeGithubToken("__oauth_default__", token.access_token);
         setStep("success");
         return; // done — stop the loop
       } catch (e) {

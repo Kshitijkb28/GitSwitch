@@ -16,6 +16,7 @@ pub fn get_profiles() -> Result<Vec<Profile>, AppError> {
 
 #[tauri::command]
 pub fn create_profile(
+    app: tauri::AppHandle,
     name: String,
     git_name: String,
     git_email: String,
@@ -24,11 +25,13 @@ pub fn create_profile(
 ) -> Result<Profile, AppError> {
     let profile = profiles::create_profile(name, git_name, git_email, ssh_key_path, directories)?;
     git_config::apply_git_config()?;
+    crate::tray::update_active_label(&app);
     Ok(profile)
 }
 
 #[tauri::command]
 pub fn update_profile(
+    app: tauri::AppHandle,
     id: String,
     name: Option<String>,
     git_name: Option<String>,
@@ -38,21 +41,24 @@ pub fn update_profile(
 ) -> Result<Profile, AppError> {
     let profile = profiles::update_profile(id, name, git_name, git_email, ssh_key_path, directories)?;
     git_config::apply_git_config()?;
+    crate::tray::update_active_label(&app);
     Ok(profile)
 }
 
 #[tauri::command]
-pub fn delete_profile(id: String) -> Result<(), AppError> {
+pub fn delete_profile(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
     credentials::delete_token(&id).ok();
     profiles::delete_profile(id)?;
     git_config::apply_git_config()?;
+    crate::tray::update_active_label(&app);
     Ok(())
 }
 
 #[tauri::command]
-pub fn set_default_profile(id: String) -> Result<Profile, AppError> {
+pub fn set_default_profile(app: tauri::AppHandle, id: String) -> Result<Profile, AppError> {
     let profile = profiles::set_default_profile(id)?;
     git_config::apply_git_config()?;
+    crate::tray::update_active_label(&app);
     Ok(profile)
 }
 
@@ -130,9 +136,13 @@ pub async fn resolve_key_account(key_path: String) -> Result<Option<String>, App
 }
 
 /// Automate "Step 4": convert HTTPS (incl. token) remotes to SSH for all repos under a folder.
+/// Runs on a blocking thread — it walks the directory tree and shells out to git
+/// per repo, which would freeze the UI if run as a sync command.
 #[tauri::command]
-pub fn convert_repos_to_ssh(directory: String) -> Result<Vec<RemoteChange>, AppError> {
-    git_remote::convert_repos_in_dir(&directory)
+pub async fn convert_repos_to_ssh(directory: String) -> Result<Vec<RemoteChange>, AppError> {
+    tokio::task::spawn_blocking(move || git_remote::convert_repos_in_dir(&directory))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
 }
 
 #[tauri::command]

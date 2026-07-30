@@ -37,9 +37,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZFMTg4N0QwRDhEMjkxN0UKUldSK2tkTFkwSWNZL2pab0ZSbjIxemg3VnRUTTd6K0U1VGFROVBsNGRkMnpjWHRaaGxPdkVybmIK",
       "endpoints": [
-        "https://github.com/nicktretyakov/gitswitch/releases/latest/download/latest.json"
+        "https://github.com/Kshitijkb28/GitSwitch/releases/latest/download/latest.json"
       ],
       "dialog": false
     }
