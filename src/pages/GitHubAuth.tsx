@@ -25,9 +25,14 @@ export function GitHubAuth() {
   const pollGenRef = useRef(0);
 
   const [ghRefreshing, setGhRefreshing] = useState(false);
+  const [ghLoading, setGhLoading] = useState(true);
 
   function loadGhAccounts() {
-    api.ghListAccounts().then(setGhAccounts).catch(() => setGhAccounts([]));
+    setGhLoading(true);
+    api.ghListAccounts()
+      .then(setGhAccounts)
+      .catch(() => setGhAccounts([]))
+      .finally(() => setGhLoading(false));
   }
 
   async function refreshGhAccounts() {
@@ -237,7 +242,12 @@ export function GitHubAuth() {
               You're already signed in to these accounts via <span className="font-mono text-zinc-400">gh</span>.
               Pick one to use instantly — no code needed.
             </p>
-            {ghAccounts.length === 0 ? (
+            {ghLoading ? (
+              <div className="flex items-center justify-center gap-2 px-3 py-5 rounded-lg bg-zinc-800/40 border border-zinc-700/40 text-sm text-zinc-400">
+                <Loader2 size={16} className="animate-spin text-emerald-400" />
+                Checking GitHub CLI accounts…
+              </div>
+            ) : ghAccounts.length === 0 ? (
               <p className="text-sm text-zinc-500 px-3 py-4 rounded-lg bg-zinc-800/40 border border-zinc-700/40 text-center">
                 No <span className="font-mono">gh</span> accounts found. Run{" "}
                 <span className="font-mono text-zinc-400">gh auth login</span> in
