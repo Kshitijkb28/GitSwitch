@@ -18,6 +18,7 @@ export async function createProfile(params: {
   gitEmail: string;
   sshKeyPath?: string | null;
   directories: string[];
+  allowPush?: boolean | null;
 }): Promise<Profile> {
   return invoke("create_profile", params);
 }
@@ -29,6 +30,7 @@ export async function updateProfile(params: {
   gitEmail?: string | null;
   sshKeyPath?: string | null;
   directories?: string[] | null;
+  allowPush?: boolean | null;
 }): Promise<Profile> {
   return invoke("update_profile", params);
 }
@@ -106,6 +108,69 @@ export async function convertReposToSsh(
   directory: string
 ): Promise<RemoteChange[]> {
   return invoke("convert_repos_to_ssh", { directory });
+}
+
+export interface ScannedRepo {
+  path: string;
+  remote_url: string;
+  owner: string;
+  name: string;
+}
+
+export interface RepoPermissions {
+  admin: boolean;
+  push: boolean;
+  pull: boolean;
+}
+
+export async function scanRepos(root: string): Promise<ScannedRepo[]> {
+  return invoke("scan_repos", { root });
+}
+
+export async function checkRepoAccess(
+  token: string,
+  owner: string,
+  repo: string
+): Promise<RepoPermissions | null> {
+  return invoke("check_repo_access", { token, owner, repo });
+}
+
+export interface SparseInfo {
+  path: string;
+  branch: string;
+  is_sparse: boolean;
+  sparse_dirs: string[];
+  available_dirs: string[];
+}
+
+export async function sparseClone(
+  url: string,
+  parentDir: string,
+  folderName?: string | null
+): Promise<string> {
+  return invoke("sparse_clone", {
+    url,
+    parentDir,
+    folderName: folderName ?? null,
+  });
+}
+
+export async function sparseRepoInfo(repoPath: string): Promise<SparseInfo> {
+  return invoke("sparse_repo_info", { repoPath });
+}
+
+export async function sparseSet(
+  repoPath: string,
+  dirs: string[]
+): Promise<void> {
+  return invoke("sparse_set", { repoPath, dirs });
+}
+
+export async function sparseAdd(
+  repoPath: string,
+  dirs: string[]
+): Promise<void> {
+  return invoke("sparse_add", { repoPath, dirs });
 }
 
 export async function storeGithubToken(

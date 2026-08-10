@@ -7,6 +7,8 @@ mod git_remote;
 mod github;
 mod oauth;
 mod profiles;
+mod repo_scan;
+mod sparse;
 mod ssh_keys;
 mod tray;
 
@@ -67,6 +69,12 @@ pub fn run() {
             commands::gh_register_ssh_key,
             commands::resolve_key_account,
             commands::convert_repos_to_ssh,
+            commands::scan_repos,
+            commands::check_repo_access,
+            commands::sparse_clone,
+            commands::sparse_repo_info,
+            commands::sparse_set,
+            commands::sparse_add,
             commands::store_github_token,
             commands::get_github_token,
             commands::apply_git_config,

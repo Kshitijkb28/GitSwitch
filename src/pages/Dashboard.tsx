@@ -134,6 +134,9 @@ export function Dashboard() {
                     {profile.is_default && (
                       <Badge variant="success">Default</Badge>
                     )}
+                    {!profile.allow_push && (
+                      <Badge variant="error">push blocked</Badge>
+                    )}
                   </div>
                   <p className="text-sm text-zinc-400 mt-0.5">
                     {profile.git_name} &lt;{profile.git_email}&gt;

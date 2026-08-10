@@ -1,11 +1,13 @@
 import { Routes, Route, NavLink, useLocation } from "react-router-dom";
-import { LayoutDashboard, Key, Settings as SettingsIcon } from "lucide-react";
+import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
 import { ProfileForm } from "./pages/ProfileForm";
 import { SSHWizard } from "./pages/SSHWizard";
 import { Settings } from "./pages/Settings";
 import { GitHubAuth } from "./pages/GitHubAuth";
+import { SparseClone } from "./pages/SparseClone";
+import { AutoAssign } from "./pages/AutoAssign";
 
 function App() {
   const location = useLocation();
@@ -32,6 +34,12 @@ function App() {
           <SidebarLink to="/github" icon={<GitHubIcon size={18} />}>
             GitHub Auth
           </SidebarLink>
+          <SidebarLink to="/sparse" icon={<GitBranch size={18} />}>
+            Sparse Clone
+          </SidebarLink>
+          <SidebarLink to="/auto-assign" icon={<ScanSearch size={18} />}>
+            Auto Assign
+          </SidebarLink>
           <SidebarLink to="/settings" icon={<SettingsIcon size={18} />}>
             Settings
           </SidebarLink>
@@ -48,6 +56,8 @@ function App() {
           <Route path="/profile/:id/edit" element={<ProfileForm />} />
           <Route path="/ssh" element={<SSHWizard />} />
           <Route path="/github" element={<GitHubAuth />} />
+          <Route path="/sparse" element={<SparseClone />} />
+          <Route path="/auto-assign" element={<AutoAssign />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>

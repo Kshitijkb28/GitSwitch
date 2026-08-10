@@ -48,24 +48,32 @@ fn prune_backups(path: &PathBuf) {
     }
 }
 
-fn generate_includeif_block(profile: &Profile) -> String {
+/// Build every includeIf block across all profiles, ordered by path length so
+/// the MOST SPECIFIC directory comes LAST. git resolves overlapping includes
+/// with last-match-wins, so this makes a nested repo folder correctly override
+/// its parent folder's profile (and matches the UI's longest-prefix logic).
+fn build_includeif_blocks(profiles: &[Profile]) -> String {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for profile in profiles {
+        for dir in &profile.directories {
+            // Trailing slash makes the gitdir match recursive over every repo inside.
+            let dir_path = if dir.ends_with('/') {
+                dir.clone()
+            } else {
+                format!("{}/", dir)
+            };
+            entries.push((dir_path, get_profile_gitconfig_path(profile)));
+        }
+    }
+    entries.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+
     let mut blocks = String::new();
-
-    for dir in &profile.directories {
-        // Trailing slash makes the gitdir match recursive over every repo inside.
-        let dir_path = if dir.ends_with('/') {
-            dir.clone()
-        } else {
-            format!("{}/", dir)
-        };
-
+    for (dir, path) in entries {
         blocks.push_str(&format!(
             "[includeIf \"gitdir:{}\"]\n\tpath = {}\n\n",
-            dir_path,
-            get_profile_gitconfig_path(profile)
+            dir, path
         ));
     }
-
     blocks
 }
 
@@ -73,6 +81,29 @@ fn get_profile_gitconfig_path(profile: &Profile) -> String {
     let data_dir = dirs::data_dir().unwrap_or_default();
     let app_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
     format!("{}/{}.gitconfig", app_dir.display(), profile.id)
+}
+
+/// Config block that makes `git push` fail locally with a recognizable error
+/// ("remote helper 'gitswitch-push-blocked' aborted") while leaving fetch/pull
+/// untouched — pushes get their URL rewritten to a scheme git can't handle.
+///
+/// pushInsteadOf is a literal prefix match, so cover every common github.com
+/// remote form. Known limits (documented in the UI): custom ssh-config host
+/// aliases and remotes with an explicit remote.<name>.pushurl are not caught.
+/// This section must only ever be written into per-folder include files, never
+/// the main ~/.gitconfig — rewrite rules ACCUMULATE across includes (they are
+/// not last-match-wins), so a global block could never be overridden.
+fn push_block_section() -> &'static str {
+    "[url \"gitswitch-push-blocked://\"]\n\
+     \tpushInsteadOf = git@github.com:\n\
+     \tpushInsteadOf = git@github.com/\n\
+     \tpushInsteadOf = ssh://git@github.com/\n\
+     \tpushInsteadOf = ssh://git@github.com:22/\n\
+     \tpushInsteadOf = ssh://git@ssh.github.com/\n\
+     \tpushInsteadOf = ssh://git@ssh.github.com:443/\n\
+     \tpushInsteadOf = https://github.com/\n\
+     \tpushInsteadOf = http://github.com/\n\
+     \tpushInsteadOf = github.com:\n"
 }
 
 fn write_profile_gitconfig(profile: &Profile) -> Result<(), AppError> {
@@ -86,6 +117,10 @@ fn write_profile_gitconfig(profile: &Profile) -> Result<(), AppError> {
 
     if let Some(ref key_path) = profile.ssh_key_path {
         content.push_str(&format!("[core]\n\tsshCommand = ssh -i {} -o IdentitiesOnly=yes\n", key_path));
+    }
+
+    if !profile.allow_push {
+        content.push_str(push_block_section());
     }
 
     fs::write(&path, content)?;
@@ -119,14 +154,19 @@ pub fn apply_git_config() -> Result<(), AppError> {
         if let Some(ref key_path) = default_profile.ssh_key_path {
             new_content.push_str(&format!("[core]\n\tsshCommand = ssh -i {} -o IdentitiesOnly=yes\n\n", key_path));
         }
+
+        // Intentionally NO push-block here: url rewrite rules accumulate across
+        // includes, so a block in the main config could never be overridden by
+        // folder profiles that allow pushes. profiles.rs enforces that the
+        // default profile always allows pushes.
     }
 
     for profile in &store.profiles {
         if !profile.directories.is_empty() {
             write_profile_gitconfig(profile)?;
-            new_content.push_str(&generate_includeif_block(profile));
         }
     }
+    new_content.push_str(&build_includeif_blocks(&store.profiles));
 
     new_content.push_str("# <<< GitSwitch managed (DO NOT EDIT) <<<\n");
 
@@ -218,24 +258,59 @@ mod tests {
         assert_eq!(remove_gitswitch_sections(content), content);
     }
 
-    #[test]
-    fn includeif_block_appends_trailing_slash_for_recursive_match() {
-        use crate::profiles::Profile;
+    fn mk_profile(id: &str, dirs: &[&str]) -> crate::profiles::Profile {
         use chrono::Utc;
-        let p = Profile {
-            id: "test-id".into(),
-            name: "t".into(),
+        crate::profiles::Profile {
+            id: id.into(),
+            name: id.into(),
             git_name: "n".into(),
             git_email: "e".into(),
             ssh_key_path: None,
             is_default: false,
-            directories: vec!["/a/work".into(), "/b/personal/".into()],
+            allow_push: true,
+            directories: dirs.iter().map(|s| s.to_string()).collect(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
-        };
-        let block = generate_includeif_block(&p);
+        }
+    }
+
+    #[test]
+    fn includeif_blocks_append_trailing_slash_for_recursive_match() {
+        let p = mk_profile("test-id", &["/a/work", "/b/personal/"]);
+        let block = build_includeif_blocks(&[p]);
         assert!(block.contains("gitdir:/a/work/"));
         assert!(block.contains("gitdir:/b/personal/"));
         assert!(!block.contains("personal//"));
+    }
+
+    #[test]
+    fn nested_dir_is_emitted_after_its_parent_so_it_wins() {
+        // Profile order intentionally puts the SPECIFIC dir's owner first —
+        // sorting must still emit the parent include before the nested one,
+        // because git's last-match-wins means "later include overrides".
+        let child_owner = mk_profile("work", &["/dev/oss-repo"]);
+        let parent_owner = mk_profile("personal", &["/dev"]);
+        let block = build_includeif_blocks(&[child_owner, parent_owner]);
+        let parent_pos = block.find("gitdir:/dev/\"").expect("parent include missing");
+        let child_pos = block.find("gitdir:/dev/oss-repo/").expect("child include missing");
+        assert!(
+            parent_pos < child_pos,
+            "nested (more specific) include must come last so it wins"
+        );
+    }
+
+    #[test]
+    fn push_block_rewrites_only_push_urls() {
+        let s = push_block_section();
+        // Must rewrite pushes for every common GitHub remote style…
+        assert!(s.contains("pushInsteadOf = git@github.com:"));
+        assert!(s.contains("pushInsteadOf = git@github.com/"));
+        assert!(s.contains("pushInsteadOf = https://github.com/"));
+        assert!(s.contains("pushInsteadOf = http://github.com/"));
+        assert!(s.contains("pushInsteadOf = ssh://git@github.com/"));
+        assert!(s.contains("pushInsteadOf = ssh://git@github.com:22/"));
+        assert!(s.contains("pushInsteadOf = ssh://git@ssh.github.com:443/"));
+        // …but never fetches (a plain insteadOf would break pull/clone).
+        assert!(!s.contains("\tinsteadOf"));
     }
 }

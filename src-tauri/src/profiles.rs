@@ -15,9 +15,17 @@ pub struct Profile {
     // NOTE: GitHub tokens are stored in the OS keyring (see credentials.rs),
     // never in this plaintext JSON store.
     pub is_default: bool,
+    /// When false, `git push` is blocked locally for repos in this profile's
+    /// folders (via a pushInsteadOf URL rewrite). Fetch/pull are unaffected.
+    #[serde(default = "default_true")]
+    pub allow_push: bool,
     pub directories: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +44,32 @@ impl ProfileStore {
 /// Normalize a directory path for comparison (trim trailing slashes).
 fn norm_dir(d: &str) -> String {
     d.trim_end_matches('/').to_string()
+}
+
+/// Expand a leading `~/` to the home directory so stored paths always compare
+/// equal to absolute paths (scanners and pickers produce absolute paths).
+fn expand_tilde(dir: &str) -> String {
+    if let Some(rest) = dir.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    dir.to_string()
+}
+
+/// Blocking pushes on the DEFAULT profile would inject an un-overridable
+/// pushInsteadOf rewrite into the main ~/.gitconfig — git accumulates URL
+/// rewrite rules across includes, so folder profiles that ALLOW pushes could
+/// never undo it. Hence: only non-default profiles may block pushes.
+fn ensure_default_can_push(is_default: bool, allow_push: bool) -> Result<(), AppError> {
+    if is_default && !allow_push {
+        return Err(AppError::Config(
+            "The default profile can't block pushes — it would affect every folder. \
+             Use a non-default profile with specific folders instead."
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Remove `dirs` from every profile EXCEPT `keep_id`, so a folder can belong to
@@ -83,10 +117,12 @@ pub fn create_profile(
     git_email: String,
     ssh_key_path: Option<String>,
     directories: Vec<String>,
+    allow_push: bool,
 ) -> Result<Profile, AppError> {
     let mut store = load_profiles()?;
 
     let is_default = store.profiles.is_empty();
+    ensure_default_can_push(is_default, allow_push)?;
     let now = Utc::now();
 
     let profile = Profile {
@@ -97,7 +133,8 @@ pub fn create_profile(
         // Normalize "" to None so an empty picker never stores an empty path.
         ssh_key_path: ssh_key_path.filter(|k| !k.is_empty()),
         is_default,
-        directories,
+        allow_push,
+        directories: directories.iter().map(|d| expand_tilde(d)).collect(),
         created_at: now,
         updated_at: now,
     };
@@ -117,6 +154,7 @@ pub fn update_profile(
     git_email: Option<String>,
     ssh_key_path: Option<String>,
     directories: Option<Vec<String>>,
+    allow_push: Option<bool>,
 ) -> Result<Profile, AppError> {
     let mut store = load_profiles()?;
 
@@ -140,7 +178,11 @@ pub fn update_profile(
         profile.ssh_key_path = if k.is_empty() { None } else { Some(k) };
     }
     if let Some(d) = directories {
-        profile.directories = d;
+        profile.directories = d.iter().map(|dir| expand_tilde(dir)).collect();
+    }
+    if let Some(ap) = allow_push {
+        ensure_default_can_push(profile.is_default, ap)?;
+        profile.allow_push = ap;
     }
     profile.updated_at = Utc::now();
 
@@ -174,9 +216,17 @@ pub fn delete_profile(id: String) -> Result<(), AppError> {
 pub fn set_default_profile(id: String) -> Result<Profile, AppError> {
     let mut store = load_profiles()?;
 
-    let exists = store.profiles.iter().any(|p| p.id == id);
-    if !exists {
-        return Err(AppError::NotFound(format!("Profile {} not found", id)));
+    let target = store
+        .profiles
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| AppError::NotFound(format!("Profile {} not found", id)))?;
+    if !target.allow_push {
+        return Err(AppError::Config(
+            "This profile blocks pushes, so it can't become the default \
+             (the block would leak into every folder). Enable push access first."
+                .into(),
+        ));
     }
 
     for p in store.profiles.iter_mut() {
@@ -200,6 +250,7 @@ mod tests {
             git_email: "e".into(),
             ssh_key_path: None,
             is_default: false,
+            allow_push: true,
             directories: dirs.iter().map(|s| s.to_string()).collect(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -236,5 +287,23 @@ mod tests {
             "created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]}"#;
         let store: ProfileStore = serde_json::from_str(json).unwrap();
         assert_eq!(store.profiles.len(), 1);
+        // Stores that predate the allow_push field must default to allowing pushes.
+        assert!(store.profiles[0].allow_push);
+    }
+
+    #[test]
+    fn tilde_paths_expand_to_home() {
+        let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
+        assert_eq!(expand_tilde("~/projects/work"), format!("{}/projects/work", home));
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(expand_tilde("relative"), "relative");
+    }
+
+    #[test]
+    fn default_profile_may_never_block_pushes() {
+        assert!(ensure_default_can_push(true, false).is_err());
+        assert!(ensure_default_can_push(true, true).is_ok());
+        assert!(ensure_default_can_push(false, false).is_ok());
+        assert!(ensure_default_can_push(false, true).is_ok());
     }
 }

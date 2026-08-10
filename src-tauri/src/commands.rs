@@ -3,9 +3,11 @@ use crate::error::AppError;
 use crate::gh_cli;
 use crate::git_config;
 use crate::git_remote::{self, RemoteChange};
-use crate::github::{self, GitHubKey, GitHubUser};
+use crate::github::{self, GitHubKey, GitHubUser, RepoPermissions};
+use crate::repo_scan::{self, ScannedRepo};
 use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
 use crate::profiles::{self, Profile};
+use crate::sparse::{self, SparseInfo};
 use crate::ssh_keys;
 
 #[tauri::command]
@@ -22,8 +24,16 @@ pub fn create_profile(
     git_email: String,
     ssh_key_path: Option<String>,
     directories: Vec<String>,
+    allow_push: Option<bool>,
 ) -> Result<Profile, AppError> {
-    let profile = profiles::create_profile(name, git_name, git_email, ssh_key_path, directories)?;
+    let profile = profiles::create_profile(
+        name,
+        git_name,
+        git_email,
+        ssh_key_path,
+        directories,
+        allow_push.unwrap_or(true),
+    )?;
     git_config::apply_git_config()?;
     crate::tray::update_active_label(&app);
     Ok(profile)
@@ -38,8 +48,11 @@ pub fn update_profile(
     git_email: Option<String>,
     ssh_key_path: Option<String>,
     directories: Option<Vec<String>>,
+    allow_push: Option<bool>,
 ) -> Result<Profile, AppError> {
-    let profile = profiles::update_profile(id, name, git_name, git_email, ssh_key_path, directories)?;
+    let profile = profiles::update_profile(
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push,
+    )?;
     git_config::apply_git_config()?;
     crate::tray::update_active_label(&app);
     Ok(profile)
@@ -133,6 +146,51 @@ pub async fn gh_register_ssh_key(
 #[tauri::command]
 pub async fn resolve_key_account(key_path: String) -> Result<Option<String>, AppError> {
     ssh_keys::resolve_key_account(&key_path).await
+}
+
+/// Auto-assign: find every git repo under a folder with its GitHub owner/name.
+#[tauri::command]
+pub async fn scan_repos(root: String) -> Result<Vec<ScannedRepo>, AppError> {
+    repo_scan::scan_repos(root).await
+}
+
+/// Auto-assign: what access does this token's account have on owner/repo?
+/// None = the account can't even see the repo.
+#[tauri::command]
+pub async fn check_repo_access(
+    token: String,
+    owner: String,
+    repo: String,
+) -> Result<Option<RepoPermissions>, AppError> {
+    github::repo_permission(&token, &owner, &repo).await
+}
+
+/// Sparse checkout: partial-clone a repo (blob:none, no checkout).
+#[tauri::command]
+pub async fn sparse_clone(
+    url: String,
+    parent_dir: String,
+    folder_name: Option<String>,
+) -> Result<String, AppError> {
+    sparse::sparse_clone(&url, &parent_dir, folder_name.as_deref()).await
+}
+
+/// Sparse checkout: inspect a repo (branch, top-level folders, current sparse set).
+#[tauri::command]
+pub async fn sparse_repo_info(repo_path: String) -> Result<SparseInfo, AppError> {
+    sparse::repo_info(&repo_path).await
+}
+
+/// Sparse checkout: replace the folder selection and materialize the tree.
+#[tauri::command]
+pub async fn sparse_set(repo_path: String, dirs: Vec<String>) -> Result<(), AppError> {
+    sparse::sparse_set(&repo_path, dirs).await
+}
+
+/// Sparse checkout: add folders to the existing selection.
+#[tauri::command]
+pub async fn sparse_add(repo_path: String, dirs: Vec<String>) -> Result<(), AppError> {
+    sparse::sparse_add(&repo_path, dirs).await
 }
 
 /// Automate "Step 4": convert HTTPS (incl. token) remotes to SSH for all repos under a folder.

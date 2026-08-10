@@ -1,4 +1,4 @@
-import { useState, useEffect, type SubmitEvent } from "react";
+import { useState, useEffect, useRef, type SubmitEvent } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ArrowLeft, FolderPlus, X, Key, FolderOpen, Link2, Loader2, CheckCircle2 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -8,6 +8,7 @@ import { Input } from "../components/Input";
 import { Card } from "../components/Card";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
+import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
 
 export function ProfileForm() {
@@ -21,6 +22,8 @@ export function ProfileForm() {
   const [gitName, setGitName] = useState(searchParams.get("git_name") || "");
   const [gitEmail, setGitEmail] = useState(searchParams.get("github_email") || "");
   const [sshKeyPath, setSshKeyPath] = useState("");
+  const [allowPush, setAllowPush] = useState(true);
+  const [isDefaultProfile, setIsDefaultProfile] = useState(false);
   const [directories, setDirectories] = useState<string[]>([]);
   const [dirInput, setDirInput] = useState("");
   const [sshKeys, setSshKeys] = useState<string[]>([]);
@@ -31,45 +34,157 @@ export function ProfileForm() {
   const [ghAccounts, setGhAccounts] = useState<string[]>([]);
   const [autofillAccount, setAutofillAccount] = useState("");
   const [autofilling, setAutofilling] = useState(false);
+  const [suggestions, setSuggestions] = useState<{ names: string[]; emails: string[] }>({
+    names: [],
+    emails: [],
+  });
+  const [originalIdentity, setOriginalIdentity] = useState<{
+    name: string;
+    email: string;
+  } | null>(null);
+  // Edit mode renders a loading state until the profile is in hand: a blank but
+  // interactive form could be typed into (and submitted), and an empty
+  // directories/ssh-key submit is treated by the backend as an explicit clear.
+  const [loadingProfile, setLoadingProfile] = useState(isEdit);
+  // Last-write-wins guard so a superseded autofill can never write stale state.
+  const autofillSeq = useRef(0);
+  // Once the user picks an account themselves, background pre-selection stops.
+  const userPicked = useRef(false);
+  // The profile name we auto-filled, so switching accounts updates it but
+  // anything the user typed is left alone.
+  const autoFilledName = useRef<string | null>(null);
 
-  async function autofillFromAccount(account: string) {
+  async function fetchIdentity(account: string) {
+    const token = await api.ghGetToken(account);
+    const u = await api.verifyGithubToken(token);
+    const noreply = `${u.id}+${u.login}@users.noreply.github.com`;
+    return {
+      login: u.login,
+      email: u.email || noreply,
+      names: Array.from(new Set([u.login, u.name].filter(Boolean) as string[])),
+      emails: Array.from(new Set([u.email, noreply].filter(Boolean) as string[])),
+    };
+  }
+
+  /** The user chose an account — fill the git identity fields. */
+  async function applyAccountIdentity(account: string) {
+    userPicked.current = true;
+    const seq = ++autofillSeq.current;
+    const previous = autofillAccount;
     setAutofillAccount(account);
-    if (!account) return;
+    if (!account) {
+      setSuggestions({ names: [], emails: [] });
+      return;
+    }
     setAutofilling(true);
     setError(null);
     try {
-      const token = await api.ghGetToken(account);
-      const u = await api.verifyGithubToken(token);
-      // Git identity: real name if set, else the login handle.
-      setGitName(u.name || u.login);
-      // Email: public email if available, else GitHub's noreply address.
-      setGitEmail(u.email || `${u.id}+${u.login}@users.noreply.github.com`);
-      // Friendly profile name — only fill if the user hasn't typed one.
-      setName((prev) => prev || u.login);
-      toast.success(`Filled in details for ${u.login}`);
+      const idty = await fetchIdentity(account);
+      if (autofillSeq.current !== seq) return; // superseded by a newer pick
+      setSuggestions({ names: idty.names, emails: idty.emails });
+      // Default to the login handle — that's what git identities conventionally
+      // use, and GitHub attributes commits by email regardless of the name.
+      setGitName(idty.login);
+      setGitEmail(idty.email);
+      setName((prev) => (!prev || prev === autoFilledName.current ? idty.login : prev));
+      autoFilledName.current = idty.login;
+      toast.success(`Filled in ${idty.login}'s git identity`);
     } catch (e) {
+      if (autofillSeq.current !== seq) return;
       setError(String(e));
+      // Don't leave the dropdown pointing at an account we never loaded, with
+      // the previous account's chips underneath it.
+      setAutofillAccount(previous);
+      setSuggestions({ names: [], emails: [] });
     } finally {
-      setAutofilling(false);
+      if (autofillSeq.current === seq) setAutofilling(false);
+    }
+  }
+
+  /**
+   * Background: show which account a loaded profile belongs to.
+   * Deliberately touches ONLY the dropdown and the suggestion chips — never the
+   * identity fields, so a slow lookup can never clobber what's on screen.
+   */
+  async function preselectAccount(account: string, isCancelled: () => boolean) {
+    const seq = ++autofillSeq.current;
+    setAutofillAccount(account);
+    try {
+      const idty = await fetchIdentity(account);
+      if (isCancelled() || userPicked.current || autofillSeq.current !== seq) return;
+      setSuggestions({ names: idty.names, emails: idty.emails });
+    } catch {
+      // Leave the chips empty; the dropdown still shows the matched account.
     }
   }
 
   useEffect(() => {
-    api.listSshKeys().then(setSshKeys).catch(() => {});
-    api.ghListAccounts().then(setGhAccounts).catch(() => setGhAccounts([]));
+    let cancelled = false;
+    const isCancelled = () => cancelled;
 
-    if (isEdit) {
-      api.getProfiles().then((profiles) => {
-        const profile = profiles.find((p) => p.id === id);
-        if (profile) {
-          setName(profile.name);
-          setGitName(profile.git_name);
-          setGitEmail(profile.git_email);
-          setSshKeyPath(profile.ssh_key_path ?? "");
-          setDirectories(profile.directories);
-        }
-      });
+    api.listSshKeys()
+      .then((k) => !cancelled && setSshKeys(k))
+      .catch(() => {});
+
+    // The gh account list is fetched independently: it shells out to
+    // `gh auth status` (network, no timeout), and the form must never wait on it.
+    const accountsPromise = api.ghListAccounts().catch(() => [] as string[]);
+    accountsPromise.then((a) => !cancelled && setGhAccounts(a));
+
+    if (!isEdit) {
+      return () => {
+        cancelled = true;
+      };
     }
+
+    (async () => {
+      try {
+        const profiles: Profile[] = await api.getProfiles();
+        if (cancelled) return;
+        const profile = profiles.find((p) => p.id === id);
+        if (!profile) {
+          setError("Profile not found — it may have been deleted.");
+          return;
+        }
+
+        setName(profile.name);
+        setGitName(profile.git_name);
+        setGitEmail(profile.git_email);
+        setSshKeyPath(profile.ssh_key_path ?? "");
+        setAllowPush(profile.allow_push);
+        setIsDefaultProfile(profile.is_default);
+        setDirectories(profile.directories);
+        setOriginalIdentity({ name: profile.git_name, email: profile.git_email });
+
+        // Work out which GitHub account this profile is, in the background.
+        // First a provisional match on the git username (instant), then the
+        // authoritative answer: which account the SSH key actually
+        // authenticates as — that's what decides pushes.
+        void (async () => {
+          const accounts = await accountsPromise;
+          if (cancelled || userPicked.current) return;
+          const byName = accounts.find(
+            (a) => a.toLowerCase() === profile.git_name.trim().toLowerCase()
+          );
+          if (byName) await preselectAccount(byName, isCancelled);
+          if (!profile.ssh_key_path) return;
+          const login = await api
+            .resolveKeyAccount(profile.ssh_key_path)
+            .catch(() => null);
+          if (cancelled || userPicked.current || !login) return;
+          const byKey = accounts.find((a) => a.toLowerCase() === login.toLowerCase());
+          if (byKey && byKey !== byName) await preselectAccount(byKey, isCancelled);
+        })();
+      } catch (e) {
+        if (!cancelled) setError(String(e));
+      } finally {
+        if (!cancelled) setLoadingProfile(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [id, isEdit]);
 
   async function handleSubmit(e: SubmitEvent<HTMLFormElement>) {
@@ -87,6 +202,7 @@ export function ProfileForm() {
           // "" = clear the key (backend treats empty string as "No SSH key")
           sshKeyPath: sshKeyPath,
           directories,
+          allowPush,
         });
         toast.success(`Profile "${name}" updated successfully`);
       } else {
@@ -96,6 +212,7 @@ export function ProfileForm() {
           gitEmail,
           sshKeyPath: sshKeyPath,
           directories,
+          allowPush,
         });
         toast.success(`Profile "${name}" created successfully`);
       }
@@ -109,11 +226,12 @@ export function ProfileForm() {
 
   function addDirectory() {
     const dir = dirInput.trim();
-    if (dir && !directories.includes(dir)) {
-      setDirectories([...directories, dir]);
-      setDirInput("");
-      toast.success("Folder added");
-    }
+    if (!dir) return;
+    // Functional update: never rebuild the list from a captured snapshot, or a
+    // late add would wipe directories loaded after this closure was created.
+    setDirectories((prev) => (prev.includes(dir) ? prev : [...prev, dir]));
+    setDirInput("");
+    toast.success("Folder added");
   }
 
   async function browseDirectory() {
@@ -124,8 +242,13 @@ export function ProfileForm() {
         multiple: false,
         title: "Select a folder for this profile",
       });
-      if (typeof selected === "string" && !directories.includes(selected)) {
-        setDirectories([...directories, selected]);
+      if (typeof selected === "string") {
+        // Functional update — the native picker can be open for a long time, so
+        // a captured `directories` snapshot would be stale (and could wipe the
+        // profile's saved folders).
+        setDirectories((prev) =>
+          prev.includes(selected) ? prev : [...prev, selected]
+        );
         toast.success("Folder added");
       }
     } catch (e) {
@@ -134,7 +257,7 @@ export function ProfileForm() {
   }
 
   function removeDirectory(dir: string) {
-    setDirectories(directories.filter((d) => d !== dir));
+    setDirectories((prev) => prev.filter((d) => d !== dir));
   }
 
   async function convertRepos() {
@@ -161,19 +284,40 @@ export function ProfileForm() {
     }
   }
 
+  const header = (
+    <div className="flex items-center gap-3">
+      <button
+        onClick={() => navigate("/")}
+        className="p-2 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
+      >
+        <ArrowLeft size={20} />
+      </button>
+      <h1 className="text-2xl font-bold text-zinc-100">
+        {isEdit ? "Edit Profile" : "New Profile"}
+      </h1>
+    </div>
+  );
+
+  // Never render an interactive form before the saved profile is loaded —
+  // typing into it would be discarded, and submitting it would clear the
+  // profile's directories and SSH key.
+  if (loadingProfile) {
+    return (
+      <div className="space-y-6">
+        {header}
+        <Card>
+          <div className="flex items-center justify-center gap-2 py-10 text-sm text-zinc-400">
+            <Loader2 size={16} className="animate-spin text-emerald-400" />
+            Loading profile…
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6">
-      <div className="flex items-center gap-3">
-        <button
-          onClick={() => navigate("/")}
-          className="p-2 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
-        >
-          <ArrowLeft size={20} />
-        </button>
-        <h1 className="text-2xl font-bold text-zinc-100">
-          {isEdit ? "Edit Profile" : "New Profile"}
-        </h1>
-      </div>
+      {header}
 
       {error && (
         <div className="px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
@@ -197,7 +341,7 @@ export function ProfileForm() {
             <div className="flex items-center gap-2">
               <Select
                 value={autofillAccount}
-                onChange={(v) => autofillFromAccount(v)}
+                onChange={(v) => applyAccountIdentity(v)}
                 disabled={autofilling}
                 placeholder="Select a GitHub account…"
                 optionIcon={<GitHubIcon size={14} />}
@@ -230,6 +374,10 @@ export function ProfileForm() {
               onChange={(e) => setGitName(e.target.value)}
               required
             />
+            <AltChips
+              options={altOptions(suggestions.names, originalIdentity?.name, gitName)}
+              onPick={setGitName}
+            />
             <Input
               label="Git Email"
               placeholder="your@email.com"
@@ -237,6 +385,10 @@ export function ProfileForm() {
               value={gitEmail}
               onChange={(e) => setGitEmail(e.target.value)}
               required
+            />
+            <AltChips
+              options={altOptions(suggestions.emails, originalIdentity?.email, gitEmail)}
+              onPick={setGitEmail}
             />
           </div>
         </Card>
@@ -397,6 +549,48 @@ export function ProfileForm() {
           )}
         </Card>
 
+        <Card>
+          <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider mb-3">
+            Push Access
+          </h2>
+          <label
+            className={`flex items-start gap-3 select-none ${
+              isDefaultProfile ? "opacity-60 cursor-not-allowed" : "cursor-pointer"
+            }`}
+          >
+            <input
+              type="checkbox"
+              checked={allowPush}
+              disabled={isDefaultProfile}
+              onChange={(e) => setAllowPush(e.target.checked)}
+              className="accent-emerald-500 mt-1 cursor-pointer disabled:cursor-not-allowed"
+            />
+            <span>
+              <span className="text-sm text-zinc-200 font-medium">
+                Allow pushing from this profile's folders
+              </span>
+              <span className="block text-xs text-zinc-500 mt-0.5">
+                Uncheck to block <span className="font-mono">git push</span> locally
+                for every repo in these folders — even if the account has push
+                rights on GitHub. Pull and fetch keep working. Pushes fail with a
+                "<span className="font-mono">gitswitch-push-blocked</span>" error.
+              </span>
+              {isDefaultProfile ? (
+                <span className="block text-xs text-amber-400/80 mt-1">
+                  The default profile can't block pushes — it would affect every
+                  folder on the machine. Use a non-default profile instead.
+                </span>
+              ) : (
+                <span className="block text-xs text-zinc-600 mt-1">
+                  Covers standard github.com remotes. Repos with a custom
+                  ssh-host alias or an explicit push URL aren't blocked; if
+                  folders overlap, a block from any covering profile wins.
+                </span>
+              )}
+            </span>
+          </label>
+        </Card>
+
         <div className="flex justify-end gap-3">
           <Button type="button" variant="secondary" onClick={() => navigate("/")}>
             Cancel
@@ -406,6 +600,43 @@ export function ProfileForm() {
           </Button>
         </div>
       </form>
+    </div>
+  );
+}
+
+/** Values worth offering as one-click alternatives to what's in a field now. */
+function altOptions(
+  fromGitHub: string[],
+  original: string | undefined,
+  current: string
+): string[] {
+  return Array.from(new Set([...fromGitHub, original].filter(Boolean) as string[])).filter(
+    (v) => v !== current
+  );
+}
+
+function AltChips({
+  options,
+  onPick,
+}: {
+  options: string[];
+  onPick: (value: string) => void;
+}) {
+  if (options.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 -mt-1">
+      <span className="text-xs text-zinc-600">use instead:</span>
+      {options.map((opt) => (
+        <button
+          key={opt}
+          type="button"
+          onClick={() => onPick(opt)}
+          title={opt}
+          className="px-2 py-0.5 rounded-md text-xs font-mono bg-zinc-800 border border-zinc-700 text-zinc-400 hover:text-emerald-300 hover:border-emerald-500/40 transition-colors cursor-pointer max-w-[22rem] truncate"
+        >
+          {opt}
+        </button>
+      ))}
     </div>
   );
 }

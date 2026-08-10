@@ -91,10 +91,18 @@ does **not** create long-running services or touch any other containers.
 
 > **Architecture note:** the Docker build produces installers for the *host's*
 > CPU architecture. On Apple Silicon / ARM machines you get **arm64** Linux
-> packages; on Intel/AMD machines you get **x86_64**. To force a specific arch,
-> add `platform: linux/amd64` (or `linux/arm64`) under the `builder` service in
-> `docker-compose.yml` — cross-arch builds run under emulation and are slower.
-> For clean native builds of both arches, prefer the GitHub Actions CI below.
+> packages; on Intel/AMD machines you get **x86_64**. To cross-build the other
+> arch under emulation (slower; AppImage must be skipped because linuxdeploy
+> can't run emulated):
+>
+> ```bash
+> docker build --platform linux/amd64 --build-arg BUNDLES=deb,rpm \
+>   -t gitswitch-builder:amd64 .
+> docker run --rm --platform linux/amd64 -v "$PWD/dist-linux:/out" gitswitch-builder:amd64
+> ```
+>
+> For clean native builds of both arches (including AppImage), prefer the
+> GitHub Actions CI below.
 
 ---
 

@@ -94,11 +94,12 @@ fn convert_one(dir: &Path) -> Option<RemoteChange> {
 }
 
 fn mask_token(url: &str) -> String {
-    // https://user:token@host/... -> https://user:***@host/...
-    if let Some(rest) = url.strip_prefix("https://") {
-        if let Some((creds, host)) = rest.split_once('@') {
-            if let Some((user, _tok)) = creds.split_once(':') {
-                return format!("https://{}:***@{}", user, host);
+    // Mask ANY embedded credentials, both `user:token@` and the
+    // token-as-username `token@` form, for https and http alike.
+    for scheme in ["https://", "http://"] {
+        if let Some(rest) = url.strip_prefix(scheme) {
+            if let Some((_creds, host)) = rest.split_once('@') {
+                return format!("{}***@{}", scheme, host);
             }
         }
     }
@@ -137,10 +138,18 @@ mod tests {
     }
 
     #[test]
-    fn mask_token_hides_secret() {
-        let masked = mask_token("https://user:ghp_secret123@github.com/o/r.git");
-        assert!(!masked.contains("ghp_secret123"));
-        assert!(masked.contains("user:***@"));
+    fn mask_token_hides_secret_in_both_credential_forms() {
+        // user:token@ form
+        let m1 = mask_token("https://user:ghp_secret123@github.com/o/r.git");
+        assert!(!m1.contains("ghp_secret123"));
+        assert!(m1.contains("***@github.com"));
+        // token-as-username form (GitHub's documented PAT clone syntax)
+        let m2 = mask_token("https://ghp_secret456@github.com/o/r.git");
+        assert!(!m2.contains("ghp_secret456"));
+        assert!(m2.contains("***@github.com"));
+        // http too
+        let m3 = mask_token("http://tok@github.com/o/r.git");
+        assert!(!m3.contains("tok@"));
     }
 }
 
