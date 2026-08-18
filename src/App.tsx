@@ -1,5 +1,5 @@
 import { Routes, Route, NavLink, useLocation } from "react-router-dom";
-import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch } from "lucide-react";
+import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, GitGraph } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
 import { ProfileForm } from "./pages/ProfileForm";
@@ -8,13 +8,16 @@ import { Settings } from "./pages/Settings";
 import { GitHubAuth } from "./pages/GitHubAuth";
 import { SparseClone } from "./pages/SparseClone";
 import { AutoAssign } from "./pages/AutoAssign";
+import { Doctor } from "./pages/Doctor";
+import { CommitAudit } from "./pages/CommitAudit";
+import { History } from "./pages/History";
 
 function App() {
   const location = useLocation();
 
   return (
     <div className="flex h-screen bg-zinc-900 text-zinc-100">
-      <nav className="w-56 border-r border-zinc-800 flex flex-col">
+      <nav className="w-56 shrink-0 border-r border-zinc-800 flex flex-col">
         <div className="p-4 border-b border-zinc-800">
           <h1 className="text-lg font-bold tracking-tight">
             <span className="text-emerald-400">Git</span>Switch
@@ -40,6 +43,15 @@ function App() {
           <SidebarLink to="/auto-assign" icon={<ScanSearch size={18} />}>
             Auto Assign
           </SidebarLink>
+          <SidebarLink to="/doctor" icon={<Stethoscope size={18} />}>
+            Doctor
+          </SidebarLink>
+          <SidebarLink to="/history" icon={<GitGraph size={18} />}>
+            History
+          </SidebarLink>
+          <SidebarLink to="/commits" icon={<HistoryIcon size={18} />}>
+            Commit Audit
+          </SidebarLink>
           <SidebarLink to="/settings" icon={<SettingsIcon size={18} />}>
             Settings
           </SidebarLink>
@@ -49,7 +61,7 @@ function App() {
         </div>
       </nav>
 
-      <main className="flex-1 overflow-y-auto p-6">
+      <main className="flex-1 min-w-0 overflow-y-auto p-6">
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/profile/new" element={<ProfileForm />} />
@@ -58,6 +70,9 @@ function App() {
           <Route path="/github" element={<GitHubAuth />} />
           <Route path="/sparse" element={<SparseClone />} />
           <Route path="/auto-assign" element={<AutoAssign />} />
+          <Route path="/doctor" element={<Doctor />} />
+          <Route path="/history" element={<History />} />
+          <Route path="/commits" element={<CommitAudit />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>

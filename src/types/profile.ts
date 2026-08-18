@@ -6,6 +6,7 @@ export interface Profile {
   ssh_key_path: string | null;
   is_default: boolean;
   allow_push: boolean;
+  signing_enabled: boolean;
   directories: string[];
   created_at: string;
   updated_at: string;

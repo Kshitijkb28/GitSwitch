@@ -123,6 +123,10 @@ fn write_profile_gitconfig(profile: &Profile) -> Result<(), AppError> {
         content.push_str(push_block_section());
     }
 
+    if let Some(block) = crate::signing::signing_config_block(profile) {
+        content.push_str(&block);
+    }
+
     fs::write(&path, content)?;
     Ok(())
 }
@@ -171,6 +175,10 @@ pub fn apply_git_config() -> Result<(), AppError> {
     new_content.push_str("# <<< GitSwitch managed (DO NOT EDIT) <<<\n");
 
     fs::write(&gitconfig_path, new_content)?;
+
+    // Keep ~/.ssh/allowed_signers in step with the profiles that sign, so local
+    // signature verification works without any manual bookkeeping.
+    let _ = crate::signing::write_allowed_signers(&store.profiles);
 
     // Remove per-profile config files that no longer belong to a live profile
     // (e.g. after a profile is deleted), so the app-managed dir never collects orphans.
@@ -268,6 +276,7 @@ mod tests {
             ssh_key_path: None,
             is_default: false,
             allow_push: true,
+            signing_enabled: false,
             directories: dirs.iter().map(|s| s.to_string()).collect(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

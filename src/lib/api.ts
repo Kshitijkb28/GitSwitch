@@ -19,6 +19,7 @@ export async function createProfile(params: {
   sshKeyPath?: string | null;
   directories: string[];
   allowPush?: boolean | null;
+  signingEnabled?: boolean | null;
 }): Promise<Profile> {
   return invoke("create_profile", params);
 }
@@ -31,6 +32,7 @@ export async function updateProfile(params: {
   sshKeyPath?: string | null;
   directories?: string[] | null;
   allowPush?: boolean | null;
+  signingEnabled?: boolean | null;
 }): Promise<Profile> {
   return invoke("update_profile", params);
 }
@@ -108,6 +110,199 @@ export async function convertReposToSsh(
   directory: string
 ): Promise<RemoteChange[]> {
   return invoke("convert_repos_to_ssh", { directory });
+}
+
+export async function registerSigningKey(
+  account: string,
+  keyPath: string
+): Promise<string> {
+  return invoke("register_signing_key", { account, keyPath });
+}
+
+export async function signingKeyRegistered(
+  account: string,
+  keyPath: string
+): Promise<boolean> {
+  return invoke("signing_key_registered", { account, keyPath });
+}
+
+export async function allowedSignersPath(): Promise<string> {
+  return invoke("allowed_signers_path");
+}
+
+export interface RepoRef {
+  path: string;
+  name: string;
+  profile_name: string;
+}
+
+export interface BranchInfo {
+  name: string;
+  is_current: boolean;
+  is_remote: boolean;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  tip: string;
+  short_tip: string;
+  last_author: string;
+  last_date: string;
+  last_subject: string;
+}
+
+export interface HistoryCommit {
+  hash: string;
+  short: string;
+  parents: string[];
+  author_name: string;
+  author_email: string;
+  date: string;
+  subject: string;
+  refs: string[];
+  is_merge: boolean;
+  lane: number;
+  parent_lanes: number[];
+  active_lanes: number[];
+}
+
+export interface HistoryPage {
+  commits: HistoryCommit[];
+  total: number;
+  offset: number;
+  limit: number;
+  has_more: boolean;
+  max_lane: number;
+}
+
+export interface FileChange {
+  path: string;
+  added: string;
+  removed: string;
+}
+
+export interface CommitDetail {
+  hash: string;
+  short: string;
+  author_name: string;
+  author_email: string;
+  author_date: string;
+  committer_name: string;
+  committer_email: string;
+  subject: string;
+  body: string;
+  parents: string[];
+  refs: string[];
+  files: FileChange[];
+  signature: string;
+}
+
+export interface MergeInfo {
+  merged_into: string[];
+  merges: HistoryCommit[];
+}
+
+export async function historyListRepos(): Promise<RepoRef[]> {
+  return invoke("history_list_repos");
+}
+
+export async function historyBranches(repoPath: string): Promise<BranchInfo[]> {
+  return invoke("history_branches", { repoPath });
+}
+
+export async function historyPage(
+  repoPath: string,
+  rev: string,
+  offset: number,
+  limit: number,
+  search?: string | null
+): Promise<HistoryPage> {
+  return invoke("history_page", { repoPath, rev, offset, limit, search: search ?? null });
+}
+
+export async function historyCommitDetail(
+  repoPath: string,
+  hash: string
+): Promise<CommitDetail> {
+  return invoke("history_commit_detail", { repoPath, hash });
+}
+
+export async function historyBranchMerges(
+  repoPath: string,
+  branch: string
+): Promise<MergeInfo> {
+  return invoke("history_branch_merges", { repoPath, branch });
+}
+
+export interface CommitInfo {
+  hash: string;
+  short: string;
+  author_name: string;
+  author_email: string;
+  date: string;
+  subject: string;
+  pushed: boolean;
+}
+
+export interface RepoAudit {
+  path: string;
+  repo_name: string;
+  profile_name: string;
+  expected_name: string;
+  expected_email: string;
+  mismatched: CommitInfo[];
+  unpushed_count: number;
+  pushed_count: number;
+  has_upstream: boolean;
+  dirty: boolean;
+  guard: "none" | "gitswitch" | "foreign";
+}
+
+export async function auditCommits(): Promise<RepoAudit[]> {
+  return invoke("audit_commits");
+}
+
+export async function fixUnpushedCommits(repoPath: string): Promise<string> {
+  return invoke("fix_unpushed_commits", { repoPath });
+}
+
+export async function installCommitGuard(
+  repoPath: string,
+  expectedEmail: string
+): Promise<string> {
+  return invoke("install_commit_guard", { repoPath, expectedEmail });
+}
+
+export async function uninstallCommitGuard(repoPath: string): Promise<string> {
+  return invoke("uninstall_commit_guard", { repoPath });
+}
+
+export interface Finding {
+  id: string;
+  severity: "error" | "warning" | "info" | "ok";
+  title: string;
+  detail: string;
+  fix: string | null;
+  fix_label: string | null;
+}
+
+export async function doctorCheckEnvironment(): Promise<Finding[]> {
+  return invoke("doctor_check_environment");
+}
+
+export async function doctorCheckProfiles(): Promise<Finding[]> {
+  return invoke("doctor_check_profiles");
+}
+
+export async function doctorCheckKeys(): Promise<Finding[]> {
+  return invoke("doctor_check_keys");
+}
+
+export async function doctorCheckRepos(): Promise<Finding[]> {
+  return invoke("doctor_check_repos");
+}
+
+export async function doctorFixSshConfig(): Promise<string> {
+  return invoke("doctor_fix_ssh_config");
 }
 
 export interface ScannedRepo {

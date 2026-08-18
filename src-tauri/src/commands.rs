@@ -1,12 +1,16 @@
+use crate::commit_audit::{self, RepoAudit};
 use crate::credentials;
+use crate::doctor::{self, Finding};
 use crate::error::AppError;
 use crate::gh_cli;
 use crate::git_config;
+use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, MergeInfo, RepoRef};
 use crate::git_remote::{self, RemoteChange};
 use crate::github::{self, GitHubKey, GitHubUser, RepoPermissions};
 use crate::repo_scan::{self, ScannedRepo};
 use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
 use crate::profiles::{self, Profile};
+use crate::signing;
 use crate::sparse::{self, SparseInfo};
 use crate::ssh_keys;
 
@@ -25,6 +29,7 @@ pub fn create_profile(
     ssh_key_path: Option<String>,
     directories: Vec<String>,
     allow_push: Option<bool>,
+    signing_enabled: Option<bool>,
 ) -> Result<Profile, AppError> {
     let profile = profiles::create_profile(
         name,
@@ -33,6 +38,7 @@ pub fn create_profile(
         ssh_key_path,
         directories,
         allow_push.unwrap_or(true),
+        signing_enabled.unwrap_or(false),
     )?;
     git_config::apply_git_config()?;
     crate::tray::update_active_label(&app);
@@ -49,9 +55,10 @@ pub fn update_profile(
     ssh_key_path: Option<String>,
     directories: Option<Vec<String>>,
     allow_push: Option<bool>,
+    signing_enabled: Option<bool>,
 ) -> Result<Profile, AppError> {
     let profile = profiles::update_profile(
-        id, name, git_name, git_email, ssh_key_path, directories, allow_push,
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled,
     )?;
     git_config::apply_git_config()?;
     crate::tray::update_active_label(&app);
@@ -146,6 +153,35 @@ pub async fn gh_register_ssh_key(
 #[tauri::command]
 pub async fn resolve_key_account(key_path: String) -> Result<Option<String>, AppError> {
     ssh_keys::resolve_key_account(&key_path).await
+}
+
+// --- Doctor: health checks, run as separate steps so the UI can show progress ---
+
+#[tauri::command]
+pub async fn doctor_check_environment() -> Result<Vec<Finding>, AppError> {
+    doctor::check_environment().await
+}
+
+#[tauri::command]
+pub async fn doctor_check_profiles() -> Result<Vec<Finding>, AppError> {
+    doctor::check_profiles().await
+}
+
+#[tauri::command]
+pub async fn doctor_check_keys() -> Result<Vec<Finding>, AppError> {
+    doctor::check_keys().await
+}
+
+#[tauri::command]
+pub async fn doctor_check_repos() -> Result<Vec<Finding>, AppError> {
+    doctor::check_repos().await
+}
+
+#[tauri::command]
+pub async fn doctor_fix_ssh_config() -> Result<String, AppError> {
+    tokio::task::spawn_blocking(doctor::fix_ssh_config)
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
 }
 
 /// Auto-assign: find every git repo under a folder with its GitHub owner/name.
@@ -253,4 +289,116 @@ pub async fn github_poll_token(
     client_id: Option<String>,
 ) -> Result<OAuthTokenResponse, AppError> {
     oauth::poll_for_token(&device_code, client_id.as_deref()).await
+}
+
+// --- Commit audit: find & fix commits made with the wrong identity ---
+
+/// Scan every profile folder for commits whose author email doesn't match the
+/// profile that owns that folder.
+#[tauri::command]
+pub async fn audit_commits() -> Result<Vec<RepoAudit>, AppError> {
+    commit_audit::audit_all().await
+}
+
+/// Rewrite the author of UNPUSHED commits in one repo. Pushed history is never
+/// touched, and the previous history is kept on a backup branch.
+#[tauri::command]
+pub async fn fix_unpushed_commits(repo_path: String) -> Result<String, AppError> {
+    tokio::task::spawn_blocking(move || commit_audit::fix_unpushed(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Install a pre-commit hook that blocks commits with the wrong identity.
+#[tauri::command]
+pub async fn install_commit_guard(
+    repo_path: String,
+    expected_email: String,
+) -> Result<String, AppError> {
+    tokio::task::spawn_blocking(move || commit_audit::install_guard(&repo_path, &expected_email))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+#[tauri::command]
+pub async fn uninstall_commit_guard(repo_path: String) -> Result<String, AppError> {
+    tokio::task::spawn_blocking(move || commit_audit::uninstall_guard(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+// --- Commit signing (SSH): "Verified" badges, per profile ---
+
+/// Register a profile's key on GitHub as a SIGNING key. This is a different key
+/// type from an authentication key — auth-only keys never produce "Verified".
+#[tauri::command]
+pub async fn register_signing_key(account: String, key_path: String) -> Result<String, AppError> {
+    let token = gh_cli::gh_get_token(&account).await?;
+    let public_key = ssh_keys::get_public_key(&key_path)?;
+    signing::register_signing_key(&token, "GitSwitch signing key", &public_key).await
+}
+
+/// Is this key already registered as a signing key on the account?
+#[tauri::command]
+pub async fn signing_key_registered(account: String, key_path: String) -> Result<bool, AppError> {
+    let token = gh_cli::gh_get_token(&account).await?;
+    let public_key = ssh_keys::get_public_key(&key_path)?;
+    signing::signing_key_registered(&token, &public_key).await
+}
+
+/// Path of the allowed_signers file GitSwitch maintains (shown in the UI).
+#[tauri::command]
+pub fn allowed_signers_path() -> Result<String, AppError> {
+    Ok(signing::allowed_signers_path().to_string_lossy().to_string())
+}
+
+// --- History browser: branches, paginated commits, graph, merges ---
+
+#[tauri::command]
+pub async fn history_list_repos() -> Result<Vec<RepoRef>, AppError> {
+    git_history::list_repos().await
+}
+
+#[tauri::command]
+pub async fn history_branches(repo_path: String) -> Result<Vec<BranchInfo>, AppError> {
+    tokio::task::spawn_blocking(move || git_history::list_branches(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Paginated: git log is fast, but a 100k-commit repo would still choke the UI
+/// if we handed it everything at once.
+#[tauri::command]
+pub async fn history_page(
+    repo_path: String,
+    rev: String,
+    offset: usize,
+    limit: usize,
+    search: Option<String>,
+) -> Result<HistoryPage, AppError> {
+    tokio::task::spawn_blocking(move || {
+        git_history::history_page(&repo_path, &rev, offset, limit, search.as_deref())
+    })
+    .await
+    .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+#[tauri::command]
+pub async fn history_commit_detail(
+    repo_path: String,
+    hash: String,
+) -> Result<CommitDetail, AppError> {
+    tokio::task::spawn_blocking(move || git_history::commit_detail(&repo_path, &hash))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+#[tauri::command]
+pub async fn history_branch_merges(
+    repo_path: String,
+    branch: String,
+) -> Result<MergeInfo, AppError> {
+    tokio::task::spawn_blocking(move || git_history::branch_merge_info(&repo_path, &branch))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
 }

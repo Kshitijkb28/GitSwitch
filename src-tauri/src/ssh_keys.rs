@@ -108,10 +108,20 @@ pub async fn test_ssh_connection_with_key(key_path: &str) -> Result<String, AppE
     }
 }
 
-/// Which GitHub account does this key actually authenticate as?
-/// Bypasses ~/.ssh/config (-F /dev/null) so we test the key itself, not a forced identity.
-pub async fn resolve_key_account(key_path: &str) -> Result<Option<String>, AppError> {
-    // Bypass the user's ssh config with the platform's null device.
+/// Is this private key protected by a passphrase?
+/// Asking ssh-keygen for the public half with an empty passphrase succeeds only
+/// when the key is unencrypted. `-P ""` guarantees it can never prompt.
+pub fn key_has_passphrase(key_path: &str) -> bool {
+    std::process::Command::new("ssh-keygen")
+        .args(["-y", "-P", "", "-f", key_path])
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(false)
+}
+
+async fn probe_key_account(key_path: &str) -> Result<Option<String>, AppError> {
+    // Bypass the user's ssh config with the platform's null device, so we test
+    // the key itself rather than whatever identity the config forces.
     let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
     let output = tokio::process::Command::new("ssh")
         .args([
@@ -119,6 +129,7 @@ pub async fn resolve_key_account(key_path: &str) -> Result<Option<String>, AppEr
             "-i", key_path,
             "-o", "IdentitiesOnly=yes",
             "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
             "-T", "git@github.com",
         ])
@@ -132,14 +143,48 @@ pub async fn resolve_key_account(key_path: &str) -> Result<Option<String>, AppEr
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // GitHub greets successful auth with "Hi <username>!"
+    interpret_ssh_probe(&combined).ok_or_else(|| {
+        AppError::Ssh(format!(
+            "Could not determine the key's GitHub account: {}",
+            combined
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("no response from github.com")
+        ))
+    })
+}
+
+/// Interpret `ssh -T git@github.com` output.
+/// `Some(Some(login))` authenticated · `Some(None)` definitively rejected ·
+/// `None` indeterminate (timeout, throttling, DNS…) — must NOT be read as
+/// "not registered", or a transient blip condemns a working key.
+fn interpret_ssh_probe(combined: &str) -> Option<Option<String>> {
     if let Some(idx) = combined.find("Hi ") {
         let rest = &combined[idx + 3..];
         if let Some(end) = rest.find('!') {
-            return Ok(Some(rest[..end].trim().to_string()));
+            return Some(Some(rest[..end].trim().to_string()));
         }
     }
-    Ok(None)
+    if combined.contains("Permission denied") {
+        return Some(None);
+    }
+    None
+}
+
+/// Which GitHub account does this key actually authenticate as?
+/// `Ok(Some(login))` = authenticated, `Ok(None)` = definitively rejected,
+/// `Err` = couldn't tell (transient failure — never treat as "not registered").
+pub async fn resolve_key_account(key_path: &str) -> Result<Option<String>, AppError> {
+    match probe_key_account(key_path).await {
+        Err(_) => {
+            // One retry: a single dropped/throttled connection shouldn't surface
+            // as a scary diagnostic.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            probe_key_account(key_path).await
+        }
+        result => result,
+    }
 }
 
 pub fn delete_ssh_key(key_path: &str) -> Result<(), AppError> {
@@ -197,4 +242,37 @@ pub fn list_ssh_keys() -> Result<Vec<String>, AppError> {
 
     keys.sort();
     Ok(keys)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authenticated_greeting_yields_login() {
+        let out = "Hi kshitijbhardwaj-kb-ethara! You've successfully authenticated, but GitHub does not provide shell access.\n";
+        assert_eq!(
+            interpret_ssh_probe(out),
+            Some(Some("kshitijbhardwaj-kb-ethara".to_string()))
+        );
+    }
+
+    #[test]
+    fn permission_denied_is_definitively_unregistered() {
+        let out = "git@github.com: Permission denied (publickey).\n";
+        assert_eq!(interpret_ssh_probe(out), Some(None));
+    }
+
+    #[test]
+    fn transient_failures_are_indeterminate_not_unregistered() {
+        // These must NOT be reported as "key isn't on any GitHub account".
+        for out in [
+            "ssh: connect to host github.com port 22: Operation timed out\n",
+            "ssh: Could not resolve hostname github.com: nodename nor servname provided\n",
+            "kex_exchange_identification: Connection closed by remote host\n",
+            "",
+        ] {
+            assert_eq!(interpret_ssh_probe(out), None, "should be indeterminate: {out:?}");
+        }
+    }
 }

@@ -379,7 +379,7 @@ export function SSHWizard() {
       )}
 
       <Card>
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
           <h2 className="text-lg font-semibold text-zinc-100">
             Existing SSH Keys
           </h2>
@@ -396,7 +396,7 @@ export function SSHWizard() {
                 key={k}
                 className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-zinc-800/70 border border-zinc-700/50"
               >
-                <span className="text-sm text-zinc-300 font-mono truncate">
+                <span className="text-sm text-zinc-300 font-mono truncate min-w-0">
                   {k.split("/").pop()}
                 </span>
                 <button

@@ -319,7 +319,7 @@ export function AutoAssign() {
 
       {rows.length > 0 && (
         <Card>
-          <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
             <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">
               {rows.length} repo{rows.length === 1 ? "" : "s"} found
             </h2>
@@ -347,7 +347,7 @@ export function AutoAssign() {
               return (
                 <div
                   key={r.repo.path}
-                  className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-zinc-800/50 border border-zinc-700/50"
+                  className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-zinc-800/50 border border-zinc-700/50 min-w-0 flex-wrap sm:flex-nowrap"
                 >
                   <Folder size={15} className="text-zinc-500 shrink-0" />
                   <div className="min-w-0 flex-1">
@@ -361,7 +361,7 @@ export function AutoAssign() {
                     </p>
                   </div>
 
-                  <div className="hidden md:flex items-center gap-1 shrink-0">
+                  <div className="hidden lg:flex items-center gap-1 shrink-0 max-w-[38%] overflow-hidden">
                     {r.repo.owner ? (
                       <>
                         {accessEntries.map(([login, perms]) => (
@@ -386,7 +386,7 @@ export function AutoAssign() {
                     )}
                   </div>
 
-                  <div className="w-44 shrink-0">
+                  <div className="w-full sm:w-44 shrink-0">
                     <Select
                       value={r.proposedProfileId}
                       onChange={(v) => setRowProfile(r.repo.path, v)}

@@ -1,14 +1,18 @@
 mod commands;
+mod commit_audit;
 mod credentials;
+mod doctor;
 mod error;
 mod gh_cli;
 mod git_config;
+mod git_history;
 mod git_remote;
 mod github;
 mod oauth;
 mod profiles;
 mod repo_scan;
 mod sparse;
+mod signing;
 mod ssh_keys;
 mod tray;
 
@@ -69,6 +73,23 @@ pub fn run() {
             commands::gh_register_ssh_key,
             commands::resolve_key_account,
             commands::convert_repos_to_ssh,
+            commands::register_signing_key,
+            commands::signing_key_registered,
+            commands::allowed_signers_path,
+            commands::history_list_repos,
+            commands::history_branches,
+            commands::history_page,
+            commands::history_commit_detail,
+            commands::history_branch_merges,
+            commands::audit_commits,
+            commands::fix_unpushed_commits,
+            commands::install_commit_guard,
+            commands::uninstall_commit_guard,
+            commands::doctor_check_environment,
+            commands::doctor_check_profiles,
+            commands::doctor_check_keys,
+            commands::doctor_check_repos,
+            commands::doctor_fix_ssh_config,
             commands::scan_repos,
             commands::check_repo_access,
             commands::sparse_clone,

@@ -69,7 +69,7 @@ export function Dashboard() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold text-zinc-100">Profiles</h1>
           <p className="text-sm text-zinc-400 mt-1">
@@ -136,6 +136,9 @@ export function Dashboard() {
                     )}
                     {!profile.allow_push && (
                       <Badge variant="error">push blocked</Badge>
+                    )}
+                    {profile.signing_enabled && (
+                      <Badge variant="success">signed</Badge>
                     )}
                   </div>
                   <p className="text-sm text-zinc-400 mt-0.5">

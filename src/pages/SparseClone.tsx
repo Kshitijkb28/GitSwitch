@@ -185,7 +185,7 @@ export function SparseClone() {
 
       {info && !loadingInfo && (
         <Card>
-          <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center justify-between mb-1 gap-3 flex-wrap">
             <div className="flex items-center gap-2 min-w-0">
               <GitBranch size={16} className="text-emerald-400 shrink-0" />
               <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider truncate">

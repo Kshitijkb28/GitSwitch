@@ -26,8 +26,31 @@ for folders that still use HTTPS.
 
 ## Features
 
+- **Doctor** — one click finds the things that silently send commits to the
+  wrong account: an `~/.ssh/config` block pinning one key for github.com, SSH
+  keys not registered on any account, hand-written `includeIf` rules fighting
+  the managed ones, HTTPS remotes (and **tokens embedded in remote URLs**),
+  passphrase-protected keys, and missing folders. Most findings come with a
+  one-click fix.
 - **Profiles** — create/edit identities, assign folders with a native folder
   picker. A folder can belong to only one profile (auto-deduplicated).
+- **Auto Assign** — scan a folder tree, check which of your GitHub accounts
+  actually has access to each repo, and map them to the right profile.
+- **Sparse Clone** — metadata-only clone of a huge repo, then tick just the
+  folders you need (`git sparse-checkout`, with add-later support).
+- **Push blocking** — mark a profile read-only; `git push` fails locally in its
+  folders while pull/fetch keep working.
+- **History** — browse branches (local/remote, ahead/behind), paginated commit
+  history with a real commit graph (lanes, forks and merges drawn the way
+  `git log --graph` does), per-commit detail with files changed and signature
+  status, message search, and a merge panel showing which branches already
+  contain the one you're looking at.
+- **Commit Audit** — finds commits authored with the wrong identity, rewrites the
+  ones you haven't pushed (keeping a backup branch, never touching published
+  history), and can install a `pre-commit` guard that blocks future mistakes.
+- **Commit signing** — per profile, turn on SSH signing (`gpg.format=ssh`) for
+  GitHub's *Verified* badge. GitSwitch keeps `~/.ssh/allowed_signers` in sync
+  automatically, which is the step that's easy to get wrong by hand.
 - **SSH key wizard** — generate Ed25519 keys, register them on a GitHub account
   in one click (via `gh`), test the connection, delete old keys.
 - **GitHub sign-in** — device-flow OAuth *and* instant sign-in via your

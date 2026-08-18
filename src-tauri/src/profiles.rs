@@ -19,6 +19,10 @@ pub struct Profile {
     /// folders (via a pushInsteadOf URL rewrite). Fetch/pull are unaffected.
     #[serde(default = "default_true")]
     pub allow_push: bool,
+    /// Sign commits/tags in this profile's folders with its SSH key, so GitHub
+    /// shows them as Verified. Off by default (older stores lack the field).
+    #[serde(default)]
+    pub signing_enabled: bool,
     pub directories: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -118,6 +122,7 @@ pub fn create_profile(
     ssh_key_path: Option<String>,
     directories: Vec<String>,
     allow_push: bool,
+    signing_enabled: bool,
 ) -> Result<Profile, AppError> {
     let mut store = load_profiles()?;
 
@@ -134,6 +139,7 @@ pub fn create_profile(
         ssh_key_path: ssh_key_path.filter(|k| !k.is_empty()),
         is_default,
         allow_push,
+        signing_enabled,
         directories: directories.iter().map(|d| expand_tilde(d)).collect(),
         created_at: now,
         updated_at: now,
@@ -155,6 +161,7 @@ pub fn update_profile(
     ssh_key_path: Option<String>,
     directories: Option<Vec<String>>,
     allow_push: Option<bool>,
+    signing_enabled: Option<bool>,
 ) -> Result<Profile, AppError> {
     let mut store = load_profiles()?;
 
@@ -183,6 +190,9 @@ pub fn update_profile(
     if let Some(ap) = allow_push {
         ensure_default_can_push(profile.is_default, ap)?;
         profile.allow_push = ap;
+    }
+    if let Some(se) = signing_enabled {
+        profile.signing_enabled = se;
     }
     profile.updated_at = Utc::now();
 
@@ -251,6 +261,7 @@ mod tests {
             ssh_key_path: None,
             is_default: false,
             allow_push: true,
+            signing_enabled: false,
             directories: dirs.iter().map(|s| s.to_string()).collect(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

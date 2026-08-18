@@ -23,6 +23,9 @@ export function ProfileForm() {
   const [gitEmail, setGitEmail] = useState(searchParams.get("github_email") || "");
   const [sshKeyPath, setSshKeyPath] = useState("");
   const [allowPush, setAllowPush] = useState(true);
+  const [signingEnabled, setSigningEnabled] = useState(false);
+  const [signingBusy, setSigningBusy] = useState(false);
+  const [signingMsg, setSigningMsg] = useState<string | null>(null);
   const [isDefaultProfile, setIsDefaultProfile] = useState(false);
   const [directories, setDirectories] = useState<string[]>([]);
   const [dirInput, setDirInput] = useState("");
@@ -152,6 +155,7 @@ export function ProfileForm() {
         setGitEmail(profile.git_email);
         setSshKeyPath(profile.ssh_key_path ?? "");
         setAllowPush(profile.allow_push);
+      setSigningEnabled(profile.signing_enabled);
         setIsDefaultProfile(profile.is_default);
         setDirectories(profile.directories);
         setOriginalIdentity({ name: profile.git_name, email: profile.git_email });
@@ -203,6 +207,7 @@ export function ProfileForm() {
           sshKeyPath: sshKeyPath,
           directories,
           allowPush,
+          signingEnabled,
         });
         toast.success(`Profile "${name}" updated successfully`);
       } else {
@@ -213,6 +218,7 @@ export function ProfileForm() {
           sshKeyPath: sshKeyPath,
           directories,
           allowPush,
+          signingEnabled,
         });
         toast.success(`Profile "${name}" created successfully`);
       }
@@ -258,6 +264,33 @@ export function ProfileForm() {
 
   function removeDirectory(dir: string) {
     setDirectories((prev) => prev.filter((d) => d !== dir));
+  }
+
+  async function registerSigning() {
+    if (!sshKeyPath) return;
+    setSigningBusy(true);
+    setSigningMsg(null);
+    setError(null);
+    try {
+      // Prefer the account the user picked; otherwise ask the key itself.
+      let account = autofillAccount;
+      if (!account) {
+        const login = await api.resolveKeyAccount(sshKeyPath).catch(() => null);
+        if (!login) {
+          throw new Error(
+            "Couldn't tell which GitHub account this key belongs to — pick one in \"Autofill from GitHub\" above."
+          );
+        }
+        account = login;
+      }
+      const msg = await api.registerSigningKey(account, sshKeyPath);
+      setSigningMsg(msg);
+      toast.success(msg);
+    } catch (e) {
+      setSigningMsg(String(e));
+    } finally {
+      setSigningBusy(false);
+    }
   }
 
   async function convertRepos() {
@@ -470,7 +503,7 @@ export function ProfileForm() {
                   key={dir}
                   className="flex items-center justify-between px-3 py-2 rounded-lg bg-zinc-800/70 border border-zinc-700/50"
                 >
-                  <span className="text-sm text-zinc-300 font-mono truncate">
+                  <span className="text-sm text-zinc-300 font-mono truncate min-w-0">
                     {dir}
                   </span>
                   <button
@@ -487,7 +520,7 @@ export function ProfileForm() {
 
           {directories.length > 0 && (
             <div className="mt-4 pt-4 border-t border-zinc-800">
-              <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
                 <p className="text-xs text-zinc-500">
                   Make every repo in these folders push over SSH (removes any
                   embedded HTTPS tokens).
@@ -589,6 +622,78 @@ export function ProfileForm() {
               )}
             </span>
           </label>
+        </Card>
+
+        <Card>
+          <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider mb-3">
+            Commit Signing
+          </h2>
+          <label
+            className={`flex items-start gap-3 select-none ${
+              sshKeyPath ? "cursor-pointer" : "opacity-60 cursor-not-allowed"
+            }`}
+          >
+            <input
+              type="checkbox"
+              checked={signingEnabled}
+              disabled={!sshKeyPath}
+              onChange={(e) => setSigningEnabled(e.target.checked)}
+              className="accent-emerald-500 mt-1 cursor-pointer disabled:cursor-not-allowed"
+            />
+            <span className="min-w-0">
+              <span className="text-sm text-zinc-200 font-medium">
+                Sign commits and tags with this profile's SSH key
+              </span>
+              <span className="block text-xs text-zinc-500 mt-0.5">
+                Sets <span className="font-mono">gpg.format=ssh</span> and{" "}
+                <span className="font-mono">commit.gpgsign</span> for these folders, and
+                keeps <span className="font-mono">~/.ssh/allowed_signers</span> in sync so
+                signatures verify locally too.
+              </span>
+              {!sshKeyPath && (
+                <span className="block text-xs text-amber-400/80 mt-1">
+                  Pick an SSH key above first — signing uses that key's public half.
+                </span>
+              )}
+            </span>
+          </label>
+
+          {signingEnabled && sshKeyPath && (
+            <div className="mt-4 pt-4 border-t border-zinc-800">
+              <p className="text-xs text-zinc-500 mb-2">
+                For GitHub to show the <span className="text-zinc-300">Verified</span>{" "}
+                badge, the same key must also be registered as a{" "}
+                <strong className="text-zinc-300">signing</strong> key (that's a separate
+                key type from an authentication key).
+              </p>
+              <div className="flex items-center gap-3 flex-wrap">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={registerSigning}
+                  disabled={signingBusy}
+                >
+                  {signingBusy ? (
+                    <>
+                      <Loader2 size={14} className="animate-spin" />
+                      Registering…
+                    </>
+                  ) : (
+                    <>
+                      <GitHubIcon size={14} />
+                      Register signing key on GitHub
+                    </>
+                  )}
+                </Button>
+                {signingMsg && (
+                  <span className="text-xs text-zinc-400 break-words min-w-0">
+                    {signingMsg}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
         </Card>
 
         <div className="flex justify-end gap-3">
