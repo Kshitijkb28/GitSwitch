@@ -108,8 +108,8 @@ pub fn signing_config_block(profile: &Profile) -> Option<String> {
     let key = profile.ssh_key_path.as_ref()?;
     Some(format!(
         "[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tallowedSignersFile = {}\n[user]\n\tsigningkey = {}.pub\n[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n",
-        allowed_signers_path().display(),
-        key
+        crate::paths::norm(&allowed_signers_path().to_string_lossy()),
+        crate::paths::norm(key)
     ))
 }
 
@@ -222,6 +222,8 @@ mod tests {
         assert!(signing_config_block(&prof("a@b", None, true)).is_none());
         let block = signing_config_block(&prof("a@b", Some("/k"), true)).unwrap();
         assert!(block.contains("format = ssh"));
+        // A backslash here would make git report "bad config line".
+        assert!(!block.contains('\\'), "config values must never contain backslashes");
         // SSH signing points signingkey at the PUBLIC half.
         assert!(block.contains("signingkey = /k.pub"));
         assert!(block.contains("gpgsign = true"));
