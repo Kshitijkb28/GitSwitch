@@ -236,15 +236,16 @@ mod tests {
         std::fs::create_dir_all(base.join("node_modules/dep/.git")).unwrap();
 
         let repos = scan_sync(&base.to_string_lossy()).unwrap();
-        let names: Vec<&str> = repos
+        let names: Vec<String> = repos
             .iter()
-            .map(|r| r.path.rsplit('/').next().unwrap())
+            .map(|r| crate::paths::base_name(&r.path))
             .collect();
 
-        assert!(names.contains(&"repo_a"));
-        assert!(names.contains(&"repo_b"));
-        assert!(!names.contains(&"inner"), "must not descend into a repo");
-        assert!(!names.contains(&"dep"), "must skip node_modules");
+        let has = |n: &str| names.iter().any(|x| x == n);
+        assert!(has("repo_a"));
+        assert!(has("repo_b"));
+        assert!(!has("inner"), "must not descend into a repo");
+        assert!(!has("dep"), "must skip node_modules");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
