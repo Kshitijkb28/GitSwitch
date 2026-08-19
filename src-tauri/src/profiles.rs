@@ -306,7 +306,10 @@ mod tests {
     #[test]
     fn tilde_paths_expand_to_home() {
         let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
-        assert_eq!(expand_tilde("~/projects/work"), format!("{}/projects/work", home));
+        assert_eq!(
+            crate::paths::norm(&expand_tilde("~/projects/work")),
+            crate::paths::norm(&format!("{}/projects/work", home))
+        );
         assert_eq!(expand_tilde("/abs/path"), "/abs/path");
         assert_eq!(expand_tilde("relative"), "relative");
     }
