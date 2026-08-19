@@ -6,6 +6,7 @@ import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Input } from "../components/Input";
 import { Card } from "../components/Card";
+import { Checkbox } from "../components/Checkbox";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import type { Profile } from "../types/profile";
@@ -591,12 +592,11 @@ export function ProfileForm() {
               isDefaultProfile ? "opacity-60 cursor-not-allowed" : "cursor-pointer"
             }`}
           >
-            <input
-              type="checkbox"
+            <Checkbox
               checked={allowPush}
               disabled={isDefaultProfile}
-              onChange={(e) => setAllowPush(e.target.checked)}
-              className="accent-emerald-500 mt-1 cursor-pointer disabled:cursor-not-allowed"
+              onChange={setAllowPush}
+              className="mt-0.5"
             />
             <span>
               <span className="text-sm text-zinc-200 font-medium">
@@ -633,12 +633,11 @@ export function ProfileForm() {
               sshKeyPath ? "cursor-pointer" : "opacity-60 cursor-not-allowed"
             }`}
           >
-            <input
-              type="checkbox"
+            <Checkbox
               checked={signingEnabled}
               disabled={!sshKeyPath}
-              onChange={(e) => setSigningEnabled(e.target.checked)}
-              className="accent-emerald-500 mt-1 cursor-pointer disabled:cursor-not-allowed"
+              onChange={setSigningEnabled}
+              className="mt-0.5"
             />
             <span className="min-w-0">
               <span className="text-sm text-zinc-200 font-medium">

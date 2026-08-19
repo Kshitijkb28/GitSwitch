@@ -11,7 +11,9 @@ import {
   ShieldCheck,
   X,
 } from "lucide-react";
+import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
+import { Checkbox } from "../components/Checkbox";
 import { Card } from "../components/Card";
 import { Badge } from "../components/Badge";
 import { Input } from "../components/Input";
@@ -79,6 +81,8 @@ function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
 export function History() {
   const [repos, setRepos] = useState<api.RepoRef[]>([]);
   const [repo, setRepo] = useState("");
+  const [account, setAccount] = useState("");        // profile id, "" = all
+  const [onlyMine, setOnlyMine] = useState(false);   // filter commits by that identity
   const [branches, setBranches] = useState<api.BranchInfo[]>([]);
   const [rev, setRev] = useState("--all");
   const [page, setPage] = useState<api.HistoryPage | null>(null);
@@ -94,6 +98,15 @@ export function History() {
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const pageSeq = useRef(0);
+
+  const accounts = Array.from(
+    new Map(
+      repos.map((r) => [r.profile_id, { id: r.profile_id, name: r.profile_name, email: r.profile_email }])
+    ).values()
+  );
+  const accountEmail = accounts.find((a) => a.id === account)?.email ?? "";
+  const visibleRepos = account ? repos.filter((r) => r.profile_id === account) : repos;
+
 
   useEffect(() => {
     let cancelled = false;
@@ -132,15 +145,32 @@ export function History() {
     loadBranches(repo);
   }, [repo, loadBranches]);
 
+  // If the chosen account doesn't own the current repo, move to one it does —
+  // otherwise the picker would show a repo the filter says shouldn't be there.
+  useEffect(() => {
+    if (!account) return;
+    const owned = repos.filter((r) => r.profile_id === account);
+    if (owned.length > 0 && !owned.some((r) => r.path === repo)) {
+      setRepo(owned[0].path);
+    }
+  }, [account, repos, repo]);
+
   useEffect(() => {
     if (!repo) return;
     const seq = ++pageSeq.current;
     setLoadingPage(true);
-    api.historyPage(repo, rev, offset, PAGE_SIZE, appliedSearch || null)
+    api.historyPage(
+      repo,
+      rev,
+      offset,
+      PAGE_SIZE,
+      appliedSearch || null,
+      onlyMine && accountEmail ? accountEmail : null
+    )
       .then((p) => { if (pageSeq.current === seq) { setPage(p); setError(null); } })
       .catch((e) => { if (pageSeq.current === seq) { setError(String(e)); setPage(null); } })
       .finally(() => { if (pageSeq.current === seq) setLoadingPage(false); });
-  }, [repo, rev, offset, appliedSearch, reloadKey]);
+  }, [repo, rev, offset, appliedSearch, reloadKey, onlyMine, accountEmail]);
 
   async function selectBranch(name: string) {
     setRev(name);
@@ -168,16 +198,28 @@ export function History() {
             Browse branches, commits and how they merged — one repo at a time.
           </p>
         </div>
-        <div className="flex items-center gap-2 min-w-0">
+        <div className="flex items-center gap-2 min-w-0 flex-wrap">
+          <div className="w-52 max-w-full">
+            <Select
+              value={account}
+              onChange={(v) => { setAccount(v); setOffset(0); if (!v) setOnlyMine(false); }}
+              placeholder="All accounts"
+              optionIcon={<GitHubIcon size={14} />}
+              options={[
+                { value: "", label: "All accounts" },
+                ...accounts.map((a) => ({ value: a.id, label: a.name })),
+              ]}
+            />
+          </div>
           <div className="w-64 max-w-full">
             <Select
               value={repo}
               onChange={setRepo}
               placeholder={loadingRepos ? "Loading repos…" : "Pick a repository…"}
               optionIcon={<GitBranch size={14} />}
-              options={repos.map((r) => ({
+              options={visibleRepos.map((r) => ({
                 value: r.path,
-                label: `${r.name}  ·  ${r.profile_name}`,
+                label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
               }))}
             />
           </div>
@@ -352,9 +394,28 @@ export function History() {
                 )}
               </form>
 
+              {account && (
+                <label className="flex items-start gap-2.5 mb-3 cursor-pointer select-none">
+                  <Checkbox
+                    checked={onlyMine}
+                    onChange={(v) => { setOnlyMine(v); setOffset(0); }}
+                    className="mt-0.5"
+                  />
+                  <span className="min-w-0">
+                    <span className="text-xs text-zinc-300">
+                      Only commits authored by this account
+                    </span>
+                    <span className="block text-[11px] text-zinc-600 font-mono truncate">
+                      {accountEmail}
+                    </span>
+                  </span>
+                </label>
+              )}
+
               <div className="flex items-center justify-between gap-3 flex-wrap mb-2">
                 <p className="text-xs text-zinc-500">
                   {rev === "--all" ? "All branches" : rev}
+                  {onlyMine && accountEmail && " · this account only"}
                   {page && (
                     <>
                       {" · "}
@@ -379,7 +440,8 @@ export function History() {
 
               {page && page.commits.length === 0 && !loadingPage && (
                 <p className="text-sm text-zinc-500 py-6 text-center">
-                  No commits{appliedSearch ? ` matching “${appliedSearch}”` : ""}.
+                  No commits{appliedSearch ? ` matching “${appliedSearch}”` : ""}
+                  {onlyMine ? " authored by this account" : ""}.
                 </p>
               )}
 

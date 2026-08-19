@@ -133,7 +133,9 @@ export async function allowedSignersPath(): Promise<string> {
 export interface RepoRef {
   path: string;
   name: string;
+  profile_id: string;
   profile_name: string;
+  profile_email: string;
 }
 
 export interface BranchInfo {
@@ -214,9 +216,17 @@ export async function historyPage(
   rev: string,
   offset: number,
   limit: number,
-  search?: string | null
+  search?: string | null,
+  author?: string | null
 ): Promise<HistoryPage> {
-  return invoke("history_page", { repoPath, rev, offset, limit, search: search ?? null });
+  return invoke("history_page", {
+    repoPath,
+    rev,
+    offset,
+    limit,
+    search: search ?? null,
+    author: author ?? null,
+  });
 }
 
 export async function historyCommitDetail(

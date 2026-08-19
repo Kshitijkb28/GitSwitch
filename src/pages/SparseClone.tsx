@@ -11,6 +11,7 @@ import {
 import { open } from "@tauri-apps/plugin-dialog";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
+import { Checkbox } from "../components/Checkbox";
 import { Input } from "../components/Input";
 import { Badge } from "../components/Badge";
 import { useToast } from "../components/Toast";
@@ -228,12 +229,7 @@ export function SparseClone() {
                           : "bg-zinc-800/50 border-zinc-700/50 hover:border-zinc-600"
                       }`}
                     >
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => toggle(dir)}
-                        className="accent-emerald-500 cursor-pointer"
-                      />
+                      <Checkbox checked={checked} onChange={() => toggle(dir)} />
                       <Folder
                         size={14}
                         className={checked ? "text-emerald-400" : "text-zinc-500"}

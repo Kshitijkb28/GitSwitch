@@ -11,7 +11,9 @@ const US: char = '\x1f';
 pub struct RepoRef {
     pub path: String,
     pub name: String,
+    pub profile_id: String,
     pub profile_name: String,
+    pub profile_email: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -212,7 +214,9 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
                 out.push(RepoRef {
                     name: r.path.rsplit('/').next().unwrap_or(&r.path).to_string(),
                     path: r.path,
+                    profile_id: p.id.clone(),
                     profile_name: p.name.clone(),
+                    profile_email: p.git_email.clone(),
                 });
             }
         }
@@ -303,6 +307,7 @@ pub fn history_page(
     offset: usize,
     limit: usize,
     search: Option<&str>,
+    author: Option<&str>,
 ) -> Result<HistoryPage, AppError> {
     let repo = PathBuf::from(repo_path);
     if rev != "--all" && rev.starts_with('-') {
@@ -321,11 +326,22 @@ pub fn history_page(
         "--date-order".into(),
         format!("--format={}", fmt),
     ];
+    // Limiting patterns are matched as FIXED STRINGS: emails and names routinely
+    // contain regex metacharacters (`.`, `+`, `[`), and a noreply address like
+    // `1234+user@users.noreply.github.com` must match literally.
+    let mut limits: Vec<String> = Vec::new();
     if let Some(q) = search.filter(|s| !s.trim().is_empty()) {
-        for a in [
-            "--regexp-ignore-case".to_string(),
-            format!("--grep={}", q),
-        ] {
+        limits.push(format!("--grep={}", q.trim()));
+    }
+    if let Some(a) = author.filter(|s| !s.trim().is_empty()) {
+        limits.push(format!("--author={}", a.trim()));
+    }
+    if !limits.is_empty() {
+        for a in ["--fixed-strings".to_string(), "--regexp-ignore-case".to_string()] {
+            count_args.push(a.clone());
+            log_args.push(a);
+        }
+        for a in limits {
             count_args.push(a.clone());
             log_args.push(a);
         }
@@ -476,7 +492,7 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
     .filter(|s| !s.is_empty() && s != branch && !s.ends_with("/HEAD"))
     .collect();
 
-    let page = history_page(repo_path, branch, 0, 400, None)?;
+    let page = history_page(repo_path, branch, 0, 400, None, None)?;
     let merges = page.commits.into_iter().filter(|c| c.is_merge).take(50).collect();
 
     Ok(MergeInfo {

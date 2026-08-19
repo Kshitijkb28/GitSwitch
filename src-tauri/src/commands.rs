@@ -375,9 +375,17 @@ pub async fn history_page(
     offset: usize,
     limit: usize,
     search: Option<String>,
+    author: Option<String>,
 ) -> Result<HistoryPage, AppError> {
     tokio::task::spawn_blocking(move || {
-        git_history::history_page(&repo_path, &rev, offset, limit, search.as_deref())
+        git_history::history_page(
+            &repo_path,
+            &rev,
+            offset,
+            limit,
+            search.as_deref(),
+            author.as_deref(),
+        )
     })
     .await
     .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?

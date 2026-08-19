@@ -43,8 +43,9 @@ for folders that still use HTTPS.
 - **History** — browse branches (local/remote, ahead/behind), paginated commit
   history with a real commit graph (lanes, forks and merges drawn the way
   `git log --graph` does), per-commit detail with files changed and signature
-  status, message search, and a merge panel showing which branches already
-  contain the one you're looking at.
+  status, message search, a **GitHub account filter** (narrow the repo list to
+  one profile, and optionally show only that identity's commits), and a merge
+  panel showing which branches already contain the one you're looking at.
 - **Commit Audit** — finds commits authored with the wrong identity, rewrites the
   ones you haven't pushed (keeping a backup branch, never touching published
   history), and can install a `pre-commit` guard that blocks future mistakes.
