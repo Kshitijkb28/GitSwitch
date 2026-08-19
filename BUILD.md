@@ -141,3 +141,41 @@ To ship signed updates from CI:
 2. Set `"createUpdaterArtifacts": true` under `bundle` in `tauri.conf.json`.
 3. Tag a release — the workflow uploads the updater artifacts + `latest.json`
    that the in-app "Check for Updates" consumes.
+
+## 6. Testing on Windows
+
+The `.exe` / `.msi` come from the CI workflow (Windows installers can only be
+built on Windows). Grab them from the draft Release, or from the run's
+artifacts if it was triggered manually.
+
+### Installing
+
+1. Run `GitSwitch_x.y.z_x64-setup.exe` (or the `.msi`).
+2. SmartScreen will say **"Windows protected your PC"** — the build is
+   unsigned, like the unnotarized macOS build. Click **More info → Run anyway**.
+
+### Runtime requirements
+
+| Tool | Needed for | Notes |
+|------|------------|-------|
+| `git` | everything | [git-scm.com](https://git-scm.com/download/win) — includes the `sh` that runs the commit guard hook |
+| `ssh`, `ssh-keygen` | keys, per-folder auth | ships with Windows 10/11 (OpenSSH Client) |
+| `gh` | account list, key registration, Auto Assign, autofill | optional — [cli.github.com](https://cli.github.com) |
+
+### What to check first
+
+Windows differs from macOS in ways that have bitten this app before, so verify
+these specifically:
+
+1. **`git config --global --list` still works** after creating a profile.
+   Paths written into git config MUST use forward slashes — a backslash is an
+   escape character there, and one bad line makes the whole `~/.gitconfig`
+   unreadable by *every* git command. There is a regression test for this
+   (`config_values_never_contain_backslashes`), but confirm on real hardware.
+2. **Per-folder identity** — create a profile, assign a folder, then inside a
+   repo in it run `git config user.email` and confirm it matches.
+3. **Commit Audit / Auto Assign list something.** If they come up empty, path
+   comparison is failing (`C:\Users\...` vs `/`).
+4. **Doctor** — it should find `%USERPROFILE%\.ssh\config` and report sensibly.
+5. **Commit guard** — enable it, then commit with a mismatched email; the hook
+   is `#!/bin/sh`, which Git for Windows runs through its bundled shell.
