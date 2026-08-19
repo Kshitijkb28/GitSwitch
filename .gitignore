@@ -15,6 +15,14 @@ dist-ssr
 # Tauri/Rust
 src-tauri/target
 
+# Built installers — CI produces these, they don't belong in git
+dist-linux
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+*.msi
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
