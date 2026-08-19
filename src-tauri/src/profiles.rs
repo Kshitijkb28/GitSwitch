@@ -45,9 +45,10 @@ impl ProfileStore {
     }
 }
 
-/// Normalize a directory path for comparison (trim trailing slashes).
+/// Normalize a directory path for comparison (separator-agnostic, so folder
+/// dedup works on Windows too).
 fn norm_dir(d: &str) -> String {
-    d.trim_end_matches('/').to_string()
+    crate::paths::norm(d)
 }
 
 /// Expand a leading `~/` to the home directory so stored paths always compare

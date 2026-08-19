@@ -15,6 +15,7 @@ import { Checkbox } from "../components/Checkbox";
 import { Input } from "../components/Input";
 import { Badge } from "../components/Badge";
 import { useToast } from "../components/Toast";
+import { baseName } from "../lib/paths";
 import * as api from "../lib/api";
 
 export function SparseClone() {
@@ -190,7 +191,7 @@ export function SparseClone() {
             <div className="flex items-center gap-2 min-w-0">
               <GitBranch size={16} className="text-emerald-400 shrink-0" />
               <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider truncate">
-                {info.path.split("/").pop()}
+                {baseName(info.path)}
               </h2>
               <Badge variant="success">{info.branch}</Badge>
               {info.is_sparse && <Badge variant="default">sparse</Badge>}

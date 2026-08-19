@@ -14,6 +14,7 @@ import { Input } from "../components/Input";
 import { Modal } from "../components/Modal";
 import { Select } from "../components/Select";
 import { GitHubIcon } from "../components/GitHubIcon";
+import { baseName } from "../lib/paths";
 import * as api from "../lib/api";
 
 type Step = "generate" | "pubkey" | "test";
@@ -397,7 +398,7 @@ export function SSHWizard() {
                 className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-zinc-800/70 border border-zinc-700/50"
               >
                 <span className="text-sm text-zinc-300 font-mono truncate min-w-0">
-                  {k.split("/").pop()}
+                  {baseName(k)}
                 </span>
                 <button
                   onClick={() => setKeyToDelete(k)}
@@ -422,7 +423,7 @@ export function SSHWizard() {
           <span className="text-zinc-300"> ~/.ssh</span>:
         </p>
         <p className="text-xs font-mono text-zinc-300 bg-zinc-800 rounded-lg px-3 py-2 mb-4 break-all">
-          {keyToDelete?.split("/").pop()}
+          {keyToDelete ? baseName(keyToDelete) : ""}
         </p>
         <p className="text-xs text-zinc-500 mb-4">
           If this key is in use by a profile, that profile will lose its SSH

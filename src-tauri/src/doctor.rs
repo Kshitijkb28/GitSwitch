@@ -282,7 +282,7 @@ pub async fn check_profiles() -> Result<Vec<Finding>, AppError> {
     let mut seen: Vec<(String, String)> = Vec::new();
     for p in &store.profiles {
         for d in &p.directories {
-            let norm = d.trim_end_matches('/').to_string();
+            let norm = crate::paths::norm(d);
             if let Some((other, _)) = seen.iter().find(|(_, dd)| dd == &norm) {
                 out.push(Finding::new(
                     "folder-conflict",
@@ -398,7 +398,7 @@ pub async fn check_repos() -> Result<Vec<Finding>, AppError> {
                     continue;
                 }
                 checked.push(r.path.clone());
-                let name = r.path.rsplit('/').next().unwrap_or(&r.path).to_string();
+                let name = crate::paths::base_name(&r.path);
 
                 if r.remote_url.is_empty() {
                     continue; // no origin — nothing to push to yet
