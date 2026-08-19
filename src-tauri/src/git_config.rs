@@ -74,10 +74,14 @@ fn build_includeif_blocks(profiles: &[Profile]) -> String {
     blocks
 }
 
+/// NOTE: every path written into a git config VALUE must use forward slashes.
+/// git treats `\` as an escape character, so a Windows path like
+/// `C:\Users\me\...` produces `fatal: bad config line` and makes the entire
+/// ~/.gitconfig unreadable — not just for GitSwitch, for every git command.
 fn get_profile_gitconfig_path(profile: &Profile) -> String {
     let data_dir = dirs::data_dir().unwrap_or_default();
     let app_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
-    format!("{}/{}.gitconfig", app_dir.display(), profile.id)
+    crate::paths::norm(&format!("{}/{}.gitconfig", app_dir.display(), profile.id))
 }
 
 /// Config block that makes `git push` fail locally with a recognizable error
@@ -113,7 +117,10 @@ fn write_profile_gitconfig(profile: &Profile) -> Result<(), AppError> {
     let mut content = format!("[user]\n\tname = {}\n\temail = {}\n", profile.git_name, profile.git_email);
 
     if let Some(ref key_path) = profile.ssh_key_path {
-        content.push_str(&format!("[core]\n\tsshCommand = ssh -i {} -o IdentitiesOnly=yes\n", key_path));
+        content.push_str(&format!(
+            "[core]\n\tsshCommand = ssh -i {} -o IdentitiesOnly=yes\n",
+            crate::paths::norm(key_path)
+        ));
     }
 
     if !profile.allow_push {
@@ -153,7 +160,10 @@ pub fn apply_git_config() -> Result<(), AppError> {
         new_content.push_str(&format!("[user]\n\tname = {}\n\temail = {}\n\n", default_profile.git_name, default_profile.git_email));
 
         if let Some(ref key_path) = default_profile.ssh_key_path {
-            new_content.push_str(&format!("[core]\n\tsshCommand = ssh -i {} -o IdentitiesOnly=yes\n\n", key_path));
+            new_content.push_str(&format!(
+                "[core]\n\tsshCommand = ssh -i {} -o IdentitiesOnly=yes\n\n",
+                crate::paths::norm(key_path)
+            ));
         }
 
         // Intentionally NO push-block here: url rewrite rules accumulate across
@@ -303,6 +313,29 @@ mod tests {
             parent_pos < child_pos,
             "nested (more specific) include must come last so it wins"
         );
+    }
+
+    #[test]
+    fn config_values_never_contain_backslashes() {
+        // Regression guard: a Windows path written verbatim into a git config
+        // value makes git fail with "bad config line" and renders the whole
+        // ~/.gitconfig unreadable. Everything we emit must be forward-slashed.
+        let mut p = mk_profile("win", &[r"C:\Users\me\Work"]);
+        p.ssh_key_path = Some(r"C:\Users\me\.ssh\id_key".into());
+        p.signing_enabled = true;
+
+        let includes = build_includeif_blocks(&[p.clone()]);
+        assert!(!includes.contains('\\'), "includeIf block: {includes}");
+        assert!(includes.contains("gitdir:C:/Users/me/Work/"));
+
+        let ssh_line = format!(
+            "sshCommand = ssh -i {} -o IdentitiesOnly=yes",
+            crate::paths::norm(p.ssh_key_path.as_ref().unwrap())
+        );
+        assert!(!ssh_line.contains('\\'), "{ssh_line}");
+
+        let signing = crate::signing::signing_config_block(&p).unwrap();
+        assert!(!signing.contains('\\'), "signing block: {signing}");
     }
 
     #[test]
