@@ -56,13 +56,10 @@ fn build_includeif_blocks(profiles: &[Profile]) -> String {
     let mut entries: Vec<(String, String)> = Vec::new();
     for profile in profiles {
         for dir in &profile.directories {
-            // Trailing slash makes the gitdir match recursive over every repo inside.
-            let dir_path = if dir.ends_with('/') {
-                dir.clone()
-            } else {
-                format!("{}/", dir)
-            };
-            entries.push((dir_path, get_profile_gitconfig_path(profile)));
+            entries.push((
+                crate::paths::gitdir_pattern(dir),
+                get_profile_gitconfig_path(profile),
+            ));
         }
     }
     entries.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));

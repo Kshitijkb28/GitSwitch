@@ -13,6 +13,7 @@ import { Badge } from "../components/Badge";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import type { Profile } from "../types/profile";
+import { baseName, isWithin, normPath } from "../lib/paths";
 import * as api from "../lib/api";
 
 type Phase = "idle" | "scanning" | "resolving" | "checking" | "ready" | "applying";
@@ -38,8 +39,8 @@ function currentProfileFor(repoPath: string, profiles: Profile[]): Profile | nul
   let bestLen = -1;
   for (const p of profiles) {
     for (const d of p.directories) {
-      const dir = d.replace(/\/+$/, "");
-      if ((repoPath === dir || repoPath.startsWith(dir + "/")) && dir.length > bestLen) {
+      const dir = normPath(d);
+      if (isWithin(repoPath, dir) && dir.length > bestLen) {
         best = p;
         bestLen = dir.length;
       }
@@ -352,7 +353,7 @@ export function AutoAssign() {
                   <Folder size={15} className="text-zinc-500 shrink-0" />
                   <div className="min-w-0 flex-1">
                     <p className="text-sm text-zinc-200 font-medium truncate">
-                      {r.repo.path.split("/").pop()}
+                      {baseName(r.repo.path)}
                     </p>
                     <p className="text-xs text-zinc-500 font-mono truncate">
                       {r.repo.owner

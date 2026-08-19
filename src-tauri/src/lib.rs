@@ -9,6 +9,7 @@ mod git_history;
 mod git_remote;
 mod github;
 mod oauth;
+mod paths;
 mod profiles;
 mod repo_scan;
 mod sparse;

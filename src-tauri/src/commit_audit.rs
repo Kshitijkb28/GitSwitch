@@ -60,8 +60,8 @@ fn owning_profile<'a>(
     let mut best_len = 0usize;
     for p in profs {
         for d in &p.directories {
-            let dir = d.trim_end_matches('/');
-            if (repo == dir || repo.starts_with(&format!("{}/", dir))) && dir.len() >= best_len {
+            let dir = crate::paths::norm(d);
+            if crate::paths::is_within(repo, &dir) && dir.len() >= best_len {
                 best_len = dir.len();
                 best = Some(p);
             }
@@ -149,7 +149,7 @@ fn audit_repo(
         .is_empty();
 
     Some(RepoAudit {
-        repo_name: repo_path.rsplit('/').next().unwrap_or(repo_path).to_string(),
+        repo_name: crate::paths::base_name(repo_path),
         path: repo_path.to_string(),
         profile_name: profile.name.clone(),
         expected_name: profile.git_name.clone(),

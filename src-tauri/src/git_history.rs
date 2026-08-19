@@ -212,7 +212,7 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
                     continue;
                 }
                 out.push(RepoRef {
-                    name: r.path.rsplit('/').next().unwrap_or(&r.path).to_string(),
+                    name: crate::paths::base_name(&r.path),
                     path: r.path,
                     profile_id: p.id.clone(),
                     profile_name: p.name.clone(),

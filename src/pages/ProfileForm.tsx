@@ -10,6 +10,7 @@ import { Checkbox } from "../components/Checkbox";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import type { Profile } from "../types/profile";
+import { baseName } from "../lib/paths";
 import * as api from "../lib/api";
 
 export function ProfileForm() {
@@ -445,7 +446,7 @@ export function ProfileForm() {
                   { value: "", label: "No SSH key" },
                   ...sshKeys.map((key) => ({
                     value: key,
-                    label: key.split("/").pop() || key,
+                    label: baseName(key),
                   })),
                 ]}
               />
@@ -568,7 +569,7 @@ export function ProfileForm() {
                         )}
                         <div className="min-w-0">
                           <p className="text-zinc-300 font-mono truncate">
-                            {r.repo.split("/").pop()}
+                            {baseName(r.repo)}
                           </p>
                           <p className="text-zinc-500 font-mono break-all">
                             {r.changed ? r.new_url : r.note}
