@@ -83,6 +83,58 @@ pub struct CommitDetail {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub struct FetchResult {
+    pub message: String,
+    /// Proof, not a promise: these are re-checked after the fetch runs.
+    pub head_unchanged: bool,
+    pub worktree_unchanged: bool,
+    pub local_branches_unchanged: bool,
+    /// How many remote-tracking refs moved — the only thing fetch may change.
+    pub updated_remote_refs: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct CommitRef {
+    pub short: String,
+    pub subject: String,
+    pub author: String,
+    pub date: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SyncStatus {
+    /// Branch these numbers describe (resolved from HEAD for the "all" view).
+    pub branch: String,
+    pub upstream: Option<String>,
+    /// Local commits the remote doesn't have.
+    pub ahead: usize,
+    /// Remote commits you haven't pulled — the number people actually want.
+    pub behind: usize,
+    /// Seconds since the last `git fetch`, from .git/FETCH_HEAD.
+    pub last_fetch_secs: Option<u64>,
+    /// Revision range listing exactly the commits you're missing.
+    pub incoming_rev: Option<String>,
+    /// Where your local branch is pointing right now.
+    pub local_tip: Option<CommitRef>,
+    /// Where the remote branch is pointing (as of the last fetch).
+    pub remote_tip: Option<CommitRef>,
+}
+
+fn commit_ref(repo: &Path, rev: &str) -> Option<CommitRef> {
+    let raw = git(repo, &["log", "-1", &format!("--format=%h{US}%s{US}%an{US}%cI", US = US), rev]).ok()?;
+    let f: Vec<&str> = raw.splitn(4, US).collect();
+    if f.len() < 4 {
+        return None;
+    }
+    Some(CommitRef {
+        short: f[0].into(),
+        subject: f[1].into(),
+        author: f[2].into(),
+        date: f[3].into(),
+    })
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct MergeInfo {
     /// Branches whose history contains this branch's tip — i.e. it's merged in.
     pub merged_into: Vec<String>,
@@ -221,7 +273,7 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
             }
         }
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|r| r.name.to_lowercase());
     Ok(out)
 }
 
@@ -310,6 +362,7 @@ pub fn history_page(
     author: Option<&str>,
 ) -> Result<HistoryPage, AppError> {
     let repo = PathBuf::from(repo_path);
+    // Ranges (main..origin/main) are legitimate revisions; only flags are not.
     if rev != "--all" && rev.starts_with('-') {
         return Err(AppError::Config(format!("Invalid revision: {}", rev)));
     }
@@ -498,6 +551,127 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
     Ok(MergeInfo {
         merged_into,
         merges,
+    })
+}
+
+fn snapshot_refs(repo: &Path, space: &str) -> String {
+    git(repo, &["for-each-ref", "--format=%(refname) %(objectname)", space]).unwrap_or_default()
+}
+
+/// Refresh remote-tracking refs. This is `fetch`, never `pull`, and it is
+/// deliberately conservative:
+///
+/// * no refspec is passed, so git can only write under `refs/remotes/*`
+///   (a refspec ending in `refs/heads/*` is the ONLY way fetch can move a
+///   local branch, and we never supply one);
+/// * no `--prune` — deleting remote-tracking refs isn't needed to answer
+///   "am I behind?", so we don't do it;
+/// * nothing merges, rebases or checks out, so the working tree cannot change.
+///
+/// Rather than just asserting that, the state is snapshotted before and after
+/// and the comparison is returned to the caller as evidence.
+pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
+    let repo = PathBuf::from(repo_path);
+    if git(&repo, &["remote"])?.trim().is_empty() {
+        return Err(AppError::Config("This repo has no remote to fetch from.".into()));
+    }
+
+    let head_before = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let worktree_before = git(&repo, &["status", "--porcelain"]).unwrap_or_default();
+    let locals_before = snapshot_refs(&repo, "refs/heads");
+    let remotes_before = snapshot_refs(&repo, "refs/remotes");
+
+    git(&repo, &["fetch", "--all", "--quiet"])?;
+
+    let head_after = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let worktree_after = git(&repo, &["status", "--porcelain"]).unwrap_or_default();
+    let locals_after = snapshot_refs(&repo, "refs/heads");
+    let remotes_after = snapshot_refs(&repo, "refs/remotes");
+
+    let before: Vec<&str> = remotes_before.lines().collect();
+    let updated = remotes_after
+        .lines()
+        .filter(|l| !before.contains(l))
+        .count();
+
+    let result = FetchResult {
+        head_unchanged: head_before == head_after,
+        worktree_unchanged: worktree_before == worktree_after,
+        local_branches_unchanged: locals_before == locals_after,
+        updated_remote_refs: updated,
+        message: if updated == 0 {
+            "Fetched — no new commits on the remote".into()
+        } else {
+            format!(
+                "Fetched — {} remote branch{} updated. Your branch and working tree were not touched.",
+                updated,
+                if updated == 1 { "" } else { "es" }
+            )
+        },
+    };
+
+    // Should be unreachable, but if a repo is configured to do something exotic
+    // on fetch, say so loudly instead of quietly having changed the user's work.
+    if !(result.head_unchanged && result.worktree_unchanged && result.local_branches_unchanged) {
+        return Err(AppError::Command(
+            "Fetch unexpectedly modified local state — check `git status`.              This repo may have a custom fetch refspec pointing at refs/heads."
+                .into(),
+        ));
+    }
+    Ok(result)
+}
+
+fn seconds_since_last_fetch(repo: &Path) -> Option<u64> {
+    // git rewrites FETCH_HEAD on every fetch, so its mtime is the fetch time.
+    let meta = std::fs::metadata(repo.join(".git").join("FETCH_HEAD")).ok()?;
+    let modified = meta.modified().ok()?;
+    std::time::SystemTime::now()
+        .duration_since(modified)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// How far the branch is from its remote, and how stale that answer is.
+pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError> {
+    let repo = PathBuf::from(repo_path);
+    // The "all branches" view has no single branch — describe HEAD's.
+    let branch = if branch == "--all" || branch.is_empty() {
+        git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".into())
+    } else {
+        branch.to_string()
+    };
+
+    let upstream = git(
+        &repo,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", &format!("{}@{{upstream}}", branch)],
+    )
+    .ok()
+    .filter(|s| !s.is_empty());
+
+    let (mut ahead, mut behind) = (0usize, 0usize);
+    if let Some(up) = upstream.as_ref() {
+        if let Ok(counts) = git(
+            &repo,
+            &["rev-list", "--left-right", "--count", &format!("{}...{}", branch, up)],
+        ) {
+            let mut it = counts.split_whitespace();
+            ahead = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            behind = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        }
+    }
+
+    Ok(SyncStatus {
+        local_tip: commit_ref(&repo, &branch),
+        remote_tip: upstream.as_ref().and_then(|u| commit_ref(&repo, u)),
+        incoming_rev: upstream
+            .as_ref()
+            .filter(|_| behind > 0)
+            .map(|up| format!("{}..{}", branch, up)),
+        branch,
+        upstream,
+        ahead,
+        behind,
+        last_fetch_secs: seconds_since_last_fetch(&repo),
     })
 }
 

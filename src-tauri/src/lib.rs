@@ -11,6 +11,7 @@ mod github;
 mod oauth;
 mod paths;
 mod profiles;
+mod remote_repos;
 mod repo_scan;
 mod sparse;
 mod signing;
@@ -77,6 +78,8 @@ pub fn run() {
             commands::register_signing_key,
             commands::signing_key_registered,
             commands::allowed_signers_path,
+            commands::history_fetch,
+            commands::history_sync_status,
             commands::history_list_repos,
             commands::history_branches,
             commands::history_page,
@@ -94,6 +97,12 @@ pub fn run() {
             commands::scan_repos,
             commands::check_repo_access,
             commands::sparse_clone,
+            commands::full_clone,
+            commands::repo_accounts,
+            commands::list_remote_repos,
+            commands::ssh_certificate_info,
+            commands::clone_destination_status,
+            commands::switch_repo_origin,
             commands::sparse_repo_info,
             commands::sparse_set,
             commands::sparse_add,

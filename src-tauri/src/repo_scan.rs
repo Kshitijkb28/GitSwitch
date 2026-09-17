@@ -77,7 +77,7 @@ pub fn parse_github_owner_name(url: &str) -> Option<(String, String)> {
 
 /// Hide any credentials embedded in a remote URL — covers BOTH forms GitHub
 /// documents: `https://user:token@…` and the token-as-username `https://token@…`.
-fn mask_token(url: &str) -> String {
+pub(crate) fn mask_token(url: &str) -> String {
     for scheme in ["https://", "http://"] {
         if let Some(rest) = url.strip_prefix(scheme) {
             if let Some((_creds, host)) = rest.split_once('@') {
@@ -88,7 +88,7 @@ fn mask_token(url: &str) -> String {
     url.to_string()
 }
 
-fn get_origin(dir: &PathBuf) -> Option<String> {
+fn get_origin(dir: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .args(["-C", &dir.to_string_lossy(), "remote", "get-url", "origin"])
         .output()
@@ -171,16 +171,16 @@ mod tests {
     #[test]
     fn parses_all_github_url_forms() {
         let cases = [
-            "git@github.com:Ethara-Ai/unified-personas.git",
-            "https://github.com/Ethara-Ai/unified-personas.git",
-            "https://github.com/Ethara-Ai/unified-personas",
-            "https://user:ghp_tok@github.com/Ethara-Ai/unified-personas.git",
-            "ssh://git@github.com/Ethara-Ai/unified-personas.git",
+            "git@github.com:acme/widgets.git",
+            "https://github.com/acme/widgets.git",
+            "https://github.com/acme/widgets",
+            "https://user:ghp_tok@github.com/acme/widgets.git",
+            "ssh://git@github.com/acme/widgets.git",
         ];
         for c in cases {
             assert_eq!(
                 parse_github_owner_name(c),
-                Some(("Ethara-Ai".to_string(), "unified-personas".to_string())),
+                Some(("acme".to_string(), "widgets".to_string())),
                 "failed for {c}"
             );
         }

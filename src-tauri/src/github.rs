@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// All GitHub API calls share a client with a hard timeout so one stalled
 /// connection can never hang a command (and with it the UI) indefinitely.
-fn http_client() -> Result<reqwest::Client, AppError> {
+pub(crate) fn http_client() -> Result<reqwest::Client, AppError> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()

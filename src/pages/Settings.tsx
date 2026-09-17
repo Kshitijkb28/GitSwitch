@@ -207,7 +207,8 @@ export function Settings() {
             placeholder="Ov23li…  (your OAuth App Client ID)"
             value={clientId}
             onChange={(e) => setClientId(e.target.value)}
-            className="flex-1 font-mono"
+            containerClassName="flex-1 min-w-0"
+            className="font-mono"
           />
           <Button variant="secondary" onClick={saveClientId}>
             Save

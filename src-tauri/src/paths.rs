@@ -1,9 +1,9 @@
-/// Path helpers that behave the same on Windows and Unix.
-///
-/// Windows paths use `\`, but git (and gh, and our own stored config) freely
-/// mix in `/`. Comparing raw strings therefore fails on Windows — and a `\`
-/// inside a git-config value is an ESCAPE character, so `gitdir:` patterns must
-/// be written with forward slashes there too.
+//! Path helpers that behave the same on Windows and Unix.
+//!
+//! Windows paths use `\`, but git (and gh, and our own stored config) freely
+//! mix in `/`. Comparing raw strings therefore fails on Windows — and a `\`
+//! inside a git-config value is an ESCAPE character, so `gitdir:` patterns must
+//! be written with forward slashes there too.
 
 /// Normalize for comparison: forward slashes, no trailing separator.
 pub fn norm(path: &str) -> String {

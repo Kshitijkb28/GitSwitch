@@ -106,6 +106,46 @@ fn mask_token(url: &str) -> String {
     url.to_string()
 }
 
+/// Find git repos within `root` (up to a few levels deep) and convert their origin to SSH.
+pub fn convert_repos_in_dir(root: &str) -> Result<Vec<RemoteChange>, AppError> {
+    let root_path = PathBuf::from(root);
+    if !root_path.exists() {
+        return Err(AppError::Config(format!("Folder not found: {}", root)));
+    }
+
+    let mut changes = Vec::new();
+    let mut stack = vec![(root_path, 0u32)];
+    const MAX_DEPTH: u32 = 4;
+
+    while let Some((dir, depth)) = stack.pop() {
+        if dir.join(".git").exists() {
+            if let Some(change) = convert_one(&dir) {
+                changes.push(change);
+            }
+            // Don't descend into a repo's subfolders.
+            continue;
+        }
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    // Skip noise
+                    if name == "node_modules" || name == ".git" || name.starts_with('.') {
+                        continue;
+                    }
+                    stack.push((path, depth + 1));
+                }
+            }
+        }
+    }
+
+    Ok(changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,44 +191,4 @@ mod tests {
         let m3 = mask_token("http://tok@github.com/o/r.git");
         assert!(!m3.contains("tok@"));
     }
-}
-
-/// Find git repos within `root` (up to a few levels deep) and convert their origin to SSH.
-pub fn convert_repos_in_dir(root: &str) -> Result<Vec<RemoteChange>, AppError> {
-    let root_path = PathBuf::from(root);
-    if !root_path.exists() {
-        return Err(AppError::Config(format!("Folder not found: {}", root)));
-    }
-
-    let mut changes = Vec::new();
-    let mut stack = vec![(root_path, 0u32)];
-    const MAX_DEPTH: u32 = 4;
-
-    while let Some((dir, depth)) = stack.pop() {
-        if dir.join(".git").exists() {
-            if let Some(change) = convert_one(&dir) {
-                changes.push(change);
-            }
-            // Don't descend into a repo's subfolders.
-            continue;
-        }
-        if depth >= MAX_DEPTH {
-            continue;
-        }
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    // Skip noise
-                    if name == "node_modules" || name == ".git" || name.starts_with('.') {
-                        continue;
-                    }
-                    stack.push((path, depth + 1));
-                }
-            }
-        }
-    }
-
-    Ok(changes)
 }

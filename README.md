@@ -36,8 +36,18 @@ for folders that still use HTTPS.
   picker. A folder can belong to only one profile (auto-deduplicated).
 - **Auto Assign** — scan a folder tree, check which of your GitHub accounts
   actually has access to each repo, and map them to the right profile.
-- **Sparse Clone** — metadata-only clone of a huge repo, then tick just the
-  folders you need (`git sparse-checkout`, with add-later support).
+- **Clone** — clone over SSH as the right account. The destination folder's
+  profile decides the key, or pick one with **Clone as** (the new folder is then
+  added to that profile). Downloads submodules with the same result as
+  `git clone --recurse-submodules`, notices when the repo is already cloned
+  (and can switch an HTTPS clone to the SSH link), and explains refusals —
+  unregistered key, missing org SSO authorization, or an organization that
+  requires SSH certificates (`org-<id>@github.com` links). A **sparse** mode
+  clones metadata only and lets you tick just the folders you need.
+- **Repositories** — every repository your signed-in GitHub accounts can reach
+  (owned, collaborator and organization), with search, filters and paging.
+  Each one can be cloned in a click — straight into the Clone page with the
+  right link and a suggested profile — or opened if it's already on disk.
 - **Push blocking** — mark a profile read-only; `git push` fails locally in its
   folders while pull/fetch keep working.
 - **History** — browse branches (local/remote, ahead/behind), paginated commit
@@ -46,6 +56,9 @@ for folders that still use HTTPS.
   status, message search, a **GitHub account filter** (narrow the repo list to
   one profile, and optionally show only that identity's commits), and a merge
   panel showing which branches already contain the one you're looking at.
+  **Fetch** shows where your branch and its remote each point and which
+  commits you haven't pulled yet — it never merges or touches your working
+  tree, and verifies that before reporting success.
 - **Commit Audit** — finds commits authored with the wrong identity, rewrites the
   ones you haven't pushed (keeping a backup branch, never touching published
   history), and can install a `pre-commit` guard that blocks future mistakes.
@@ -57,6 +70,7 @@ for folders that still use HTTPS.
 - **GitHub sign-in** — device-flow OAuth *and* instant sign-in via your
   existing GitHub CLI (`gh`) logins; autofill profile name/email from an account.
 - **Tray icon**, toast feedback, and a Settings view of the managed gitconfig.
+  Pages remember where you were (selected repo, branch, filters) between visits.
 
 ## VS Code extension
 

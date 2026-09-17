@@ -14,6 +14,7 @@ import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import type { Profile } from "../types/profile";
 import { baseName, isWithin, normPath } from "../lib/paths";
+import { usePersistedState } from "../lib/persist";
 import * as api from "../lib/api";
 
 type Phase = "idle" | "scanning" | "resolving" | "checking" | "ready" | "applying";
@@ -51,7 +52,7 @@ function currentProfileFor(repoPath: string, profiles: Profile[]): Profile | nul
 
 export function AutoAssign() {
   const toast = useToast();
-  const [root, setRoot] = useState("");
+  const [root, setRoot] = usePersistedState("autoassign.root", "");
   const [phase, setPhase] = useState<Phase>("idle");
   const [statusLine, setStatusLine] = useState("");
   const [profiles, setProfiles] = useState<Profile[]>([]);

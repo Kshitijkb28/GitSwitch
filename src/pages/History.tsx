@@ -7,6 +7,8 @@ import {
   ChevronRight,
   Search,
   RefreshCw,
+  CloudDownload,
+  CheckCircle2,
   FileText,
   ShieldCheck,
   X,
@@ -18,6 +20,8 @@ import { Card } from "../components/Card";
 import { Badge } from "../components/Badge";
 import { Input } from "../components/Input";
 import { Select } from "../components/Select";
+import { useToast } from "../components/Toast";
+import { usePersistedState } from "../lib/persist";
 import * as api from "../lib/api";
 
 const PAGE_SIZE = 50;
@@ -29,6 +33,15 @@ const LANE_COLORS = [
 ];
 const laneColor = (l: number) => LANE_COLORS[l % LANE_COLORS.length];
 const laneX = (l: number) => l * LANE_W + 10;
+
+/** How stale the ahead/behind numbers are — they're only as good as the last fetch. */
+function fetchAgo(secs: number | null): string {
+  if (secs === null) return "never fetched — counts may be stale";
+  if (secs < 90) return "fetched just now";
+  if (secs < 3600) return `fetched ${Math.floor(secs / 60)}m ago`;
+  if (secs < 86400) return `fetched ${Math.floor(secs / 3600)}h ago`;
+  return `fetched ${Math.floor(secs / 86400)}d ago`;
+}
 
 /** One row of the commit graph: rails passing through, the dot, and the
  *  connectors that fan out to a merge's parents. Mirrors `git log --graph`. */
@@ -79,23 +92,27 @@ function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
 }
 
 export function History() {
+  const toast = useToast();
   const [repos, setRepos] = useState<api.RepoRef[]>([]);
-  const [repo, setRepo] = useState("");
-  const [account, setAccount] = useState("");        // profile id, "" = all
-  const [onlyMine, setOnlyMine] = useState(false);   // filter commits by that identity
+  const [repo, setRepo] = usePersistedState("history.repo", "");
+  const [account, setAccount] = usePersistedState("history.account", ""); // profile id, "" = all
+  const [onlyMine, setOnlyMine] = usePersistedState("history.onlyMine", false);
   const [branches, setBranches] = useState<api.BranchInfo[]>([]);
-  const [rev, setRev] = useState("--all");
+  const [rev, setRev] = usePersistedState("history.rev", "--all");
   const [page, setPage] = useState<api.HistoryPage | null>(null);
   const [offset, setOffset] = useState(0);
   const [search, setSearch] = useState("");
   const [appliedSearch, setAppliedSearch] = useState("");
-  const [showRemote, setShowRemote] = useState(false);
+  const [showRemote, setShowRemote] = usePersistedState("history.showRemote", false);
   const [mergeInfo, setMergeInfo] = useState<api.MergeInfo | null>(null);
   const [detail, setDetail] = useState<api.CommitDetail | null>(null);
   const [loadingRepos, setLoadingRepos] = useState(true);
   const [loadingBranches, setLoadingBranches] = useState(false);
   const [loadingPage, setLoadingPage] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sync, setSync] = useState<api.SyncStatus | null>(null);
+  const [fetching, setFetching] = useState(false);
+  const [autoFetch, setAutoFetch] = usePersistedState("history.autoFetch", false);
   const [reloadKey, setReloadKey] = useState(0);
   const pageSeq = useRef(0);
 
@@ -107,6 +124,43 @@ export function History() {
   const accountEmail = accounts.find((a) => a.id === account)?.email ?? "";
   const visibleRepos = account ? repos.filter((r) => r.profile_id === account) : repos;
 
+  const isRange = rev.includes("..");
+
+  const loadSync = useCallback(async (path: string, r: string) => {
+    if (!path) return;
+    try {
+      setSync(await api.historySyncStatus(path, r.includes("..") ? "--all" : r));
+    } catch {
+      setSync(null);
+    }
+  }, []);
+
+  /** git fetch — updates remote refs only; the working tree is never touched. */
+  async function doFetch(path = repo, silent = false) {
+    if (!path) return;
+    setFetching(true);
+    if (!silent) setError(null);
+    try {
+      const res = await api.historyFetch(path);
+      await loadBranches(path);
+      await loadSync(path, rev);
+      setReloadKey((k) => k + 1); // re-read the commit page with fresh refs
+      if (!silent) toast.success(res.message);
+    } catch (e) {
+      if (!silent) setError(String(e));
+    } finally {
+      setFetching(false);
+    }
+  }
+
+  function showIncoming() {
+    if (!sync?.incoming_rev) return;
+    setRev(sync.incoming_rev);
+    setOffset(0);
+    setMergeInfo(null);
+  }
+
+
 
   useEffect(() => {
     let cancelled = false;
@@ -114,7 +168,10 @@ export function History() {
       .then((r) => {
         if (cancelled) return;
         setRepos(r);
-        if (r.length > 0) setRepo((prev) => prev || r[0].path);
+        // Keep the remembered repo only if it still exists.
+        setRepo((prev) =>
+          prev && r.some((x) => x.path === prev) ? prev : r[0]?.path ?? ""
+        );
       })
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoadingRepos(false));
@@ -134,14 +191,21 @@ export function History() {
     }
   }, []);
 
-  // Switching repo resets the view; a stale branch would query the wrong repo.
+  // Switching repo resets the view (a branch from another repo would query the
+  // wrong thing) — but returning to the page must NOT reset, or the restored
+  // selection would be wiped on mount. So only react to a genuine change.
+  const prevRepo = useRef<string | null>(null);
   useEffect(() => {
     if (!repo) return;
-    setRev("--all");
-    setOffset(0);
-    setMergeInfo(null);
-    setSearch("");
-    setAppliedSearch("");
+    const switched = prevRepo.current !== null && prevRepo.current !== repo;
+    prevRepo.current = repo;
+    if (switched) {
+      setRev("--all");
+      setOffset(0);
+      setMergeInfo(null);
+      setSearch("");
+      setAppliedSearch("");
+    }
     loadBranches(repo);
   }, [repo, loadBranches]);
 
@@ -172,11 +236,23 @@ export function History() {
       .finally(() => { if (pageSeq.current === seq) setLoadingPage(false); });
   }, [repo, rev, offset, appliedSearch, reloadKey, onlyMine, accountEmail]);
 
+  useEffect(() => {
+    loadSync(repo, rev);
+  }, [repo, rev, loadSync]);
+
+  // Opt-in: refresh remote refs whenever a repo is opened, so the counts and
+  // "latest commit" are true without the user thinking about it.
+  useEffect(() => {
+    if (!repo || !autoFetch) return;
+    doFetch(repo, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repo, autoFetch]);
+
   async function selectBranch(name: string) {
     setRev(name);
     setOffset(0);
     setMergeInfo(null);
-    if (name !== "--all") {
+    if (name !== "--all" && !name.includes("..")) {
       try {
         setMergeInfo(await api.historyBranchMerges(repo, name));
       } catch {
@@ -225,6 +301,16 @@ export function History() {
           </div>
           <Button
             variant="secondary"
+            onClick={() => doFetch()}
+            disabled={!repo || fetching}
+            className="min-w-[8.25rem]" // fits "Fetching…" (≈125px), so the label swap never shifts Refresh
+            title="git fetch — updates remote branches only, never your working tree"
+          >
+            <CloudDownload size={16} className={fetching ? "animate-pulse" : ""} />
+            {fetching ? "Fetching…" : "Fetch"}
+          </Button>
+          <Button
+            variant="secondary"
             onClick={() => { loadBranches(repo); setOffset(0); setReloadKey((k) => k + 1); }}
             disabled={!repo || loadingBranches}
           >
@@ -248,6 +334,85 @@ export function History() {
             Assign folders to a profile and GitSwitch will list the repos inside them here.
           </p>
         </Card>
+      )}
+
+      {repo && sync && (
+        <div className="flex items-center gap-3 flex-wrap text-sm">
+          {sync.behind > 0 ? (
+            <div className="flex items-center gap-3 flex-wrap px-4 py-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 min-w-0">
+              <CloudDownload size={16} className="shrink-0" />
+              <span className="min-w-0">
+                <strong>{sync.behind}</strong> commit{sync.behind === 1 ? "" : "s"} on{" "}
+                <span className="font-mono">{sync.upstream}</span> you haven't pulled
+                {sync.ahead > 0 && <> · you're also <strong>{sync.ahead}</strong> ahead</>}
+              </span>
+              {!isRange && (
+                <Button size="sm" variant="secondary" onClick={showIncoming}>
+                  Show incoming
+                </Button>
+              )}
+            </div>
+          ) : sync.upstream ? (
+            <span className="inline-flex items-center gap-1.5 text-zinc-500">
+              <CheckCircle2 size={14} className="text-emerald-400" />
+              Up to date with <span className="font-mono">{sync.upstream}</span>
+              {sync.ahead > 0 && <> · {sync.ahead} to push</>}
+            </span>
+          ) : (
+            <span className="text-zinc-600">No upstream branch — nothing to compare against.</span>
+          )}
+
+          <span
+            className={`text-xs ${sync.last_fetch_secs === null ? "text-amber-400/80" : "text-zinc-600"}`}
+            title="Counts are only as fresh as the last fetch"
+          >
+            {fetchAgo(sync.last_fetch_secs)}
+          </span>
+
+          <label className="inline-flex items-center gap-2 text-xs text-zinc-500 cursor-pointer select-none ml-auto">
+            <Checkbox
+              checked={autoFetch}
+              onChange={setAutoFetch}
+            />
+            Auto-fetch on open
+          </label>
+        </div>
+      )}
+
+      {repo && sync && (sync.local_tip || sync.remote_tip) && (
+        <div className="grid sm:grid-cols-2 gap-3">
+          <TipCard
+            label="Your local branch"
+            name={sync.branch}
+            tip={sync.local_tip}
+            accent="zinc"
+            note={sync.ahead > 0 ? `${sync.ahead} commit${sync.ahead === 1 ? "" : "s"} not pushed` : undefined}
+          />
+          <TipCard
+            label="Remote branch"
+            name={sync.upstream ?? "no upstream"}
+            tip={sync.remote_tip}
+            accent={sync.behind > 0 ? "amber" : "emerald"}
+            note={
+              sync.behind > 0
+                ? `${sync.behind} commit${sync.behind === 1 ? "" : "s"} ahead of you — not pulled`
+                : "you have everything from here"
+            }
+          />
+        </div>
+      )}
+
+      {isRange && (
+        <div className="flex items-center gap-3 flex-wrap px-4 py-3 rounded-lg bg-zinc-800/60 border border-zinc-700/50 text-sm">
+          <span className="text-zinc-300">
+            Showing <strong>incoming</strong> commits — on the remote, not in your clone yet
+          </span>
+          <span className="font-mono text-xs text-zinc-500">{rev}</span>
+          <Button size="sm" variant="ghost" onClick={() => selectBranch("--all")}>
+            <X size={14} />
+            Back to history
+          </Button>
+        </div>
       )}
 
       {repo && (
@@ -377,7 +542,7 @@ export function History() {
                   placeholder="Search commit messages…"
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  className="flex-1"
+                  containerClassName="flex-1 min-w-0"
                 />
                 <Button type="submit" variant="secondary">
                   <Search size={16} />
@@ -513,6 +678,51 @@ export function History() {
       )}
 
       {detail && <CommitDetailPanel detail={detail} onClose={() => setDetail(null)} />}
+    </div>
+  );
+}
+
+function TipCard({
+  label,
+  name,
+  tip,
+  note,
+  accent,
+}: {
+  label: string;
+  name: string;
+  tip: api.CommitRef | null;
+  note?: string;
+  accent: "zinc" | "amber" | "emerald";
+}) {
+  const ring =
+    accent === "amber"
+      ? "border-amber-500/30"
+      : accent === "emerald"
+      ? "border-emerald-500/25"
+      : "border-zinc-700/50";
+  const noteColor =
+    accent === "amber" ? "text-amber-400" : accent === "emerald" ? "text-emerald-400/80" : "text-zinc-500";
+  return (
+    <div className={`rounded-xl border ${ring} bg-zinc-900/50 px-4 py-3 min-w-0`}>
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="text-[11px] uppercase tracking-wider text-zinc-500 shrink-0">{label}</span>
+        <span className="font-mono text-xs text-zinc-300 truncate min-w-0">{name}</span>
+      </div>
+      {tip ? (
+        <>
+          <p className="text-sm text-zinc-200 truncate mt-1.5" title={tip.subject}>
+            <span className="font-mono text-zinc-500 mr-2">{tip.short}</span>
+            {tip.subject}
+          </p>
+          <p className="text-[11px] text-zinc-600 truncate mt-0.5">
+            {tip.author} · {tip.date.replace("T", " ").slice(0, 16)}
+          </p>
+        </>
+      ) : (
+        <p className="text-sm text-zinc-600 mt-1.5">—</p>
+      )}
+      {note && <p className={`text-[11px] mt-1 ${noteColor}`}>{note}</p>}
     </div>
   );
 }

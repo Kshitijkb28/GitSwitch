@@ -154,6 +154,7 @@ pub fn create_profile(
     Ok(profile)
 }
 
+#[allow(clippy::too_many_arguments)] // one optional value per editable field
 pub fn update_profile(
     id: String,
     name: Option<String>,
