@@ -58,6 +58,21 @@ for folders that still use HTTPS.
   existing GitHub CLI (`gh`) logins; autofill profile name/email from an account.
 - **Tray icon**, toast feedback, and a Settings view of the managed gitconfig.
 
+## VS Code extension
+
+`vscode-extension/` is a companion extension that surfaces the active identity
+where you actually commit — a status-bar readout, an amber warning when a repo's
+git identity doesn't match its GitSwitch profile, and a fetch-only "what's
+incoming" check.
+
+It reads the same `profiles.json` this app writes rather than reimplementing
+anything, so the two can't drift apart.
+
+```bash
+cd vscode-extension && npm install && npm run package
+code --install-extension gitswitch-0.1.0.vsix
+```
+
 ## Requirements
 
 - **git** (required)
