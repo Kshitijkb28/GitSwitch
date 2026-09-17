@@ -250,10 +250,10 @@ mod tests {
 
     #[test]
     fn authenticated_greeting_yields_login() {
-        let out = "Hi kshitijbhardwaj-kb-ethara! You've successfully authenticated, but GitHub does not provide shell access.\n";
+        let out = "Hi octo-work! You've successfully authenticated, but GitHub does not provide shell access.\n";
         assert_eq!(
             interpret_ssh_probe(out),
-            Some(Some("kshitijbhardwaj-kb-ethara".to_string()))
+            Some(Some("octo-work".to_string()))
         );
     }
 

@@ -198,6 +198,43 @@ export interface CommitDetail {
   signature: string;
 }
 
+export interface CommitRef {
+  short: string;
+  subject: string;
+  author: string;
+  date: string;
+}
+
+export interface SyncStatus {
+  branch: string;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  last_fetch_secs: number | null;
+  incoming_rev: string | null;
+  local_tip: CommitRef | null;
+  remote_tip: CommitRef | null;
+}
+
+export interface FetchResult {
+  message: string;
+  head_unchanged: boolean;
+  worktree_unchanged: boolean;
+  local_branches_unchanged: boolean;
+  updated_remote_refs: number;
+}
+
+export async function historyFetch(repoPath: string): Promise<FetchResult> {
+  return invoke("history_fetch", { repoPath });
+}
+
+export async function historySyncStatus(
+  repoPath: string,
+  branch: string
+): Promise<SyncStatus> {
+  return invoke("history_sync_status", { repoPath, branch });
+}
+
 export interface MergeInfo {
   merged_into: string[];
   merges: HistoryCommit[];
@@ -348,16 +385,133 @@ export interface SparseInfo {
   available_dirs: string[];
 }
 
+export interface SubmoduleReport {
+  /** submodules with an address in .gitmodules */
+  listed: number;
+  /** of those, actually checked out */
+  downloaded: number;
+  /** entries with no address — git can't fetch them */
+  unlisted: number;
+  error: string | null;
+}
+
+export interface CloneResult {
+  path: string;
+  /** Profile whose SSH key authenticated the clone. */
+  profile_name: string | null;
+  /** Set when the new folder was added to that profile. */
+  mapped_to: string | null;
+  submodules: SubmoduleReport | null;
+}
+
+/** `cloneAs` = profile id to authenticate as; null lets the folder decide. */
 export async function sparseClone(
   url: string,
   parentDir: string,
-  folderName?: string | null
-): Promise<string> {
+  folderName?: string | null,
+  cloneAs?: string | null
+): Promise<CloneResult> {
   return invoke("sparse_clone", {
     url,
     parentDir,
     folderName: folderName ?? null,
+    cloneAs: cloneAs || null,
   });
+}
+
+export async function fullClone(
+  url: string,
+  parentDir: string,
+  folderName?: string | null,
+  cloneAs?: string | null,
+  withSubmodules = true
+): Promise<CloneResult> {
+  return invoke("full_clone", {
+    url,
+    parentDir,
+    folderName: folderName ?? null,
+    cloneAs: cloneAs || null,
+    withSubmodules,
+  });
+}
+
+export interface RepoAccount {
+  /** "gh:<account>" or "profile:<profile id>" */
+  key: string;
+  label: string;
+  source: string;
+}
+
+export interface RemoteRepo {
+  full_name: string;
+  owner: string;
+  name: string;
+  owner_is_org: boolean;
+  description: string | null;
+  private: boolean;
+  archived: boolean;
+  fork: boolean;
+  default_branch: string;
+  clone_url: string;
+  pushed_at: string | null;
+  permission: "admin" | "write" | "read";
+  local_path: string | null;
+  suggested_profile_id: string | null;
+}
+
+export interface RepoListing {
+  account: string;
+  login: string;
+  suggested_profile_id: string | null;
+  repos: RemoteRepo[];
+  truncated: boolean;
+  sso_hidden_orgs: number;
+}
+
+/** GitHub accounts that can list repositories (GitHub CLI + GitSwitch sign-ins). */
+export async function repoAccounts(): Promise<RepoAccount[]> {
+  return invoke("repo_accounts");
+}
+
+/** Every repository the account can reach (all pages). */
+export async function listRemoteRepos(account: string): Promise<RepoListing> {
+  return invoke("list_remote_repos", { account });
+}
+
+export interface CertInfo {
+  path: string;
+  exists: boolean;
+  valid_until: string | null;
+  expired: boolean;
+}
+
+export interface DestinationStatus {
+  path: string;
+  exists: boolean;
+  is_repo: boolean;
+  origin: string | null;
+  same_repo: boolean;
+  same_url: boolean;
+  origin_is_https: boolean;
+}
+
+/** Is the clone destination already taken — and by this same repo? (local only) */
+export async function cloneDestinationStatus(
+  url: string,
+  parentDir: string,
+  folderName?: string | null
+): Promise<DestinationStatus> {
+  return invoke("clone_destination_status", { url, parentDir, folderName: folderName || null });
+}
+
+/** Point an existing clone's origin at another link to the SAME repo. */
+export async function switchRepoOrigin(repoPath: string, url: string): Promise<string> {
+  return invoke("switch_repo_origin", { repoPath, url });
+}
+
+/** Company-signed SSH certificate next to a key (`<key>-cert.pub`), if any. */
+export async function sshCertificateInfo(keyPath: string): Promise<CertInfo> {
+  return invoke("ssh_certificate_info", { keyPath });
 }
 
 export async function sparseRepoInfo(repoPath: string): Promise<SparseInfo> {

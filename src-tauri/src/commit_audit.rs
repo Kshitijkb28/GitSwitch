@@ -52,7 +52,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 /// The profile that owns a repo path — longest matching directory wins, which
 /// mirrors how the generated gitconfig resolves overlapping folders.
-fn owning_profile<'a>(
+pub(crate) fn owning_profile<'a>(
     repo: &str,
     profs: &'a [profiles::Profile],
 ) -> Option<&'a profiles::Profile> {
@@ -188,7 +188,7 @@ pub async fn audit_all() -> Result<Vec<RepoAudit>, AppError> {
             .iter()
             .filter_map(|p| audit_repo(p, &profs, &own_emails))
             .collect();
-        out.sort_by(|a, b| b.unpushed_count.cmp(&a.unpushed_count));
+        out.sort_by_key(|a| std::cmp::Reverse(a.unpushed_count));
         Ok(out)
     })
     .await
@@ -201,7 +201,7 @@ pub fn fix_unpushed(repo_path: &str) -> Result<String, AppError> {
     let repo = PathBuf::from(repo_path);
 
     if !git(&repo, &["status", "--porcelain"])
-        .map_err(|e| AppError::Command(e))?
+        .map_err(AppError::Command)?
         .is_empty()
     {
         return Err(AppError::Config(
@@ -296,9 +296,7 @@ pub fn install_guard(repo_path: &str, expected_email: &str) -> Result<String, Ap
         if !existing.contains(MARKER) {
             let saved = hooks.join("pre-commit.gitswitch-saved");
             std::fs::rename(&hook, &saved)?;
-            chain = format!(
-                "# run the hook that was here before GitSwitch\nif [ -x \"$(dirname \"$0\")/pre-commit.gitswitch-saved\" ]; then\n  \"$(dirname \"$0\")/pre-commit.gitswitch-saved\" \"$@\" || exit $?\nfi"
-            );
+            chain = "# run the hook that was here before GitSwitch\nif [ -x \"$(dirname \"$0\")/pre-commit.gitswitch-saved\" ]; then\n  \"$(dirname \"$0\")/pre-commit.gitswitch-saved\" \"$@\" || exit $?\nfi".to_string();
         }
     }
 

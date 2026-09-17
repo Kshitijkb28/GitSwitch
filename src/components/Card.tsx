@@ -16,7 +16,7 @@ export function Card({
   return (
     <div
       onClick={onClick}
-      className={`rounded-xl border bg-zinc-800/50 p-4 transition-all duration-150 ${
+      className={`rounded-xl border bg-zinc-800/50 p-4 transition-colors duration-150 ${
         active
           ? "border-emerald-500/50 shadow-lg shadow-emerald-500/10"
           : "border-zinc-700/50 hover:border-zinc-600"

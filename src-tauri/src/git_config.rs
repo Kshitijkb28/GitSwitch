@@ -22,7 +22,7 @@ fn backup_file(path: &PathBuf) -> Result<(), AppError> {
 
 /// Keep only the newest MAX_BACKUPS `<file>.backup.<timestamp>` siblings.
 /// Timestamps are fixed-width, so lexicographic order == chronological order.
-fn prune_backups(path: &PathBuf) {
+fn prune_backups(path: &std::path::Path) {
     let (Some(parent), Some(file_name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
     else {
         return;

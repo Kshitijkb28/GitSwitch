@@ -4,14 +4,15 @@ use crate::doctor::{self, Finding};
 use crate::error::AppError;
 use crate::gh_cli;
 use crate::git_config;
-use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, MergeInfo, RepoRef};
+use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, FetchResult, MergeInfo, RepoRef, SyncStatus};
 use crate::git_remote::{self, RemoteChange};
 use crate::github::{self, GitHubKey, GitHubUser, RepoPermissions};
+use crate::remote_repos::{self, RepoAccount, RepoListing};
 use crate::repo_scan::{self, ScannedRepo};
 use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
 use crate::profiles::{self, Profile};
 use crate::signing;
-use crate::sparse::{self, SparseInfo};
+use crate::sparse::{self, CertInfo, CloneResult, DestinationStatus, SparseInfo};
 use crate::ssh_keys;
 
 #[tauri::command]
@@ -21,6 +22,7 @@ pub fn get_profiles() -> Result<Vec<Profile>, AppError> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
 pub fn create_profile(
     app: tauri::AppHandle,
     name: String,
@@ -46,6 +48,7 @@ pub fn create_profile(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
 pub fn update_profile(
     app: tauri::AppHandle,
     id: String,
@@ -204,11 +207,64 @@ pub async fn check_repo_access(
 /// Sparse checkout: partial-clone a repo (blob:none, no checkout).
 #[tauri::command]
 pub async fn sparse_clone(
+    app: tauri::AppHandle,
     url: String,
     parent_dir: String,
     folder_name: Option<String>,
-) -> Result<String, AppError> {
-    sparse::sparse_clone(&url, &parent_dir, folder_name.as_deref()).await
+    clone_as: Option<String>,
+) -> Result<CloneResult, AppError> {
+    let res = sparse::sparse_clone(&url, &parent_dir, folder_name.as_deref(), clone_as.as_deref()).await?;
+    if res.mapped_to.is_some() {
+        crate::tray::update_active_label(&app);
+    }
+    Ok(res)
+}
+
+/// Full clone. `clone_as` = profile id to authenticate as; None lets the
+/// destination folder's profile decide.
+#[tauri::command]
+pub async fn full_clone(
+    app: tauri::AppHandle,
+    url: String,
+    parent_dir: String,
+    folder_name: Option<String>,
+    clone_as: Option<String>,
+    with_submodules: Option<bool>,
+) -> Result<CloneResult, AppError> {
+    let res = sparse::full_clone(
+        &url,
+        &parent_dir,
+        folder_name.as_deref(),
+        clone_as.as_deref(),
+        with_submodules.unwrap_or(true),
+    )
+    .await?;
+    if res.mapped_to.is_some() {
+        crate::tray::update_active_label(&app);
+    }
+    Ok(res)
+}
+
+/// Is the clone destination already taken (and by this same repo)?
+#[tauri::command]
+pub async fn clone_destination_status(
+    url: String,
+    parent_dir: String,
+    folder_name: Option<String>,
+) -> Result<DestinationStatus, AppError> {
+    sparse::destination_status(&url, &parent_dir, folder_name.as_deref()).await
+}
+
+/// Point an existing clone's origin at another address of the same repo.
+#[tauri::command]
+pub async fn switch_repo_origin(repo_path: String, url: String) -> Result<String, AppError> {
+    sparse::switch_origin(&repo_path, &url).await
+}
+
+/// Is there a company-signed SSH certificate (`<key>-cert.pub`) for this key?
+#[tauri::command]
+pub async fn ssh_certificate_info(key_path: String) -> Result<CertInfo, AppError> {
+    Ok(sparse::certificate_info(&key_path).await)
 }
 
 /// Sparse checkout: inspect a repo (branch, top-level folders, current sparse set).
@@ -409,4 +465,35 @@ pub async fn history_branch_merges(
     tokio::task::spawn_blocking(move || git_history::branch_merge_info(&repo_path, &branch))
         .await
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Fetch remote refs for one repo. Safe: never touches the working tree.
+#[tauri::command]
+pub async fn history_fetch(repo_path: String) -> Result<FetchResult, AppError> {
+    tokio::task::spawn_blocking(move || git_history::fetch_repo(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Ahead/behind vs the remote, plus how stale that answer is.
+#[tauri::command]
+pub async fn history_sync_status(
+    repo_path: String,
+    branch: String,
+) -> Result<SyncStatus, AppError> {
+    tokio::task::spawn_blocking(move || git_history::sync_status(&repo_path, &branch))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+// --- Repositories: everything the signed-in GitHub accounts can reach ---
+
+#[tauri::command]
+pub async fn repo_accounts() -> Result<Vec<RepoAccount>, AppError> {
+    Ok(remote_repos::accounts().await)
+}
+
+#[tauri::command]
+pub async fn list_remote_repos(account: String) -> Result<RepoListing, AppError> {
+    remote_repos::list_repos(&account).await
 }
