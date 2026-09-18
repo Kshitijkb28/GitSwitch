@@ -468,6 +468,25 @@ export interface RepoListing {
   sso_hidden_orgs: number;
 }
 
+export interface LocalClones {
+  /** "owner/name" (lowercase) -> local path */
+  clones: Record<string, string>;
+  /** owner (lowercase) -> profile id its local repos belong to */
+  owner_profiles: Record<string, string>;
+  /** owner (lowercase) -> "org-<id>" SSH user seen locally */
+  org_ssh_users: Record<string, string>;
+}
+
+/** Which repos are on this machine right now — local disk only, no network. */
+export async function localCloneIndex(): Promise<LocalClones> {
+  return invoke("local_clone_index");
+}
+
+/** Does this path still exist? */
+export async function pathExists(path: string): Promise<boolean> {
+  return invoke("path_exists", { path });
+}
+
 /** GitHub accounts that can list repositories (GitHub CLI + GitSwitch sign-ins). */
 export async function repoAccounts(): Promise<RepoAccount[]> {
   return invoke("repo_accounts");
@@ -493,6 +512,8 @@ export interface DestinationStatus {
   same_repo: boolean;
   same_url: boolean;
   origin_is_https: boolean;
+  /** repo folder with no commit — an interrupted clone (or an empty repo) */
+  incomplete: boolean;
 }
 
 /** Is the clone destination already taken — and by this same repo? (local only) */

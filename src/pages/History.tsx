@@ -22,6 +22,7 @@ import { Input } from "../components/Input";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import { usePersistedState } from "../lib/persist";
+import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
 
 const PAGE_SIZE = 50;
@@ -162,7 +163,7 @@ export function History() {
 
 
 
-  useEffect(() => {
+  const loadRepos = useCallback(() => {
     let cancelled = false;
     api.historyListRepos()
       .then((r) => {
@@ -176,7 +177,10 @@ export function History() {
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoadingRepos(false));
     return () => { cancelled = true; };
-  }, []);
+  }, [setRepo]);
+  useEffect(loadRepos, [loadRepos]);
+  // Repos get cloned and deleted outside the app; re-scan on return.
+  useRefreshOnFocus(loadRepos);
 
   const loadBranches = useCallback(async (path: string) => {
     if (!path) return;
@@ -311,7 +315,7 @@ export function History() {
           </Button>
           <Button
             variant="secondary"
-            onClick={() => { loadBranches(repo); setOffset(0); setReloadKey((k) => k + 1); }}
+            onClick={() => { loadRepos(); loadBranches(repo); setOffset(0); setReloadKey((k) => k + 1); }}
             disabled={!repo || loadingBranches}
           >
             <RefreshCw size={16} className={loadingBranches ? "animate-spin" : ""} />

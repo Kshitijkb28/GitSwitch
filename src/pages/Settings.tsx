@@ -6,6 +6,7 @@ import { Card } from "../components/Card";
 import { Input } from "../components/Input";
 import { useToast } from "../components/Toast";
 import { getCustomClientId, setOAuthClientId } from "../lib/oauth";
+import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -32,6 +33,9 @@ export function Settings() {
         : "OAuth Client ID cleared"
     );
   }
+
+  // ~/.gitconfig can be edited outside the app.
+  useRefreshOnFocus(() => loadConfig());
 
   async function loadConfig() {
     try {

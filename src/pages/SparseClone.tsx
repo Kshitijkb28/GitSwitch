@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 import {
   GitBranch,
   FolderOpen,
@@ -24,6 +24,7 @@ import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import { baseName, isWithin, normPath } from "../lib/paths";
 import { usePersistedState } from "../lib/persist";
+import { useRefreshOnFocus } from "../lib/focus";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
 
@@ -54,6 +55,30 @@ function repoNameFromUrl(url: string): string {
 function httpsToSsh(url: string): string | null {
   const m = url.trim().match(/^https?:\/\/(?:[^@/]+@)?github\.com\/([^/]+)\/([^/]+?)(?:\.git)?\/?$/);
   return m ? `git@github.com:${m[1]}/${m[2]}.git` : null;
+}
+
+/**
+ * A clone keeps running while the user browses other pages, so its progress is
+ * held outside the component. Otherwise leaving and returning loses the
+ * "Cloning…" state, and the half-written folder then looks like a finished
+ * clone — the page would offer to switch or reuse a repo that is still
+ * downloading.
+ */
+type CloneJob = {
+  /** destination path being written */
+  key: string;
+  name: string;
+  mode: "full" | "sparse";
+  startedAt: number;
+  done?: { result?: api.CloneResult; error?: string };
+  /** the result has been shown once */
+  consumed?: boolean;
+};
+let cloneJob: CloneJob | null = null;
+const jobListeners = new Set<() => void>();
+function publishJob(job: CloneJob | null) {
+  cloneJob = job;
+  jobListeners.forEach((notify) => notify());
 }
 
 export function SparseClone() {
@@ -94,7 +119,15 @@ export function SparseClone() {
   }, [cloneAs, profiles]);
   // A result card describes the clone that just happened — drop it once the
   // form points somewhere else, so it can't be mistaken for the next one.
-  useEffect(() => setCloned(null), [url, parentDir]);
+  // Only an actual change clears it: re-opening the page must not wipe the
+  // result of a clone that finished while the user was elsewhere.
+  const lastFormKey = useRef(`${url}|${parentDir}`);
+  useEffect(() => {
+    const key = `${url}|${parentDir}`;
+    if (lastFormKey.current === key) return;
+    lastFormKey.current = key;
+    setCloned(null);
+  }, [url, parentDir]);
 
   // git matches the NEW repo's path (parent/name), not the parent — a more
   // specific profile folder can own that exact path.
@@ -108,6 +141,10 @@ export function SparseClone() {
   // GitHub shows org-<ID>@github.com links for orgs with an SSH certificate authority.
   const certOrgUrl = /^(?:ssh:\/\/)?org-[^@\s]+@github\.com[:/]/i.test(url.trim());
   const keyInUse = effective?.ssh_key_path ?? null;
+  // Bumped when the user returns to the app: the destination folder may have
+  // been created or deleted, and a certificate may have appeared, meanwhile.
+  const [recheck, setRecheck] = useState(0);
+  useRefreshOnFocus(() => setRecheck((n) => n + 1));
   const [cert, setCert] = useState<api.CertInfo | null>(null);
   useEffect(() => {
     if (!certOrgUrl || !keyInUse) {
@@ -121,7 +158,28 @@ export function SparseClone() {
     return () => {
       stale = true;
     };
-  }, [certOrgUrl, keyInUse]);
+  }, [certOrgUrl, keyInUse, recheck]);
+
+  const [, bumpJob] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => {
+    jobListeners.add(bumpJob);
+    return () => {
+      jobListeners.delete(bumpJob);
+    };
+  }, []);
+  const job = cloneJob;
+  const cloning = !!job && !job.done;
+  const elapsedSecs = job ? Math.max(0, Math.round((Date.now() - job.startedAt) / 1000)) : 0;
+  const elapsedLabel =
+    elapsedSecs < 60
+      ? `${elapsedSecs}s`
+      : `${Math.floor(elapsedSecs / 60)}m ${String(elapsedSecs % 60).padStart(2, "0")}s`;
+  // keep the elapsed time ticking while it runs
+  useEffect(() => {
+    if (!cloning) return;
+    const t = setInterval(bumpJob, 1000);
+    return () => clearInterval(t);
+  }, [cloning]);
 
   const [dest, setDest] = useState<api.DestinationStatus | null>(null);
   const [destTick, setDestTick] = useState(0);
@@ -141,11 +199,14 @@ export function SparseClone() {
       stale = true;
       clearTimeout(t);
     };
-  }, [url, parentDir, folderName, destTick]);
+  }, [url, parentDir, folderName, destTick, recheck]);
 
-  const destTaken = !!dest?.exists && cloned?.path !== dest.path;
+  // The clone in progress creates its folder immediately; that is not a
+  // finished clone, so it must not be offered for switching or reuse.
+  const cloningHere = cloning && job?.key === destination;
+  const destTaken = !!dest?.exists && cloned?.path !== dest.path && !cloningHere;
   const canSwitch =
-    destTaken && !!dest?.same_repo && !dest?.same_url && !/^https?:\/\//i.test(url.trim());
+    destTaken && !!dest?.same_repo && !dest?.same_url && !dest?.incomplete && !/^https?:\/\//i.test(url.trim());
 
   async function switchExisting() {
     if (!dest) return;
@@ -161,7 +222,9 @@ export function SparseClone() {
     }
   }
 
-  const blockReason = destTaken
+  const blockReason = cloning
+    ? `Cloning ${job?.name ?? ""} — wait for it to finish.`
+    : destTaken
     ? `${baseName(dest!.path)} already exists in this folder.`
     : chosen && !chosen.ssh_key_path
     ? `Profile "${chosen.name}" has no SSH key — add one to it first.`
@@ -170,7 +233,6 @@ export function SparseClone() {
     : null;
   const sshSuggestion = httpsToSsh(url);
   const isHttps = /^https?:\/\//i.test(url.trim());
-  const [cloning, setCloning] = useState(false);
   const [info, setInfo] = useState<api.SparseInfo | null>(null);
   const [loadingInfo, setLoadingInfo] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -211,33 +273,56 @@ export function SparseClone() {
       setError(blockReason);
       return;
     }
-    setCloning(true);
+    if (cloning) {
+      setError("A clone is already running — wait for it to finish.");
+      return;
+    }
     setError(null);
     setCloned(null);
-    try {
-      if (mode === "full") {
-        const res = await api.fullClone(url, parentDir, folderName || null, cloneAs || null, withSubmodules);
-        setInfo(null);
-        setCloned(res);
-        toast.success(`Cloned ${baseName(res.path)} as ${res.profile_name ?? "your global identity"}`);
-        if (res.mapped_to) reloadProfiles();
-      } else {
-        const res = await api.sparseClone(url, parentDir, folderName || null, cloneAs || null);
-        setCloned(res);
-        toast.success(
-          res.mapped_to
-            ? `Cloned (metadata only) as ${res.mapped_to} and added to that profile — now pick folders`
-            : "Repository cloned (metadata only) — now pick folders"
-        );
-        if (res.mapped_to) reloadProfiles();
-        await loadInfo(res.path);
-      }
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setCloning(false);
-    }
+    const name = folderName.trim() || repoNameFromUrl(url);
+    const started: CloneJob = {
+      key: `${parentDir}/${name}`,
+      name,
+      mode,
+      startedAt: Date.now(),
+    };
+    publishJob(started);
+    const request =
+      mode === "full"
+        ? api.fullClone(url, parentDir, folderName || null, cloneAs || null, withSubmodules)
+        : api.sparseClone(url, parentDir, folderName || null, cloneAs || null);
+    request.then(
+      (result) => publishJob({ ...started, done: { result } }),
+      (e) => publishJob({ ...started, done: { error: String(e) } })
+    );
   }
+
+  // Show the outcome once, even if it finished while the user was on another page.
+  useEffect(() => {
+    if (!job?.done || job.consumed) return;
+    job.consumed = true;
+    const { result, error: failed } = job.done;
+    setDestTick((n) => n + 1);
+    if (failed || !result) {
+      setError(failed ?? "Clone failed");
+      return;
+    }
+    if (job.mode === "full") {
+      setInfo(null);
+      setCloned(result);
+      toast.success(`Cloned ${baseName(result.path)} as ${result.profile_name ?? "your global identity"}`);
+    } else {
+      setCloned(result);
+      toast.success(
+        result.mapped_to
+          ? `Cloned (metadata only) as ${result.mapped_to} and added to that profile — now pick folders`
+          : "Repository cloned (metadata only) — now pick folders"
+      );
+      loadInfo(result.path);
+    }
+    if (result.mapped_to) reloadProfiles();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job, job?.done]);
 
   function toggle(dir: string) {
     setSelected((prev) => {
@@ -289,6 +374,23 @@ export function SparseClone() {
           >
             <X size={14} />
           </button>
+        </div>
+      )}
+
+      {cloning && job && (
+        <div className="flex items-start gap-3 px-4 py-3 rounded-lg bg-zinc-800/60 border border-zinc-700/50 text-sm">
+          <Loader2 size={16} className="animate-spin text-emerald-400 mt-0.5 shrink-0" />
+          <span className="min-w-0">
+            <span className="text-zinc-200">
+              Cloning <strong>{job.name}</strong>
+              {job.mode === "sparse" && " (metadata only)"}…
+            </span>
+            <span className="block text-xs text-zinc-500 font-mono truncate">{job.key}</span>
+            <span className="block text-xs text-zinc-500 mt-0.5">
+              Running for {elapsedLabel} — you can use other pages, it keeps going and the result
+              appears here.
+            </span>
+          </span>
         </div>
       )}
 
@@ -450,7 +552,13 @@ export function SparseClone() {
             <div className="flex items-start gap-2.5 px-3 py-2.5 rounded-lg bg-amber-500/5 border border-amber-500/30 text-xs min-w-0">
               <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-400" />
               <span className="min-w-0 flex-1">
-                {!dest.is_repo ? (
+                {dest.is_repo && dest.incomplete ? (
+                  <span className="text-amber-200">
+                    <span className="font-mono">{baseName(dest.path)}</span> exists but has no commits —
+                    it looks like a clone that was interrupted (or an empty repository). Delete the
+                    folder and clone again.
+                  </span>
+                ) : !dest.is_repo ? (
                   <span className="text-amber-200">
                     <span className="font-mono">{baseName(dest.path)}</span> already exists here and
                     isn't a git repository — choose another folder name.
@@ -534,7 +642,13 @@ export function SparseClone() {
             </div>
           )}
           <div className="flex items-center gap-3 flex-wrap">
-            <Button onClick={handleClone} disabled={cloning || !!blockReason}>
+            <Button
+              onClick={handleClone}
+              disabled={cloning || !!blockReason}
+              // measured: "Clone" 94px / "Cloning…" 118px / "Sparse Clone" 144px —
+              // reserve the widest of each pair so the label swap shifts nothing
+              className={mode === "full" ? "min-w-[8rem]" : "min-w-[9.25rem]"}
+            >
               {cloning ? (
                 <>
                   <Loader2 size={16} className="animate-spin" />

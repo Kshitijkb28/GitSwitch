@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   BookMarked,
@@ -24,6 +24,7 @@ import { Checkbox } from "../components/Checkbox";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { useToast } from "../components/Toast";
 import { usePersistedState } from "../lib/persist";
+import { useRefreshOnFocus } from "../lib/focus";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
 
@@ -34,6 +35,19 @@ const listingCache = new Map<string, { listing: api.RepoListing; fetchedAt: numb
 // A listing can take a while for big accounts — never ask GitHub twice at once
 // for the same account (double mounts, quick account flips back and forth).
 const inflight = new Map<string, Promise<api.RepoListing>>();
+
+// The local scan is cheap but not free (it walks the profile folders), and
+// several things ask for it at once — mount, account change, window focus.
+// One scan serves all of them.
+let localInflight: Promise<api.LocalClones> | null = null;
+function scanLocalClones(): Promise<api.LocalClones> {
+  if (!localInflight) {
+    localInflight = api.localCloneIndex().finally(() => {
+      localInflight = null;
+    });
+  }
+  return localInflight;
+}
 
 function fetchListing(key: string, force: boolean): Promise<api.RepoListing> {
   const running = inflight.get(key);
@@ -82,6 +96,24 @@ export function Repositories() {
   const [page, setPage] = useState(0);
   const loadSeq = useRef(0);
 
+  // Which repos are on disk is local, cheap and changes behind the app's back
+  // (a folder deleted in Finder), so it is re-read on every visit and whenever
+  // the window regains focus — never taken from the cached GitHub listing.
+  const [local, setLocal] = useState<api.LocalClones | null>(null);
+  const refreshLocal = useCallback(() => {
+    scanLocalClones().then(setLocal).catch(() => setLocal(null));
+  }, []);
+  useEffect(refreshLocal, [refreshLocal]);
+  useRefreshOnFocus(refreshLocal);
+
+  /** Fresh local answers win over whatever the listing said when it was fetched. */
+  const localPathOf = (r: api.RemoteRepo) =>
+    local ? local.clones[r.full_name.toLowerCase()] ?? null : r.local_path;
+  const cloneUrlOf = (r: api.RemoteRepo) => {
+    const orgUser = local?.org_ssh_users[r.owner.toLowerCase()];
+    return orgUser ? `${orgUser}@github.com:${r.owner}/${r.name}.git` : r.clone_url;
+  };
+
   useEffect(() => {
     api.getProfiles().then(setProfiles).catch(() => setProfiles([]));
     api.repoAccounts()
@@ -124,6 +156,7 @@ export function Repositories() {
 
   useEffect(() => {
     if (account) load(account);
+    refreshLocal();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account]);
 
@@ -148,20 +181,23 @@ export function Repositories() {
         (visibility === "all" || (visibility === "private") === r.private) &&
         (!hideArchived || !r.archived) &&
         (!hideForks || !r.fork) &&
-        (!notClonedOnly || !r.local_path)
+        (!notClonedOnly || !localPathOf(r))
     );
     if (sort === "name") rows.sort((a, b) => a.full_name.localeCompare(b.full_name));
     else rows.sort((a, b) => (b.pushed_at ?? "").localeCompare(a.pushed_at ?? ""));
     return rows;
-  }, [listing, search, owner, visibility, hideArchived, hideForks, notClonedOnly, sort]);
+  }, [listing, local, search, owner, visibility, hideArchived, hideForks, notClonedOnly, sort]);
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
   const visible = filtered.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE);
   const profileName = (id: string | null) => profiles.find((p) => p.id === id)?.name ?? null;
 
+
   function suggestionFor(r: api.RemoteRepo): string | null {
-    if (r.suggested_profile_id) return r.suggested_profile_id;
+    const fromDisk = local?.owner_profiles[r.owner.toLowerCase()];
+    if (fromDisk) return fromDisk;
+    if (!local && r.suggested_profile_id) return r.suggested_profile_id;
     // The account's own profile only ever applies to the account's own repos.
     return listing && r.owner.toLowerCase() === listing.login.toLowerCase()
       ? listing.suggested_profile_id
@@ -169,13 +205,22 @@ export function Repositories() {
   }
 
   function cloneRepo(r: api.RemoteRepo) {
-    const params = new URLSearchParams({ url: r.clone_url, from: r.full_name, mode: "full" });
+    const params = new URLSearchParams({ url: cloneUrlOf(r), from: r.full_name, mode: "full" });
     const s = suggestionFor(r);
     if (s) params.set("cloneAs", s);
     navigate(`/sparse?${params.toString()}`);
   }
 
-  function openInHistory(path: string) {
+  async function openInHistory(path: string) {
+    // The row may be a moment out of date — check before acting on the folder.
+    // Only an explicit "no" blocks: if the check itself fails, let the user
+    // through rather than refusing to open a folder that is probably there.
+    const stillThere = await api.pathExists(path).catch(() => true);
+    if (stillThere === false) {
+      toast.error("That folder no longer exists — the list has been updated");
+      refreshLocal();
+      return;
+    }
     try {
       localStorage.setItem("gitswitch:history.repo", JSON.stringify(path));
       localStorage.setItem("gitswitch:history.account", JSON.stringify(""));
@@ -196,7 +241,7 @@ export function Repositories() {
   }
 
   const noAccounts = accounts !== null && accounts.length === 0;
-  const clonedCount = (listing?.repos ?? []).filter((r) => r.local_path).length;
+  const clonedCount = (listing?.repos ?? []).filter((r) => localPathOf(r)).length;
 
   return (
     <div className="space-y-6">
@@ -379,6 +424,7 @@ export function Repositories() {
           <div className="divide-y divide-zinc-800/70">
             {visible.map((r) => {
               const suggestion = profileName(suggestionFor(r));
+              const localPath = localPathOf(r);
               return (
                 <div key={r.full_name} className="flex items-start gap-3 py-3 min-w-0">
                   <span className="mt-0.5 shrink-0 text-zinc-500" title={r.private ? "Private" : "Public"}>
@@ -402,9 +448,9 @@ export function Repositories() {
                     <p className="text-[11px] text-zinc-600 mt-1 truncate">
                       {timeAgo(r.pushed_at)}
                       {r.default_branch && <> · {r.default_branch}</>}
-                      {r.local_path ? (
-                        <span className="text-emerald-400/80" title={r.local_path}>
-                          {" "}· cloned at {shortPath(r.local_path)}
+                      {localPath ? (
+                        <span className="text-emerald-400/80" title={localPath}>
+                          {" "}· cloned at {shortPath(localPath)}
                         </span>
                       ) : (
                         suggestion && <> · clones as {suggestion}</>
@@ -413,15 +459,15 @@ export function Repositories() {
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">
                     <button
-                      onClick={() => copyLink(r.clone_url)}
-                      title={`Copy ${r.clone_url}`}
+                      onClick={() => copyLink(cloneUrlOf(r))}
+                      title={`Copy ${cloneUrlOf(r)}`}
                       className="p-2 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer"
                       aria-label="Copy SSH link"
                     >
                       <Copy size={14} />
                     </button>
-                    {r.local_path ? (
-                      <Button size="sm" variant="secondary" onClick={() => openInHistory(r.local_path!)}>
+                    {localPath ? (
+                      <Button size="sm" variant="secondary" onClick={() => openInHistory(localPath)}>
                         <FolderOpen size={14} />
                         Open
                       </Button>
