@@ -48,8 +48,27 @@ for folders that still use HTTPS.
   (owned, collaborator and organization), with search, filters and paging.
   Each one can be cloned in a click — straight into the Clone page with the
   right link and a suggested profile — or opened if it's already on disk.
-- **Push blocking** — mark a profile read-only; `git push` fails locally in its
-  folders while pull/fetch keep working.
+- **Changes** — the everyday git loop, without leaving the app: see every
+  changed file with its real diff, stage and unstage individual files, discard
+  (with an explicit confirmation naming what gets deleted), commit as the
+  folder's own identity, pull, push and update submodules. Pull offers all
+  three strategies — fast-forward, merge, rebase — each with a sentence saying
+  what it will do to *your* commits before it runs, because `git pull` alone
+  behaves differently depending on settings you may not know you have. Nothing
+  is forced and nothing is bypassed: no `--force`, no `--no-verify`, no
+  amending a commit that is already pushed, and conflicts are surfaced for you
+  to resolve rather than resolved behind your back. Long operations keep
+  running while you browse other pages.
+- **Push blocking** — per profile *and* per repository. A blocked repo refuses
+  `git push` **in your terminal too**, via two mechanisms with different blind
+  spots: a `pushInsteadOf` rewrite in the repo's own `.git/config` (which
+  `--no-verify` cannot get past) and a `pre-push` hook (which catches remote
+  forms the rewrite can't, and chains any hook already there — Git LFS's, for
+  instance — instead of replacing it). Pull and fetch keep working. The app
+  states plainly what this does *not* stop: it is a guard-rail against
+  accidents, not a lock — anyone with a terminal can turn it off with one git
+  command, and only branch protection on GitHub is enforcement nobody can
+  bypass.
 - **History** — browse branches (local/remote, ahead/behind), paginated commit
   history with a real commit graph (lanes, forks and merges drawn the way
   `git log --graph` does), per-commit detail with files changed and signature

@@ -208,7 +208,7 @@ pub struct CloneResult {
     pub submodules: Option<SubmoduleReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct SubmoduleReport {
     /// Submodules that have an address in .gitmodules.
     pub listed: usize,
@@ -229,7 +229,7 @@ pub struct SubmoduleReport {
 /// path gets its own call. (A bare `git submodule update --init` is no good
 /// either: it aborts on the first entry with no address in .gitmodules —
 /// some repos have dozens — and downloads nothing.)
-async fn update_submodules(repo: &Path, ssh_override: Option<&str>, key: Option<&str>, url: &str) -> SubmoduleReport {
+pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, key: Option<&str>, url: &str) -> SubmoduleReport {
     let listed: Vec<String> = run_git(Some(repo), &["config", "-f", ".gitmodules", "--get-regexp", r"\.path$"])
         .await
         .map(|out| {
@@ -345,7 +345,7 @@ pub(crate) fn uses_org_certificate_url(url: &str) -> bool {
 }
 
 /// Turn git/ssh's terse failures into something that says what to do.
-fn explain_clone_error(stderr: &str, key: Option<&str>, url: &str) -> String {
+pub(crate) fn explain_clone_error(stderr: &str, key: Option<&str>, url: &str) -> String {
     let key_name = key
         .map(crate::paths::base_name)
         .unwrap_or_else(|| "your default SSH key".into());

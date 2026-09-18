@@ -4,13 +4,18 @@ mod credentials;
 mod doctor;
 mod error;
 mod gh_cli;
+mod git_advice;
 mod git_config;
+mod git_exec;
 mod git_history;
+mod git_ops;
+mod git_status;
 mod git_remote;
 mod github;
 mod oauth;
 mod paths;
 mod profiles;
+mod push_guard;
 mod remote_repos;
 mod repo_scan;
 mod sparse;
@@ -78,6 +83,20 @@ pub fn run() {
             commands::register_signing_key,
             commands::signing_key_registered,
             commands::allowed_signers_path,
+            commands::changes_repo_status,
+            commands::changes_stage,
+            commands::changes_stage_all,
+            commands::changes_unstage,
+            commands::changes_discard,
+            commands::changes_commit,
+            commands::changes_push,
+            commands::changes_pull,
+            commands::changes_submodule_update,
+            commands::changes_abort,
+            commands::changes_file_diff,
+            commands::changes_push_state,
+            commands::changes_set_push_blocked,
+            commands::changes_repair_push_block,
             commands::history_fetch,
             commands::history_sync_status,
             commands::history_list_repos,

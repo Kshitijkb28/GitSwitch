@@ -6,6 +6,9 @@ use crate::gh_cli;
 use crate::git_config;
 use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, FetchResult, MergeInfo, RepoRef, SyncStatus};
 use crate::git_remote::{self, RemoteChange};
+use crate::git_ops::{self, OpResult};
+use crate::git_status::{self, FileDiff, RepoStatus};
+use crate::push_guard::PushState;
 use crate::github::{self, GitHubKey, GitHubUser, RepoPermissions};
 use crate::remote_repos::{self, LocalClones, RepoAccount, RepoListing};
 use crate::repo_scan::{self, ScannedRepo};
@@ -509,4 +512,106 @@ pub async fn local_clone_index() -> Result<LocalClones, AppError> {
 #[tauri::command]
 pub fn path_exists(path: String) -> bool {
     !path.is_empty() && std::path::Path::new(&path).exists()
+}
+
+// --- Changes page: working-tree state, diffs, and per-repo push access ---
+
+/// Everything the Changes page needs about one repo, in one call: files,
+/// branch, ahead/behind, identity, in-progress operation and push state.
+#[tauri::command]
+pub async fn changes_repo_status(repo_path: String) -> Result<RepoStatus, AppError> {
+    git_status::repo_status(&repo_path).await
+}
+
+/// One file's diff, capped and binary-aware. `staged` picks the index-vs-HEAD
+/// side; `untracked` diffs a brand-new file against nothing so it still shows.
+#[tauri::command]
+pub async fn changes_file_diff(
+    repo_path: String,
+    path: String,
+    staged: bool,
+    untracked: bool,
+) -> Result<FileDiff, AppError> {
+    git_status::file_diff(&repo_path, &path, staged, untracked).await
+}
+
+#[tauri::command]
+pub async fn changes_push_state(repo_path: String) -> Result<PushState, AppError> {
+    git_status::push_state_for(&repo_path).await
+}
+
+/// Turn the per-repo push block on or off. Returns the re-measured state, so
+/// the UI shows what actually took effect rather than what was asked for.
+#[tauri::command]
+pub async fn changes_set_push_blocked(
+    repo_path: String,
+    blocked: bool,
+) -> Result<PushState, AppError> {
+    git_status::set_push_blocked_for(&repo_path, blocked).await
+}
+
+/// Re-apply a block that has drifted — usually because a remote was added
+/// after it was turned on.
+#[tauri::command]
+pub async fn changes_repair_push_block(repo_path: String) -> Result<PushState, AppError> {
+    git_status::repair_push_block_for(&repo_path).await
+}
+
+/// Stage the named files. Never "everything" by accident: an empty list is an
+/// error, and staging all is a separate command.
+#[tauri::command]
+pub async fn changes_stage(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
+    git_ops::stage(&repo_path, paths).await
+}
+
+#[tauri::command]
+pub async fn changes_stage_all(repo_path: String) -> Result<OpResult, AppError> {
+    git_ops::stage_all(&repo_path).await
+}
+
+#[tauri::command]
+pub async fn changes_unstage(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
+    git_ops::unstage(&repo_path, paths).await
+}
+
+/// Destructive: tracked files go back to HEAD, untracked ones are deleted.
+/// Only ever the files named here.
+#[tauri::command]
+pub async fn changes_discard(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
+    git_ops::discard(&repo_path, paths).await
+}
+
+/// Commits with the folder's own identity. Hooks always run, so the identity
+/// guard keeps working.
+#[tauri::command]
+pub async fn changes_commit(
+    repo_path: String,
+    message: String,
+    amend: bool,
+) -> Result<OpResult, AppError> {
+    git_ops::commit(&repo_path, &message, amend).await
+}
+
+#[tauri::command]
+pub async fn changes_push(repo_path: String, set_upstream: bool) -> Result<OpResult, AppError> {
+    git_ops::push(&repo_path, set_upstream).await
+}
+
+/// `mode` is one of "ff-only", "merge", "rebase" — chosen by the user, never
+/// inferred from their git settings.
+#[tauri::command]
+pub async fn changes_pull(repo_path: String, mode: String) -> Result<OpResult, AppError> {
+    let mode = git_ops::PullMode::parse(&mode)?;
+    git_ops::pull(&repo_path, mode).await
+}
+
+#[tauri::command]
+pub async fn changes_submodule_update(repo_path: String) -> Result<OpResult, AppError> {
+    git_ops::submodule_update(&repo_path).await
+}
+
+/// Abort the merge or rebase that is in progress, putting the branch back.
+#[tauri::command]
+pub async fn changes_abort(repo_path: String) -> Result<OpResult, AppError> {
+    git_ops::abort(&repo_path).await
 }

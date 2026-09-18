@@ -633,3 +633,256 @@ export async function githubPollToken(
     clientId: clientId ?? null,
   });
 }
+
+// --- Changes page: working-tree state, diffs, and git operations ---
+
+export interface ChangeEntry {
+  path: string;
+  orig_path: string | null;
+  /** Index vs HEAD: "M" "T" "A" "D" "R" "C" or "." */
+  staged: string;
+  /** Worktree vs index: "M" "T" "D" "?" or "." */
+  unstaged: string;
+  kind: "tracked" | "untracked" | "conflicted";
+  conflict: string | null;
+  rename_score: number | null;
+  is_submodule: boolean;
+  sub_commit_changed: boolean;
+  sub_tracked_changes: boolean;
+  sub_untracked: boolean;
+  staged_added: number | null;
+  staged_removed: number | null;
+  unstaged_added: number | null;
+  unstaged_removed: number | null;
+  is_binary: boolean;
+}
+
+export interface InProgress {
+  kind: string;
+  label: string;
+  detail: string;
+  abort_command: string;
+}
+
+export interface RepoIdentity {
+  name: string;
+  email: string;
+  email_scope: string;
+  email_origin: string | null;
+  profile_id: string | null;
+  profile_name: string | null;
+  profile_email: string | null;
+  matches_profile: boolean;
+  signing_on: boolean;
+  signing_key: string | null;
+  guard: "gitswitch" | "foreign" | "none";
+}
+
+export interface RemotePushState {
+  name: string;
+  fetch_url: string;
+  push_url: string;
+  rewritten: boolean;
+  has_explicit_pushurl: boolean;
+}
+
+export interface PushState {
+  profile_blocked: boolean;
+  profile_name: string | null;
+  repo_blocked: boolean;
+  blocked: boolean;
+  reason: string;
+  hook: "gitswitch" | "chained" | "foreign" | "none";
+  hooks_path_overridden: string | null;
+  config_block_present: boolean;
+  remotes: RemotePushState[];
+  gaps: string[];
+  needs_repair: boolean;
+}
+
+export interface RepoStatus {
+  path: string;
+  name: string;
+  branch: string | null;
+  detached: boolean;
+  unborn: boolean;
+  head_oid: string | null;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  last_fetch_secs: number | null;
+  entries: ChangeEntry[];
+  staged_count: number;
+  unstaged_count: number;
+  untracked_count: number;
+  conflicted_count: number;
+  submodule_dirty_count: number;
+  untracked_truncated: boolean;
+  stash_count: number;
+  operation: InProgress | null;
+  identity: RepoIdentity;
+  push: PushState;
+  can_amend: boolean;
+  head_subject: string | null;
+  merge_message: string | null;
+  has_submodules: boolean;
+}
+
+export interface DiffLine {
+  kind: "hunk" | "add" | "del" | "context" | "meta";
+  text: string;
+}
+
+export interface FileDiff {
+  path: string;
+  staged: boolean;
+  lines: DiffLine[];
+  is_binary: boolean;
+  truncated: boolean;
+  total_lines: number;
+  added: number;
+  removed: number;
+  empty_reason: string | null;
+}
+
+export interface Advice {
+  headline: string;
+  guidance: string;
+  action: string | null;
+  git_said: string;
+}
+
+export interface Refusal {
+  code: string;
+  message: string;
+}
+
+export interface CommitResult {
+  hash: string;
+  short: string;
+  subject: string;
+  author_name: string;
+  author_email: string;
+  signature: string;
+  signed: boolean;
+  amended: boolean;
+  files_changed: number;
+  insertions: number;
+  deletions: number;
+}
+
+export interface PushedRef {
+  flag: string;
+  summary: string;
+  from: string;
+  to: string;
+}
+
+export interface PushOutcome {
+  refs: PushedRef[];
+  up_to_date: boolean;
+  new_upstream: string | null;
+  remote: string;
+}
+
+export interface PullOutcome {
+  mode: string;
+  head_before: string;
+  head_after: string;
+  fast_forward: boolean;
+  commits_pulled: number;
+  files_changed: number;
+  conflicts: string[];
+  recovery: string | null;
+}
+
+export interface SubmoduleReport {
+  listed: number;
+  downloaded: number;
+  unlisted: number;
+  error: string | null;
+}
+
+/** What every git operation returns: the outcome plus the re-read repo state. */
+export interface OpResult {
+  ok: boolean;
+  headline: string;
+  detail: string;
+  advice?: Advice;
+  refusal?: Refusal;
+  status?: RepoStatus;
+  commit?: CommitResult;
+  push?: PushOutcome;
+  pull?: PullOutcome;
+  submodules?: SubmoduleReport;
+}
+
+export type PullMode = "ff-only" | "merge" | "rebase";
+
+export async function changesRepoStatus(repoPath: string): Promise<RepoStatus> {
+  return invoke("changes_repo_status", { repoPath });
+}
+
+export async function changesFileDiff(
+  repoPath: string,
+  path: string,
+  staged: boolean,
+  untracked: boolean
+): Promise<FileDiff> {
+  return invoke("changes_file_diff", { repoPath, path, staged, untracked });
+}
+
+export async function changesStage(repoPath: string, paths: string[]): Promise<OpResult> {
+  return invoke("changes_stage", { repoPath, paths });
+}
+
+export async function changesStageAll(repoPath: string): Promise<OpResult> {
+  return invoke("changes_stage_all", { repoPath });
+}
+
+export async function changesUnstage(repoPath: string, paths: string[]): Promise<OpResult> {
+  return invoke("changes_unstage", { repoPath, paths });
+}
+
+export async function changesDiscard(repoPath: string, paths: string[]): Promise<OpResult> {
+  return invoke("changes_discard", { repoPath, paths });
+}
+
+export async function changesCommit(
+  repoPath: string,
+  message: string,
+  amend: boolean
+): Promise<OpResult> {
+  return invoke("changes_commit", { repoPath, message, amend });
+}
+
+export async function changesPush(repoPath: string, setUpstream: boolean): Promise<OpResult> {
+  return invoke("changes_push", { repoPath, setUpstream });
+}
+
+export async function changesPull(repoPath: string, mode: PullMode): Promise<OpResult> {
+  return invoke("changes_pull", { repoPath, mode });
+}
+
+export async function changesSubmoduleUpdate(repoPath: string): Promise<OpResult> {
+  return invoke("changes_submodule_update", { repoPath });
+}
+
+export async function changesAbort(repoPath: string): Promise<OpResult> {
+  return invoke("changes_abort", { repoPath });
+}
+
+export async function changesPushState(repoPath: string): Promise<PushState> {
+  return invoke("changes_push_state", { repoPath });
+}
+
+export async function changesSetPushBlocked(
+  repoPath: string,
+  blocked: boolean
+): Promise<PushState> {
+  return invoke("changes_set_push_blocked", { repoPath, blocked });
+}
+
+export async function changesRepairPushBlock(repoPath: string): Promise<PushState> {
+  return invoke("changes_repair_push_block", { repoPath });
+}
