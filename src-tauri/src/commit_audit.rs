@@ -71,8 +71,15 @@ pub(crate) fn owning_profile<'a>(
 }
 
 pub fn guard_state(repo: &Path) -> String {
-    let hook = repo.join(".git").join("hooks").join("pre-commit");
-    match std::fs::read_to_string(&hook) {
+    guard_state_in(&repo.join(".git").join("hooks"))
+}
+
+/// Same answer, but for a hooks directory already resolved with
+/// `git rev-parse --git-path hooks` — which is the only correct way to find it
+/// in a submodule or worktree (`.git` is a file there) or when the repo sets
+/// `core.hooksPath`.
+pub(crate) fn guard_state_in(hooks: &Path) -> String {
+    match std::fs::read_to_string(hooks.join("pre-commit")) {
         Ok(content) if content.contains(MARKER) => "gitswitch".into(),
         Ok(_) => "foreign".into(),
         Err(_) => "none".into(),

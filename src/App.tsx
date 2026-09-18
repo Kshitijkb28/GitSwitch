@@ -1,5 +1,5 @@
 import { Routes, Route, NavLink, useLocation } from "react-router-dom";
-import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, GitGraph, BookMarked } from "lucide-react";
+import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, GitGraph, BookMarked, GitPullRequestArrow } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
 import { ProfileForm } from "./pages/ProfileForm";
@@ -12,6 +12,7 @@ import { AutoAssign } from "./pages/AutoAssign";
 import { Doctor } from "./pages/Doctor";
 import { CommitAudit } from "./pages/CommitAudit";
 import { History } from "./pages/History";
+import { Changes } from "./pages/Changes";
 
 function App() {
   const location = useLocation();
@@ -44,6 +45,9 @@ function App() {
           <SidebarLink to="/sparse" icon={<GitBranch size={18} />}>
             Clone
           </SidebarLink>
+          <SidebarLink to="/changes" icon={<GitPullRequestArrow size={18} />}>
+            Changes
+          </SidebarLink>
           <SidebarLink to="/auto-assign" icon={<ScanSearch size={18} />}>
             Auto Assign
           </SidebarLink>
@@ -74,6 +78,7 @@ function App() {
           <Route path="/github" element={<GitHubAuth />} />
           <Route path="/repos" element={<Repositories />} />
           <Route path="/sparse" element={<SparseClone />} />
+          <Route path="/changes" element={<Changes />} />
           <Route path="/auto-assign" element={<AutoAssign />} />
           <Route path="/doctor" element={<Doctor />} />
           <Route path="/history" element={<History />} />
