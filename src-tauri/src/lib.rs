@@ -1,12 +1,25 @@
 mod commands;
+mod commit_audit;
 mod credentials;
+mod doctor;
 mod error;
 mod gh_cli;
+mod git_advice;
 mod git_config;
+mod git_exec;
+mod git_history;
+mod git_ops;
+mod git_status;
 mod git_remote;
 mod github;
 mod oauth;
+mod paths;
 mod profiles;
+mod push_guard;
+mod remote_repos;
+mod repo_scan;
+mod sparse;
+mod signing;
 mod ssh_keys;
 mod tray;
 
@@ -67,6 +80,53 @@ pub fn run() {
             commands::gh_register_ssh_key,
             commands::resolve_key_account,
             commands::convert_repos_to_ssh,
+            commands::register_signing_key,
+            commands::signing_key_registered,
+            commands::allowed_signers_path,
+            commands::changes_repo_status,
+            commands::changes_stage,
+            commands::changes_stage_all,
+            commands::changes_unstage,
+            commands::changes_discard,
+            commands::changes_commit,
+            commands::changes_push,
+            commands::changes_pull,
+            commands::changes_submodule_update,
+            commands::changes_abort,
+            commands::changes_file_diff,
+            commands::changes_push_state,
+            commands::changes_set_push_blocked,
+            commands::changes_repair_push_block,
+            commands::history_fetch,
+            commands::history_sync_status,
+            commands::history_list_repos,
+            commands::history_branches,
+            commands::history_page,
+            commands::history_commit_detail,
+            commands::history_branch_merges,
+            commands::audit_commits,
+            commands::fix_unpushed_commits,
+            commands::install_commit_guard,
+            commands::uninstall_commit_guard,
+            commands::doctor_check_environment,
+            commands::doctor_check_profiles,
+            commands::doctor_check_keys,
+            commands::doctor_check_repos,
+            commands::doctor_fix_ssh_config,
+            commands::scan_repos,
+            commands::check_repo_access,
+            commands::sparse_clone,
+            commands::full_clone,
+            commands::repo_accounts,
+            commands::list_remote_repos,
+            commands::local_clone_index,
+            commands::path_exists,
+            commands::ssh_certificate_info,
+            commands::clone_destination_status,
+            commands::switch_repo_origin,
+            commands::sparse_repo_info,
+            commands::sparse_set,
+            commands::sparse_add,
             commands::store_github_token,
             commands::get_github_token,
             commands::apply_git_config,

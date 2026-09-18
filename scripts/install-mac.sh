@@ -15,8 +15,12 @@ APP_DST="/Applications/GitSwitch.app"
 LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 if [[ "${1:-}" != "--skip-build" ]]; then
-  echo "▸ Building release bundle…"
-  npm run tauri build
+  # Only the .app is needed to install locally. Skipping the .dmg keeps this
+  # fast and sidesteps bundle_dmg.sh, whose AppleScript step fails whenever a
+  # stale disk image is mounted or Finder automation is unavailable.
+  # The shareable .dmg comes from CI (or `npm run tauri build` without --bundles).
+  echo "▸ Building release .app…"
+  npm run tauri build -- --bundles app
 fi
 
 [[ -d "$APP_SRC" ]] || { echo "✗ Build output not found at $APP_SRC"; exit 1; }
@@ -47,4 +51,4 @@ echo "▸ Fixing Launch Services registrations…"
 echo "▸ Launching…"
 open "$APP_DST"
 echo "✓ Installed and launched $APP_DST"
-echo "  Shareable DMG: src-tauri/target/release/bundle/dmg/"
+echo "  For a shareable .dmg use CI, or: npm run tauri build"

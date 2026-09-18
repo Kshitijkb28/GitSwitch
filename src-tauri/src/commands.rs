@@ -1,11 +1,21 @@
+use crate::commit_audit::{self, RepoAudit};
 use crate::credentials;
+use crate::doctor::{self, Finding};
 use crate::error::AppError;
 use crate::gh_cli;
 use crate::git_config;
+use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, FetchResult, MergeInfo, RepoRef, SyncStatus};
 use crate::git_remote::{self, RemoteChange};
-use crate::github::{self, GitHubKey, GitHubUser};
+use crate::git_ops::{self, OpResult};
+use crate::git_status::{self, FileDiff, RepoStatus};
+use crate::push_guard::PushState;
+use crate::github::{self, GitHubKey, GitHubUser, RepoPermissions};
+use crate::remote_repos::{self, LocalClones, RepoAccount, RepoListing};
+use crate::repo_scan::{self, ScannedRepo};
 use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
 use crate::profiles::{self, Profile};
+use crate::signing;
+use crate::sparse::{self, CertInfo, CloneResult, DestinationStatus, SparseInfo};
 use crate::ssh_keys;
 
 #[tauri::command]
@@ -15,6 +25,7 @@ pub fn get_profiles() -> Result<Vec<Profile>, AppError> {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
 pub fn create_profile(
     app: tauri::AppHandle,
     name: String,
@@ -22,14 +33,25 @@ pub fn create_profile(
     git_email: String,
     ssh_key_path: Option<String>,
     directories: Vec<String>,
+    allow_push: Option<bool>,
+    signing_enabled: Option<bool>,
 ) -> Result<Profile, AppError> {
-    let profile = profiles::create_profile(name, git_name, git_email, ssh_key_path, directories)?;
+    let profile = profiles::create_profile(
+        name,
+        git_name,
+        git_email,
+        ssh_key_path,
+        directories,
+        allow_push.unwrap_or(true),
+        signing_enabled.unwrap_or(false),
+    )?;
     git_config::apply_git_config()?;
     crate::tray::update_active_label(&app);
     Ok(profile)
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
 pub fn update_profile(
     app: tauri::AppHandle,
     id: String,
@@ -38,8 +60,12 @@ pub fn update_profile(
     git_email: Option<String>,
     ssh_key_path: Option<String>,
     directories: Option<Vec<String>>,
+    allow_push: Option<bool>,
+    signing_enabled: Option<bool>,
 ) -> Result<Profile, AppError> {
-    let profile = profiles::update_profile(id, name, git_name, git_email, ssh_key_path, directories)?;
+    let profile = profiles::update_profile(
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled,
+    )?;
     git_config::apply_git_config()?;
     crate::tray::update_active_label(&app);
     Ok(profile)
@@ -135,6 +161,133 @@ pub async fn resolve_key_account(key_path: String) -> Result<Option<String>, App
     ssh_keys::resolve_key_account(&key_path).await
 }
 
+// --- Doctor: health checks, run as separate steps so the UI can show progress ---
+
+#[tauri::command]
+pub async fn doctor_check_environment() -> Result<Vec<Finding>, AppError> {
+    doctor::check_environment().await
+}
+
+#[tauri::command]
+pub async fn doctor_check_profiles() -> Result<Vec<Finding>, AppError> {
+    doctor::check_profiles().await
+}
+
+#[tauri::command]
+pub async fn doctor_check_keys() -> Result<Vec<Finding>, AppError> {
+    doctor::check_keys().await
+}
+
+#[tauri::command]
+pub async fn doctor_check_repos() -> Result<Vec<Finding>, AppError> {
+    doctor::check_repos().await
+}
+
+#[tauri::command]
+pub async fn doctor_fix_ssh_config() -> Result<String, AppError> {
+    tokio::task::spawn_blocking(doctor::fix_ssh_config)
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Auto-assign: find every git repo under a folder with its GitHub owner/name.
+#[tauri::command]
+pub async fn scan_repos(root: String) -> Result<Vec<ScannedRepo>, AppError> {
+    repo_scan::scan_repos(root).await
+}
+
+/// Auto-assign: what access does this token's account have on owner/repo?
+/// None = the account can't even see the repo.
+#[tauri::command]
+pub async fn check_repo_access(
+    token: String,
+    owner: String,
+    repo: String,
+) -> Result<Option<RepoPermissions>, AppError> {
+    github::repo_permission(&token, &owner, &repo).await
+}
+
+/// Sparse checkout: partial-clone a repo (blob:none, no checkout).
+#[tauri::command]
+pub async fn sparse_clone(
+    app: tauri::AppHandle,
+    url: String,
+    parent_dir: String,
+    folder_name: Option<String>,
+    clone_as: Option<String>,
+) -> Result<CloneResult, AppError> {
+    let res = sparse::sparse_clone(&url, &parent_dir, folder_name.as_deref(), clone_as.as_deref()).await?;
+    if res.mapped_to.is_some() {
+        crate::tray::update_active_label(&app);
+    }
+    Ok(res)
+}
+
+/// Full clone. `clone_as` = profile id to authenticate as; None lets the
+/// destination folder's profile decide.
+#[tauri::command]
+pub async fn full_clone(
+    app: tauri::AppHandle,
+    url: String,
+    parent_dir: String,
+    folder_name: Option<String>,
+    clone_as: Option<String>,
+    with_submodules: Option<bool>,
+) -> Result<CloneResult, AppError> {
+    let res = sparse::full_clone(
+        &url,
+        &parent_dir,
+        folder_name.as_deref(),
+        clone_as.as_deref(),
+        with_submodules.unwrap_or(true),
+    )
+    .await?;
+    if res.mapped_to.is_some() {
+        crate::tray::update_active_label(&app);
+    }
+    Ok(res)
+}
+
+/// Is the clone destination already taken (and by this same repo)?
+#[tauri::command]
+pub async fn clone_destination_status(
+    url: String,
+    parent_dir: String,
+    folder_name: Option<String>,
+) -> Result<DestinationStatus, AppError> {
+    sparse::destination_status(&url, &parent_dir, folder_name.as_deref()).await
+}
+
+/// Point an existing clone's origin at another address of the same repo.
+#[tauri::command]
+pub async fn switch_repo_origin(repo_path: String, url: String) -> Result<String, AppError> {
+    sparse::switch_origin(&repo_path, &url).await
+}
+
+/// Is there a company-signed SSH certificate (`<key>-cert.pub`) for this key?
+#[tauri::command]
+pub async fn ssh_certificate_info(key_path: String) -> Result<CertInfo, AppError> {
+    Ok(sparse::certificate_info(&key_path).await)
+}
+
+/// Sparse checkout: inspect a repo (branch, top-level folders, current sparse set).
+#[tauri::command]
+pub async fn sparse_repo_info(repo_path: String) -> Result<SparseInfo, AppError> {
+    sparse::repo_info(&repo_path).await
+}
+
+/// Sparse checkout: replace the folder selection and materialize the tree.
+#[tauri::command]
+pub async fn sparse_set(repo_path: String, dirs: Vec<String>) -> Result<(), AppError> {
+    sparse::sparse_set(&repo_path, dirs).await
+}
+
+/// Sparse checkout: add folders to the existing selection.
+#[tauri::command]
+pub async fn sparse_add(repo_path: String, dirs: Vec<String>) -> Result<(), AppError> {
+    sparse::sparse_add(&repo_path, dirs).await
+}
+
 /// Automate "Step 4": convert HTTPS (incl. token) remotes to SSH for all repos under a folder.
 /// Runs on a blocking thread — it walks the directory tree and shells out to git
 /// per repo, which would freeze the UI if run as a sync command.
@@ -195,4 +348,270 @@ pub async fn github_poll_token(
     client_id: Option<String>,
 ) -> Result<OAuthTokenResponse, AppError> {
     oauth::poll_for_token(&device_code, client_id.as_deref()).await
+}
+
+// --- Commit audit: find & fix commits made with the wrong identity ---
+
+/// Scan every profile folder for commits whose author email doesn't match the
+/// profile that owns that folder.
+#[tauri::command]
+pub async fn audit_commits() -> Result<Vec<RepoAudit>, AppError> {
+    commit_audit::audit_all().await
+}
+
+/// Rewrite the author of UNPUSHED commits in one repo. Pushed history is never
+/// touched, and the previous history is kept on a backup branch.
+#[tauri::command]
+pub async fn fix_unpushed_commits(repo_path: String) -> Result<String, AppError> {
+    tokio::task::spawn_blocking(move || commit_audit::fix_unpushed(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Install a pre-commit hook that blocks commits with the wrong identity.
+#[tauri::command]
+pub async fn install_commit_guard(
+    repo_path: String,
+    expected_email: String,
+) -> Result<String, AppError> {
+    tokio::task::spawn_blocking(move || commit_audit::install_guard(&repo_path, &expected_email))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+#[tauri::command]
+pub async fn uninstall_commit_guard(repo_path: String) -> Result<String, AppError> {
+    tokio::task::spawn_blocking(move || commit_audit::uninstall_guard(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+// --- Commit signing (SSH): "Verified" badges, per profile ---
+
+/// Register a profile's key on GitHub as a SIGNING key. This is a different key
+/// type from an authentication key — auth-only keys never produce "Verified".
+#[tauri::command]
+pub async fn register_signing_key(account: String, key_path: String) -> Result<String, AppError> {
+    let token = gh_cli::gh_get_token(&account).await?;
+    let public_key = ssh_keys::get_public_key(&key_path)?;
+    signing::register_signing_key(&token, "GitSwitch signing key", &public_key).await
+}
+
+/// Is this key already registered as a signing key on the account?
+#[tauri::command]
+pub async fn signing_key_registered(account: String, key_path: String) -> Result<bool, AppError> {
+    let token = gh_cli::gh_get_token(&account).await?;
+    let public_key = ssh_keys::get_public_key(&key_path)?;
+    signing::signing_key_registered(&token, &public_key).await
+}
+
+/// Path of the allowed_signers file GitSwitch maintains (shown in the UI).
+#[tauri::command]
+pub fn allowed_signers_path() -> Result<String, AppError> {
+    Ok(signing::allowed_signers_path().to_string_lossy().to_string())
+}
+
+// --- History browser: branches, paginated commits, graph, merges ---
+
+#[tauri::command]
+pub async fn history_list_repos() -> Result<Vec<RepoRef>, AppError> {
+    git_history::list_repos().await
+}
+
+#[tauri::command]
+pub async fn history_branches(repo_path: String) -> Result<Vec<BranchInfo>, AppError> {
+    tokio::task::spawn_blocking(move || git_history::list_branches(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Paginated: git log is fast, but a 100k-commit repo would still choke the UI
+/// if we handed it everything at once.
+#[tauri::command]
+pub async fn history_page(
+    repo_path: String,
+    rev: String,
+    offset: usize,
+    limit: usize,
+    search: Option<String>,
+    author: Option<String>,
+) -> Result<HistoryPage, AppError> {
+    tokio::task::spawn_blocking(move || {
+        git_history::history_page(
+            &repo_path,
+            &rev,
+            offset,
+            limit,
+            search.as_deref(),
+            author.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+#[tauri::command]
+pub async fn history_commit_detail(
+    repo_path: String,
+    hash: String,
+) -> Result<CommitDetail, AppError> {
+    tokio::task::spawn_blocking(move || git_history::commit_detail(&repo_path, &hash))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+#[tauri::command]
+pub async fn history_branch_merges(
+    repo_path: String,
+    branch: String,
+) -> Result<MergeInfo, AppError> {
+    tokio::task::spawn_blocking(move || git_history::branch_merge_info(&repo_path, &branch))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Fetch remote refs for one repo. Safe: never touches the working tree.
+#[tauri::command]
+pub async fn history_fetch(repo_path: String) -> Result<FetchResult, AppError> {
+    tokio::task::spawn_blocking(move || git_history::fetch_repo(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Ahead/behind vs the remote, plus how stale that answer is.
+#[tauri::command]
+pub async fn history_sync_status(
+    repo_path: String,
+    branch: String,
+) -> Result<SyncStatus, AppError> {
+    tokio::task::spawn_blocking(move || git_history::sync_status(&repo_path, &branch))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+// --- Repositories: everything the signed-in GitHub accounts can reach ---
+
+#[tauri::command]
+pub async fn repo_accounts() -> Result<Vec<RepoAccount>, AppError> {
+    Ok(remote_repos::accounts().await)
+}
+
+#[tauri::command]
+pub async fn list_remote_repos(account: String) -> Result<RepoListing, AppError> {
+    remote_repos::list_repos(&account).await
+}
+
+/// Which repositories are on this machine right now (local disk only).
+#[tauri::command]
+pub async fn local_clone_index() -> Result<LocalClones, AppError> {
+    remote_repos::local_clones().await
+}
+
+/// Does this path still exist? Used before acting on a folder the UI listed
+/// earlier — it may have been deleted or moved since.
+#[tauri::command]
+pub fn path_exists(path: String) -> bool {
+    !path.is_empty() && std::path::Path::new(&path).exists()
+}
+
+// --- Changes page: working-tree state, diffs, and per-repo push access ---
+
+/// Everything the Changes page needs about one repo, in one call: files,
+/// branch, ahead/behind, identity, in-progress operation and push state.
+#[tauri::command]
+pub async fn changes_repo_status(repo_path: String) -> Result<RepoStatus, AppError> {
+    git_status::repo_status(&repo_path).await
+}
+
+/// One file's diff, capped and binary-aware. `staged` picks the index-vs-HEAD
+/// side; `untracked` diffs a brand-new file against nothing so it still shows.
+#[tauri::command]
+pub async fn changes_file_diff(
+    repo_path: String,
+    path: String,
+    staged: bool,
+    untracked: bool,
+) -> Result<FileDiff, AppError> {
+    git_status::file_diff(&repo_path, &path, staged, untracked).await
+}
+
+#[tauri::command]
+pub async fn changes_push_state(repo_path: String) -> Result<PushState, AppError> {
+    git_status::push_state_for(&repo_path).await
+}
+
+/// Turn the per-repo push block on or off. Returns the re-measured state, so
+/// the UI shows what actually took effect rather than what was asked for.
+#[tauri::command]
+pub async fn changes_set_push_blocked(
+    repo_path: String,
+    blocked: bool,
+) -> Result<PushState, AppError> {
+    git_status::set_push_blocked_for(&repo_path, blocked).await
+}
+
+/// Re-apply a block that has drifted — usually because a remote was added
+/// after it was turned on.
+#[tauri::command]
+pub async fn changes_repair_push_block(repo_path: String) -> Result<PushState, AppError> {
+    git_status::repair_push_block_for(&repo_path).await
+}
+
+/// Stage the named files. Never "everything" by accident: an empty list is an
+/// error, and staging all is a separate command.
+#[tauri::command]
+pub async fn changes_stage(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
+    git_ops::stage(&repo_path, paths).await
+}
+
+#[tauri::command]
+pub async fn changes_stage_all(repo_path: String) -> Result<OpResult, AppError> {
+    git_ops::stage_all(&repo_path).await
+}
+
+#[tauri::command]
+pub async fn changes_unstage(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
+    git_ops::unstage(&repo_path, paths).await
+}
+
+/// Destructive: tracked files go back to HEAD, untracked ones are deleted.
+/// Only ever the files named here.
+#[tauri::command]
+pub async fn changes_discard(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
+    git_ops::discard(&repo_path, paths).await
+}
+
+/// Commits with the folder's own identity. Hooks always run, so the identity
+/// guard keeps working.
+#[tauri::command]
+pub async fn changes_commit(
+    repo_path: String,
+    message: String,
+    amend: bool,
+) -> Result<OpResult, AppError> {
+    git_ops::commit(&repo_path, &message, amend).await
+}
+
+#[tauri::command]
+pub async fn changes_push(repo_path: String, set_upstream: bool) -> Result<OpResult, AppError> {
+    git_ops::push(&repo_path, set_upstream).await
+}
+
+/// `mode` is one of "ff-only", "merge", "rebase" — chosen by the user, never
+/// inferred from their git settings.
+#[tauri::command]
+pub async fn changes_pull(repo_path: String, mode: String) -> Result<OpResult, AppError> {
+    let mode = git_ops::PullMode::parse(&mode)?;
+    git_ops::pull(&repo_path, mode).await
+}
+
+#[tauri::command]
+pub async fn changes_submodule_update(repo_path: String) -> Result<OpResult, AppError> {
+    git_ops::submodule_update(&repo_path).await
+}
+
+/// Abort the merge or rebase that is in progress, putting the branch back.
+#[tauri::command]
+pub async fn changes_abort(repo_path: String) -> Result<OpResult, AppError> {
+    git_ops::abort(&repo_path).await
 }

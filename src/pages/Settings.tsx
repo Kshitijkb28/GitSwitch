@@ -6,6 +6,7 @@ import { Card } from "../components/Card";
 import { Input } from "../components/Input";
 import { useToast } from "../components/Toast";
 import { getCustomClientId, setOAuthClientId } from "../lib/oauth";
+import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -32,6 +33,9 @@ export function Settings() {
         : "OAuth Client ID cleared"
     );
   }
+
+  // ~/.gitconfig can be edited outside the app.
+  useRefreshOnFocus(() => loadConfig());
 
   async function loadConfig() {
     try {
@@ -133,7 +137,7 @@ export function Settings() {
       )}
 
       <Card>
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
           <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">
             Current Git Config (Managed Sections)
           </h2>
@@ -207,7 +211,8 @@ export function Settings() {
             placeholder="Ov23li…  (your OAuth App Client ID)"
             value={clientId}
             onChange={(e) => setClientId(e.target.value)}
-            className="flex-1 font-mono"
+            containerClassName="flex-1 min-w-0"
+            className="font-mono"
           />
           <Button variant="secondary" onClick={saveClientId}>
             Save

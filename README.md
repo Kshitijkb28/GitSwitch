@@ -26,13 +26,85 @@ for folders that still use HTTPS.
 
 ## Features
 
+- **Doctor** — one click finds the things that silently send commits to the
+  wrong account: an `~/.ssh/config` block pinning one key for github.com, SSH
+  keys not registered on any account, hand-written `includeIf` rules fighting
+  the managed ones, HTTPS remotes (and **tokens embedded in remote URLs**),
+  passphrase-protected keys, and missing folders. Most findings come with a
+  one-click fix.
 - **Profiles** — create/edit identities, assign folders with a native folder
   picker. A folder can belong to only one profile (auto-deduplicated).
+- **Auto Assign** — scan a folder tree, check which of your GitHub accounts
+  actually has access to each repo, and map them to the right profile.
+- **Clone** — clone over SSH as the right account. The destination folder's
+  profile decides the key, or pick one with **Clone as** (the new folder is then
+  added to that profile). Downloads submodules with the same result as
+  `git clone --recurse-submodules`, notices when the repo is already cloned
+  (and can switch an HTTPS clone to the SSH link), and explains refusals —
+  unregistered key, missing org SSO authorization, or an organization that
+  requires SSH certificates (`org-<id>@github.com` links). A **sparse** mode
+  clones metadata only and lets you tick just the folders you need.
+- **Repositories** — every repository your signed-in GitHub accounts can reach
+  (owned, collaborator and organization), with search, filters and paging.
+  Each one can be cloned in a click — straight into the Clone page with the
+  right link and a suggested profile — or opened if it's already on disk.
+- **Changes** — the everyday git loop, without leaving the app: see every
+  changed file with its real diff, stage and unstage individual files, discard
+  (with an explicit confirmation naming what gets deleted), commit as the
+  folder's own identity, pull, push and update submodules. Pull offers all
+  three strategies — fast-forward, merge, rebase — each with a sentence saying
+  what it will do to *your* commits before it runs, because `git pull` alone
+  behaves differently depending on settings you may not know you have. Nothing
+  is forced and nothing is bypassed: no `--force`, no `--no-verify`, no
+  amending a commit that is already pushed, and conflicts are surfaced for you
+  to resolve rather than resolved behind your back. Long operations keep
+  running while you browse other pages.
+- **Push blocking** — per profile *and* per repository. A blocked repo refuses
+  `git push` **in your terminal too**, via two mechanisms with different blind
+  spots: a `pushInsteadOf` rewrite in the repo's own `.git/config` (which
+  `--no-verify` cannot get past) and a `pre-push` hook (which catches remote
+  forms the rewrite can't, and chains any hook already there — Git LFS's, for
+  instance — instead of replacing it). Pull and fetch keep working. The app
+  states plainly what this does *not* stop: it is a guard-rail against
+  accidents, not a lock — anyone with a terminal can turn it off with one git
+  command, and only branch protection on GitHub is enforcement nobody can
+  bypass.
+- **History** — browse branches (local/remote, ahead/behind), paginated commit
+  history with a real commit graph (lanes, forks and merges drawn the way
+  `git log --graph` does), per-commit detail with files changed and signature
+  status, message search, a **GitHub account filter** (narrow the repo list to
+  one profile, and optionally show only that identity's commits), and a merge
+  panel showing which branches already contain the one you're looking at.
+  **Fetch** shows where your branch and its remote each point and which
+  commits you haven't pulled yet — it never merges or touches your working
+  tree, and verifies that before reporting success.
+- **Commit Audit** — finds commits authored with the wrong identity, rewrites the
+  ones you haven't pushed (keeping a backup branch, never touching published
+  history), and can install a `pre-commit` guard that blocks future mistakes.
+- **Commit signing** — per profile, turn on SSH signing (`gpg.format=ssh`) for
+  GitHub's *Verified* badge. GitSwitch keeps `~/.ssh/allowed_signers` in sync
+  automatically, which is the step that's easy to get wrong by hand.
 - **SSH key wizard** — generate Ed25519 keys, register them on a GitHub account
   in one click (via `gh`), test the connection, delete old keys.
 - **GitHub sign-in** — device-flow OAuth *and* instant sign-in via your
   existing GitHub CLI (`gh`) logins; autofill profile name/email from an account.
 - **Tray icon**, toast feedback, and a Settings view of the managed gitconfig.
+  Pages remember where you were (selected repo, branch, filters) between visits.
+
+## VS Code extension
+
+`vscode-extension/` is a companion extension that surfaces the active identity
+where you actually commit — a status-bar readout, an amber warning when a repo's
+git identity doesn't match its GitSwitch profile, and a fetch-only "what's
+incoming" check.
+
+It reads the same `profiles.json` this app writes rather than reimplementing
+anything, so the two can't drift apart.
+
+```bash
+cd vscode-extension && npm install && npm run package
+code --install-extension gitswitch-0.1.0.vsix
+```
 
 ## Requirements
 
