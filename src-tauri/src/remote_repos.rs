@@ -99,6 +99,19 @@ pub struct RepoListing {
     pub sso_hidden_orgs: usize,
 }
 
+/// What is actually on this machine right now. Cheap (local disk only), so it
+/// can be re-checked whenever the user returns to the app — folders come and go
+/// behind the app's back, while the GitHub listing itself changes rarely.
+#[derive(Debug, Serialize)]
+pub struct LocalClones {
+    /// "owner/name" (lowercase) -> local path
+    pub clones: HashMap<String, String>,
+    /// owner (lowercase) -> profile its local repos belong to
+    pub owner_profiles: HashMap<String, String>,
+    /// owner (lowercase) -> "org-<id>" SSH user seen in local remotes
+    pub org_ssh_users: HashMap<String, String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RepoAccount {
     /// "gh:<account>" or "profile:<profile id>"
@@ -256,6 +269,21 @@ async fn token_for(account: &str) -> Result<String, AppError> {
             .ok_or_else(|| AppError::NotFound("This profile has no saved GitHub sign-in.".into()));
     }
     Err(AppError::Config(format!("Unknown account \"{}\"", account)))
+}
+
+/// Re-read only the local side of the picture: no GitHub call, no token.
+pub async fn local_clones() -> Result<LocalClones, AppError> {
+    let store = profiles::load_profiles()?;
+    let idx = local_index(&store.profiles).await;
+    Ok(LocalClones {
+        clones: idx.clones,
+        owner_profiles: idx
+            .owner_profiles
+            .iter()
+            .filter_map(|(owner, counts)| majority(counts).map(|p| (owner.clone(), p)))
+            .collect(),
+        org_ssh_users: idx.org_ssh_users,
+    })
 }
 
 pub async fn list_repos(account: &str) -> Result<RepoListing, AppError> {

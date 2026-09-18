@@ -17,6 +17,7 @@ import { Card } from "../components/Card";
 import { Badge } from "../components/Badge";
 import { Modal } from "../components/Modal";
 import { useProfiles } from "../hooks/useProfiles";
+import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
 
 export function Dashboard() {
@@ -25,6 +26,7 @@ export function Dashboard() {
   const [deleteTarget, setDeleteTarget] = useState<Profile | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  useRefreshOnFocus(() => refresh());
 
   async function handleRefresh() {
     setRefreshing(true);

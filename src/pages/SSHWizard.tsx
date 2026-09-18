@@ -15,6 +15,7 @@ import { Modal } from "../components/Modal";
 import { Select } from "../components/Select";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { baseName } from "../lib/paths";
+import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
 
 type Step = "generate" | "pubkey" | "test";
@@ -45,6 +46,9 @@ export function SSHWizard() {
   function loadKeys() {
     api.listSshKeys().then(setExistingKeys).catch(() => {});
   }
+
+  // Keys are created and deleted in Terminal too.
+  useRefreshOnFocus(() => loadKeys());
 
   useEffect(() => {
     loadKeys();

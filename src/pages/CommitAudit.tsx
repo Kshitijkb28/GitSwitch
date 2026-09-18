@@ -13,6 +13,7 @@ import { Card } from "../components/Card";
 import { Badge } from "../components/Badge";
 import { Modal } from "../components/Modal";
 import { useToast } from "../components/Toast";
+import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
 
 export function CommitAudit() {
@@ -24,6 +25,10 @@ export function CommitAudit() {
   const [error, setError] = useState<string | null>(null);
   const [confirmFix, setConfirmFix] = useState<api.RepoAudit | null>(null);
   const runSeq = useRef(0);
+
+  // Repos and commits change outside the app — re-scan on return, but not
+  // more than once every 15s: this walks every repo and reads its log.
+  useRefreshOnFocus(() => scan(), 15000);
 
   async function scan() {
     const seq = ++runSeq.current;

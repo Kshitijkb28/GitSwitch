@@ -7,7 +7,7 @@ use crate::git_config;
 use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, FetchResult, MergeInfo, RepoRef, SyncStatus};
 use crate::git_remote::{self, RemoteChange};
 use crate::github::{self, GitHubKey, GitHubUser, RepoPermissions};
-use crate::remote_repos::{self, RepoAccount, RepoListing};
+use crate::remote_repos::{self, LocalClones, RepoAccount, RepoListing};
 use crate::repo_scan::{self, ScannedRepo};
 use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
 use crate::profiles::{self, Profile};
@@ -496,4 +496,17 @@ pub async fn repo_accounts() -> Result<Vec<RepoAccount>, AppError> {
 #[tauri::command]
 pub async fn list_remote_repos(account: String) -> Result<RepoListing, AppError> {
     remote_repos::list_repos(&account).await
+}
+
+/// Which repositories are on this machine right now (local disk only).
+#[tauri::command]
+pub async fn local_clone_index() -> Result<LocalClones, AppError> {
+    remote_repos::local_clones().await
+}
+
+/// Does this path still exist? Used before acting on a folder the UI listed
+/// earlier — it may have been deleted or moved since.
+#[tauri::command]
+pub fn path_exists(path: String) -> bool {
+    !path.is_empty() && std::path::Path::new(&path).exists()
 }

@@ -98,6 +98,9 @@ pub struct DestinationStatus {
     /// ...and already exactly this URL.
     pub same_url: bool,
     pub origin_is_https: bool,
+    /// A repo folder with no commit: either a clone that was interrupted or an
+    /// empty repository. Either way it can't be cloned into or switched.
+    pub incomplete: bool,
 }
 
 fn same_github_repo(a: &str, b: &str) -> bool {
@@ -128,7 +131,7 @@ pub async fn destination_status(
         Err(_) => {
             return Ok(DestinationStatus {
                 path: String::new(), exists: false, is_repo: false, origin: None,
-                same_repo: false, same_url: false, origin_is_https: false,
+                same_repo: false, same_url: false, origin_is_https: false, incomplete: false,
             })
         }
     };
@@ -139,6 +142,7 @@ pub async fn destination_status(
     } else {
         None
     };
+    let incomplete = is_repo && run_git(Some(&dest), &["rev-parse", "--verify", "HEAD"]).await.is_err();
     Ok(DestinationStatus {
         path: dest.to_string_lossy().to_string(),
         exists,
@@ -147,6 +151,7 @@ pub async fn destination_status(
         same_url: origin.as_deref().is_some_and(|o| o.trim() == url.trim()),
         origin_is_https: origin.as_deref().is_some_and(is_http_url),
         origin: origin.as_deref().map(crate::repo_scan::mask_token),
+        incomplete,
     })
 }
 
@@ -166,6 +171,11 @@ pub async fn switch_origin(repo_path: &str, url: &str) -> Result<String, AppErro
     if is_http_url(url) {
         return Err(AppError::Config(
             "Switching to an HTTPS link wouldn't use your SSH key — use the SSH link (Code → SSH).".into(),
+        ));
+    }
+    if run_git(Some(&repo), &["rev-parse", "--verify", "HEAD"]).await.is_err() {
+        return Err(AppError::Config(
+            "That folder has no commits — it looks like a clone that was interrupted. Delete it and clone again.".into(),
         ));
     }
     let current = run_git(Some(&repo), &["remote", "get-url", "origin"])

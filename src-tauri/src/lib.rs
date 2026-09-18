@@ -100,6 +100,8 @@ pub fn run() {
             commands::full_clone,
             commands::repo_accounts,
             commands::list_remote_repos,
+            commands::local_clone_index,
+            commands::path_exists,
             commands::ssh_certificate_info,
             commands::clone_destination_status,
             commands::switch_repo_origin,
