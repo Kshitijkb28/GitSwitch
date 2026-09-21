@@ -13,7 +13,6 @@ import {
   FilePlus2,
   FileEdit,
   ShieldAlert,
-  Box,
   Ban,
   CircleSlash,
 } from "lucide-react";
@@ -27,6 +26,8 @@ import { CommitBox } from "../components/changes/CommitBox";
 import { DiffPanel } from "../components/changes/DiffPanel";
 import { PullControl, whyDisabled } from "../components/changes/PullControl";
 import { PushAccessCard } from "../components/changes/PushAccessCard";
+import { SubmodulesCard } from "../components/changes/SubmodulesCard";
+import { baseName } from "../lib/paths";
 import { usePersistedState } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
 import { elapsedLabel, runJob, useGitJob, clearJob } from "../lib/gitJobs";
@@ -63,6 +64,8 @@ export function Changes() {
   const [diffFor, setDiffFor] = useState<ChangeEntry | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState<string[] | null>(null);
   const [tick, setTick] = useState(0);
+  const [subRefresh, setSubRefresh] = useState(0);
+  const [extraRepos, setExtraRepos] = useState<string[]>([]);
 
   const job = useGitJob(repoPath);
   const seq = useRef(0);
@@ -153,6 +156,12 @@ export function Changes() {
     loadStatus(repoPath);
   }, [job, repoPath, loadStatus]);
 
+  /** Work in another repo (a submodule) without waiting for the scan. */
+  const openRepo = (path: string) => {
+    setExtraRepos((list) => (list.includes(path) ? list : [...list, path]));
+    setRepoPath(path);
+  };
+
   const message = drafts[repoPath] ?? "";
   const setMessage = (m: string) => setDrafts((d) => ({ ...d, [repoPath]: m }));
 
@@ -171,6 +180,7 @@ export function Changes() {
       const r = await fn();
       setResult(r);
       if (r.status) setStatus(r.status);
+      setSubRefresh((n) => n + 1);
       if (r.ok) {
         toast.success(r.headline);
       } else if (r.refusal) {
@@ -198,6 +208,7 @@ export function Changes() {
       if (r.ok) toast.success(r.headline);
       else toast.error(r.refusal?.message ?? r.advice?.headline ?? "That didn't work");
       loadStatus(repoPath);
+      setSubRefresh((n) => n + 1);
     });
   };
 
@@ -255,10 +266,15 @@ export function Changes() {
               value={repoPath}
               onChange={setRepoPath}
               placeholder={visibleRepos.length ? "Pick a repository" : "No repositories found"}
-              options={visibleRepos.map((r) => ({
-                value: r.path,
-                label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
-              }))}
+              options={[
+                ...visibleRepos.map((r) => ({
+                  value: r.path,
+                  label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
+                })),
+                ...extraRepos
+                  .filter((p) => !visibleRepos.some((r) => r.path === p))
+                  .map((p) => ({ value: p, label: baseName(p) })),
+              ]}
             />
           </div>
           <Button
@@ -485,7 +501,10 @@ export function Changes() {
             </Card>
           )}
 
-          <div className="flex flex-col lg:flex-row gap-4 items-start">
+          {/* items-start only in row mode: in the stacked (column) layout it is the
+              cross axis, so it would size each column to its content and let a long
+              file path widen the whole page. */}
+          <div className="flex flex-col lg:flex-row gap-4 lg:items-start">
             <div className="flex-1 min-w-0 space-y-3">
               {conflicted.length > 0 && (
                 <ChangesList
@@ -621,32 +640,17 @@ export function Changes() {
                 onChanged={(p) => setStatus({ ...status, push: p })}
               />
 
-              {status.has_submodules && (
-                <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40 p-3 space-y-2">
-                  <div className="flex items-center gap-2">
-                    <Box size={15} className="text-zinc-400 shrink-0" />
-                    <h3 className="text-sm font-medium text-zinc-200">Submodules</h3>
-                  </div>
-                  <p className="text-xs text-zinc-400 leading-relaxed">
-                    {status.submodule_dirty_count > 0
-                      ? `${status.submodule_dirty_count} submodule(s) differ from what this repo records.`
-                      : "Checks out the commits this repository records for each submodule."}
-                  </p>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    disabled={anyBusy}
-                    onClick={() =>
-                      runLong("submodules", "Updating submodules…", () =>
-                        api.changesSubmoduleUpdate(repoPath)
-                      )
-                    }
-                  >
-                    <Download size={13} />
-                    Update submodules
-                  </Button>
-                </div>
-              )}
+              <SubmodulesCard
+                repoPath={repoPath}
+                busy={anyBusy}
+                refreshKey={subRefresh}
+                onOpenRepo={openRepo}
+                onUpdate={() =>
+                  runLong("submodules", "Updating submodules…", () =>
+                    api.changesSubmoduleUpdate(repoPath)
+                  )
+                }
+              />
 
               {status.stash_count > 0 && (
                 <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40 p-3">

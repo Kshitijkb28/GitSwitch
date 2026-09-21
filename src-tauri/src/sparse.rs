@@ -217,6 +217,9 @@ pub struct SubmoduleReport {
     /// Submodule entries with NO address in .gitmodules — git can't fetch
     /// these, so they stay empty (as in any clone).
     pub unlisted: usize,
+    /// Which listed submodules failed, by path. The loop below already knows;
+    /// collapsing them into one error string threw the detail away.
+    pub failed_paths: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -247,6 +250,7 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
         listed: listed.len(),
         downloaded: 0,
         unlisted: gitlinks.saturating_sub(listed.len()),
+        failed_paths: Vec::new(),
         error: None,
     };
     // Leave the repo exactly as `git clone --recurse-submodules` does: every
@@ -284,6 +288,7 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
             }
         }
     }
+    report.failed_paths = failed.clone();
     if let Some(err) = first_error {
         report.error = Some(format!(
             "Couldn't download: {}.\n\n{}\n\nOnce that's sorted, run `git submodule update --recursive` inside the repo to fetch {}.",
