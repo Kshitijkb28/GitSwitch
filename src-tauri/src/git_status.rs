@@ -36,6 +36,9 @@ pub struct ChangeEntry {
     pub sub_commit_changed: bool,
     pub sub_tracked_changes: bool,
     pub sub_untracked: bool,
+    /// For a gitlink, the commit the superproject records (v2 field `hH`).
+    /// Without it nothing downstream can say where a submodule moved *from*.
+    pub recorded_oid: Option<String>,
     pub staged_added: Option<u64>,
     pub staged_removed: Option<u64>,
     pub unstaged_added: Option<u64>,
@@ -201,6 +204,7 @@ fn blank_entry(path: String) -> ChangeEntry {
         sub_commit_changed: false,
         sub_tracked_changes: false,
         sub_untracked: false,
+        recorded_oid: None,
         staged_added: None,
         staged_removed: None,
         unstaged_added: None,
@@ -273,6 +277,9 @@ pub fn parse_porcelain_v2(data: &[u8]) -> ParsedStatus {
                 let mut e = blank_entry(f[8].to_string());
                 e.staged = code_at(f[1], 0);
                 e.unstaged = code_at(f[1], 1);
+                if is_sub {
+                    e.recorded_oid = Some(f[6].to_string());
+                }
                 e.is_submodule = is_sub;
                 e.sub_commit_changed = c;
                 e.sub_tracked_changes = m;
@@ -295,6 +302,9 @@ pub fn parse_porcelain_v2(data: &[u8]) -> ParsedStatus {
                 e.unstaged = code_at(f[1], 1);
                 e.orig_path = orig;
                 e.rename_score = f[8].get(1..).and_then(|s| s.parse().ok());
+                if is_sub {
+                    e.recorded_oid = Some(f[6].to_string());
+                }
                 e.is_submodule = is_sub;
                 e.sub_commit_changed = c;
                 e.sub_tracked_changes = m;
@@ -733,6 +743,12 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         .unwrap_or_default();
 
     for e in parsed.entries.iter_mut() {
+        // A gitlink is a pointer, not text. `git diff --numstat -- <sub>` still
+        // reports "1 1 <path>" for a moved submodule, which would render as
+        // "+1 −1" and read as if one line changed inside it.
+        if e.is_submodule {
+            continue;
+        }
         if let Some((a, r, bin)) = unstaged_stats.get(&e.path) {
             e.unstaged_added = *a;
             e.unstaged_removed = *r;
@@ -933,7 +949,10 @@ pub async fn file_diff(repo_path: &str, path: &str, staged: bool, untracked: boo
             .run()
             .await?
     } else {
-        let mut cmd = GitCmd::at(&repo).args(["diff", "--no-color"]);
+        // --ignore-submodules=none is required or `git diff -- <submodule>`
+        // prints nothing at all, and the panel then claims the submodule has no
+        // changes while it may hold thousands.
+        let mut cmd = GitCmd::at(&repo).args(["diff", "--no-color", "--ignore-submodules=none"]);
         if staged {
             cmd = cmd.arg("--cached");
         }

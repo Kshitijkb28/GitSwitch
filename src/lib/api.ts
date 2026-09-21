@@ -392,6 +392,8 @@ export interface SubmoduleReport {
   downloaded: number;
   /** entries with no address — git can't fetch them */
   unlisted: number;
+  /** the listed submodules whose update failed, by path */
+  failed_paths: string[];
   error: string | null;
 }
 
@@ -650,6 +652,8 @@ export interface ChangeEntry {
   sub_commit_changed: boolean;
   sub_tracked_changes: boolean;
   sub_untracked: boolean;
+  /** For a submodule, the commit the superproject records. */
+  recorded_oid: string | null;
   staged_added: number | null;
   staged_removed: number | null;
   unstaged_added: number | null;
@@ -728,6 +732,51 @@ export interface RepoStatus {
   has_submodules: boolean;
 }
 
+export interface MovedCommit {
+  short: string;
+  subject: string;
+}
+
+/** One gitlink, with everything that can be known about it locally. */
+export interface SubmoduleInfo {
+  path: string;
+  name: string | null;
+  url: string | null;
+  configured_branch: string | null;
+  recorded: string;
+  recorded_short: string;
+  actual: string | null;
+  actual_short: string | null;
+  initialised: boolean;
+  /** Has a .gitmodules entry. Without one, git has no address to fetch from. */
+  listed: boolean;
+  ahead: number;
+  behind: number;
+  recorded_missing: boolean;
+  moved_commits: MovedCommit[];
+  more_moved: number;
+  own_branch: string | null;
+  own_upstream: string | null;
+  own_ahead: number;
+  own_behind: number;
+  dirty_tracked: number;
+  dirty_untracked: number;
+  /** The untracked count hit the parser's cap — treat it as a floor. */
+  dirty_untracked_capped: boolean;
+  state:
+    | "clean"
+    | "moved"
+    | "dirty"
+    | "moved-and-dirty"
+    | "not-initialised"
+    | "unmapped";
+  summary: string;
+}
+
+export async function changesSubmodules(repoPath: string): Promise<SubmoduleInfo[]> {
+  return invoke("changes_submodules", { repoPath });
+}
+
 export interface DiffLine {
   kind: "hunk" | "add" | "del" | "context" | "meta";
   text: string;
@@ -794,13 +843,6 @@ export interface PullOutcome {
   files_changed: number;
   conflicts: string[];
   recovery: string | null;
-}
-
-export interface SubmoduleReport {
-  listed: number;
-  downloaded: number;
-  unlisted: number;
-  error: string | null;
 }
 
 /** What every git operation returns: the outcome plus the re-read repo state. */

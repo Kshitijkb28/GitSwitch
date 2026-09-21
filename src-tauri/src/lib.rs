@@ -19,6 +19,7 @@ mod push_guard;
 mod remote_repos;
 mod repo_scan;
 mod sparse;
+mod submodules;
 mod signing;
 mod ssh_keys;
 mod tray;
@@ -91,6 +92,7 @@ pub fn run() {
             commands::changes_commit,
             commands::changes_push,
             commands::changes_pull,
+            commands::changes_submodules,
             commands::changes_submodule_update,
             commands::changes_abort,
             commands::changes_file_diff,

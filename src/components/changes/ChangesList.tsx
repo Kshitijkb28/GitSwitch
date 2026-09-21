@@ -89,7 +89,7 @@ export function ChangesList({
           <span className={accent === "danger" ? "text-red-400" : "text-zinc-400"}>
             {icon}
           </span>
-          <h3 className="text-sm font-medium text-zinc-200 truncate">{title}</h3>
+          <h3 className="text-sm font-medium text-zinc-200 truncate min-w-0">{title}</h3>
           <span className="text-xs text-zinc-500 shrink-0">{entries.length}</span>
         </div>
         {headerAction}
@@ -124,7 +124,7 @@ export function ChangesList({
                   ) : (
                     <FileText size={13} className="shrink-0 text-zinc-600" />
                   )}
-                  <span className="text-xs font-mono text-zinc-300 truncate group-hover:text-zinc-100">
+                  <span className="text-xs font-mono text-zinc-300 truncate min-w-0 group-hover:text-zinc-100">
                     {e.path}
                   </span>
                   {e.conflict && (
@@ -132,6 +132,14 @@ export function ChangesList({
                   )}
                   {e.is_binary && (
                     <span className="text-[10px] text-zinc-500 shrink-0">binary</span>
+                  )}
+                  {e.is_submodule && (
+                    // Said out loud, not just in a tooltip: a submodule row has
+                    // no line counts, so without this it looks like nothing
+                    // happened to it.
+                    <span className="text-[10px] text-sky-300/80 truncate min-w-0">
+                      {submoduleReason(e)}
+                    </span>
                   )}
                   {!e.is_binary && (added != null || removed != null) && (
                     <span className="text-[10px] font-mono shrink-0">

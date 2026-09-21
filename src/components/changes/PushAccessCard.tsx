@@ -104,7 +104,7 @@ export function PushAccessCard({ repoPath, push, onChanged }: Props) {
                 }`}
               />
               <span className="text-zinc-400 shrink-0">{r.name}</span>
-              <span className="text-zinc-600 truncate font-mono">
+              <span className="text-zinc-600 truncate min-w-0 font-mono">
                 {r.rewritten ? "rewritten" : "not rewritten"}
               </span>
             </li>

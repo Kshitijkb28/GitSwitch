@@ -59,7 +59,7 @@ export function DiffPanel({ repoPath, entry, onClose }: Props) {
       <div className="relative w-full max-w-5xl max-h-[85vh] flex flex-col rounded-xl border border-zinc-700/50 bg-zinc-900 shadow-2xl">
         <div className="flex items-start justify-between gap-3 p-4 border-b border-zinc-800">
           <div className="min-w-0">
-            <p className="font-mono text-sm text-zinc-100 truncate">{entry.path}</p>
+            <p className="font-mono text-sm text-zinc-100 truncate min-w-0">{entry.path}</p>
             {entry.orig_path && (
               <p className="text-xs text-zinc-500 truncate mt-0.5">
                 renamed from {entry.orig_path}

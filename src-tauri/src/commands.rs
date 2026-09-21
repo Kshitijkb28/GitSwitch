@@ -16,6 +16,7 @@ use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
 use crate::profiles::{self, Profile};
 use crate::signing;
 use crate::sparse::{self, CertInfo, CloneResult, DestinationStatus, SparseInfo};
+use crate::submodules::{self, SubmoduleInfo};
 use crate::ssh_keys;
 
 #[tauri::command]
@@ -603,6 +604,13 @@ pub async fn changes_push(repo_path: String, set_upstream: bool) -> Result<OpRes
 pub async fn changes_pull(repo_path: String, mode: String) -> Result<OpResult, AppError> {
     let mode = git_ops::PullMode::parse(&mode)?;
     git_ops::pull(&repo_path, mode).await
+}
+
+/// Every gitlink in the repo with its real state — where it moved, what is
+/// dirty inside it, and whether git can fetch it at all.
+#[tauri::command]
+pub async fn changes_submodules(repo_path: String) -> Result<Vec<SubmoduleInfo>, AppError> {
+    submodules::list_submodules(&repo_path).await
 }
 
 #[tauri::command]
