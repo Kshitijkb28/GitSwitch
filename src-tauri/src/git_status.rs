@@ -39,6 +39,12 @@ pub struct ChangeEntry {
     /// For a gitlink, the commit the superproject records (v2 field `hH`).
     /// Without it nothing downstream can say where a submodule moved *from*.
     pub recorded_oid: Option<String>,
+    /// Conflicted entries only: the modes and oids of index stages 1, 2, 3
+    /// (base, ours, theirs). A mode of "160000" marks a submodule pointer.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub stage_modes: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub stage_oids: Vec<String>,
     pub staged_added: Option<u64>,
     pub staged_removed: Option<u64>,
     pub unstaged_added: Option<u64>,
@@ -81,6 +87,9 @@ pub struct InProgress {
     pub label: String,
     pub detail: String,
     pub abort_command: String,
+    /// What finishes it once conflicts are staged; `None` when only a commit
+    /// (merge) or nothing (bisect) can.
+    pub continue_command: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -132,6 +141,10 @@ pub struct RepoStatus {
     /// Prefilled commit message for a merge being concluded.
     pub merge_message: Option<String>,
     pub has_submodules: bool,
+    /// Some tracked .gitattributes routes files through Git LFS.
+    pub uses_lfs: bool,
+    /// A paused sync (sync.rs) here or in this repository's superproject.
+    pub sync: Option<crate::sync::SyncSummary>,
 }
 
 /// Split porcelain `-z` output into NUL-delimited chunks. The trailing NUL
@@ -205,6 +218,8 @@ fn blank_entry(path: String) -> ChangeEntry {
         sub_tracked_changes: false,
         sub_untracked: false,
         recorded_oid: None,
+        stage_modes: Vec::new(),
+        stage_oids: Vec::new(),
         staged_added: None,
         staged_removed: None,
         unstaged_added: None,
@@ -324,6 +339,11 @@ pub fn parse_porcelain_v2(data: &[u8]) -> ParsedStatus {
                 e.sub_commit_changed = c;
                 e.sub_tracked_changes = m;
                 e.sub_untracked = u;
+                // The three index stages (base, ours, theirs). For a gitlink
+                // conflict during a rebase, "ours" is the upstream side and
+                // "theirs" the commit being replayed — the sync needs both.
+                e.stage_modes = vec![f[3].to_string(), f[4].to_string(), f[5].to_string()];
+                e.stage_oids = vec![f[7].to_string(), f[8].to_string(), f[9].to_string()];
                 st.entries.push(e);
             }
             Some('?') => {
@@ -431,6 +451,7 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
             label: "Merge in progress".into(),
             detail: "Finish it with one commit, or abort.".into(),
             abort_command: "git merge --abort".into(),
+            continue_command: Some("git commit --no-edit".into()),
         });
     }
     if p.rebase_merge || p.rebase_apply {
@@ -459,6 +480,11 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
             } else {
                 "git rebase --abort".into()
             },
+            continue_command: Some(if am {
+                "git am --continue".into()
+            } else {
+                "git rebase --continue".into()
+            }),
         });
     }
     if p.cherry_pick_head {
@@ -467,6 +493,7 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
             label: "Cherry-pick in progress".into(),
             detail: String::new(),
             abort_command: "git cherry-pick --abort".into(),
+            continue_command: Some("git cherry-pick --continue".into()),
         });
     }
     if p.revert_head {
@@ -475,6 +502,7 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
             label: "Revert in progress".into(),
             detail: String::new(),
             abort_command: "git revert --abort".into(),
+            continue_command: Some("git revert --continue".into()),
         });
     }
     if p.bisect_log {
@@ -483,6 +511,7 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
             label: "Bisect in progress".into(),
             detail: String::new(),
             abort_command: "git bisect reset".into(),
+            continue_command: None,
         });
     }
     None
@@ -562,7 +591,7 @@ fn read_line_file(path: &Path) -> Option<String> {
     }
 }
 
-fn presence_from_disk(p: &GitPaths) -> OpPresence {
+pub(crate) fn presence_from_disk(p: &GitPaths) -> OpPresence {
     let rebase_merge = p.rebase_merge.is_dir();
     let rebase_apply = p.rebase_apply.is_dir();
     let step = if rebase_merge {
@@ -721,6 +750,11 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         .run()
         .await?;
     if !status_out.ok() {
+        // With filter.lfs.required set and git-lfs gone, status itself fails
+        // with a message that looks like a dropped connection. Say what it is.
+        if let Some(msg) = crate::lfs::missing_lfs_message(&status_out.stderr) {
+            return Err(AppError::Command(msg));
+        }
         return Err(AppError::Command(format!(
             "git status failed: {}",
             status_out.stderr
@@ -796,6 +830,7 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
     let can_amend = !parsed.unborn && head_subject.is_some() && !published && operation.is_none();
 
     let has_submodules = repo.join(".gitmodules").exists();
+    let uses_lfs = crate::lfs::repo_uses_lfs(&repo).await;
 
     let staged_count = parsed.entries.iter().filter(|e| e.kind == "tracked" && e.is_staged()).count();
     let unstaged_count = parsed
@@ -839,10 +874,12 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         head_subject,
         merge_message,
         has_submodules,
+        uses_lfs,
+        sync: crate::sync::summary_for(&repo).await,
     })
 }
 
-fn owning_profile_id(repo_path: &str) -> Option<String> {
+pub(crate) fn owning_profile_id(repo_path: &str) -> Option<String> {
     let store = profiles::load_profiles().ok()?;
     let repo = crate::paths::norm(repo_path);
     crate::commit_audit::owning_profile(&repo, &store.profiles).map(|p| p.id.clone())
@@ -854,20 +891,6 @@ pub async fn push_state_for(repo_path: &str) -> Result<crate::push_guard::PushSt
     let repo = PathBuf::from(repo_path);
     let paths = git_paths(&repo).await?;
     Ok(crate::push_guard::push_state(&repo, &paths.hooks, owning_profile_id(repo_path).as_deref()).await)
-}
-
-pub async fn set_push_blocked_for(
-    repo_path: &str,
-    blocked: bool,
-) -> Result<crate::push_guard::PushState, AppError> {
-    let paths = git_paths(&PathBuf::from(repo_path)).await?;
-    crate::push_guard::set_repo_blocked(
-        repo_path,
-        &paths.hooks,
-        blocked,
-        owning_profile_id(repo_path).as_deref(),
-    )
-    .await
 }
 
 pub async fn repair_push_block_for(repo_path: &str) -> Result<crate::push_guard::PushState, AppError> {
@@ -1213,6 +1236,22 @@ mod tests {
         assert_eq!(map.get("new.ts"), Some(&(Some(10), Some(0), false)));
         assert!(!map.contains_key("old.ts"));
         assert_eq!(map.get("logo.png"), Some(&(None, None, true)));
+    }
+
+    #[test]
+    fn a_gitlink_conflict_keeps_its_three_stages() {
+        let line = b"u UU S... 160000 160000 160000 160000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccccccc staging\0";
+        let st = parse_porcelain_v2(line);
+        let e = &st.entries[0];
+        assert!(e.is_submodule);
+        assert_eq!(e.kind, "conflicted");
+        assert_eq!(e.stage_modes, vec!["160000", "160000", "160000"]);
+        assert_eq!(e.stage_oids[1], "b".repeat(40), "stage 2 is ours (upstream during a rebase)");
+        assert_eq!(e.stage_oids[2], "c".repeat(40), "stage 3 is theirs (the commit being replayed)");
+        // An ordinary tracked entry carries no stages, and serialises none.
+        let plain = parse_porcelain_v2(b"1 .M N... 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa file.txt\0");
+        assert!(plain.entries[0].stage_oids.is_empty());
+        assert!(!serde_json::to_string(&plain.entries[0]).unwrap().contains("stage_oids"));
     }
 
     #[test]

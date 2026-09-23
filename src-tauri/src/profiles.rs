@@ -62,10 +62,11 @@ fn expand_tilde(dir: &str) -> String {
     dir.to_string()
 }
 
-/// Blocking pushes on the DEFAULT profile would inject an un-overridable
-/// pushInsteadOf rewrite into the main ~/.gitconfig — git accumulates URL
-/// rewrite rules across includes, so folder profiles that ALLOW pushes could
-/// never undo it. Hence: only non-default profiles may block pushes.
+/// Blocking pushes on the DEFAULT profile would put a pushInsteadOf rewrite in
+/// the main ~/.gitconfig, i.e. in every folder on the machine. git would let a
+/// folder profile undo it — longest matching rewrite wins, in any scope — but
+/// only with a longer rewrite for every URL form, which is fragile and
+/// surprising. Hence: only non-default profiles may block pushes.
 fn ensure_default_can_push(is_default: bool, allow_push: bool) -> Result<(), AppError> {
     if is_default && !allow_push {
         return Err(AppError::Config(

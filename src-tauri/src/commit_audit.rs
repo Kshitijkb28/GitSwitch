@@ -246,6 +246,10 @@ pub fn fix_unpushed(repo_path: &str) -> Result<String, AppError> {
         &[
             "-c",
             "core.editor=true",
+            // With rebase.updateRefs=true git would move the backup branch
+            // along with the rewrite — the one thing it exists not to do.
+            "-c",
+            "rebase.updateRefs=false",
             "rebase",
             "--empty=keep",
             &base,

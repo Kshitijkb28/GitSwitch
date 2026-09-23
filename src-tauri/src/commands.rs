@@ -9,14 +9,16 @@ use crate::git_remote::{self, RemoteChange};
 use crate::git_ops::{self, OpResult};
 use crate::git_status::{self, FileDiff, RepoStatus};
 use crate::push_guard::PushState;
+use crate::push_lock::{self, HelperStatus, JobOutcome, PushModeResult};
 use crate::github::{self, GitHubKey, GitHubUser, RepoPermissions};
 use crate::remote_repos::{self, LocalClones, RepoAccount, RepoListing};
 use crate::repo_scan::{self, ScannedRepo};
 use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
 use crate::profiles::{self, Profile};
 use crate::signing;
-use crate::sparse::{self, CertInfo, CloneResult, DestinationStatus, SparseInfo};
+use crate::sparse::{self, CertInfo, CloneResult, DestinationStatus, SparseInfo, SparseSetResult};
 use crate::submodules::{self, SubmoduleInfo};
+use crate::lfs::{self, LfsStatus, LfsTool};
 use crate::ssh_keys;
 
 #[tauri::command]
@@ -234,6 +236,7 @@ pub async fn full_clone(
     folder_name: Option<String>,
     clone_as: Option<String>,
     with_submodules: Option<bool>,
+    with_lfs: Option<bool>,
 ) -> Result<CloneResult, AppError> {
     let res = sparse::full_clone(
         &url,
@@ -241,6 +244,7 @@ pub async fn full_clone(
         folder_name.as_deref(),
         clone_as.as_deref(),
         with_submodules.unwrap_or(true),
+        with_lfs.unwrap_or(true),
     )
     .await?;
     if res.mapped_to.is_some() {
@@ -277,10 +281,17 @@ pub async fn sparse_repo_info(repo_path: String) -> Result<SparseInfo, AppError>
     sparse::repo_info(&repo_path).await
 }
 
-/// Sparse checkout: replace the folder selection and materialize the tree.
+/// Sparse checkout: replace the folder selection and materialize the tree,
+/// downloading LFS content for it when asked.
 #[tauri::command]
-pub async fn sparse_set(repo_path: String, dirs: Vec<String>) -> Result<(), AppError> {
-    sparse::sparse_set(&repo_path, dirs).await
+pub async fn sparse_set(repo_path: String, dirs: Vec<String>, with_lfs: Option<bool>) -> Result<SparseSetResult, AppError> {
+    sparse::sparse_set(&repo_path, dirs, with_lfs.unwrap_or(true)).await
+}
+
+/// Is git-lfs installed on this computer? Asked before a repository exists.
+#[tauri::command]
+pub async fn lfs_available() -> LfsTool {
+    lfs::lfs_available().await
 }
 
 /// Sparse checkout: add folders to the existing selection.
@@ -541,14 +552,51 @@ pub async fn changes_push_state(repo_path: String) -> Result<PushState, AppError
     git_status::push_state_for(&repo_path).await
 }
 
-/// Turn the per-repo push block on or off. Returns the re-measured state, so
-/// the UI shows what actually took effect rather than what was asked for.
+/// Switch push access: "allowed" | "guardrail" | "locked". Locking and
+/// unlocking run through the privileged helper behind the operating system's
+/// administrator prompt; the result says what happened — including that the
+/// prompt was cancelled — and carries the re-measured state.
 #[tauri::command]
-pub async fn changes_set_push_blocked(
-    repo_path: String,
-    blocked: bool,
-) -> Result<PushState, AppError> {
-    git_status::set_push_blocked_for(&repo_path, blocked).await
+pub async fn changes_set_push_mode(repo_path: String, mode: String) -> Result<PushModeResult, AppError> {
+    push_lock::set_push_mode(&repo_path, &mode).await
+}
+
+/// Repair a lock whose admin-owned layers drifted (one prompt) after
+/// re-applying the user-level mirrors (no prompt).
+#[tauri::command]
+pub async fn changes_repair_push_lock(repo_path: String) -> Result<PushModeResult, AppError> {
+    push_lock::repair_lock(&repo_path).await
+}
+
+/// The installed and bundled lock helper, the registry and every lock — for
+/// Settings and Doctor.
+#[tauri::command]
+pub async fn push_lock_helper_status() -> HelperStatus {
+    push_lock::helper_status().await
+}
+
+/// Remove every lock, the registry, the remote helper and the helper itself
+/// (one prompt), then the per-repo mirrors.
+#[tauri::command]
+pub async fn push_lock_uninstall() -> JobOutcome {
+    push_lock::uninstall_all().await
+}
+
+/// Doctor's `lock-*` fixes.
+#[tauri::command]
+pub async fn push_lock_fix(fix: String) -> JobOutcome {
+    push_lock::fix(&fix).await
+}
+
+/// After a `manual-required` outcome, read the helper's result for that job.
+#[tauri::command]
+pub async fn push_lock_finish_manual(nonce: String) -> JobOutcome {
+    push_lock::finish_manual(&nonce).await
+}
+
+#[tauri::command]
+pub async fn doctor_check_push_locks() -> Result<Vec<Finding>, AppError> {
+    doctor::check_push_locks().await
 }
 
 /// Re-apply a block that has drifted — usually because a remote was added
@@ -599,11 +647,17 @@ pub async fn changes_push(repo_path: String, set_upstream: bool) -> Result<OpRes
 }
 
 /// `mode` is one of "ff-only", "merge", "rebase" — chosen by the user, never
-/// inferred from their git settings.
+/// inferred from their git settings. `with_lfs` additionally downloads the
+/// content behind any LFS pointer stub, which a plain pull does not do unless
+/// the repository's LFS filters happen to be configured.
 #[tauri::command]
-pub async fn changes_pull(repo_path: String, mode: String) -> Result<OpResult, AppError> {
+pub async fn changes_pull(
+    repo_path: String,
+    mode: String,
+    with_lfs: bool,
+) -> Result<OpResult, AppError> {
     let mode = git_ops::PullMode::parse(&mode)?;
-    git_ops::pull(&repo_path, mode).await
+    git_ops::pull(&repo_path, mode, with_lfs).await
 }
 
 /// Every gitlink in the repo with its real state — where it moved, what is
@@ -618,7 +672,63 @@ pub async fn changes_submodule_update(repo_path: String) -> Result<OpResult, App
     git_ops::submodule_update(&repo_path).await
 }
 
+/// Are this repo's large files really here, or still LFS pointer stubs?
+#[tauri::command]
+pub async fn changes_lfs_status(repo_path: String) -> Result<LfsStatus, AppError> {
+    lfs::lfs_status(&repo_path).await
+}
+
+/// `git lfs pull`: download the content for every pointer stub. Reports how
+/// many actually arrived, measured by counting the stubs again afterwards.
+#[tauri::command]
+pub async fn changes_lfs_pull(repo_path: String) -> Result<OpResult, AppError> {
+    git_ops::lfs_pull(&repo_path).await
+}
+
 /// Abort the merge or rebase that is in progress, putting the branch back.
+/// Sync, step 1: fetch, measure, decide. Nothing is written. `stash` says
+/// whether uncommitted changes may be stashed around the rebase.
+#[tauri::command]
+pub async fn changes_sync_plan(repo_path: String, stash: bool, fetch: bool) -> Result<crate::sync::SyncPlan, AppError> {
+    crate::sync::sync_plan(&repo_path, stash, fetch).await
+}
+
+/// Sync, step 2: run the plan. `fingerprint` comes from the plan; the run
+/// refuses if upstream moved since.
+#[tauri::command]
+pub async fn changes_sync_run(
+    repo_path: String,
+    stash: bool,
+    bundles: bool,
+    fingerprint: Vec<(String, String)>,
+) -> Result<OpResult, AppError> {
+    crate::sync::sync_run(&repo_path, crate::sync::RunOptions { stash, bundles, fingerprint }).await
+}
+
+/// Resume a paused sync after conflicts were resolved and staged.
+#[tauri::command]
+pub async fn changes_sync_continue(repo_path: String) -> Result<OpResult, AppError> {
+    crate::sync::sync_continue(&repo_path).await
+}
+
+/// Undo a paused sync.
+#[tauri::command]
+pub async fn changes_sync_abort(repo_path: String) -> Result<OpResult, AppError> {
+    crate::sync::sync_abort(&repo_path).await
+}
+
+/// One commit recording submodule pointers that sit ahead of the branch.
+#[tauri::command]
+pub async fn changes_record_pointers(repo_path: String) -> Result<OpResult, AppError> {
+    crate::sync::record_pointers(&repo_path).await
+}
+
+/// Finish the operation in progress once its conflicts are staged.
+#[tauri::command]
+pub async fn changes_continue(repo_path: String) -> Result<OpResult, AppError> {
+    git_ops::continue_op(&repo_path).await
+}
+
 #[tauri::command]
 pub async fn changes_abort(repo_path: String) -> Result<OpResult, AppError> {
     git_ops::abort(&repo_path).await

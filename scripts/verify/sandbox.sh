@@ -221,6 +221,35 @@ cd "$SB/work"; git checkout -q --ours conflict.txt 2>/dev/null; git add conflict
 OUT=$(probe commit "$SB/work" "finish the merge")
 ok "a commit during a merge is allowed, not blocked" "$(printf '%s' "$OUT" | jqf ok)$(printf '%s' "$OUT" | jqf refusal.code)" "True"
 
+section "Continue finishes a stopped rebase, skipping a pick that became empty"
+git -C "$SB/work" push -q origin main 2>/dev/null
+cd "$SB/other"; git pull -q --rebase origin main 2>/dev/null; printf 'THEIRS-2\n' > conflict.txt; git add -A >/dev/null; git commit -qm "their second"; git push -q origin main 2>/dev/null
+cd "$SB/work"; printf 'MINE-2\n' > conflict.txt; git add -A >/dev/null; git commit -qm "my second"
+OUT=$(probe pull "$SB/work" "rebase")
+ok "the rebase stops on the conflict" "$(printf '%s' "$OUT" | jqf advice.action)" "resolve-conflicts"
+OUT=$(probe status "$SB/work")
+ok "  status names the continue command" "$(printf '%s' "$OUT" | jqf operation.continue_command)" "git rebase --continue"
+OUT=$(probe continue "$SB/work")
+ok "continue is refused while the file is conflicted" "$(printf '%s' "$OUT" | jqf refusal.code)" "unmerged-paths"
+printf 'BOTH\n' > "$SB/work/conflict.txt"; git -C "$SB/work" add conflict.txt
+OUT=$(probe continue "$SB/work")
+ok "after resolving and staging, continue finishes the rebase" "$(printf '%s' "$OUT" | jqf headline)" "Finished the rebase"
+ok "  my commit is on top" "$(git -C "$SB/work" log -1 --format=%s)" "my second"
+ok "  and no operation is left" "$(printf '%s' "$OUT" | jqf operation)" "None"
+# A resolution identical to upstream's side leaves nothing to commit: git
+# refuses --continue for that pick, so GitSwitch skips it and says so.
+git -C "$SB/work" push -q origin main 2>/dev/null
+cd "$SB/other"; git pull -q --rebase origin main 2>/dev/null; printf 'THEIRS-3\n' > conflict.txt; git add -A >/dev/null; git commit -qm "their third"; git push -q origin main 2>/dev/null
+cd "$SB/work"; printf 'MINE-3\n' > conflict.txt; git add -A >/dev/null; git commit -qm "my third"
+OUT=$(probe pull "$SB/work" "rebase")
+printf 'THEIRS-3\n' > "$SB/work/conflict.txt"; git -C "$SB/work" add conflict.txt
+OUT=$(probe continue "$SB/work")
+ok "a pick that became empty is skipped, not stuck" "$(printf '%s' "$OUT" | jqf detail)" "skipped"
+ok "  the rebase is finished" "$(printf '%s' "$OUT" | jqf headline)" "Finished the rebase"
+ok "  and HEAD is upstream's commit" "$(git -C "$SB/work" log -1 --format=%s)" "their third"
+OUT=$(probe continue "$SB/work")
+ok "with nothing in progress, continue is refused by name" "$(printf '%s' "$OUT" | jqf refusal.code)" "nothing-to-continue"
+
 section "Diff viewer"
 printf 'diffline\n' >> "$SB/work/a.txt"
 OUT=$(probe diff "$SB/work" "a.txt,unstaged")

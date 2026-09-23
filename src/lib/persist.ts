@@ -22,6 +22,16 @@ function read<T>(key: string, fallback: T): T {
  * Only durable selections belong here — never transient things like loading
  * flags, fetched results or error messages, which must be re-derived fresh.
  */
+/** Write a persisted value from outside its page — e.g. the Clone page
+ *  handing a fresh clone to the Changes page before navigating there. */
+export function writePersisted<T>(key: string, value: T) {
+  try {
+    localStorage.setItem(PREFIX + key, JSON.stringify(value));
+  } catch {
+    // storage full or disabled — the page will just not be preselected
+  }
+}
+
 export function usePersistedState<T>(key: string, initial: T) {
   const [value, setValue] = useState<T>(() => read(key, initial));
 

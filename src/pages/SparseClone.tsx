@@ -14,7 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { Checkbox } from "../components/Checkbox";
@@ -23,7 +23,7 @@ import { Badge } from "../components/Badge";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import { baseName, isWithin, normPath } from "../lib/paths";
-import { usePersistedState } from "../lib/persist";
+import { usePersistedState, writePersisted } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
@@ -92,6 +92,16 @@ export function SparseClone() {
   // "" = automatic: the destination folder's profile decides, like a terminal clone.
   const [cloneAs, setCloneAs] = useState("");
   const [withSubmodules, setWithSubmodules] = usePersistedState("clone.submodules", true);
+  // On by default: a clone of an LFS repository without this looks complete
+  // but every large file is a pointer stub, and git status never says so.
+  const [withLfs, setWithLfs] = usePersistedState("clone.lfs", true);
+  const [lfsTool, setLfsTool] = useState<api.LfsTool | null>(null);
+  const [sparseLfs, setSparseLfs] = useState<api.LfsReport | null>(null);
+  const navigate = useNavigate();
+  const openInChanges = (path: string) => {
+    writePersisted("changes.repo", path);
+    navigate("/changes");
+  };
 
   // Arriving from Repositories: take the link (and suggested profile) it sent,
   // then drop the query so a reload doesn't re-apply it over later edits.
@@ -145,6 +155,17 @@ export function SparseClone() {
   // been created or deleted, and a certificate may have appeared, meanwhile.
   const [recheck, setRecheck] = useState(0);
   useRefreshOnFocus(() => setRecheck((n) => n + 1));
+  // git-lfs can be installed while the app is open, so ask again on focus.
+  useEffect(() => {
+    let stale = false;
+    api.lfsAvailable()
+      .then((t) => !stale && setLfsTool(t))
+      .catch(() => !stale && setLfsTool(null));
+    return () => {
+      stale = true;
+    };
+  }, [recheck]);
+  const lfsInstalled = lfsTool?.installed ?? true;
   const [cert, setCert] = useState<api.CertInfo | null>(null);
   useEffect(() => {
     if (!certOrgUrl || !keyInUse) {
@@ -289,7 +310,7 @@ export function SparseClone() {
     publishJob(started);
     const request =
       mode === "full"
-        ? api.fullClone(url, parentDir, folderName || null, cloneAs || null, withSubmodules)
+        ? api.fullClone(url, parentDir, folderName || null, cloneAs || null, withSubmodules, withLfs && lfsInstalled)
         : api.sparseClone(url, parentDir, folderName || null, cloneAs || null);
     request.then(
       (result) => publishJob({ ...started, done: { result } }),
@@ -338,7 +359,8 @@ export function SparseClone() {
     setApplying(true);
     setError(null);
     try {
-      await api.sparseSet(info.path, Array.from(selected));
+      const r = await api.sparseSet(info.path, Array.from(selected), withLfs && lfsInstalled);
+      setSparseLfs(r.lfs);
       toast.success(
         `Checked out ${selected.size} folder${selected.size === 1 ? "" : "s"}`
       );
@@ -486,6 +508,40 @@ export function SparseClone() {
               </span>
             </label>
           )}
+          <label
+            className={`flex items-start gap-2.5 select-none ${lfsInstalled ? "cursor-pointer" : "cursor-not-allowed"}`}
+            title={
+              lfsInstalled
+                ? "A clone only downloads large files when git-lfs is installed and set up — otherwise they arrive as pointer stubs"
+                : "git-lfs isn't installed, so large files will arrive as pointer stubs"
+            }
+          >
+            <Checkbox
+              checked={withLfs && lfsInstalled}
+              onChange={setWithLfs}
+              disabled={!lfsInstalled}
+              className="mt-0.5"
+              aria-label="Also download Git LFS files"
+            />
+            <span className="min-w-0">
+              <span className={`text-sm ${lfsInstalled ? "text-zinc-300" : "text-zinc-500"}`}>Also download Git LFS files</span>
+              <span className="block text-xs text-zinc-500">
+                {lfsInstalled ? (
+                  <>
+                    Otherwise large files arrive as pointer stubs
+                    {mode === "sparse" ? " — done when you check folders out" : ""}. You can also download them
+                    later from Changes → Git LFS.
+                  </>
+                ) : (
+                  <>
+                    git-lfs isn't installed on this computer, so large files will arrive as pointer stubs.
+                    Install it (<span className="font-mono">{lfsTool?.install_hint ?? "git-lfs"}</span>) and
+                    download them later from Changes → Git LFS.
+                  </>
+                )}
+              </span>
+            </span>
+          </label>
           <div>
             <label className="block text-sm font-medium text-zinc-300 mb-1.5">Clone as</label>
             <Select
@@ -716,6 +772,25 @@ export function SparseClone() {
                   {cloned.submodules.error}
                 </pre>
               )}
+              {cloned.lfs && (
+                <p
+                  className={`text-xs mt-0.5 ${
+                    cloned.lfs.error || (cloned.lfs.pointers_left > 0 && !cloned.lfs.installed)
+                      ? "text-amber-300/90"
+                      : cloned.lfs.pointers_left > 0
+                        ? "text-zinc-400"
+                        : "text-emerald-400/90"
+                  }`}
+                >
+                  Git LFS: {cloned.lfs.note}
+                </p>
+              )}
+              {cloned.lfs && cloned.lfs.pointers_left > 0 && cloned.lfs.installed && (
+                <Button size="sm" variant="secondary" className="mt-2" onClick={() => openInChanges(cloned.path)}>
+                  <Download size={12} />
+                  Open in Changes to download them
+                </Button>
+              )}
             </div>
           </div>
         </Card>
@@ -751,6 +826,11 @@ export function SparseClone() {
             </button>
           </div>
           <p className="text-xs text-zinc-500 font-mono mb-4 truncate">{info.path}</p>
+          {sparseLfs && (
+            <p className={`text-xs mb-3 ${sparseLfs.error ? "text-amber-300/90" : sparseLfs.pointers_left > 0 ? "text-zinc-400" : "text-emerald-400/90"}`}>
+              Git LFS: {sparseLfs.note}
+            </p>
+          )}
 
           {info.available_dirs.length === 0 ? (
             <p className="text-sm text-zinc-500">

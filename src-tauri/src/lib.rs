@@ -2,6 +2,7 @@ mod commands;
 mod commit_audit;
 mod credentials;
 mod doctor;
+mod elevate;
 mod error;
 mod gh_cli;
 mod git_advice;
@@ -10,16 +11,22 @@ mod git_exec;
 mod git_history;
 mod git_ops;
 mod git_status;
+mod lfs;
 mod git_remote;
 mod github;
 mod oauth;
 mod paths;
+/// Test-only driver for scripts/verify — never part of the app binary.
+#[cfg(test)]
+mod probe;
 mod profiles;
 mod push_guard;
+mod push_lock;
 mod remote_repos;
 mod repo_scan;
 mod sparse;
 mod submodules;
+mod sync;
 mod signing;
 mod ssh_keys;
 mod tray;
@@ -94,11 +101,26 @@ pub fn run() {
             commands::changes_pull,
             commands::changes_submodules,
             commands::changes_submodule_update,
+            commands::changes_lfs_status,
+            commands::changes_lfs_pull,
+            commands::lfs_available,
             commands::changes_abort,
+            commands::changes_continue,
+            commands::changes_sync_plan,
+            commands::changes_sync_run,
+            commands::changes_sync_continue,
+            commands::changes_sync_abort,
+            commands::changes_record_pointers,
             commands::changes_file_diff,
             commands::changes_push_state,
-            commands::changes_set_push_blocked,
+            commands::changes_set_push_mode,
             commands::changes_repair_push_block,
+            commands::changes_repair_push_lock,
+            commands::push_lock_helper_status,
+            commands::push_lock_uninstall,
+            commands::push_lock_fix,
+            commands::push_lock_finish_manual,
+            commands::doctor_check_push_locks,
             commands::history_fetch,
             commands::history_sync_status,
             commands::history_list_repos,

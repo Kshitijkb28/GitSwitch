@@ -5,15 +5,26 @@
 # write once overwrote the real ~/.gitconfig, which is why it lives here and
 # not in each script.
 
+# Portable helpers: the suites also run on GitHub's Linux and Windows runners
+# (Git Bash), where python3/shasum may be missing and native binaries cannot
+# open MSYS paths (/c/Users/…) handed to them through environment variables.
+PY="$(command -v python3 || command -v python)"
+sha256file() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1; else sha256sum "$1" | cut -d' ' -f1; fi; }
+# realdir <dir> -> the real, native path of a directory (symlinks resolved;
+# Windows: long-name mixed form C:/Users/…)
+realdir() { if command -v cygpath >/dev/null 2>&1; then cygpath -m -l "$(cd "$1" && pwd -P)"; else (cd "$1" && pwd -P); fi; }
+
 verify_init() {
   local suite="$1"
   VERIFY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   ROOT="$(cd "$VERIFY_DIR/../.." && pwd)"
   SRC="$ROOT/src-tauri"
-  WORK="${GITSWITCH_VERIFY_TMP:-${TMPDIR:-/tmp}/gitswitch-verify}"
+  local tmp="${TMPDIR:-${TEMP:-/tmp}}"; tmp="${tmp%/}"     # macOS TMPDIR ends in a slash
+  WORK="${GITSWITCH_VERIFY_TMP:-$tmp/gitswitch-verify}"
   SB="$WORK/$suite"
   REAL_HOME="$HOME"                 # cargo needs the real one; git must never see it
   rm -rf "$SB"; mkdir -p "$SB/home"
+  if command -v cygpath >/dev/null 2>&1; then SB="$(cygpath -m -l "$SB")"; fi
   export HOME="$SB/home"            # FIRST — before any line that writes a gitconfig
   export GIT_CONFIG_NOSYSTEM=1
   cat > "$HOME/.gitconfig" <<EOF
@@ -29,12 +40,16 @@ verify_init() {
 EOF
 
   PASS=0; FAIL=0
-  BIN="$(cd "$SRC" && HOME="$REAL_HOME" cargo test --lib --no-run --message-format=json 2>/dev/null | python3 -c "
+  # tauri-build refuses to compile the app unless the lock-helper sidecar file
+  # exists, so build it (debug) before the app's test binary.
+  (HOME="$REAL_HOME" bash "$ROOT/scripts/build-lock-helper.sh" debug >/dev/null 2>&1) || { echo "could not build the lock helper sidecar"; exit 1; }
+  HELPER_BUNDLED="$SRC/target/debug/gitswitch-lock-helper"; [ -x "$HELPER_BUNDLED.exe" ] && HELPER_BUNDLED="$HELPER_BUNDLED.exe"
+  BIN="$(cd "$SRC" && HOME="$REAL_HOME" cargo test -p gitswitch --lib --no-run --message-format=json 2>/dev/null | "$PY" -c "
 import sys,json
 for l in sys.stdin:
     try: d=json.loads(l)
     except: continue
-    if d.get('profile',{}).get('test') and d.get('executable'): print(d['executable'])
+    if d.get('profile',{}).get('test') and d.get('executable') and d.get('target',{}).get('name')=='gitswitch_lib': print(d['executable'])
 " | tail -1)"
   [ -n "$BIN" ] || { echo "could not build the test binary (is src-tauri/src/probe.rs registered in lib.rs?)"; exit 1; }
 }
@@ -47,7 +62,7 @@ probe() {
 
 # jqf <dotted.path>  — read one field from JSON on stdin (python, no jq needed)
 jqf() {
-  python3 -c "
+  "$PY" -c "
 import sys,json
 d=json.load(sys.stdin)
 for k in '$1'.split('.'):

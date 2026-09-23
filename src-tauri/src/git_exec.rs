@@ -65,8 +65,31 @@ pub fn hardened_env() -> Vec<(&'static str, Option<&'static str>)> {
     ]
 }
 
+/// Variables an inherited shell environment could use to redirect what the
+/// app's own git reads or measures — `npm run tauri dev` from a terminal
+/// inherits them all. None is something the app wants; `GIT_CONFIG_*` in
+/// particular would let the push lock's measurement be fooled.
+pub fn inherited_git_env_to_strip() -> Vec<String> {
+    let mut names: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, _)| k.into_string().ok())
+        .filter(|k| {
+            k.starts_with("GIT_CONFIG_")
+                || matches!(
+                    k.as_str(),
+                    "GIT_EXEC_PATH" | "GIT_DIR" | "GIT_WORK_TREE" | "GIT_COMMON_DIR" | "GIT_INDEX_FILE"
+                )
+        })
+        .collect();
+    // The verify suites redirect the system and global scopes on purpose.
+    if cfg!(test) {
+        names.retain(|k| !matches!(k.as_str(), "GIT_CONFIG_NOSYSTEM" | "GIT_CONFIG_SYSTEM" | "GIT_CONFIG_GLOBAL"));
+    }
+    names
+}
+
 pub struct GitCmd {
     repo: Option<PathBuf>,
+    program: Option<PathBuf>,
     cfg: Vec<(String, String)>,
     top: Vec<String>,
     args: Vec<String>,
@@ -79,12 +102,52 @@ impl GitCmd {
     pub fn at(repo: impl AsRef<Path>) -> Self {
         Self {
             repo: Some(repo.as_ref().to_path_buf()),
+            program: None,
             cfg: Vec::new(),
             top: Vec::new(),
             args: Vec::new(),
             stdin: None,
             timeout: READ_TIMEOUT,
         }
+    }
+
+    /// Run a specific git binary instead of the first on PATH — the push lock
+    /// measures with the system git whose config it lives in.
+    pub fn with_program(mut self, program: impl Into<PathBuf>) -> Self {
+        self.program = Some(program.into());
+        self
+    }
+
+    /// A `-c key=value` for this one command. Never written to any config file.
+    pub fn cfg(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.cfg.push((key.into(), value.into()));
+        self
+    }
+
+    /// A ready-made `key=value` (the clone path builds `core.sshCommand=…`).
+    pub fn cfg_raw(mut self, kv: &str) -> Self {
+        match kv.split_once('=') {
+            Some((k, v)) => self.cfg.push((k.to_string(), v.to_string())),
+            None => self.cfg.push((kv.to_string(), String::new())),
+        }
+        self
+    }
+
+    /// Pin every user setting that would change what a rebase, fetch or diff
+    /// means, so the sync does the same thing on every machine:
+    /// `rebase.updateRefs=true` would move a backup branch along with the
+    /// rebase; `submodule.recurse` would detach submodules on every checkout;
+    /// `fetch.recurseSubmodules` would fail the superproject fetch on one
+    /// unreachable submodule remote; the apply backend has no ancestry-aware
+    /// gitlink merge; `rebaseMerges` changes what "my commits on top" means;
+    /// colour would corrupt the plumbing output the app parses.
+    pub fn pinned(self) -> Self {
+        self.cfg("submodule.recurse", "false")
+            .cfg("fetch.recurseSubmodules", "false")
+            .cfg("rebase.updateRefs", "false")
+            .cfg("rebase.backend", "merge")
+            .cfg("rebase.rebaseMerges", "false")
+            .cfg("color.ui", "never")
     }
 
     /// A top-level flag that must precede the subcommand (e.g.
@@ -134,7 +197,7 @@ impl GitCmd {
     /// or a timeout is an `Err`; a non-zero exit is for the caller to read.
     pub async fn run(self) -> Result<GitOutput, AppError> {
         let sub = self.subcommand();
-        let mut cmd = tokio::process::Command::new("git");
+        let mut cmd = tokio::process::Command::new(self.program.clone().unwrap_or_else(|| PathBuf::from("git")));
         if let Some(dir) = &self.repo {
             cmd.arg("-C").arg(dir);
         }
@@ -155,6 +218,9 @@ impl GitCmd {
                     cmd.env_remove(key);
                 }
             }
+        }
+        for key in inherited_git_env_to_strip() {
+            cmd.env_remove(key);
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());

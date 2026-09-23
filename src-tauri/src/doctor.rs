@@ -439,6 +439,265 @@ pub async fn check_repos() -> Result<Vec<Finding>, AppError> {
     Ok(out)
 }
 
+/// The first `git` on PATH, resolved the way a shell would.
+fn git_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(if cfg!(windows) { "git.exe" } else { "git" });
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+async fn sudo_would_not_ask() -> bool {
+    // `-n` never prompts: success means a live timestamp or a NOPASSWD rule.
+    let run = tokio::process::Command::new("sudo").args(["-n", "true"]).output();
+    matches!(tokio::time::timeout(std::time::Duration::from_secs(5), run).await, Ok(Ok(o)) if o.status.success())
+}
+
+#[cfg(not(unix))]
+async fn sudo_would_not_ask() -> bool {
+    false
+}
+
+/// The push lock: its admin-owned layers, its helper, and every locked
+/// repository. Fix ids all start with `lock-` and run through `push_lock::fix`.
+pub async fn check_push_locks() -> Result<Vec<Finding>, AppError> {
+    use crate::push_lock;
+    let mut out = Vec::new();
+    let status = push_lock::helper_status().await;
+    if !status.supported {
+        return Ok(out);
+    }
+    let has_locks = !status.locks.is_empty();
+    match status.registry.as_str() {
+        "missing" => {
+            if status.installed {
+                out.push(
+                    Finding::new(
+                        "push-lock-registry-missing",
+                        "warning",
+                        "The lock helper is installed but its registry is gone",
+                        "Without the registry no repository is locked. Rebuild it, or remove the helper from Settings if you no longer use push locks.",
+                    )
+                    .with_fix("lock-repair-system", "Rebuild (administrator)"),
+                );
+            }
+            return Ok(out);
+        }
+        "untrusted" => out.push(
+            Finding::new(
+                "push-lock-registry-untrusted",
+                "error",
+                "The push-lock registry is not administrator-owned",
+                "Someone or something replaced the registry directory or file with one this account can write. Until it is repaired, no lock can be trusted.",
+            )
+            .with_fix("lock-repair-system", "Repair (administrator)"),
+        ),
+        "unreadable" => out.push(
+            Finding::new(
+                "push-lock-registry-unreadable",
+                "error",
+                "The push-lock registry cannot be read",
+                "It may have been written by a newer GitSwitch, or damaged. Repairing rewrites it from the helper's own records.",
+            )
+            .with_fix("lock-repair-system", "Repair (administrator)"),
+        ),
+        _ => {}
+    }
+
+    match status.helper.as_str() {
+        "missing" if has_locks => out.push(
+            Finding::new(
+                "push-lock-helper-missing",
+                "error",
+                "The lock helper is missing",
+                format!(
+                    "{} repositories are locked, but the program that applies and removes locks is gone from {}. Locks still hold; they cannot be changed until it is reinstalled.",
+                    status.locks.len(),
+                    status.helper_path.clone().unwrap_or_default()
+                ),
+            )
+            .with_fix("lock-bootstrap", "Reinstall the helper (administrator)"),
+        ),
+        "untrusted" => out.push(
+            Finding::new(
+                "push-lock-helper-untrusted",
+                "error",
+                "The installed lock helper is not the one the registry vouches for",
+                "Its checksum or ownership no longer matches. Reinstalling replaces it with the copy shipped inside this GitSwitch.",
+            )
+            .with_fix("lock-upgrade-helper", "Reinstall the helper (administrator)"),
+        ),
+        "outdated" => out.push(
+            Finding::new(
+                "push-lock-helper-outdated",
+                "info",
+                "A newer lock helper ships with this GitSwitch",
+                format!(
+                    "Installed: {}. Bundled: {}. Upgrading needs the administrator prompt once.",
+                    status.installed_version.clone().unwrap_or_else(|| "unknown".into()),
+                    status.bundled_version.clone().unwrap_or_else(|| "unknown".into())
+                ),
+            )
+            .with_fix("lock-upgrade-helper", "Upgrade (administrator)"),
+        ),
+        _ => {}
+    }
+
+    if has_locks {
+        match status.remote_helper.as_str() {
+            "missing" | "foreign" => out.push(
+                Finding::new(
+                    "push-lock-remote-helper-missing",
+                    "info",
+                    "A refused push shows git's generic error instead of GitSwitch's explanation",
+                    "The small program named git-remote-gitswitch-push-blocked is missing or is not GitSwitch's. Enforcement does not depend on it; the explanation does.",
+                )
+                .with_fix("lock-install-remote-helper", "Install it (administrator)"),
+            ),
+            "unprotected-dir" => out.push(Finding::new(
+                "push-lock-remote-helper-unprotected-dir",
+                "info",
+                "The refused-push explanation lives in a folder this account can write",
+                "Usually a Homebrew-owned /usr/local/bin. Someone could replace the explanation; the lock itself is not affected.",
+            )),
+            _ => {}
+        }
+    }
+
+    for l in &status.locks {
+        let name = crate::paths::base_name(&l.repo);
+        if !l.exists {
+            out.push(
+                Finding::new(
+                    &format!("push-lock-repo-missing:{}", l.repo),
+                    "warning",
+                    format!("{} is locked but no longer exists", name),
+                    format!("{} was moved or deleted. A repository moved elsewhere is not locked at its new place — lock it again there. Forgetting removes the stale entry.", l.repo),
+                )
+                .with_fix(format!("lock-forget:{}", l.repo), "Forget this lock (administrator)"),
+            );
+            continue;
+        }
+        let state = match crate::git_status::push_state_for(&l.repo).await {
+            Ok(s) => s,
+            Err(e) => {
+                out.push(Finding::new(
+                    &format!("push-lock-repo-unreadable:{}", l.repo),
+                    "warning",
+                    format!("{} is locked but could not be read", name),
+                    format!("{}", e),
+                ));
+                continue;
+            }
+        };
+        let lk = &state.lock;
+        if lk.needs_elevation {
+            let codes: Vec<&String> = lk
+                .drift
+                .iter()
+                .filter(|d| !d.starts_with("mirror-") && !d.starts_with("explicit-pushurl") && *d != "hook-redirected")
+                .collect();
+            out.push(
+                Finding::new(
+                    &format!("push-lock-system-drift:{}", l.repo),
+                    "error",
+                    format!("{}'s lock is not fully in place", name),
+                    format!(
+                        "The administrator-owned rules for {} have drifted ({}). Until repaired, a push may not be refused.",
+                        l.repo,
+                        codes.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    ),
+                )
+                .with_fix(format!("lock-repair:{}", l.repo), "Repair (administrator)"),
+            );
+        }
+        if lk.mirrors == "unfixable" {
+            out.push(Finding::new(
+                &format!("push-lock-hook-redirected:{}", l.repo),
+                "warning",
+                format!("{}: core.hooksPath sends hooks elsewhere", name),
+                format!(
+                    "GitSwitch will not write its pre-push hook into {}, so a remote with an explicit push URL is stopped by nothing. The system-scope rewrite still applies to every other remote.",
+                    state.hooks_path_overridden.clone().unwrap_or_default()
+                ),
+            ));
+        }
+        if lk.mirrors == "healed" {
+            out.push(Finding::new(
+                &format!("push-lock-mirrors-healed:{}", l.repo),
+                "info",
+                format!("{}: the user-level mirrors were re-applied just now", name),
+                "Something removed the repository's own flag, rewrite or hook since the last look. The lock's administrator-owned rules were unaffected; see the card's recent events.",
+            ));
+        }
+        for r in state.remotes.iter().filter(|r| r.has_explicit_pushurl) {
+            out.push(
+                Finding::new(
+                    &format!("push-lock-explicit-pushurl:{}", l.repo),
+                    "warning",
+                    format!("{}: remote '{}' has an explicit push URL", name, r.name),
+                    "remote.<name>.pushurl is exempt from pushInsteadOf, so only the pre-push hook stops a push to it — and `--no-verify` skips hooks. Neutralising stores the push URL under gitswitch.savedpushurl.<remote> and removes it; unlocking puts it back.",
+                )
+                .with_fix(format!("lock-neutralise-pushurl:{}", l.repo), "Store and neutralise pushurl"),
+            );
+        }
+    }
+
+    if has_locks {
+        let system_git = push_lock::system_git();
+        if let Some(on_path) = git_on_path() {
+            let same = match (std::fs::canonicalize(&on_path), std::fs::canonicalize(&system_git)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => on_path == system_git,
+            };
+            if !same && system_git.is_absolute() {
+                out.push(Finding::new(
+                    "push-lock-other-git",
+                    "info",
+                    "A different git comes first on your PATH",
+                    format!(
+                        "{} is what your terminal runs; the lock lives in the system config of {}. That other git reads its own system file and is not covered.",
+                        on_path.display(),
+                        system_git.display()
+                    ),
+                ));
+            }
+        }
+        if let Some(uac) = &status.uac {
+            if !uac.enabled || uac.admin_behavior == 0 {
+                out.push(Finding::new(
+                    "push-lock-uac-off",
+                    "warning",
+                    "User Account Control is turned off, so unlocking never asks",
+                    "With UAC disabled (or set to \"never notify\"), any program on this account can run the lock helper elevated without a prompt. Turn UAC back on in Windows settings for the lock to mean anything.",
+                ));
+            } else if matches!(uac.admin_behavior, 2 | 5) {
+                out.push(Finding::new(
+                    "push-lock-uac-consent",
+                    "info",
+                    "On this administrator account the unlock prompt is a click, not a password",
+                    "Windows asks administrators for consent (\"Yes\"), which anyone at the keyboard — or software that can click for you — can give. For a real password prompt, work from a standard account and keep a separate administrator account.",
+                ));
+            }
+        }
+        if sudo_would_not_ask().await {
+            out.push(Finding::new(
+                "push-lock-sudo-cached",
+                "info",
+                "sudo would not ask this terminal for a password right now",
+                "A live sudo timestamp or a NOPASSWD rule means the unlock helper could be run from a terminal without a new password until it expires. GitSwitch's own prompt is unaffected.",
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Fixes
 // ---------------------------------------------------------------------------
