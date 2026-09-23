@@ -43,6 +43,8 @@ mod tests {
                 "push": o.push,
                 "pull": o.pull,
                 "submodules": o.submodules,
+                "lfs": o.lfs,
+                "sync": o.sync,
                 "staged": o.status.as_ref().map(|s| s.staged_count),
                 "unstaged": o.status.as_ref().map(|s| s.unstaged_count),
                 "untracked": o.status.as_ref().map(|s| s.untracked_count),
@@ -85,13 +87,63 @@ mod tests {
                 show(git_ops::commit(&repo(), first, amend).await)
             }
             "push" => show(git_ops::push(&repo(), first == "upstream").await),
-            "pull" => show(git_ops::pull(&repo(), PullMode::parse(first).unwrap()).await),
+            "pull" => {
+                let with_lfs = a.get(1).map(|s| s == "lfs").unwrap_or(false);
+                show(git_ops::pull(&repo(), PullMode::parse(first).unwrap(), with_lfs).await)
+            }
             "submodule" => show(git_ops::submodule_update(&repo()).await),
             "abort" => show(git_ops::abort(&repo()).await),
-            "block" => match git_status::set_push_blocked_for(&repo(), first == "on").await {
+            "continue" => show(git_ops::continue_op(&repo()).await),
+            // PROBE_ARGS: "stash" | "nostash"
+            "sync_plan" => match crate::sync::sync_plan(&repo(), first != "nostash", true).await {
+                Ok(p) => emit(&p),
+                Err(e) => emit_err(e),
+            },
+            // PROBE_ARGS: "[nostash][,bundles]" — no fingerprint: the run measures afresh
+            "sync_run" => show(crate::sync::sync_run(&repo(), crate::sync::RunOptions { stash: !a.iter().any(|s| s == "nostash"), bundles: a.iter().any(|s| s == "bundles"), fingerprint: Vec::new() }).await),
+            "sync_continue" => show(crate::sync::sync_continue(&repo()).await),
+            "sync_abort" => show(crate::sync::sync_abort(&repo()).await),
+            "record_pointers" => show(crate::sync::record_pointers(&repo()).await),
+            "block" => match crate::push_lock::set_push_mode(&repo(), if first == "on" { "guardrail" } else { "allowed" }).await {
+                Ok(r) => match r.state {
+                    Some(s) => emit(&s),
+                    None => emit(&r),
+                },
+                Err(e) => emit_err(e),
+            },
+            // The guard-rail path on its own (what the old boolean toggle did),
+            // to prove it cannot remove a lock.
+            "guardrail_off" => match git_status::git_paths(std::path::Path::new(&repo())).await {
+                Ok(paths) => match crate::push_guard::set_repo_blocked(&repo(), &paths.hooks, false, git_status::owning_profile_id(&repo()).as_deref()).await {
+                    Ok(s) => emit(&s),
+                    Err(e) => emit_err(e),
+                },
+                Err(e) => emit_err(e),
+            },
+            "push_mode" => match crate::push_lock::set_push_mode(&repo(), first).await {
+                Ok(r) => emit(&r),
+                Err(e) => emit_err(e),
+            },
+            "lock_state" => match git_status::push_state_for(&repo()).await {
                 Ok(s) => emit(&s),
                 Err(e) => emit_err(e),
             },
+            "lock_repair" => match crate::push_lock::repair_lock(&repo()).await {
+                Ok(r) => emit(&r),
+                Err(e) => emit_err(e),
+            },
+            "lock_fix" => emit(&crate::push_lock::fix(first).await),
+            "lock_helper_status" => emit(&crate::push_lock::helper_status().await),
+            "lock_uninstall" => emit(&crate::push_lock::uninstall_all().await),
+            "doctor_locks" => match crate::doctor::check_push_locks().await {
+                Ok(f) => emit(&f),
+                Err(e) => emit_err(e),
+            },
+            "lfs_status" => match crate::lfs::lfs_status(&repo()).await {
+                Ok(r) => emit(&r),
+                Err(e) => emit_err(e),
+            },
+            "lfs_pull" => show(git_ops::lfs_pull(&repo()).await),
             "submodules_list" => match crate::submodules::list_submodules(&repo()).await {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),
@@ -99,11 +151,22 @@ mod tests {
             // --- features that predate the Changes page ---
             "clone" => {
                 let with_submodules = a.get(3).map(|s| s == "submodules").unwrap_or(false);
-                match crate::sparse::full_clone(first, a.get(1).map(|s| s.as_str()).unwrap_or(""), a.get(2).map(|s| s.as_str()), None, with_submodules).await {
+                let with_lfs = a.get(4).map(|s| s == "lfs").unwrap_or(false);
+                match crate::sparse::full_clone(first, a.get(1).map(|s| s.as_str()).unwrap_or(""), a.get(2).map(|s| s.as_str()), None, with_submodules, with_lfs).await {
                     Ok(r) => emit(&r),
                     Err(e) => emit_err(e),
                 }
             }
+            // PROBE_ARGS = "<dir1:dir2>[,lfs]"
+            "sparse_set" => {
+                let dirs: Vec<String> = first.split(':').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+                let with_lfs = a.get(1).map(|s| s == "lfs").unwrap_or(false);
+                match crate::sparse::sparse_set(&repo(), dirs, with_lfs).await {
+                    Ok(r) => emit(&r),
+                    Err(e) => emit_err(e),
+                }
+            }
+            "lfs_available" => emit(&crate::lfs::lfs_available().await),
             "sparse_clone" => match crate::sparse::sparse_clone(first, a.get(1).map(|s| s.as_str()).unwrap_or(""), a.get(2).map(|s| s.as_str()), None).await {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),

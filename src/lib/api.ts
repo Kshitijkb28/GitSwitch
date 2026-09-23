@@ -397,6 +397,25 @@ export interface SubmoduleReport {
   error: string | null;
 }
 
+/** The large files after a checkout — present whenever the repo uses Git LFS. */
+export interface LfsReport {
+  installed: boolean;
+  requested: boolean;
+  tracked: number;
+  fetched: number;
+  pointers_left: number;
+  configured_now: boolean;
+  error: string | null;
+  /** One sentence for the UI, written by the backend. */
+  note: string;
+}
+
+export interface LfsTool {
+  installed: boolean;
+  version: string | null;
+  install_hint: string;
+}
+
 export interface CloneResult {
   path: string;
   /** Profile whose SSH key authenticated the clone. */
@@ -404,6 +423,15 @@ export interface CloneResult {
   /** Set when the new folder was added to that profile. */
   mapped_to: string | null;
   submodules: SubmoduleReport | null;
+  lfs: LfsReport | null;
+}
+
+export interface SparseSetResult {
+  lfs: LfsReport | null;
+}
+
+export async function lfsAvailable(): Promise<LfsTool> {
+  return invoke("lfs_available");
 }
 
 /** `cloneAs` = profile id to authenticate as; null lets the folder decide. */
@@ -426,7 +454,8 @@ export async function fullClone(
   parentDir: string,
   folderName?: string | null,
   cloneAs?: string | null,
-  withSubmodules = true
+  withSubmodules = true,
+  withLfs = true
 ): Promise<CloneResult> {
   return invoke("full_clone", {
     url,
@@ -434,6 +463,7 @@ export async function fullClone(
     folderName: folderName ?? null,
     cloneAs: cloneAs || null,
     withSubmodules,
+    withLfs,
   });
 }
 
@@ -543,9 +573,10 @@ export async function sparseRepoInfo(repoPath: string): Promise<SparseInfo> {
 
 export async function sparseSet(
   repoPath: string,
-  dirs: string[]
-): Promise<void> {
-  return invoke("sparse_set", { repoPath, dirs });
+  dirs: string[],
+  withLfs = true
+): Promise<SparseSetResult> {
+  return invoke("sparse_set", { repoPath, dirs, withLfs });
 }
 
 export async function sparseAdd(
@@ -654,6 +685,9 @@ export interface ChangeEntry {
   sub_untracked: boolean;
   /** For a submodule, the commit the superproject records. */
   recorded_oid: string | null;
+  /** Conflicted entries only: modes and oids of index stages 1, 2, 3 (base, ours, theirs). */
+  stage_modes?: string[];
+  stage_oids?: string[];
   staged_added: number | null;
   staged_removed: number | null;
   unstaged_added: number | null;
@@ -666,6 +700,27 @@ export interface InProgress {
   label: string;
   detail: string;
   abort_command: string;
+  /** What finishes it once conflicts are staged; null when only a commit or nothing can. */
+  continue_command: string | null;
+}
+
+/** A sync that is paused or running in this repository (or in its superproject). */
+export interface SyncSummary {
+  /** preparing | rebasing | aligning | done | aborted */
+  phase: string;
+  started_at: string;
+  needs_user: SyncNeedsUser | null;
+  /** The superproject the sync belongs to — this repo, or the parent of a submodule. */
+  root: string;
+  /** False when this repository is a submodule of the one being synced. */
+  is_root: boolean;
+}
+
+export interface SyncNeedsUser {
+  /** superproject | submodule:<path> | submodule-autostash:<path> | autostash-conflict */
+  where_: string;
+  paths: string[];
+  hint: string;
 }
 
 export interface RepoIdentity {
@@ -690,6 +745,37 @@ export interface RemotePushState {
   has_explicit_pushurl: boolean;
 }
 
+export interface LockEvent {
+  ts: string;
+  repo: string;
+  code: string;
+  detail: string;
+  healed: boolean;
+}
+
+/** The tamper-resistant lock, measured. Nested in PushState because the page replaces `status.push` wholesale. */
+export interface LockState {
+  supported: boolean;
+  platform: string | null;
+  locked: boolean;
+  registry: "ok" | "missing" | "untrusted" | "unreadable" | string;
+  system_include: "ok" | "missing" | "wrong-target" | string;
+  stanza: "ok" | "missing" | "stale" | string;
+  system_rewrite_measured: boolean;
+  helper: "ok" | "missing" | "outdated" | "untrusted" | string;
+  helper_installed: boolean;
+  remote_helper: "ok" | "missing" | "foreign" | "unprotected-dir" | string;
+  mirrors: "ok" | "healed" | "drifted" | "unfixable" | string;
+  drift: string[];
+  needs_elevation: boolean;
+  caveats: string[];
+  locked_at: string | null;
+  recent_events: LockEvent[];
+  system_gitconfig: string | null;
+  audit_log: string | null;
+  bundled_helper_sha256: string | null;
+}
+
 export interface PushState {
   profile_blocked: boolean;
   profile_name: string | null;
@@ -702,6 +788,74 @@ export interface PushState {
   remotes: RemotePushState[];
   gaps: string[];
   needs_repair: boolean;
+  lock: LockState;
+}
+
+export type PushMode = "allowed" | "guardrail" | "locked";
+
+export type JobOutcomeKind =
+  | "applied"
+  | "cancelled"
+  | "denied"
+  | "no-agent"
+  | "manual-required"
+  | "busy"
+  | "failed"
+  | "refused"
+  | "unsupported";
+
+export interface LockChange {
+  op: string;
+  repo?: string | null;
+  detail: string;
+}
+
+export interface JobOutcome {
+  outcome: JobOutcomeKind;
+  message: string;
+  command: string | null;
+  job_nonce: string | null;
+  changed: LockChange[];
+  errors: string[];
+  bootstrapped: boolean;
+}
+
+export interface PushModeResult {
+  outcome: JobOutcomeKind;
+  message: string;
+  command: string | null;
+  job_nonce: string | null;
+  state: PushState | null;
+}
+
+export interface LockSummary {
+  repo: string;
+  label: string;
+  locked_at: string;
+  exists: boolean;
+}
+
+export interface HelperStatus {
+  supported: boolean;
+  platform: string | null;
+  helper_path: string | null;
+  installed: boolean;
+  installed_version: string | null;
+  installed_sha256: string | null;
+  helper: "ok" | "missing" | "outdated" | "untrusted" | string;
+  bundled_path: string | null;
+  bundled_version: string | null;
+  bundled_sha256: string | null;
+  bundled_signed: boolean;
+  registry: string;
+  locks: LockSummary[];
+  system_gitconfig: string | null;
+  remote_helper: string;
+  remote_helper_path: string | null;
+  registry_dir: string | null;
+  audit_log: string | null;
+  events_log: string | null;
+  uac: { enabled: boolean; admin_behavior: number } | null;
 }
 
 export interface RepoStatus {
@@ -730,6 +884,10 @@ export interface RepoStatus {
   head_subject: string | null;
   merge_message: string | null;
   has_submodules: boolean;
+  /** Some tracked .gitattributes routes files through Git LFS. */
+  uses_lfs: boolean;
+  /** A paused sync here or in the superproject this repo belongs to. */
+  sync?: SyncSummary | null;
 }
 
 export interface MovedCommit {
@@ -771,6 +929,32 @@ export interface SubmoduleInfo {
     | "not-initialised"
     | "unmapped";
   summary: string;
+  gitdir_valid: boolean;
+  operation: string | null;
+  conflicted: number;
+  upstream_remote: string | null;
+}
+
+export interface LfsStatus {
+  installed: boolean;
+  version: string | null;
+  uses_lfs: boolean;
+  /** `git lfs install --local` has been run here (or globally). */
+  filters_configured: boolean;
+  tracked: number;
+  /** Files still holding a pointer stub — what `git lfs pull` would fetch. */
+  pointers: number;
+  pointer_paths: string[];
+  more_pointers: number;
+  summary: string;
+}
+
+export async function changesLfsStatus(repoPath: string): Promise<LfsStatus> {
+  return invoke("changes_lfs_status", { repoPath });
+}
+
+export async function changesLfsPull(repoPath: string): Promise<OpResult> {
+  return invoke("changes_lfs_pull", { repoPath });
 }
 
 export async function changesSubmodules(repoPath: string): Promise<SubmoduleInfo[]> {
@@ -857,6 +1041,149 @@ export interface OpResult {
   push?: PushOutcome;
   pull?: PullOutcome;
   submodules?: SubmoduleReport;
+  lfs?: LfsStatus;
+  sync?: SyncOutcome;
+}
+
+// --- Sync: the latest from upstream with your commits on top -----------------
+
+export interface SyncCommitRef {
+  oid: string;
+  short: string;
+  subject: string;
+  /** Submodule paths whose pointer this commit moves. */
+  touches: string[];
+}
+
+export interface SyncSubPlan {
+  path: string;
+  name: string | null;
+  /** none | fast-forward | rebase | ahead | blocked */
+  action: string;
+  reason: string;
+  head: string | null;
+  recorded: string;
+  target: string | null;
+  rebase_onto: string | null;
+  predicted_gitlink_conflict: boolean;
+  branch: string | null;
+  detached: boolean;
+  reattach_to: string | null;
+  dirty_tracked: number;
+  untracked: number;
+  fetch_error: string | null;
+  notes: string[];
+}
+
+export interface SyncSuperPlan {
+  branch: string;
+  upstream: string;
+  head: string;
+  upstream_oid: string;
+  ahead: number;
+  behind: number;
+  own_commits: SyncCommitRef[];
+  incoming: SyncCommitRef[];
+  /** Files both sides changed: where conflicts are likely. */
+  file_overlap: string[];
+  dirty_count: number;
+  untracked: number;
+  will_stash: boolean;
+  notes: string[];
+}
+
+export interface SyncSkipped {
+  path: string;
+  /** unmapped | not-initialised */
+  why: string;
+}
+
+export interface SyncPlan {
+  can_run: boolean;
+  nothing_to_do: boolean;
+  refusal: Refusal | null;
+  blockers: string[];
+  superproject: SyncSuperPlan;
+  submodules: SyncSubPlan[];
+  skipped: SyncSkipped[];
+  /** Oids the run re-checks: ["", upstream] then [path, target] per submodule. */
+  fingerprint: [string, string][];
+  summary: string;
+}
+
+export interface SyncSubOutcome {
+  path: string;
+  action: string;
+  head_before: string | null;
+  head_after: string | null;
+  recorded_after: string | null;
+  ok: boolean;
+  note: string;
+}
+
+export interface SyncBackupRef {
+  repo: string;
+  branch: string;
+  oid: string;
+  /** The exact command that puts that repository back. */
+  recovery: string;
+}
+
+export interface SyncVerified {
+  behind_zero: boolean;
+  own_on_top: boolean;
+  dirty_paths_unchanged: boolean;
+  untracked_unchanged: boolean;
+  submodules_aligned: boolean;
+  no_conflicts_left: boolean;
+}
+
+export interface SyncOutcome {
+  /** done | needs-user | aborted | failed */
+  phase: string;
+  needs_user: SyncNeedsUser | null;
+  backups: SyncBackupRef[];
+  bundles: string[];
+  head_before: string;
+  head_after: string;
+  incoming: number;
+  own_kept: SyncCommitRef[];
+  own_dropped: SyncCommitRef[];
+  stashed: boolean;
+  /** An autostash entry git could not re-apply is still in `git stash list`. */
+  stash_left: boolean;
+  submodules: SyncSubOutcome[];
+  verified: SyncVerified;
+  /** Submodules checked out ahead of what the branch records after the sync. */
+  unrecorded_pointers: string[];
+}
+
+/** Says exactly what a sync would do; nothing is changed. `fetch` false re-plans locally after a stash toggle. */
+export async function changesSyncPlan(repoPath: string, stash: boolean, fetch: boolean): Promise<SyncPlan> {
+  return invoke("changes_sync_plan", { repoPath, stash, fetch });
+}
+
+/** Runs the plan; refuses when upstream moved since it was assessed (the fingerprint). */
+export async function changesSyncRun(
+  repoPath: string,
+  stash: boolean,
+  bundles: boolean,
+  fingerprint: [string, string][]
+): Promise<OpResult> {
+  return invoke("changes_sync_run", { repoPath, stash, bundles, fingerprint });
+}
+
+export async function changesSyncContinue(repoPath: string): Promise<OpResult> {
+  return invoke("changes_sync_continue", { repoPath });
+}
+
+export async function changesSyncAbort(repoPath: string): Promise<OpResult> {
+  return invoke("changes_sync_abort", { repoPath });
+}
+
+/** One commit recording every submodule checked out ahead of what the branch records. */
+export async function changesRecordPointers(repoPath: string): Promise<OpResult> {
+  return invoke("changes_record_pointers", { repoPath });
 }
 
 export type PullMode = "ff-only" | "merge" | "rebase";
@@ -902,12 +1229,21 @@ export async function changesPush(repoPath: string, setUpstream: boolean): Promi
   return invoke("changes_push", { repoPath, setUpstream });
 }
 
-export async function changesPull(repoPath: string, mode: PullMode): Promise<OpResult> {
-  return invoke("changes_pull", { repoPath, mode });
+/** `withLfs` also downloads LFS content — a plain pull leaves pointer stubs. */
+export async function changesPull(
+  repoPath: string,
+  mode: PullMode,
+  withLfs: boolean
+): Promise<OpResult> {
+  return invoke("changes_pull", { repoPath, mode, withLfs });
 }
 
 export async function changesSubmoduleUpdate(repoPath: string): Promise<OpResult> {
   return invoke("changes_submodule_update", { repoPath });
+}
+
+export async function changesContinue(repoPath: string): Promise<OpResult> {
+  return invoke("changes_continue", { repoPath });
 }
 
 export async function changesAbort(repoPath: string): Promise<OpResult> {
@@ -918,11 +1254,33 @@ export async function changesPushState(repoPath: string): Promise<PushState> {
   return invoke("changes_push_state", { repoPath });
 }
 
-export async function changesSetPushBlocked(
-  repoPath: string,
-  blocked: boolean
-): Promise<PushState> {
-  return invoke("changes_set_push_blocked", { repoPath, blocked });
+/** "allowed" | "guardrail" | "locked". Locking and unlocking show the OS administrator prompt; the outcome may be "cancelled". */
+export async function changesSetPushMode(repoPath: string, mode: PushMode): Promise<PushModeResult> {
+  return invoke("changes_set_push_mode", { repoPath, mode });
+}
+
+export async function changesRepairPushLock(repoPath: string): Promise<PushModeResult> {
+  return invoke("changes_repair_push_lock", { repoPath });
+}
+
+export async function pushLockHelperStatus(): Promise<HelperStatus> {
+  return invoke("push_lock_helper_status");
+}
+
+export async function pushLockUninstall(): Promise<JobOutcome> {
+  return invoke("push_lock_uninstall");
+}
+
+export async function pushLockFix(fix: string): Promise<JobOutcome> {
+  return invoke("push_lock_fix", { fix });
+}
+
+export async function pushLockFinishManual(nonce: string): Promise<JobOutcome> {
+  return invoke("push_lock_finish_manual", { nonce });
+}
+
+export async function doctorCheckPushLocks(): Promise<Finding[]> {
+  return invoke("doctor_check_push_locks");
 }
 
 export async function changesRepairPushBlock(repoPath: string): Promise<PushState> {

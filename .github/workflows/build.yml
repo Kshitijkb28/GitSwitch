@@ -7,13 +7,72 @@ on:
   push:
     tags:
       - "v*"
+    branches:
+      - "**"
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  # The push lock's privileged helper, proven on every platform. GitHub's
+  # Linux and macOS runners have passwordless sudo and the Windows runner is
+  # already elevated with UAC off, so besides the unprivileged test-root mode
+  # the suite runs the REAL helper against the runner's real system paths
+  # (LOCK_REAL=1) and uninstalls it afterwards. Throwaway VMs; nothing else
+  # could prove Linux and Windows without a person at a prompt.
+  verify-lock:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+      - name: Install Linux deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            git-lfs
+      - name: Install git-lfs (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install git-lfs
+      - name: Build the lock helper sidecar
+        shell: bash
+        run: bash scripts/build-lock-helper.sh debug
+      - name: Lock suite (test root, no privileges)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: bash scripts/verify/lock.sh
+      - name: Lock suite (REAL helper on the runner's system paths)
+        shell: bash
+        env:
+          LOCK_REAL: "1"
+        run: bash scripts/verify/lock.sh
+      - name: Git suites (Changes sandbox, regression, submodules, LFS)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          bash scripts/verify/sandbox.sh
+          bash scripts/verify/regression.sh
+          bash scripts/verify/submodules.sh
+          bash scripts/verify/lfs.sh
+
   build:
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -59,6 +118,12 @@ jobs:
 
       - name: Install frontend deps
         run: npm ci
+
+      # tauri-build refuses to compile the app without the lock-helper sidecar
+      # file, so build it (host triple) before the tests. `tauri build` below
+      # rebuilds it for the bundle target through beforeBuildCommand.
+      - name: Build the lock helper sidecar
+        run: bash scripts/build-lock-helper.sh release
 
       - name: Run Rust unit tests
         run: cargo test --manifest-path src-tauri/Cargo.toml

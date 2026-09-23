@@ -206,6 +206,104 @@ pub struct CloneResult {
     pub mapped_to: Option<String>,
     /// Present when submodules were requested.
     pub submodules: Option<SubmoduleReport>,
+    /// Present whenever the repository uses Git LFS — whether or not the
+    /// download was requested, so the result can say what state the large
+    /// files are in either way.
+    pub lfs: Option<LfsReport>,
+}
+
+/// What happened to the large files after a checkout. Measured by counting
+/// pointer stubs before and after, like the Changes page's LFS card.
+#[derive(Debug, Serialize, Clone)]
+pub struct LfsReport {
+    pub installed: bool,
+    pub requested: bool,
+    pub tracked: usize,
+    pub fetched: usize,
+    pub pointers_left: usize,
+    /// `git lfs install --local` had to be run first (a fresh clone with no
+    /// global LFS filters is exactly the state in which `git lfs pull` does nothing).
+    pub configured_now: bool,
+    pub error: Option<String>,
+    /// One sentence, written here so the Clone page and its result say the same thing.
+    pub note: String,
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {}", one)
+    } else {
+        format!("{} {}", n, many)
+    }
+}
+
+/// After a clone or a sparse checkout: download the LFS content when asked
+/// and possible, and in every case say what state the large files are in.
+/// `None` when the repository does not use LFS. Never an error — the
+/// repository is usable and the Changes page can retry.
+pub(crate) async fn lfs_after_checkout(repo: &Path, requested: bool) -> Option<LfsReport> {
+    let repo_str = repo.to_string_lossy().to_string();
+    let before = crate::lfs::lfs_status(&repo_str).await.ok()?;
+    if !before.uses_lfs {
+        return None;
+    }
+    let stubs = |n: usize| plural(n, "large file is a pointer stub", "large files are pointer stubs");
+    let go_to_changes = "open the repository in Changes → Git LFS → Pull LFS files";
+    if requested && before.installed && before.pointers > 0 {
+        return Some(match crate::git_ops::fetch_lfs_content(&repo_str).await {
+            Ok(f) => {
+                let note = if let Some(a) = &f.error {
+                    format!("The large files could not be downloaded: {} To retry, {}.", a.headline, go_to_changes)
+                } else if f.after.pointers == 0 {
+                    format!("Downloaded {} (Git LFS).", plural(f.fetched, "large file", "large files"))
+                } else {
+                    format!("Downloaded {}; {} — {}.", plural(f.fetched, "large file", "large files"), stubs(f.after.pointers), go_to_changes)
+                };
+                LfsReport {
+                    installed: true,
+                    requested,
+                    tracked: f.after.tracked,
+                    fetched: f.fetched,
+                    pointers_left: f.after.pointers,
+                    configured_now: f.configured_now,
+                    error: f.error.map(|a| a.headline),
+                    note,
+                }
+            }
+            Err(e) => LfsReport {
+                installed: true,
+                requested,
+                tracked: before.tracked,
+                fetched: 0,
+                pointers_left: before.pointers,
+                configured_now: false,
+                error: Some(e.to_string()),
+                note: format!("The large files could not be downloaded ({}). To retry, {}.", e, go_to_changes),
+            },
+        });
+    }
+    let note = if !before.installed {
+        format!(
+            "This repository uses Git LFS, but git-lfs isn't installed on this computer, so {}. Install it ({}) and then {}.",
+            stubs(before.pointers),
+            crate::lfs::install_hint(),
+            go_to_changes
+        )
+    } else if before.pointers == 0 {
+        format!("All {} present (Git LFS).", plural(before.tracked, "large file is", "large files are"))
+    } else {
+        format!("{} — {} to download {}.", stubs(before.pointers), go_to_changes, if before.pointers == 1 { "it" } else { "them" })
+    };
+    Some(LfsReport {
+        installed: before.installed,
+        requested,
+        tracked: before.tracked,
+        fetched: 0,
+        pointers_left: before.pointers,
+        configured_now: false,
+        error: None,
+        note,
+    })
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -268,17 +366,19 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
     let mut failed: Vec<String> = Vec::new();
     let mut first_error: Option<String> = None;
     for path in &listed {
-        let mut args: Vec<String> = Vec::new();
-        if let Some(cmd) = ssh_override {
-            args.push("-c".into());
-            args.push(cmd.to_string());
+        // The hardened runner: a network timeout, no credential prompt that
+        // could hang a GUI forever, and the ssh override as a `-c` for this
+        // command only.
+        let mut cmd = crate::git_exec::GitCmd::at(repo);
+        if let Some(kv) = ssh_override {
+            cmd = cmd.cfg_raw(kv);
         }
-        for a in ["submodule", "update", "--init", "--recursive", "--"] {
-            args.push(a.into());
-        }
-        args.push(path.clone());
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        if let Err(e) = run_git(Some(repo), &refs).await {
+        let res = cmd
+            .args(["submodule", "update", "--init", "--recursive", "--", path])
+            .timeout(crate::git_exec::NET_TIMEOUT)
+            .text()
+            .await;
+        if let Err(e) = res {
             failed.push(path.clone());
             if first_error.is_none() {
                 first_error = Some(match e {
@@ -458,6 +558,7 @@ async fn clone_as_profile(
     clone_as: Option<&str>,
     extra_args: &[&str],
     with_submodules: bool,
+    with_lfs: bool,
 ) -> Result<CloneResult, AppError> {
     let (parent, name, dest) = clone_destination(url, parent_dir, folder_name)?;
     let dest_str = dest.to_string_lossy().to_string();
@@ -517,6 +618,13 @@ async fn clone_as_profile(
     } else {
         None
     };
+    // Same rule for the large files: reported, never fatal. A `--no-checkout`
+    // clone has no work tree yet, so its LFS step waits for `sparse_set`.
+    let lfs = if extra_args.contains(&"--no-checkout") {
+        None
+    } else {
+        lfs_after_checkout(&dest, with_lfs).await
+    };
 
     let mut mapped_to = None;
     if let Some(p) = chosen.as_ref() {
@@ -541,6 +649,7 @@ async fn clone_as_profile(
         profile_name: acting.map(|p| p.name),
         mapped_to,
         submodules,
+        lfs,
     })
 }
 
@@ -552,7 +661,7 @@ pub async fn sparse_clone(
     folder_name: Option<&str>,
     clone_as: Option<&str>,
 ) -> Result<CloneResult, AppError> {
-    clone_as_profile(url, parent_dir, folder_name, clone_as, &["--filter=blob:none", "--no-checkout"], false).await
+    clone_as_profile(url, parent_dir, folder_name, clone_as, &["--filter=blob:none", "--no-checkout"], false, false).await
 }
 
 /// Ordinary full clone — what `git clone <url>` does in a terminal.
@@ -562,8 +671,9 @@ pub async fn full_clone(
     folder_name: Option<&str>,
     clone_as: Option<&str>,
     with_submodules: bool,
+    with_lfs: bool,
 ) -> Result<CloneResult, AppError> {
-    clone_as_profile(url, parent_dir, folder_name, clone_as, &[], with_submodules).await
+    clone_as_profile(url, parent_dir, folder_name, clone_as, &[], with_submodules, with_lfs).await
 }
 
 /// Inspect a repo: default branch, top-level folders, and current sparse config.
@@ -605,9 +715,16 @@ pub async fn repo_info(repo_path: &str) -> Result<SparseInfo, AppError> {
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct SparseSetResult {
+    /// Present when the repository uses Git LFS (see `lfs_after_checkout`).
+    pub lfs: Option<LfsReport>,
+}
+
 /// Set the sparse folder selection (replaces the current set) and materialize:
-/// `sparse-checkout init --cone` → `sparse-checkout set <dirs>` → `checkout <branch>`.
-pub async fn sparse_set(repo_path: &str, dirs: Vec<String>) -> Result<(), AppError> {
+/// `sparse-checkout init --cone` → `sparse-checkout set <dirs>` → `checkout <branch>`,
+/// then the LFS step for what is now checked out.
+pub async fn sparse_set(repo_path: &str, dirs: Vec<String>, with_lfs: bool) -> Result<SparseSetResult, AppError> {
     if dirs.is_empty() {
         return Err(AppError::Config("Select at least one folder".into()));
     }
@@ -623,7 +740,7 @@ pub async fn sparse_set(repo_path: &str, dirs: Vec<String>) -> Result<(), AppErr
     let branch = run_git(Some(&repo), &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
     run_git(Some(&repo), &["checkout", &branch]).await?;
 
-    Ok(())
+    Ok(SparseSetResult { lfs: lfs_after_checkout(&repo, with_lfs).await })
 }
 
 /// Add folders to an existing sparse checkout: `git sparse-checkout add <dirs>`.

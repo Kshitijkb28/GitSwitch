@@ -24,6 +24,7 @@ const STEPS: Step[] = [
   { key: "profiles", label: "Profiles & folders", run: api.doctorCheckProfiles },
   { key: "repos", label: "Repository remotes", run: api.doctorCheckRepos },
   { key: "keys", label: "SSH key ↔ GitHub account", run: api.doctorCheckKeys },
+  { key: "locks", label: "Push locks", run: api.doctorCheckPushLocks },
 ];
 
 const SEVERITY_ORDER: Record<string, number> = { error: 0, warning: 1, info: 2, ok: 3 };
@@ -102,6 +103,17 @@ export function Doctor() {
         toast.success(
           changed > 0 ? "Remote converted to SSH" : "Nothing needed converting"
         );
+      } else if (finding.fix.startsWith("lock-")) {
+        // Most of these open the administrator prompt; the outcome — cancelled
+        // included — comes back as a sentence rather than an exception.
+        const r = await api.pushLockFix(finding.fix);
+        if (r.outcome === "applied") {
+          toast.success(r.message);
+        } else if (r.outcome === "manual-required" && r.command) {
+          setError(`${r.message}\n${r.command}`);
+        } else {
+          setError(r.message);
+        }
       }
       await runChecks();
     } catch (e) {
@@ -128,7 +140,8 @@ export function Doctor() {
           <h1 className="text-2xl font-bold text-zinc-100">Doctor</h1>
           <p className="text-sm text-zinc-400 mt-1">
             Checks the things that silently send commits to the wrong account —
-            ssh config overrides, unregistered keys, HTTPS remotes and leaked tokens.
+            ssh config overrides, unregistered keys, HTTPS remotes and leaked tokens —
+            and that every push lock is still in place.
           </p>
         </div>
         <Button onClick={runChecks} disabled={running}>
@@ -147,7 +160,7 @@ export function Doctor() {
       </div>
 
       {error && (
-        <div className="px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm break-words">
+        <div className="px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm break-words whitespace-pre-wrap">
           {error}
         </div>
       )}

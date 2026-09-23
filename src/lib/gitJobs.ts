@@ -12,7 +12,7 @@ import type { OpResult } from "./api";
  * One slot per repository, so two repos can be busy at once without either
  * hiding the other.
  */
-export type GitJobKind = "pull" | "push" | "fetch" | "submodules";
+export type GitJobKind = "pull" | "push" | "fetch" | "submodules" | "lfs" | "sync";
 
 export type GitJob = {
   repo: string;
@@ -85,6 +85,11 @@ export async function runJob(
 ): Promise<OpResult | undefined> {
   const existing = jobs.get(repo);
   if (existing?.running) return undefined;
+  // A superproject and its submodules share files: a sync of the parent must
+  // not race a pull inside a submodule, and vice versa.
+  for (const j of jobs.values()) {
+    if (j.running && (repo.startsWith(j.repo + "/") || j.repo.startsWith(repo + "/"))) return undefined;
+  }
 
   jobs.set(repo, { repo, kind, label, startedAt: Date.now(), running: true });
   emit();

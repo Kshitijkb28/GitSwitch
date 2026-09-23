@@ -616,9 +616,13 @@ export function ProfileForm() {
                 </span>
               ) : (
                 <span className="block text-xs text-zinc-600 mt-1">
-                  Covers standard github.com remotes. Repos with a custom
-                  ssh-host alias or an explicit push URL aren't blocked; if
-                  folders overlap, a block from any covering profile wins.
+                  Covers standard github.com remotes in this profile's folders.
+                  Remotes with a custom ssh-host alias or an explicit push URL,
+                  and anyone who sets a more specific rewrite of their own or
+                  GIT_CONFIG_NOSYSTEM, get past it. A folder profile that allows
+                  pushes does not undo a parent profile's block. For a block that
+                  needs the administrator password to remove, lock the repository
+                  on the Changes page.
                 </span>
               )}
             </span>

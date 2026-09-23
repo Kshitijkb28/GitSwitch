@@ -90,10 +90,14 @@ fn get_profile_gitconfig_path(profile: &Profile) -> String {
 ///
 /// pushInsteadOf is a literal prefix match, so cover every common github.com
 /// remote form. Known limits (documented in the UI): custom ssh-config host
-/// aliases and remotes with an explicit remote.<name>.pushurl are not caught.
-/// This section must only ever be written into per-folder include files, never
-/// the main ~/.gitconfig — rewrite rules ACCUMULATE across includes (they are
-/// not last-match-wins), so a global block could never be overridden.
+/// aliases and remotes with an explicit remote.<name>.pushurl are not caught,
+/// a LONGER rewrite in any scope wins over these (git picks the longest
+/// match), and `GIT_CONFIG_NOSYSTEM` / another git binary skip config
+/// altogether. This section is only ever written into per-folder include
+/// files, never the main ~/.gitconfig: a block there would apply to every
+/// folder, and undoing it per folder would need a longer rewrite for each URL
+/// form. The push lock (push_lock.rs) is the variant that needs the
+/// administrator password to remove.
 fn push_block_section() -> &'static str {
     "[url \"gitswitch-push-blocked://\"]\n\
      \tpushInsteadOf = git@github.com:\n\
@@ -166,10 +170,10 @@ pub fn apply_git_config() -> Result<(), AppError> {
             ));
         }
 
-        // Intentionally NO push-block here: url rewrite rules accumulate across
-        // includes, so a block in the main config could never be overridden by
-        // folder profiles that allow pushes. profiles.rs enforces that the
-        // default profile always allows pushes.
+        // Intentionally NO push-block here: a block in the main config would
+        // apply to every folder, and a folder profile could only undo it with a
+        // longer rewrite per URL form. profiles.rs enforces that the default
+        // profile always allows pushes.
     }
 
     for profile in &store.profiles {

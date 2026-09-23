@@ -39,7 +39,10 @@ for folders that still use HTTPS.
 - **Clone** — clone over SSH as the right account. The destination folder's
   profile decides the key, or pick one with **Clone as** (the new folder is then
   added to that profile). Downloads submodules with the same result as
-  `git clone --recurse-submodules`, notices when the repo is already cloned
+  `git clone --recurse-submodules`, downloads Git LFS content (a clone without
+  it looks complete but every large file is a pointer stub; the option is on
+  by default and the result says what state the large files are in either
+  way), notices when the repo is already cloned
   (and can switch an HTTPS clone to the SSH link), and explains refusals —
   unregistered key, missing org SSO authorization, or an organization that
   requires SSH certificates (`org-<id>@github.com` links). A **sparse** mode
@@ -59,6 +62,38 @@ for folders that still use HTTPS.
   amending a commit that is already pushed, and conflicts are surfaced for you
   to resolve rather than resolved behind your back. Long operations keep
   running while you browse other pages.
+  - **Submodules** are listed from `git ls-files` plus `.gitmodules` — never
+    `git submodule status`, which aborts on the first gitlink missing from
+    `.gitmodules` and hides every other one. Each shows where it moved from and
+    to, what is dirty inside it, and whether git can fetch it at all; clicking
+    one opens it as its own repository.
+  - **Sync — the latest from upstream, your commits on top.** For anyone who
+    works on a branch that also receives other people's commits, in a
+    repository with or without submodules. *Assess* fetches and shows exactly
+    what would happen: how many of your commits are replayed on top of how many
+    incoming ones, which submodules are rebased (onto the commit upstream
+    records for them — never their remote's tip), which are fast-forwarded,
+    which are left alone, and every reason the sync would refuse (a submodule
+    checked out at a commit your branch does not record, two of your commits
+    moving one submodule pointer, an upstream pointer nobody can fetch…). *Sync
+    now* runs it: a backup branch in every repository it touches first, your
+    uncommitted changes stashed and put back (or the sync refuses, if you turn
+    that off), the superproject rebased with git's own behaviour pinned so
+    `rebase.updateRefs` or `submodule.recurse` in your config cannot change the
+    result, each submodule your commits move rebased when the superproject
+    stops on its pointer, and the rest aligned afterwards. A conflict pauses it
+    where the conflict is — resolve on the Changes page, then *Continue sync*;
+    *Abort sync* puts the superproject **and** the rebased submodules back,
+    which `git rebase --abort` alone would not. Commits upstream already
+    contains are dropped and named; submodules checked out ahead of what the
+    branch records are named, with one button to record them. Nothing is
+    pushed — ever.
+  - **Git LFS**: a clone made without git-lfs (or with `GIT_LFS_SKIP_SMUDGE`)
+    looks complete but every large file is a pointer stub, and `git status`
+    never says so. The Changes page counts the stubs and offers `git lfs pull`,
+    setting the repository's LFS filters up first when they were never
+    configured — the state in which `git lfs pull` exits 0 and downloads
+    nothing.
 - **Push blocking** — per profile *and* per repository. A blocked repo refuses
   `git push` **in your terminal too**, via two mechanisms with different blind
   spots: a `pushInsteadOf` rewrite in the repo's own `.git/config` (which
@@ -67,8 +102,37 @@ for folders that still use HTTPS.
   instance — instead of replacing it). Pull and fetch keep working. The app
   states plainly what this does *not* stop: it is a guard-rail against
   accidents, not a lock — anyone with a terminal can turn it off with one git
-  command, and only branch protection on GitHub is enforcement nobody can
-  bypass.
+  command, a longer `pushInsteadOf` of their own wins (git picks the longest
+  match, in any scope), and `GIT_CONFIG_NOSYSTEM=1` skips it.
+- **Push lock** — the same block, written by a small privileged helper into
+  **administrator-owned, system-wide** git config (`/etc/gitconfig` →
+  `/etc/gitswitch/` on macOS and Linux), so that turning it off — from the app,
+  a terminal, a script or an AI agent — needs the **administrator password**.
+  Every lock and unlock shows the operating system's own prompt; the job is a
+  one-time file whose checksum is part of the approved command, so a cached
+  approval cannot be replayed with different content. A refused push prints an
+  explanation addressed to people and agents ("Do not work around this; ask the
+  owner to unlock it, which requires their administrator password") and never a
+  command that would disable it. The repository's own flag, rewrite and hook
+  become mirrors the app re-applies whenever they are removed, with an event
+  log; the helper keeps an administrator-only audit log. Doctor checks every
+  layer. What it does **not** stop, stated in the app: a user of the account
+  who deliberately sets `GIT_CONFIG_NOSYSTEM=1`, gives the remote an explicit
+  `pushurl`, supplies their own `git-remote-gitswitch-push-blocked`, uses another
+  git binary, or copies the repository elsewhere — git's own manual says the
+  system scope is protected *by* the environment, not *against* the user. The
+  lock is purely local; nothing is sent to or configured on GitHub. To remove
+  everything by hand as an administrator:
+  `sudo /Library/PrivilegedHelperTools/com.gitswitch.lock-helper --uninstall-all`
+  (Linux: `sudo /usr/local/lib/gitswitch/lock-helper --uninstall-all`; Windows,
+  elevated: `C:\ProgramData\GitSwitch\lock\bin\gitswitch-lock-helper.exe --uninstall-all`).
+  Dragging the app to the Trash does not run that.
+
+  | | macOS | Linux | Windows |
+  |---|---|---|---|
+  | Where the rule lives | `/etc/gitconfig` → `/etc/gitswitch/` (root:wheel) | `/etc/gitconfig` → `/etc/gitswitch/` (root:root) | `<Git for Windows>\etc\gitconfig` → `C:\ProgramData\GitSwitch\lock` (Administrators-only DACL) |
+  | The prompt | macOS administrator name + password (`osascript`) | polkit agent password; `sudo -A` or the exact `sudo` command over ssh | UAC: a consent click on an administrator account, a password on a standard one (Doctor says which) |
+  | Proven by | `scripts/verify/lock.sh` (test root) on every push, the real helper as root on the macOS runner, and the manual checklist for the dialog | the real helper as root on the Ubuntu runner | the real helper elevated on the Windows runner (UAC is off there, so the dialog itself is a manual check) |
 - **History** — browse branches (local/remote, ahead/behind), paginated commit
   history with a real commit graph (lanes, forks and merges drawn the way
   `git log --graph` does), per-commit detail with files changed and signature

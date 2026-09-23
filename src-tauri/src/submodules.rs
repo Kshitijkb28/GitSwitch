@@ -79,6 +79,14 @@ pub struct SubmoduleInfo {
     pub state: String,
     /// One plain sentence, written here so every surface says the same thing.
     pub summary: String,
+    /// `.git` resolves to a real git directory (a gitfile whose target was
+    /// deleted still "exists" but is not a repository).
+    pub gitdir_valid: bool,
+    /// An interrupted merge/rebase/cherry-pick inside the submodule.
+    pub operation: Option<String>,
+    pub conflicted: usize,
+    /// The remote its branch's upstream lives on ("origin" for origin/main).
+    pub upstream_remote: Option<String>,
 }
 
 const MAX_MOVED: usize = 10;
@@ -283,7 +291,17 @@ fn short(oid: &str) -> String {
 
 /// Read one submodule's own repository state. Cheap — measured at 70 ms even
 /// for a submodule holding 8060 untracked files.
-type OwnState = (Option<String>, Option<String>, usize, usize, usize, usize, bool);
+#[derive(Default)]
+struct OwnState {
+    branch: Option<String>,
+    upstream: Option<String>,
+    ahead: usize,
+    behind: usize,
+    tracked: usize,
+    untracked: usize,
+    capped: bool,
+    conflicted: usize,
+}
 
 async fn read_own_state(sub: &Path) -> OwnState {
     let Ok(out) = GitCmd::at(sub)
@@ -298,31 +316,22 @@ async fn read_own_state(sub: &Path) -> OwnState {
         .run()
         .await
     else {
-        return (None, None, 0, 0, 0, 0, false);
+        return OwnState::default();
     };
     if !out.ok() {
-        return (None, None, 0, 0, 0, 0, false);
+        return OwnState::default();
     }
     let parsed = parse_porcelain_v2(&out.stdout);
-    let tracked = parsed
-        .entries
-        .iter()
-        .filter(|e| e.kind != "untracked")
-        .count();
-    let untracked = parsed
-        .entries
-        .iter()
-        .filter(|e| e.kind == "untracked")
-        .count();
-    (
-        parsed.branch,
-        parsed.upstream,
-        parsed.ahead,
-        parsed.behind,
-        tracked,
-        untracked,
-        parsed.untracked_truncated,
-    )
+    OwnState {
+        tracked: parsed.entries.iter().filter(|e| e.kind != "untracked").count(),
+        untracked: parsed.entries.iter().filter(|e| e.kind == "untracked").count(),
+        conflicted: parsed.entries.iter().filter(|e| e.kind == "conflicted").count(),
+        branch: parsed.branch,
+        upstream: parsed.upstream,
+        ahead: parsed.ahead,
+        behind: parsed.behind,
+        capped: parsed.untracked_truncated,
+    }
 }
 
 /// Every gitlink in the repo, with everything known about it.
@@ -393,9 +402,18 @@ pub async fn list_submodules(repo_path: &str) -> Result<Vec<SubmoduleInfo>, AppE
             dirty_untracked_capped: false,
             state: String::new(),
             summary: String::new(),
+            gitdir_valid: false,
+            operation: None,
+            conflicted: 0,
+            upstream_remote: None,
         };
 
         if initialised {
+            info.gitdir_valid = GitCmd::at(&sub_dir)
+                .args(["rev-parse", "--git-dir"])
+                .ok_text()
+                .await
+                .is_some();
             info.actual = GitCmd::at(&sub_dir)
                 .args(["rev-parse", "HEAD"])
                 .ok_text()
@@ -403,15 +421,19 @@ pub async fn list_submodules(repo_path: &str) -> Result<Vec<SubmoduleInfo>, AppE
                 .filter(|s| !s.is_empty());
             info.actual_short = info.actual.as_deref().map(short);
 
-            let (branch, upstream, ahead, behind, tracked, untracked, capped) =
-                read_own_state(&sub_dir).await;
-            info.own_branch = branch;
-            info.own_upstream = upstream;
-            info.own_ahead = ahead;
-            info.own_behind = behind;
-            info.dirty_tracked = tracked;
-            info.dirty_untracked = untracked;
-            info.dirty_untracked_capped = capped;
+            let own = read_own_state(&sub_dir).await;
+            info.upstream_remote = own.upstream.as_deref().and_then(|u| u.split('/').next()).map(|s| s.to_string());
+            info.own_branch = own.branch;
+            info.own_upstream = own.upstream;
+            info.own_ahead = own.ahead;
+            info.own_behind = own.behind;
+            info.dirty_tracked = own.tracked;
+            info.dirty_untracked = own.untracked;
+            info.dirty_untracked_capped = own.capped;
+            info.conflicted = own.conflicted;
+            if let Ok(paths) = crate::git_status::git_paths(&sub_dir).await {
+                info.operation = crate::git_status::parse_in_progress(&crate::git_status::presence_from_disk(&paths)).map(|o| o.kind);
+            }
 
             if let Some(actual) = info.actual.clone() {
                 if actual != info.recorded {

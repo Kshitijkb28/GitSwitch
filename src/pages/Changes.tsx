@@ -1,23 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  RefreshCw,
-  Loader2,
-  ArrowUp,
-  ArrowDown,
-  GitBranch,
-  Upload,
-  Download,
-  CheckCircle2,
-  AlertTriangle,
-  XCircle,
-  FilePlus2,
-  FileEdit,
-  ShieldAlert,
-  Ban,
-  CircleSlash,
-} from "lucide-react";
+import { RefreshCw, Loader2, ArrowUp, ArrowDown, GitBranch, Upload, Download, CheckCircle2, AlertTriangle, XCircle, FilePlus2, FileEdit, ShieldAlert, Ban, CircleSlash, Play } from "lucide-react";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
+import { Checkbox } from "../components/Checkbox";
 import { Select } from "../components/Select";
 import { Modal } from "../components/Modal";
 import { useToast } from "../components/Toast";
@@ -27,10 +12,12 @@ import { DiffPanel } from "../components/changes/DiffPanel";
 import { PullControl, whyDisabled } from "../components/changes/PullControl";
 import { PushAccessCard } from "../components/changes/PushAccessCard";
 import { SubmodulesCard } from "../components/changes/SubmodulesCard";
+import { LfsCard } from "../components/changes/LfsCard";
+import { SyncCard, SyncOutcomeView, SyncPausedCard } from "../components/changes/SyncCard";
 import { baseName } from "../lib/paths";
 import { usePersistedState } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
-import { elapsedLabel, runJob, useGitJob, clearJob } from "../lib/gitJobs";
+import { elapsedLabel, runJob, useGitJob, clearJob, type GitJobKind } from "../lib/gitJobs";
 import * as api from "../lib/api";
 import type { ChangeEntry, OpResult, PullMode, RepoRef, RepoStatus } from "../lib/api";
 
@@ -52,6 +39,9 @@ export function Changes() {
   const [repoPath, setRepoPath] = usePersistedState("changes.repo", "");
   const [pullMode, setPullMode] = usePersistedState<PullMode>("changes.pullMode", "ff-only");
   const [drafts, setDrafts] = usePersistedState<Record<string, string>>("changes.drafts", {});
+  // On by default: with LFS filters configured git already downloads large
+  // files on pull, so this makes every repo behave the way people expect.
+  const [pullLfs, setPullLfs] = usePersistedState("changes.pullLfs", true);
 
   // Deliberately not persisted: amending must be a fresh decision every time,
   // and status/results must always be re-read rather than restored.
@@ -198,7 +188,7 @@ export function Changes() {
   };
 
   /** Long operations survive leaving the page, so they run in the job slot. */
-  const runLong = (kind: "pull" | "push" | "fetch" | "submodules", label: string, fn: () => Promise<OpResult>) => {
+  const runLong = (kind: GitJobKind, label: string, fn: () => Promise<OpResult>) => {
     setResult(null);
     setError(null);
     void runJob(repoPath, kind, label, fn).then((r) => {
@@ -326,7 +316,20 @@ export function Changes() {
 
       {status && (
         <>
-          {status.operation && (
+          {status.sync && (
+            <SyncPausedCard
+              sync={status.sync}
+              status={status}
+              busy={anyBusy}
+              onContinue={() =>
+                runLong("sync", "Continuing the sync…", () => api.changesSyncContinue(repoPath))
+              }
+              onAbort={() => runLong("sync", "Aborting the sync…", () => api.changesSyncAbort(repoPath))}
+              onOpenRoot={() => status.sync && openRepo(status.sync.root)}
+            />
+          )}
+
+          {status.operation && !status.sync && (
             <Card className="border-amber-500/30 bg-amber-500/5">
               <div className="flex flex-wrap items-center gap-3">
                 <AlertTriangle size={16} className="text-amber-400 shrink-0" />
@@ -336,6 +339,22 @@ export function Changes() {
                     {status.operation.detail || "Finish it, or abort to go back."}
                   </p>
                 </div>
+                {status.operation.continue_command && status.operation.kind !== "merge" && (
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    disabled={anyBusy || status.conflicted_count > 0}
+                    onClick={() => apply("continue", () => api.changesContinue(repoPath))}
+                    title={
+                      status.conflicted_count > 0
+                        ? "Resolve and stage every conflicted file first"
+                        : status.operation.continue_command
+                    }
+                  >
+                    <Play size={13} />
+                    Continue
+                  </Button>
+                )}
                 <Button
                   size="sm"
                   variant="secondary"
@@ -388,6 +407,26 @@ export function Changes() {
                   dirty={dirty}
                   upstream={status.upstream}
                 />
+                {status.uses_lfs && (
+                  <label
+                    className="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer"
+                    title="A plain pull only downloads large files when this repository's LFS filters are set up — otherwise they arrive as pointer stubs"
+                  >
+                    <Checkbox
+                      checked={pullLfs}
+                      onChange={setPullLfs}
+                      className="mt-0.5"
+                      aria-label="Also download LFS files when pulling"
+                    />
+                    <span className="leading-relaxed">
+                      Also download Git LFS files
+                      <span className="text-zinc-500">
+                        {" "}
+                        — otherwise large files arrive as pointer stubs
+                      </span>
+                    </span>
+                  </label>
+                )}
               </div>
 
               <div className="flex items-center gap-2 flex-wrap">
@@ -418,8 +457,12 @@ export function Changes() {
                   disabled={anyBusy || !status.upstream || pullBlocked !== null}
                   title={pullBlocked ?? undefined}
                   onClick={() =>
-                    runLong("pull", `Pulling (${pullMode})…`, () =>
-                      api.changesPull(repoPath, pullMode)
+                    runLong(
+                      "pull",
+                      status.uses_lfs && pullLfs
+                        ? `Pulling (${pullMode}) and downloading LFS files…`
+                        : `Pulling (${pullMode})…`,
+                      () => api.changesPull(repoPath, pullMode, status.uses_lfs && pullLfs)
                     )
                   }
                   className="min-w-[8.5rem]"
@@ -440,7 +483,9 @@ export function Changes() {
                   className="min-w-[8.5rem]"
                 >
                   {status.push.blocked ? <Ban size={13} /> : <Upload size={13} />}
-                  {status.push.blocked
+                  {status.push.lock.locked
+                    ? "Push locked"
+                    : status.push.blocked
                     ? "Push blocked"
                     : status.upstream
                       ? `Push${status.ahead ? ` (${status.ahead})` : ""}`
@@ -449,6 +494,19 @@ export function Changes() {
               </div>
             </div>
           </Card>
+
+          {!status.unborn && !status.sync && (
+            <SyncCard
+              repoPath={repoPath}
+              status={status}
+              busy={anyBusy}
+              onSync={(stash, bundles, fingerprint) =>
+                runLong("sync", "Syncing — fetching, rebasing, aligning submodules…", () =>
+                  api.changesSyncRun(repoPath, stash, bundles, fingerprint)
+                )
+              }
+            />
+          )}
 
           {result && (
             <Card
@@ -476,6 +534,24 @@ export function Changes() {
                     <p className="text-xs text-zinc-500 font-mono break-all">
                       undo: {result.pull.recovery}
                     </p>
+                  )}
+                  {result.submodules && result.submodules.listed > 0 && (
+                    <p className="text-xs text-zinc-400">
+                      Submodules: {result.submodules.downloaded} of {result.submodules.listed} up to date
+                      {result.submodules.failed_paths.length > 0 && ` — failed: ${result.submodules.failed_paths.join(", ")}`}.
+                    </p>
+                  )}
+                  {result.lfs && result.lfs.uses_lfs && (
+                    <p className="text-xs text-zinc-400">Git LFS: {result.lfs.summary}</p>
+                  )}
+                  {result.sync && (
+                    <SyncOutcomeView
+                      outcome={result.sync}
+                      busy={anyBusy}
+                      onRecordPointers={() =>
+                        apply("record", () => api.changesRecordPointers(repoPath))
+                      }
+                    />
                   )}
                   {result.advice?.git_said && (
                     <details>
@@ -639,6 +715,17 @@ export function Changes() {
                 push={status.push}
                 onChanged={(p) => setStatus({ ...status, push: p })}
               />
+
+              {status.uses_lfs && (
+                <LfsCard
+                  repoPath={repoPath}
+                  busy={anyBusy}
+                  refreshKey={subRefresh}
+                  onPull={() =>
+                    runLong("lfs", "Downloading LFS files…", () => api.changesLfsPull(repoPath))
+                  }
+                />
+              )}
 
               <SubmodulesCard
                 repoPath={repoPath}

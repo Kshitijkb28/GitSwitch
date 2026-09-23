@@ -20,6 +20,7 @@ pub enum GitOp {
     Checkout,
     Merge,
     Rebase,
+    Lfs,
 }
 
 impl GitOp {
@@ -32,6 +33,7 @@ impl GitOp {
             GitOp::Checkout => "branch switch",
             GitOp::Merge => "merge",
             GitOp::Rebase => "rebase",
+            GitOp::Lfs => "LFS download",
         }
     }
 }
@@ -196,6 +198,38 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
                     s,
                 );
             }
+            if has("The previous cherry-pick is now empty") || has("is now empty, possibly due to conflict resolution") {
+                return advice(
+                    "This commit has nothing left to apply.",
+                    "The resolution made it identical to what's already there. Continue again: GitSwitch skips the empty commit and moves on.",
+                    Some("skip-empty"),
+                    s,
+                );
+            }
+            if has("Applying autostash resulted in conflicts") {
+                return advice(
+                    "Your stashed changes conflict with the new commits.",
+                    "The rebase itself finished. Your uncommitted work is safe in the stash: resolve the conflicted files and stage them, or run `git reset --hard` (nothing of yours is lost — it is still in stash@{0}) and `git stash pop` to try again by hand.",
+                    Some("resolve-conflicts"),
+                    s,
+                );
+            }
+            if has("Failed to merge submodule") || has("commits not present") || has("not checked out") {
+                return advice(
+                    "A submodule pointer conflicts.",
+                    "Both sides moved the same submodule. Bring that submodule to the commit you want (with your commits on top), stage its path, then continue — or abort.",
+                    Some("resolve-conflicts"),
+                    s,
+                );
+            }
+            if has("pre-rebase hook refused") {
+                return advice(
+                    "A pre-rebase hook refused to let this rebase start.",
+                    "The repository's own hook said no. Read its message below; nothing was changed.",
+                    None,
+                    s,
+                );
+            }
             if has("refusing to merge unrelated histories") {
                 return advice(
                     "These two histories have nothing in common.",
@@ -271,10 +305,50 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
                 );
             }
         }
+        GitOp::Lfs => {
+            if has("'lfs' is not a git command") || has("git-lfs: command not found") {
+                return advice(
+                    "git-lfs isn't installed.",
+                    "This repository stores large files with Git LFS, but the git-lfs tool isn't on this Mac. Install it (brew install git-lfs), then pull the files again.",
+                    None,
+                    s,
+                );
+            }
+            // An HTTP LFS server says "Object does not exist on the server";
+            // a path remote (git-lfs 3.x) says "remote missing object".
+            if has("does not exist on the server")
+                || has("Object does not exist")
+                || has("remote missing object")
+                || has("missing object")
+            {
+                return advice(
+                    "Some large files aren't on the server.",
+                    "The repository points at LFS objects the server doesn't have — usually because whoever committed them never pushed the objects, or they were pruned. Ask the person who added those files to run `git lfs push --all`.",
+                    None,
+                    s,
+                );
+            }
+            if has("smudge filter lfs failed") || has("batch response") {
+                return advice(
+                    "The LFS server refused the download.",
+                    "Git could reach the repository but the LFS batch request failed. Check the details below — it is usually an authentication or permissions problem for the LFS endpoint rather than for git itself.",
+                    None,
+                    s,
+                );
+            }
+        }
         _ => {}
     }
 
     // --- Shared, operation-independent ---
+    if let Some(msg) = crate::lfs::missing_lfs_message(s) {
+        return advice(
+            "git-lfs isn't installed, and this repository requires it.",
+            &msg,
+            None,
+            s,
+        );
+    }
     if has("index.lock") {
         return advice(
             "Another git process is working in this folder.",

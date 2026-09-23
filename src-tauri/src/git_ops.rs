@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 /// A refusal carries a stable `code` (for the UI and for tests) and a sentence
 /// the user can act on.
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Refusal {
     pub code: String,
     pub message: String,
@@ -45,6 +45,12 @@ pub enum Intent {
     Pull(PullMode),
     Submodule,
     Abort,
+    /// Finish the operation in progress once its conflicts are staged.
+    Continue,
+    /// Assess or run a sync (sync.rs): fetch, rebase with my commits on top.
+    Sync,
+    SyncContinue,
+    SyncAbort,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -86,10 +92,14 @@ pub struct StatusFacts {
     pub conflicted: usize,
     pub operation: Option<String>,
     pub abort_command: Option<String>,
+    pub continue_command: Option<String>,
+    /// A sync is paused here (or in this repository's superproject).
+    pub sync_in_progress: bool,
     pub detached: bool,
     pub unborn: bool,
     pub upstream: Option<String>,
     pub push_blocked: bool,
+    pub push_locked: bool,
     pub push_reason: String,
     pub identity_matches: bool,
     pub identity_email: String,
@@ -106,10 +116,13 @@ impl From<&RepoStatus> for StatusFacts {
             conflicted: s.conflicted_count,
             operation: s.operation.as_ref().map(|o| o.kind.clone()),
             abort_command: s.operation.as_ref().map(|o| o.abort_command.clone()),
+            continue_command: s.operation.as_ref().and_then(|o| o.continue_command.clone()),
+            sync_in_progress: s.sync.is_some(),
             detached: s.detached,
             unborn: s.unborn,
             upstream: s.upstream.clone(),
             push_blocked: s.push.blocked,
+            push_locked: s.push.lock.locked,
             push_reason: s.push.reason.clone(),
             identity_matches: s.identity.matches_profile,
             identity_email: s.identity.email.clone(),
@@ -135,6 +148,17 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
             )
         })
     };
+
+    // While a sync is paused, only the sync's own buttons and the resolution
+    // work (stage, unstage, diff) make sense; everything else would fight it.
+    if f.sync_in_progress
+        && !matches!(intent, Intent::Stage | Intent::Unstage { .. } | Intent::Discard { .. } | Intent::SyncContinue | Intent::SyncAbort)
+    {
+        return Some(refuse(
+            "sync-in-progress",
+            "A sync is paused here. Continue or abort it first (the Changes page shows both).",
+        ));
+    }
 
     match intent {
         Intent::Stage => None,
@@ -235,6 +259,9 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
         }
 
         Intent::Push => {
+            if f.push_locked {
+                return Some(refuse("push-locked", f.push_reason.clone()));
+            }
             if f.push_blocked {
                 return Some(refuse("push-blocked", f.push_reason.clone()));
             }
@@ -294,6 +321,52 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
             } else {
                 None
             }
+        }
+
+        Intent::Sync => {
+            if f.unborn {
+                return Some(refuse("unborn-head", "There are no commits yet — nothing to sync."));
+            }
+            if f.detached {
+                return Some(refuse("detached-head", "You're not on a branch. Check one out first."));
+            }
+            if f.upstream.is_none() {
+                return Some(refuse("no-upstream", "This branch isn't tracking a remote branch, so there is nothing to sync with."));
+            }
+            busy("sync")
+        }
+
+        Intent::SyncContinue | Intent::SyncAbort => {
+            if f.sync_in_progress {
+                None
+            } else {
+                Some(refuse("no-sync", "No sync is paused here."))
+            }
+        }
+
+        Intent::Continue => {
+            if f.operation.is_none() {
+                return Some(refuse("nothing-to-continue", "There's no operation in progress."));
+            }
+            if f.continue_command.is_none() {
+                return Some(refuse(
+                    "cannot-continue",
+                    format!("A {} can't be continued from here; finish it in a terminal or abort it.", f.operation.clone().unwrap_or_default()),
+                ));
+            }
+            if f.conflicted > 0 {
+                return Some(refuse(
+                    "unmerged-paths",
+                    format!(
+                        "{} file{} still {} conflicts. Resolve and stage {} first.",
+                        f.conflicted,
+                        if f.conflicted == 1 { "" } else { "s" },
+                        if f.conflicted == 1 { "has" } else { "have" },
+                        if f.conflicted == 1 { "it" } else { "them" }
+                    ),
+                ));
+            }
+            None
         }
     }
 }
@@ -455,10 +528,14 @@ pub struct OpResult {
     pub pull: Option<PullOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submodules: Option<SubmoduleReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lfs: Option<crate::lfs::LfsStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync: Option<crate::sync::SyncOutcome>,
 }
 
 impl OpResult {
-    fn blank() -> Self {
+    pub(crate) fn blank() -> Self {
         OpResult {
             ok: true,
             headline: String::new(),
@@ -470,10 +547,22 @@ impl OpResult {
             push: None,
             pull: None,
             submodules: None,
+            lfs: None,
+            sync: None,
         }
     }
 
-    fn refused(r: Refusal, status: RepoStatus) -> Self {
+    /// A refusal decided before the repo could be read at all.
+    pub(crate) fn refused_alone(r: Refusal) -> Self {
+        OpResult {
+            ok: false,
+            headline: r.message.clone(),
+            refusal: Some(r),
+            ..OpResult::blank()
+        }
+    }
+
+    pub(crate) fn refused(r: Refusal, status: RepoStatus) -> Self {
         OpResult {
             ok: false,
             headline: r.message.clone(),
@@ -483,7 +572,7 @@ impl OpResult {
         }
     }
 
-    fn done(headline: impl Into<String>, detail: impl Into<String>, status: RepoStatus) -> Self {
+    pub(crate) fn done(headline: impl Into<String>, detail: impl Into<String>, status: RepoStatus) -> Self {
         OpResult {
             ok: true,
             headline: headline.into(),
@@ -493,7 +582,7 @@ impl OpResult {
         }
     }
 
-    fn failed(advice: Advice, status: RepoStatus) -> Self {
+    pub(crate) fn failed(advice: Advice, status: RepoStatus) -> Self {
         OpResult {
             ok: false,
             headline: advice.headline.clone(),
@@ -509,7 +598,7 @@ async fn snapshot(repo_path: &str) -> Result<RepoStatus, AppError> {
     git_status::repo_status(repo_path).await
 }
 
-fn advice_ctx<'a>(status: &'a RepoStatus) -> AdviceCtx<'a> {
+pub(crate) fn advice_ctx<'a>(status: &'a RepoStatus) -> AdviceCtx<'a> {
     AdviceCtx {
         key_path: None,
         url: status.push.remotes.first().map(|r| r.fetch_url.as_str()),
@@ -984,7 +1073,7 @@ pub fn parse_push_porcelain(out: &str) -> Vec<PushedRef> {
 /// and `branch.<n>.rebase`, so the same button could merge for one user and
 /// rebase for another. Fetch and integrate are separate, and the mode the user
 /// picked is the command that runs.
-pub async fn pull(repo_path: &str, mode: PullMode) -> Result<OpResult, AppError> {
+pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Pull(mode), &StatusFacts::from(&before)) {
         return Ok(OpResult::refused(r, before));
@@ -1094,7 +1183,7 @@ pub async fn pull(repo_path: &str, mode: PullMode) -> Result<OpResult, AppError>
         });
     }
 
-    let headline = if commits_pulled == 0 {
+    let mut headline = if commits_pulled == 0 {
         "Already up to date.".to_string()
     } else {
         format!(
@@ -1103,7 +1192,7 @@ pub async fn pull(repo_path: &str, mode: PullMode) -> Result<OpResult, AppError>
             mode.label()
         )
     };
-    let detail = if commits_pulled == 0 {
+    let mut detail = if commits_pulled == 0 {
         String::new()
     } else {
         format!(
@@ -1117,8 +1206,41 @@ pub async fn pull(repo_path: &str, mode: PullMode) -> Result<OpResult, AppError>
         )
     };
 
+    // A plain pull only downloads LFS content for files it touches, and only
+    // when the repository's LFS filters are configured. Without them every
+    // pulled large file lands as a pointer stub and nothing says so — which is
+    // why this step is offered, and why it is named in the result either way.
+    let lfs_state;
+    if with_lfs {
+        let done = fetch_lfs_content(repo_path).await?;
+        lfs_state = Some(done.after.clone());
+        if let Some(a) = done.error {
+            detail.push_str(&format!(" The pull worked, but downloading the LFS files didn't: {}", a.headline));
+        } else if done.fetched > 0 {
+            headline.push_str(&format!(
+                " Downloaded {} LFS file{}.",
+                done.fetched,
+                if done.fetched == 1 { "" } else { "s" }
+            ));
+            if done.configured_now {
+                detail.push_str(" This repository's LFS filters weren't set up, so that was done first.");
+            }
+        }
+    } else {
+        // Not asked for, but say so rather than leaving silent stubs behind.
+        let state = crate::lfs::lfs_status(repo_path).await?;
+        if state.uses_lfs && state.pointers > 0 {
+            detail.push_str(&format!(
+                " {} LFS file(s) here are still pointer stubs — use Pull LFS files to download them.",
+                state.pointers
+            ));
+        }
+        lfs_state = Some(state);
+    }
+
     Ok(OpResult {
         pull: Some(outcome),
+        lfs: lfs_state,
         ..OpResult::done(headline, detail, after)
     })
 }
@@ -1167,6 +1289,168 @@ pub async fn submodule_update(repo_path: &str) -> Result<OpResult, AppError> {
     })
 }
 
+// --- Git LFS -------------------------------------------------------------
+
+/// Download the real content for every LFS pointer stub in the checkout.
+/// `git lfs pull` is fetch + checkout for the current ref only, so it never
+/// touches history, the index, or files that aren't LFS pointers.
+/// What a download of LFS content actually did. Every number is measured by
+/// counting pointer stubs before and after, never inferred from an exit code.
+pub struct LfsFetch {
+    pub after: crate::lfs::LfsStatus,
+    pub fetched: usize,
+    /// The repository had no LFS filters, so `git lfs install --local` was run
+    /// first — without it `git lfs pull` exits 0 and downloads nothing.
+    pub configured_now: bool,
+    /// git-lfs failed. The caller decides how loudly to say so.
+    pub error: Option<Advice>,
+}
+
+impl LfsFetch {
+    fn nothing_to_do(status: crate::lfs::LfsStatus) -> Self {
+        LfsFetch {
+            after: status,
+            fetched: 0,
+            configured_now: false,
+            error: None,
+        }
+    }
+}
+
+/// Download the content behind every pointer stub. Safe to call on any repo:
+/// one that doesn't use LFS, has no stubs, or has no git-lfs installed simply
+/// reports that nothing was done.
+pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppError> {
+    let before = crate::lfs::lfs_status(repo_path).await?;
+    if !before.uses_lfs || !before.installed || before.pointers == 0 {
+        return Ok(LfsFetch::nothing_to_do(before));
+    }
+
+    // A clone made before git-lfs was installed has no lfs filters in its
+    // config. In that state `git lfs pull` prints "Skipping object checkout,
+    // Git LFS is not installed for this repository" and exits 0 having done
+    // nothing. `git lfs install --local` writes exactly those filter entries,
+    // touches nothing else, and is what the LFS docs tell you to run first.
+    let mut configured_now = false;
+    if !before.filters_configured {
+        let setup = GitCmd::at(repo_path)
+            .args(["lfs", "install", "--local"])
+            .timeout(LOCAL_TIMEOUT)
+            .run()
+            .await?;
+        if !setup.ok() {
+            let advice = git_advice::explain(GitOp::Lfs, &setup.stderr, &AdviceCtx::default());
+            return Ok(LfsFetch {
+                after: before,
+                fetched: 0,
+                configured_now: false,
+                error: Some(advice),
+            });
+        }
+        configured_now = true;
+    }
+
+    let out = GitCmd::at(repo_path)
+        .args(["lfs", "pull"])
+        .timeout(NET_TIMEOUT)
+        .run()
+        .await?;
+
+    // Measure, don't assume: count the stubs again.
+    let after = crate::lfs::lfs_status(repo_path).await?;
+    let fetched = before.pointers.saturating_sub(after.pointers);
+    let error = if out.ok() {
+        None
+    } else {
+        let stderr = if out.stderr.is_empty() { out.text() } else { out.stderr.clone() };
+        Some(git_advice::explain(GitOp::Lfs, &stderr, &AdviceCtx::default()))
+    };
+
+    Ok(LfsFetch { after, fetched, configured_now, error })
+}
+
+pub async fn lfs_pull(repo_path: &str) -> Result<OpResult, AppError> {
+    // LFS state is read *before* the repo snapshot on purpose: with
+    // filter.lfs.required set and git-lfs missing, `git status` itself fails,
+    // and the person needs the install hint — not the snapshot's error.
+    let lfs_before = crate::lfs::lfs_status(repo_path).await?;
+    if !lfs_before.uses_lfs {
+        return Ok(OpResult::refused_alone(refuse(
+            "no-lfs",
+            "This repository doesn't use Git LFS — there is nothing to pull.",
+        )));
+    }
+    if !lfs_before.installed {
+        return Ok(OpResult::refused_alone(refuse(
+            "lfs-not-installed",
+            "git-lfs isn't installed on this Mac, so the large files can't be downloaded. Install it (brew install git-lfs) and try again.",
+        )));
+    }
+    let before = snapshot(repo_path).await?;
+    if let Some(r) = check(&Intent::Submodule, &StatusFacts::from(&before)) {
+        // Same rule as submodule update: not in the middle of a merge/rebase,
+        // because lfs pull rewrites files in the worktree.
+        return Ok(OpResult::refused(
+            Refusal {
+                code: r.code,
+                message: r.message.replace("update submodules", "pull LFS files"),
+            },
+            before,
+        ));
+    }
+    if lfs_before.pointers == 0 {
+        return Ok(OpResult {
+            lfs: Some(lfs_before),
+            ..OpResult::done(
+                "All LFS files are already here.",
+                "Nothing needed downloading.",
+                before,
+            )
+        });
+    }
+
+    let done = fetch_lfs_content(repo_path).await?;
+    let lfs_after = done.after.clone();
+    let fetched = done.fetched;
+    let configured_now = done.configured_now;
+    let after = snapshot(repo_path).await?;
+
+    if let Some(a) = done.error {
+        return Ok(OpResult {
+            lfs: Some(lfs_after),
+            detail: if fetched > 0 {
+                format!("{} file(s) did download before it failed.", fetched)
+            } else {
+                a.guidance.clone()
+            },
+            ..OpResult::failed(a, after)
+        });
+    }
+
+    let headline = if lfs_after.pointers == 0 {
+        format!("Downloaded {} LFS file{}.", fetched, if fetched == 1 { "" } else { "s" })
+    } else {
+        format!(
+            "Downloaded {} of {} LFS files — {} still missing.",
+            fetched, lfs_before.pointers, lfs_after.pointers
+        )
+    };
+    let mut detail = if lfs_after.pointers == 0 {
+        "Every pointer stub now holds its real content.".to_string()
+    } else if !lfs_after.filters_configured {
+        "git lfs pull skipped the checkout because this repository's LFS filters aren't configured — even after setting them up. Run `git lfs install --local` in the folder and try again.".to_string()
+    } else {
+        "git lfs pull finished without an error but some files are still pointer stubs; their objects may not exist on the server.".to_string()
+    };
+    if configured_now {
+        detail.push_str(" (LFS filters were not set up for this repository, so `git lfs install --local` was run first.)");
+    }
+    Ok(OpResult {
+        lfs: Some(lfs_after),
+        ..OpResult::done(headline, detail, after)
+    })
+}
+
 // --- Abort ---------------------------------------------------------------
 
 pub async fn abort(repo_path: &str) -> Result<OpResult, AppError> {
@@ -1183,7 +1467,7 @@ pub async fn abort(repo_path: &str) -> Result<OpResult, AppError> {
         .await?;
     let after = snapshot(repo_path).await?;
     if !out.ok() {
-        let a = git_advice::explain(GitOp::Merge, &out.stderr, &advice_ctx(&after));
+        let a = git_advice::explain(op_kind_to_gitop(&op.kind), &out.stderr, &advice_ctx(&after));
         return Ok(OpResult::failed(a, after));
     }
     Ok(OpResult::done(
@@ -1191,6 +1475,82 @@ pub async fn abort(repo_path: &str) -> Result<OpResult, AppError> {
         "The branch is back where it was before it started.".to_string(),
         after,
     ))
+}
+
+fn op_kind_to_gitop(kind: &str) -> GitOp {
+    if kind.contains("rebase") || kind == "am" {
+        GitOp::Rebase
+    } else {
+        GitOp::Merge
+    }
+}
+
+/// Is the pick that stopped now empty — every change resolved to what HEAD
+/// already has? Then `--continue` refuses and `--skip` is the only way on.
+async fn staged_is_empty(repo_path: &str) -> bool {
+    GitCmd::at(repo_path)
+        .args(["diff", "--cached", "--quiet", "HEAD"])
+        .run()
+        .await
+        .map(|o| o.ok())
+        .unwrap_or(false)
+}
+
+// --- Continue ------------------------------------------------------------
+
+/// Finish the operation in progress: `rebase --continue`, `cherry-pick
+/// --continue`, `revert --continue`, `am --continue`, or the commit that
+/// concludes a merge. A pick that became empty after the resolution is
+/// skipped (git would refuse to continue it) and the result says so.
+pub async fn continue_op(repo_path: &str) -> Result<OpResult, AppError> {
+    let before = snapshot(repo_path).await?;
+    if let Some(r) = check(&Intent::Continue, &StatusFacts::from(&before)) {
+        return Ok(OpResult::refused(r, before));
+    }
+    let op = before.operation.clone().unwrap();
+    let cmd = op.continue_command.clone().unwrap_or_default();
+    let mut args: Vec<String> = cmd.split_whitespace().skip(1).map(|s| s.to_string()).collect();
+    let mut skipped = false;
+    let picks = matches!(op.kind.as_str(), "rebase" | "rebase-interactive" | "cherry-pick" | "revert");
+    if picks && staged_is_empty(repo_path).await {
+        args = vec![args[0].clone(), "--skip".into()];
+        skipped = true;
+    }
+    let out = GitCmd::at(repo_path)
+        .pinned()
+        .args(args.iter().map(String::as_str))
+        .timeout(NET_TIMEOUT)
+        .run()
+        .await?;
+    let after = snapshot(repo_path).await?;
+    if !out.ok() {
+        let a = git_advice::explain(
+            op_kind_to_gitop(&op.kind),
+            &format!("{}\n{}", out.text(), out.stderr),
+            &advice_ctx(&after),
+        );
+        return Ok(OpResult::failed(a, after));
+    }
+    let (headline, detail) = if after.operation.is_some() {
+        (
+            format!("Continued the {} — it stopped again.", op.kind),
+            if after.conflicted_count > 0 {
+                format!("{} file(s) conflict this time. Resolve and stage them, then continue again.", after.conflicted_count)
+            } else {
+                after.operation.as_ref().map(|o| o.detail.clone()).unwrap_or_default()
+            },
+        )
+    } else {
+        (
+            format!("Finished the {}.", op.kind),
+            if skipped {
+                "The stopped commit had nothing left to apply after the resolution, so it was skipped.".to_string()
+            } else {
+                String::new()
+            },
+        )
+    };
+    Ok(OpResult::done(headline, detail, after))
 }
 
 #[cfg(test)]
@@ -1479,6 +1839,22 @@ mod tests {
     }
 
     #[test]
+    fn a_locked_push_is_refused_by_its_own_code() {
+        let r = check(
+            &Intent::Push,
+            &StatusFacts {
+                push_blocked: true,
+                push_locked: true,
+                push_reason: "Locked for this repository. Unlocking needs the administrator password.".into(),
+                ..Default::default()
+            },
+        )
+        .expect("refused");
+        assert_eq!(r.code, "push-locked");
+        assert!(r.message.contains("administrator"));
+    }
+
+    #[test]
     fn a_blocked_push_never_reaches_git() {
         let f = StatusFacts {
             push_blocked: true,
@@ -1531,11 +1907,52 @@ mod tests {
             Intent::Push,
             Intent::Pull(PullMode::Merge),
             Intent::Submodule,
+            Intent::Sync,
         ] {
             let r = check(&intent, &f).unwrap();
             assert_eq!(r.code, "operation-in-progress");
             assert!(r.message.contains("git rebase --abort"));
         }
+    }
+
+    #[test]
+    fn a_paused_sync_blocks_everything_but_resolution_and_its_own_buttons() {
+        let f = StatusFacts { sync_in_progress: true, operation: Some("rebase".into()), abort_command: Some("git rebase --abort".into()), continue_command: Some("git rebase --continue".into()), ..clean() };
+        for intent in [Intent::Push, Intent::Pull(PullMode::Merge), Intent::Commit { amend: false, message_empty: false }, Intent::Abort, Intent::Continue, Intent::Sync, Intent::Submodule] {
+            assert_eq!(check(&intent, &f).unwrap().code, "sync-in-progress", "{:?}", intent);
+        }
+        assert!(check(&Intent::Stage, &f).is_none());
+        assert!(check(&Intent::SyncContinue, &f).is_none());
+        assert!(check(&Intent::SyncAbort, &f).is_none());
+        assert_eq!(check(&Intent::SyncContinue, &clean()).unwrap().code, "no-sync");
+        // Sync itself needs a branch with an upstream and no operation, but not a clean tree.
+        assert!(check(&Intent::Sync, &StatusFacts { staged: 3, unstaged: 2, ..clean() }).is_none());
+        assert_eq!(check(&Intent::Sync, &StatusFacts { upstream: None, ..clean() }).unwrap().code, "no-upstream");
+        assert_eq!(check(&Intent::Sync, &StatusFacts { detached: true, ..clean() }).unwrap().code, "detached-head");
+    }
+
+    #[test]
+    fn continue_needs_an_operation_a_continue_command_and_no_conflicts() {
+        assert_eq!(check(&Intent::Continue, &clean()).unwrap().code, "nothing-to-continue");
+        let bisect = StatusFacts {
+            operation: Some("bisect".into()),
+            abort_command: Some("git bisect reset".into()),
+            continue_command: None,
+            ..clean()
+        };
+        assert_eq!(check(&Intent::Continue, &bisect).unwrap().code, "cannot-continue");
+        let conflicted = StatusFacts {
+            operation: Some("rebase".into()),
+            abort_command: Some("git rebase --abort".into()),
+            continue_command: Some("git rebase --continue".into()),
+            conflicted: 2,
+            ..clean()
+        };
+        let r = check(&Intent::Continue, &conflicted).unwrap();
+        assert_eq!(r.code, "unmerged-paths");
+        assert!(r.message.contains("2 files"));
+        let ready = StatusFacts { conflicted: 0, ..conflicted };
+        assert!(check(&Intent::Continue, &ready).is_none(), "a rebase with everything staged may continue");
     }
 
     #[test]
