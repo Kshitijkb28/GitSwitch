@@ -27,7 +27,7 @@ pub struct Refusal {
     pub message: String,
 }
 
-fn refuse(code: &str, message: impl Into<String>) -> Refusal {
+pub(crate) fn refuse(code: &str, message: impl Into<String>) -> Refusal {
     Refusal {
         code: code.to_string(),
         message: message.into(),
@@ -42,7 +42,8 @@ pub enum Intent {
     Discard { has_paths: bool, submodule_selected: bool, conflicted_selected: bool },
     Commit { amend: bool, message_empty: bool },
     Push,
-    Pull(PullMode),
+    /// `autostash` lets a rebase pull run on a dirty tree (git stashes and re-applies).
+    Pull { mode: PullMode, autostash: bool },
     Submodule,
     Abort,
     /// Finish the operation in progress once its conflicts are staged.
@@ -51,6 +52,11 @@ pub enum Intent {
     Sync,
     SyncContinue,
     SyncAbort,
+    /// Branches, undo, reset, detach, revert, cherry-pick, conflict sides,
+    /// discard-all (tree.rs). The variant carries the facts its check needs.
+    Tree(crate::tree::TreeIntent),
+    /// Stash push / apply / drop / restore one file (stash.rs).
+    Stash(crate::stash::StashIntent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -106,6 +112,7 @@ pub struct StatusFacts {
     pub profile_email: Option<String>,
     pub email_scope: String,
     pub can_amend: bool,
+    pub untracked: usize,
 }
 
 impl From<&RepoStatus> for StatusFacts {
@@ -129,31 +136,40 @@ impl From<&RepoStatus> for StatusFacts {
             profile_email: s.identity.profile_email.clone(),
             email_scope: s.identity.email_scope.clone(),
             can_amend: s.can_amend,
+            untracked: s.untracked_count,
         }
     }
 }
 
+/// "There's a rebase in progress…" — the refusal every operation that would
+/// fight an in-progress merge/rebase/cherry-pick shares.
+pub(crate) fn busy(f: &StatusFacts, verb: &str) -> Option<Refusal> {
+    f.operation.as_ref().map(|kind| {
+        refuse(
+            "operation-in-progress",
+            format!(
+                "There's a {} in progress. Finish or abort it before you {} ({}).",
+                kind,
+                verb,
+                f.abort_command.clone().unwrap_or_default()
+            ),
+        )
+    })
+}
+
 /// Everything that must be true before git runs. Pure.
 pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
-    let busy = |verb: &str| -> Option<Refusal> {
-        f.operation.as_ref().map(|kind| {
-            refuse(
-                "operation-in-progress",
-                format!(
-                    "There's a {} in progress. Finish or abort it before you {} ({}).",
-                    kind,
-                    verb,
-                    f.abort_command.clone().unwrap_or_default()
-                ),
-            )
-        })
-    };
+    let busy = |verb: &str| -> Option<Refusal> { busy(f, verb) };
 
     // While a sync is paused, only the sync's own buttons and the resolution
     // work (stage, unstage, diff) make sense; everything else would fight it.
-    if f.sync_in_progress
-        && !matches!(intent, Intent::Stage | Intent::Unstage { .. } | Intent::Discard { .. } | Intent::SyncContinue | Intent::SyncAbort)
-    {
+    let allowed_during_sync = match intent {
+        Intent::Stage | Intent::Unstage { .. } | Intent::Discard { .. } | Intent::SyncContinue | Intent::SyncAbort => true,
+        Intent::Tree(t) => t.allowed_during_sync(),
+        Intent::Stash(s) => s.allowed_during_sync(),
+        _ => false,
+    };
+    if f.sync_in_progress && !allowed_during_sync {
         return Some(refuse(
             "sync-in-progress",
             "A sync is paused here. Continue or abort it first (the Changes page shows both).",
@@ -161,6 +177,9 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
     }
 
     match intent {
+        Intent::Tree(t) => crate::tree::check_tree(t, f),
+        Intent::Stash(s) => crate::stash::check_stash(s, f),
+
         Intent::Stage => None,
 
         Intent::Unstage { conflicted_selected } => {
@@ -193,7 +212,11 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
                     "Those changes live inside a submodule. Open it as its own repository to discard them.",
                 ));
             }
-            if *conflicted_selected {
+            // Inside a merge/rebase the stage-1/2/3 entries are the conflict
+            // itself; outside one (a stash that failed to re-apply) restoring
+            // the file to HEAD is exactly the way out, and the stash still
+            // holds the change.
+            if *conflicted_selected && f.operation.is_some() {
                 return Some(refuse(
                     "unmerged-paths",
                     "Conflicted files can't be discarded here. Resolve the conflict, or abort the merge to undo all of it.",
@@ -280,7 +303,7 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
             busy("push")
         }
 
-        Intent::Pull(mode) => {
+        Intent::Pull { mode, autostash } => {
             if f.unborn {
                 return Some(refuse(
                     "unborn-head",
@@ -302,12 +325,14 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
             if let Some(r) = busy("pull") {
                 return Some(r);
             }
-            if *mode == PullMode::Rebase && (f.staged > 0 || f.unstaged > 0) {
-                // --no-autostash is deliberate: a silent stash/unstash cycle can
-                // fail halfway and leave work in a stash nobody asked for.
+            if *mode == PullMode::Rebase && !*autostash && (f.staged > 0 || f.unstaged > 0) {
+                // --no-autostash is the default on purpose: a silent
+                // stash/unstash cycle can fail halfway and leave work in a
+                // stash nobody asked for. Autostash is an explicit choice, and
+                // a failed re-apply is then reported, never hidden.
                 return Some(refuse(
                     "dirty-tree",
-                    "Rebase needs a clean working tree. Commit or stash your changes first, or pull with merge instead.",
+                    "Rebase needs a clean working tree. Commit or stash your changes first, turn on autostash, or pull with merge instead.",
                 ));
             }
             None
@@ -427,7 +452,7 @@ pub fn build_push_args(remote: &str, local_branch: &str, remote_ref: &str, set_u
 
 /// The argv that integrates fetched work. One command per mode, named by the
 /// same word the button uses.
-pub fn build_integrate_args(mode: PullMode, upstream_ref: &str) -> Vec<String> {
+pub fn build_integrate_args(mode: PullMode, upstream_ref: &str, autostash: bool) -> Vec<String> {
     match mode {
         PullMode::FfOnly => vec![
             "merge".into(),
@@ -444,7 +469,7 @@ pub fn build_integrate_args(mode: PullMode, upstream_ref: &str) -> Vec<String> {
         ],
         PullMode::Rebase => vec![
             "rebase".into(),
-            "--no-autostash".into(),
+            if autostash { "--autostash".into() } else { "--no-autostash".into() },
             upstream_ref.to_string(),
         ],
     }
@@ -505,6 +530,10 @@ pub struct PullOutcome {
     pub conflicts: Vec<String>,
     /// The literal command that puts the branch back where it was.
     pub recovery: Option<String>,
+    /// The rebase finished but git could not re-apply the autostash cleanly:
+    /// the conflicted files are in the tree and the stash entry is kept.
+    pub autostash_conflict: bool,
+    pub autostash_left: Option<String>,
 }
 
 /// What every operation returns: whether it worked, what to tell the user, and
@@ -532,6 +561,10 @@ pub struct OpResult {
     pub lfs: Option<crate::lfs::LfsStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync: Option<crate::sync::SyncOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tree: Option<crate::tree::TreeOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stash: Option<crate::stash::StashOutcome>,
 }
 
 impl OpResult {
@@ -549,6 +582,8 @@ impl OpResult {
             submodules: None,
             lfs: None,
             sync: None,
+            tree: None,
+            stash: None,
         }
     }
 
@@ -594,7 +629,7 @@ impl OpResult {
     }
 }
 
-async fn snapshot(repo_path: &str) -> Result<RepoStatus, AppError> {
+pub(crate) async fn snapshot(repo_path: &str) -> Result<RepoStatus, AppError> {
     git_status::repo_status(repo_path).await
 }
 
@@ -761,9 +796,13 @@ pub async fn discard(repo_path: &str, paths: Vec<String>) -> Result<OpResult, Ap
         return Ok(OpResult::refused(r, before));
     }
 
+    // A conflicted entry with no operation in progress (a stash that failed
+    // to re-apply) is discarded like any tracked file: back to HEAD, and the
+    // change is still in the stash. `check` refused it when an operation is
+    // in progress, so reaching here means it is safe.
     let tracked: Vec<String> = selected
         .iter()
-        .filter(|e| e.kind == "tracked")
+        .filter(|e| e.kind == "tracked" || e.kind == "conflicted")
         .map(|e| e.path.clone())
         .collect();
     let untracked: Vec<String> = selected
@@ -1073,9 +1112,9 @@ pub fn parse_push_porcelain(out: &str) -> Vec<PushedRef> {
 /// and `branch.<n>.rebase`, so the same button could merge for one user and
 /// rebase for another. Fetch and integrate are separate, and the mode the user
 /// picked is the command that runs.
-pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool) -> Result<OpResult, AppError> {
+pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
-    if let Some(r) = check(&Intent::Pull(mode), &StatusFacts::from(&before)) {
+    if let Some(r) = check(&Intent::Pull { mode, autostash }, &StatusFacts::from(&before)) {
         return Ok(OpResult::refused(r, before));
     }
     let upstream = before.upstream.clone().unwrap_or_default();
@@ -1099,12 +1138,19 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool) -> Result<OpR
     // Fully qualified, so a local branch of the same name can't win.
     let upstream_ref = format!("refs/remotes/{}", upstream);
     let out = GitCmd::at(repo_path)
-        .args(build_integrate_args(mode, &upstream_ref))
+        .args(build_integrate_args(mode, &upstream_ref, autostash))
         .timeout(NET_TIMEOUT)
         .run()
         .await?;
 
     let after = snapshot(repo_path).await?;
+    // An autostash that git could not re-apply leaves conflicted files with
+    // no rebase in progress, and keeps the entry in the stash. Git may still
+    // exit 0 here, so this is measured rather than read from the exit code.
+    let autostash_conflict = mode == PullMode::Rebase
+        && autostash
+        && after.operation.is_none()
+        && (after.conflicted_count > 0 || crate::sync::has_autostash_entry(&PathBuf::from(repo_path)).await);
     let head_after = after.head_oid.clone().unwrap_or_default();
     let conflicts: Vec<String> = after
         .entries
@@ -1162,7 +1208,21 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool) -> Result<OpR
         } else {
             Some(format!("git reset --hard {}", head_before))
         },
+        autostash_conflict,
+        autostash_left: if autostash_conflict { Some("stash@{0}".to_string()) } else { None },
     };
+
+    if autostash_conflict {
+        let a = git_advice::explain(
+            GitOp::Rebase,
+            &format!("Applying autostash resulted in conflicts\n{}\n{}", out.text(), out.stderr),
+            &advice_ctx(&after),
+        );
+        return Ok(OpResult {
+            pull: Some(outcome),
+            ..OpResult::failed(a, after)
+        });
+    }
 
     if !out.ok() {
         // Conflicts are left exactly as they are — resolving them is the user's
@@ -1531,6 +1591,16 @@ pub async fn continue_op(repo_path: &str) -> Result<OpResult, AppError> {
         );
         return Ok(OpResult::failed(a, after));
     }
+    // A rebase started with --autostash pops the stash when it finishes; a pop
+    // that conflicts leaves conflicted files behind with no rebase in progress.
+    if op.kind.contains("rebase") && after.operation.is_none() && after.conflicted_count > 0 {
+        let a = git_advice::explain(
+            GitOp::Rebase,
+            &format!("Applying autostash resulted in conflicts\n{}\n{}", out.text(), out.stderr),
+            &advice_ctx(&after),
+        );
+        return Ok(OpResult::failed(a, after));
+    }
     let (headline, detail) = if after.operation.is_some() {
         (
             format!("Continued the {} — it stopped again.", op.kind),
@@ -1622,20 +1692,24 @@ mod tests {
 
     #[test]
     fn each_pull_mode_runs_the_command_its_name_promises() {
-        let ff = build_integrate_args(PullMode::FfOnly, "refs/remotes/origin/main");
+        let ff = build_integrate_args(PullMode::FfOnly, "refs/remotes/origin/main", false);
         assert_eq!(ff[0], "merge");
         assert!(ff.iter().any(|a| a == "--ff-only"));
         assert!(!ff.iter().any(|a| a == "--rebase"));
 
-        let merge = build_integrate_args(PullMode::Merge, "refs/remotes/origin/main");
+        let merge = build_integrate_args(PullMode::Merge, "refs/remotes/origin/main", false);
         assert_eq!(merge[0], "merge");
         assert!(merge.iter().any(|a| a == "--no-edit"));
         assert!(!merge.iter().any(|a| a == "--ff-only"));
 
-        let rebase = build_integrate_args(PullMode::Rebase, "refs/remotes/origin/main");
+        let rebase = build_integrate_args(PullMode::Rebase, "refs/remotes/origin/main", false);
         assert_eq!(rebase[0], "rebase");
         // Autostash would silently move the user's work and can fail on the way back.
         assert!(rebase.iter().any(|a| a == "--no-autostash"));
+        // …unless the user asked for it, in which case the failure is reported, never hidden.
+        let auto = build_integrate_args(PullMode::Rebase, "refs/remotes/origin/main", true);
+        assert!(auto.iter().any(|a| a == "--autostash"));
+        assert!(!auto.iter().any(|a| a == "--no-autostash"));
 
         // All three point at the fully-qualified remote ref.
         for args in [ff, merge, rebase] {
@@ -1878,19 +1952,19 @@ mod tests {
     fn rebase_needs_a_clean_tree_but_fast_forward_does_not() {
         let dirty = StatusFacts { unstaged: 2, ..clean() };
         assert_eq!(
-            check(&Intent::Pull(PullMode::Rebase), &dirty).unwrap().code,
+            check(&Intent::Pull { mode: PullMode::Rebase, autostash: false }, &dirty).unwrap().code,
             "dirty-tree"
         );
         // Let git decide for the other two — it refuses only if files collide.
-        assert!(check(&Intent::Pull(PullMode::FfOnly), &dirty).is_none());
-        assert!(check(&Intent::Pull(PullMode::Merge), &dirty).is_none());
+        assert!(check(&Intent::Pull { mode: PullMode::FfOnly, autostash: false }, &dirty).is_none());
+        assert!(check(&Intent::Pull { mode: PullMode::Merge, autostash: false }, &dirty).is_none());
     }
 
     #[test]
     fn pull_refuses_without_an_upstream() {
         let f = StatusFacts { upstream: None, ..clean() };
         assert_eq!(
-            check(&Intent::Pull(PullMode::Merge), &f).unwrap().code,
+            check(&Intent::Pull { mode: PullMode::Merge, autostash: false }, &f).unwrap().code,
             "no-upstream"
         );
     }
@@ -1905,23 +1979,54 @@ mod tests {
         };
         for intent in [
             Intent::Push,
-            Intent::Pull(PullMode::Merge),
+            Intent::Pull { mode: PullMode::Merge, autostash: false },
             Intent::Submodule,
             Intent::Sync,
+            Intent::Tree(crate::tree::TreeIntent::UndoCommit { head_is_root: false, head_is_merge: false }),
+            Intent::Tree(crate::tree::TreeIntent::Switch { detached_unique: 0 }),
+            Intent::Tree(crate::tree::TreeIntent::DiscardAll { include_untracked: false, stash_first: false }),
+            Intent::Stash(crate::stash::StashIntent::Push { include_untracked: false, has_paths: false }),
+            Intent::Stash(crate::stash::StashIntent::Apply { exists: true, pop: true }),
         ] {
             let r = check(&intent, &f).unwrap();
-            assert_eq!(r.code, "operation-in-progress");
+            assert_eq!(r.code, "operation-in-progress", "{:?}", intent);
             assert!(r.message.contains("git rebase --abort"));
         }
+        // Resolving a conflict is exactly the work an operation in progress needs.
+        assert!(check(&Intent::Tree(crate::tree::TreeIntent::ResolveSide { has_paths: true, submodule_selected: false, not_conflicted_selected: false }), &f).is_none());
+    }
+
+    #[test]
+    fn autostash_lets_a_dirty_tree_rebase_and_nothing_else_changes() {
+        let dirty = StatusFacts { unstaged: 1, ..clean() };
+        assert_eq!(check(&Intent::Pull { mode: PullMode::Rebase, autostash: false }, &dirty).unwrap().code, "dirty-tree");
+        assert!(check(&Intent::Pull { mode: PullMode::Rebase, autostash: true }, &dirty).is_none());
+        assert_eq!(check(&Intent::Pull { mode: PullMode::Rebase, autostash: true }, &StatusFacts { upstream: None, ..dirty.clone() }).unwrap().code, "no-upstream");
     }
 
     #[test]
     fn a_paused_sync_blocks_everything_but_resolution_and_its_own_buttons() {
         let f = StatusFacts { sync_in_progress: true, operation: Some("rebase".into()), abort_command: Some("git rebase --abort".into()), continue_command: Some("git rebase --continue".into()), ..clean() };
-        for intent in [Intent::Push, Intent::Pull(PullMode::Merge), Intent::Commit { amend: false, message_empty: false }, Intent::Abort, Intent::Continue, Intent::Sync, Intent::Submodule] {
+        for intent in [
+            Intent::Push,
+            Intent::Pull { mode: PullMode::Merge, autostash: false },
+            Intent::Commit { amend: false, message_empty: false },
+            Intent::Abort,
+            Intent::Continue,
+            Intent::Sync,
+            Intent::Submodule,
+            Intent::Tree(crate::tree::TreeIntent::UndoCommit { head_is_root: false, head_is_merge: false }),
+            Intent::Tree(crate::tree::TreeIntent::Reset { mode: crate::tree::ResetMode::Hard, target_valid: true, target_is_head: false, drops_pushed: false, stash_first: false }),
+            Intent::Tree(crate::tree::TreeIntent::DiscardAll { include_untracked: false, stash_first: false }),
+            Intent::Stash(crate::stash::StashIntent::Push { include_untracked: false, has_paths: false }),
+            Intent::Stash(crate::stash::StashIntent::Drop { exists: true }),
+        ] {
             assert_eq!(check(&intent, &f).unwrap().code, "sync-in-progress", "{:?}", intent);
         }
         assert!(check(&Intent::Stage, &f).is_none());
+        // Resolution work is allowed: taking a side, and recovering a file from the autostash.
+        assert!(check(&Intent::Tree(crate::tree::TreeIntent::ResolveSide { has_paths: true, submodule_selected: false, not_conflicted_selected: false }), &f).is_none());
+        assert!(check(&Intent::Stash(crate::stash::StashIntent::RestoreFile { exists: true, in_stash: true }), &f).is_none());
         assert!(check(&Intent::SyncContinue, &f).is_none());
         assert!(check(&Intent::SyncAbort, &f).is_none());
         assert_eq!(check(&Intent::SyncContinue, &clean()).unwrap().code, "no-sync");
@@ -2004,6 +2109,8 @@ mod tests {
             .code,
             "submodule-selected"
         );
+        // Inside a merge the stage entries are the conflict itself…
+        let merging = StatusFacts { operation: Some("merge".into()), abort_command: Some("git merge --abort".into()), ..f.clone() };
         assert_eq!(
             check(
                 &Intent::Discard {
@@ -2011,12 +2118,19 @@ mod tests {
                     submodule_selected: false,
                     conflicted_selected: true
                 },
-                &f
+                &merging
             )
             .unwrap()
             .code,
             "unmerged-paths"
         );
+        // …but a stash that failed to re-apply leaves conflicts with no
+        // operation, and restoring the file to HEAD is the way out.
+        assert!(check(
+            &Intent::Discard { has_paths: true, submodule_selected: false, conflicted_selected: true },
+            &f
+        )
+        .is_none());
     }
 
     #[test]

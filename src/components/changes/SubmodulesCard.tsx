@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Box, Download, Loader2, FolderOpen, GitCommitHorizontal, AlertTriangle } from "lucide-react";
+import { Box, Download, Loader2, FolderOpen, GitCommitHorizontal, AlertTriangle, CornerDownRight } from "lucide-react";
 import { Button } from "../Button";
 import { ChangesList } from "./ChangesList";
 import { DiffPanel } from "./DiffPanel";
@@ -13,6 +13,9 @@ interface Props {
   onUpdate: () => void;
   /** Bumped by the page after any operation, so the list re-reads. */
   refreshKey: number;
+  /** Submodules that have their own section in the main column. */
+  sectionPaths?: string[];
+  onJumpToSection?: (path: string) => void;
 }
 
 /** A submodule is a repo, so its files open in the same diff panel. */
@@ -52,11 +55,16 @@ function SubmoduleRow({
   sub,
   busy,
   onOpenRepo,
+  hasSection,
+  onJumpToSection,
 }: {
   repoPath: string;
   sub: SubmoduleInfo;
   busy: boolean;
   onOpenRepo: (path: string) => void;
+  /** The main column already shows this submodule's files — link there instead of re-reading them. */
+  hasSection: boolean;
+  onJumpToSection?: (path: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [inner, setInner] = useState<RepoStatus | null>(null);
@@ -70,7 +78,7 @@ function SubmoduleRow({
   // Read the submodule's own files only when asked: cheap per submodule
   // (~70 ms) but pointless for every one of them at once.
   useEffect(() => {
-    if (!open || !sub.initialised || !hasInnerChanges || inner || loading) return;
+    if (hasSection || !open || !sub.initialised || !hasInnerChanges || inner || loading) return;
     let cancelled = false;
     setLoading(true);
     api
@@ -87,7 +95,7 @@ function SubmoduleRow({
     return () => {
       cancelled = true;
     };
-  }, [open, sub.initialised, hasInnerChanges, inner, loading, absolute]);
+  }, [hasSection, open, sub.initialised, hasInnerChanges, inner, loading, absolute]);
 
   const innerEntries = inner?.entries ?? [];
 
@@ -146,6 +154,18 @@ function SubmoduleRow({
                 </div>
               )}
 
+              {hasSection && hasInnerChanges && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="text-sky-300"
+                  onClick={() => onJumpToSection?.(sub.path)}
+                  title="Its changed files are listed in their own section on this page"
+                >
+                  <CornerDownRight size={12} />
+                  See the changes inside ↓
+                </Button>
+              )}
               {loading && (
                 <p className="flex items-center gap-1.5 text-xs text-zinc-500">
                   <Loader2 size={12} className="animate-spin" />
@@ -153,7 +173,7 @@ function SubmoduleRow({
                 </p>
               )}
               {error && <p className="text-xs text-red-400 break-words">{error}</p>}
-              {innerEntries.length > 0 && (
+              {!hasSection && innerEntries.length > 0 && (
                 <ChangesList
                   title={`Changed inside ${sub.path}`}
                   icon={<Box size={13} />}
@@ -197,7 +217,15 @@ function SubmoduleRow({
   );
 }
 
-export function SubmodulesCard({ repoPath, busy, onOpenRepo, onUpdate, refreshKey }: Props) {
+export function SubmodulesCard({
+  repoPath,
+  busy,
+  onOpenRepo,
+  onUpdate,
+  refreshKey,
+  sectionPaths = [],
+  onJumpToSection,
+}: Props) {
   const [subs, setSubs] = useState<SubmoduleInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -250,6 +278,8 @@ export function SubmodulesCard({ repoPath, busy, onOpenRepo, onUpdate, refreshKe
             sub={s}
             busy={busy}
             onOpenRepo={onOpenRepo}
+            hasSection={sectionPaths.includes(s.path)}
+            onJumpToSection={onJumpToSection}
           />
         ))}
       </ul>

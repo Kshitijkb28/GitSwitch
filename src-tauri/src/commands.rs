@@ -655,9 +655,10 @@ pub async fn changes_pull(
     repo_path: String,
     mode: String,
     with_lfs: bool,
+    autostash: bool,
 ) -> Result<OpResult, AppError> {
     let mode = git_ops::PullMode::parse(&mode)?;
-    git_ops::pull(&repo_path, mode, with_lfs).await
+    git_ops::pull(&repo_path, mode, with_lfs, autostash).await
 }
 
 /// Every gitlink in the repo with its real state — where it moved, what is
@@ -732,4 +733,146 @@ pub async fn changes_continue(repo_path: String) -> Result<OpResult, AppError> {
 #[tauri::command]
 pub async fn changes_abort(repo_path: String) -> Result<OpResult, AppError> {
     git_ops::abort(&repo_path).await
+}
+
+
+// --- Tree management: submodule sections, branches, undo/reset, revert, stashes ---
+
+/// The full status of every populated submodule, one section each on the
+/// Changes page (stage, resolve and commit inside them).
+#[tauri::command]
+pub async fn changes_submodule_statuses(repo_path: String) -> Result<Vec<submodules::SubmoduleStatus>, AppError> {
+    submodules::submodule_statuses(&repo_path).await
+}
+
+/// `git switch --no-guess <name>`; a remote-only name is never created implicitly.
+#[tauri::command]
+pub async fn changes_switch_branch(repo_path: String, name: String) -> Result<OpResult, AppError> {
+    crate::tree::switch_branch(&repo_path, &name).await
+}
+
+/// `from` None = HEAD. A remote-tracking start point sets the upstream.
+#[tauri::command]
+pub async fn changes_create_branch(
+    repo_path: String,
+    name: String,
+    from: Option<String>,
+    switch_to: bool,
+) -> Result<OpResult, AppError> {
+    crate::tree::create_branch(&repo_path, &name, from.as_deref(), switch_to).await
+}
+
+/// `force` deletes a branch whose commits no other branch holds; the refusal
+/// without it names the count. Remotes are never touched.
+#[tauri::command]
+pub async fn changes_delete_branch(repo_path: String, name: String, force: bool) -> Result<OpResult, AppError> {
+    crate::tree::delete_branch(&repo_path, &name, force).await
+}
+
+#[tauri::command]
+pub async fn changes_rename_branch(repo_path: String, old_name: String, new_name: String) -> Result<OpResult, AppError> {
+    crate::tree::rename_branch(&repo_path, &old_name, &new_name).await
+}
+
+/// Soft-reset HEAD~1: the last commit's changes come back staged. Refused when
+/// the commit is already on a remote (that would need a force-push).
+#[tauri::command]
+pub async fn changes_undo_commit(repo_path: String) -> Result<OpResult, AppError> {
+    crate::tree::undo_commit(&repo_path).await
+}
+
+/// Reset the branch to `target` (any commit id or ref; `@{u}` for the
+/// upstream). Makes a backup branch when commits would leave; refuses when
+/// commits already on the upstream would be dropped.
+#[tauri::command]
+pub async fn changes_reset(
+    repo_path: String,
+    target: String,
+    mode: String,
+    stash_first: bool,
+) -> Result<OpResult, AppError> {
+    let mode = crate::tree::ResetMode::parse(&mode)?;
+    crate::tree::reset_to(&repo_path, &target, mode, stash_first).await
+}
+
+/// Look at a commit without moving any branch (detached HEAD).
+#[tauri::command]
+pub async fn changes_detach(repo_path: String, target: String) -> Result<OpResult, AppError> {
+    crate::tree::detach(&repo_path, &target).await
+}
+
+/// `mainline` is only needed for a merge commit; the refusal lists the parents.
+#[tauri::command]
+pub async fn changes_revert(repo_path: String, target: String, mainline: Option<u32>) -> Result<OpResult, AppError> {
+    crate::tree::revert(&repo_path, &target, mainline).await
+}
+
+#[tauri::command]
+pub async fn changes_cherry_pick(repo_path: String, target: String) -> Result<OpResult, AppError> {
+    crate::tree::cherry_pick(&repo_path, &target).await
+}
+
+/// Resolve conflicted files by taking one side. `side` is "mine" or "theirs"
+/// in the user's words; the mapping to --ours/--theirs depends on the operation.
+#[tauri::command]
+pub async fn changes_resolve_side(repo_path: String, paths: Vec<String>, side: String) -> Result<OpResult, AppError> {
+    let side = crate::tree::Side::parse(&side)?;
+    crate::tree::resolve_side(&repo_path, paths, side).await
+}
+
+/// Everything back to HEAD. Untracked files only when asked, ignored files
+/// never; an optional stash first keeps it all recoverable.
+#[tauri::command]
+pub async fn changes_discard_all(repo_path: String, include_untracked: bool, stash_first: bool) -> Result<OpResult, AppError> {
+    crate::tree::discard_all(&repo_path, include_untracked, stash_first).await
+}
+
+#[tauri::command]
+pub async fn changes_stash_list(repo_path: String) -> Result<Vec<crate::stash::StashEntry>, AppError> {
+    crate::stash::stash_list(&repo_path).await
+}
+
+#[tauri::command]
+pub async fn changes_stash_show(repo_path: String, index: usize) -> Result<crate::stash::StashDetail, AppError> {
+    crate::stash::stash_show(&repo_path, index).await
+}
+
+#[tauri::command]
+pub async fn changes_stash_file_diff(repo_path: String, index: usize, path: String) -> Result<git_status::FileDiff, AppError> {
+    crate::stash::stash_file_diff(&repo_path, index, &path).await
+}
+
+/// `git stash push` (never `--all`): ignored files stay where they are.
+#[tauri::command]
+pub async fn changes_stash_push(repo_path: String, message: Option<String>, include_untracked: bool) -> Result<OpResult, AppError> {
+    crate::stash::stash_push(&repo_path, message.as_deref(), include_untracked, None).await
+}
+
+#[tauri::command]
+pub async fn changes_stash_apply(repo_path: String, index: usize, pop: bool, restore_index: bool) -> Result<OpResult, AppError> {
+    crate::stash::stash_apply(&repo_path, index, pop, restore_index).await
+}
+
+/// The result carries `git stash store …` so a dropped entry can be put back.
+#[tauri::command]
+pub async fn changes_stash_drop(repo_path: String, index: usize) -> Result<OpResult, AppError> {
+    crate::stash::stash_drop(&repo_path, index).await
+}
+
+#[tauri::command]
+pub async fn changes_stash_restore_file(repo_path: String, index: usize, path: String) -> Result<OpResult, AppError> {
+    crate::stash::stash_restore_file(&repo_path, index, &path).await
+}
+
+/// What one commit did to one file (first-parent diff for merges).
+#[tauri::command]
+pub async fn history_commit_file_diff(repo_path: String, hash: String, path: String) -> Result<git_status::FileDiff, AppError> {
+    git_status::commit_file_diff(&repo_path, &hash, &path).await
+}
+
+/// A commit id, short id or ref typed by the user, with what a reset to it
+/// would do. `None` when nothing matches.
+#[tauri::command]
+pub async fn history_resolve(repo_path: String, text: String) -> Result<Option<crate::tree::CommitTarget>, AppError> {
+    crate::tree::resolve_commit(&repo_path, &text).await
 }

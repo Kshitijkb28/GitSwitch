@@ -94,6 +94,37 @@ for folders that still use HTTPS.
     setting the repository's LFS filters up first when they were never
     configured — the state in which `git lfs pull` exits 0 and downloads
     nothing.
+  - **Inside submodules.** Every populated submodule gets its own section on
+    the page — its conflicts, staged, unstaged and new files, with the same
+    stage / unstage / discard / diff actions and its own commit box committing
+    as the submodule's identity. Commit inside, then record the pointer in the
+    superproject with one click. The parent's gitlink row jumps to the section.
+  - **Branches.** Switch, create (from the current branch, another one, or the
+    commit you are looking at), rename and delete from the page. A switch that
+    would overwrite uncommitted changes is refused with the files named; a
+    branch whose commits no other branch holds is only deleted after you
+    confirm, and the result prints the command that brings it back.
+  - **Tidy up.** *Undo last commit* (its changes come back staged; refused
+    when the commit is already on the remote — revert it instead), *Stash
+    changes* (with or without new files; never ignored ones), *Reset to
+    upstream* (your unpushed commits leave the branch, a
+    `gitswitch-before-reset-<time>` branch keeps them, and the undo command is
+    printed), *Discard everything* (optionally deleting new files, optionally
+    stashing first). Nothing that is already on the upstream is ever dropped:
+    that would need a force-push, which GitSwitch never does.
+  - **Stashes.** The list with apply, pop and drop (a dropped stash's id and
+    the `git stash store` command that restores it are shown), each stash's
+    files, and *Restore file* for taking one file back out of a stash — the
+    recovery a failed autostash needs. A stash or autostash that cannot be
+    re-applied leaves ordinary conflicts, and the page says where they came
+    from.
+  - **Conflicts.** *Keep mine* / *Take theirs* per file or for all, with both
+    sides named in your words — during a rebase git's "ours" is the upstream
+    and "theirs" is your commit, and the buttons map that for you.
+  - **Pull with rebase on a dirty tree.** Rebase pulls still refuse a dirty
+    tree by default; turn on *Stash my changes around the rebase* and git's
+    autostash is used, with a re-apply that conflicts reported as such rather
+    than hidden.
 - **Push blocking** — per profile *and* per repository. A blocked repo refuses
   `git push` **in your terminal too**, via two mechanisms with different blind
   spots: a `pushInsteadOf` rewrite in the repo's own `.git/config` (which
@@ -142,6 +173,15 @@ for folders that still use HTTPS.
   **Fetch** shows where your branch and its remote each point and which
   commits you haven't pulled yet — it never merges or touches your working
   tree, and verifies that before reporting success.
+  - **Go to commit.** Paste a commit id, short id or ref to open it. Every
+    commit's detail offers: *Go back to this commit* — look at it (detached),
+    or move the branch there keeping the later changes unstaged, staged, or
+    dropping them (a backup branch first, the undo command afterwards); *Start
+    a branch here*; *Undo this commit* (a revert, with the side to keep when it
+    is a merge); *Cherry-pick onto* the current branch; *Copy hash*; and the
+    line diff of every file it touched. A reset that would drop commits already
+    on the upstream is refused and the alternatives are offered instead.
+    Anything that ends in a conflict hands you to the Changes page.
 - **Commit Audit** — finds commits authored with the wrong identity, rewrites the
   ones you haven't pushed (keeping a backup branch, never touching published
   history), and can install a `pre-commit` guard that blocks future mistakes.

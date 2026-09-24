@@ -78,6 +78,32 @@ pub struct ParsedStatus {
     pub untracked_truncated: bool,
 }
 
+/// The two sides of a conflict, named the way the user thinks of them —
+/// during a rebase git's "ours" is the upstream and "theirs" is your commit,
+/// which is exactly the confusion these labels exist to remove.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct Sides {
+    pub mine: String,
+    pub theirs: String,
+}
+
+/// Which words describe each side of a conflict for this kind of operation.
+pub fn sides_for(kind: &str, branch: Option<&str>, upstream: Option<&str>, onto: Option<&str>) -> Sides {
+    let mine_branch = branch.map(|b| b.to_string()).unwrap_or_else(|| "your branch".to_string());
+    match kind {
+        "rebase" | "rebase-interactive" | "am" => Sides {
+            mine: "your commit being replayed".into(),
+            theirs: onto
+                .or(upstream)
+                .map(|s| s.trim_start_matches("refs/remotes/").to_string())
+                .unwrap_or_else(|| "the base it is replayed onto".into()),
+        },
+        "cherry-pick" => Sides { mine: mine_branch, theirs: "the picked commit".into() },
+        "revert" => Sides { mine: mine_branch, theirs: "the revert".into() },
+        _ => Sides { mine: mine_branch, theirs: "the branch being merged in".into() },
+    }
+}
+
 /// An interrupted merge/rebase/cherry-pick. Detected and shown; never acted on
 /// without an explicit request.
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -90,6 +116,8 @@ pub struct InProgress {
     /// What finishes it once conflicts are staged; `None` when only a commit
     /// (merge) or nothing (bisect) can.
     pub continue_command: Option<String>,
+    /// Who "mine" and "theirs" are in this operation's conflicts.
+    pub sides: Option<Sides>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -145,6 +173,9 @@ pub struct RepoStatus {
     pub uses_lfs: bool,
     /// A paused sync (sync.rs) here or in this repository's superproject.
     pub sync: Option<crate::sync::SyncSummary>,
+    /// Conflicts with no operation in progress can only come from a stash
+    /// that failed to re-apply: "autostash" (a rebase's) or "stash" (yours).
+    pub conflict_source: Option<String>,
 }
 
 /// Split porcelain `-z` output into NUL-delimited chunks. The trailing NUL
@@ -447,6 +478,7 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
 
     if p.merge_head {
         return Some(InProgress {
+            sides: None,
             kind: "merge".into(),
             label: "Merge in progress".into(),
             detail: "Finish it with one commit, or abort.".into(),
@@ -472,6 +504,7 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
             "Rebase in progress"
         };
         return Some(InProgress {
+            sides: None,
             kind: kind.into(),
             label: label.into(),
             detail: join(&step_text, &branch_text),
@@ -489,6 +522,7 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
     }
     if p.cherry_pick_head {
         return Some(InProgress {
+            sides: None,
             kind: "cherry-pick".into(),
             label: "Cherry-pick in progress".into(),
             detail: String::new(),
@@ -498,6 +532,7 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
     }
     if p.revert_head {
         return Some(InProgress {
+            sides: None,
             kind: "revert".into(),
             label: "Revert in progress".into(),
             detail: String::new(),
@@ -507,6 +542,7 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
     }
     if p.bisect_log {
         return Some(InProgress {
+            sides: None,
             kind: "bisect".into(),
             label: "Bisect in progress".into(),
             detail: String::new(),
@@ -796,7 +832,11 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
     }
 
     let paths = git_paths(&repo).await?;
-    let operation = parse_in_progress(&presence_from_disk(&paths));
+    let presence = presence_from_disk(&paths);
+    let mut operation = parse_in_progress(&presence);
+    if let Some(op) = operation.as_mut() {
+        op.sides = Some(sides_for(&op.kind, parsed.branch.as_deref(), parsed.upstream.as_deref(), presence.onto.as_deref()));
+    }
     let merge_message = if paths.merge_head.exists() {
         std::fs::read_to_string(&paths.merge_msg)
             .ok()
@@ -846,6 +886,12 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         .filter(|e| e.is_submodule && (e.sub_commit_changed || e.sub_tracked_changes || e.sub_untracked))
         .count();
 
+    let conflict_source = if conflicted_count > 0 && operation.is_none() {
+        Some(if crate::sync::has_autostash_entry(&repo).await { "autostash".to_string() } else { "stash".to_string() })
+    } else {
+        None
+    };
+
     let name = crate::paths::base_name(repo_path);
 
     Ok(RepoStatus {
@@ -876,6 +922,7 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         has_submodules,
         uses_lfs,
         sync: crate::sync::summary_for(&repo).await,
+        conflict_source,
     })
 }
 
@@ -986,11 +1033,16 @@ pub async fn file_diff(repo_path: &str, path: &str, staged: bool, untracked: boo
         return Err(AppError::Command(format!("git diff failed: {}", out.stderr)));
     }
 
-    let raw = out.stdout;
+    let empty = if staged { "Nothing staged for this file." } else { "No unstaged changes for this file." };
+    Ok(render_diff(out.stdout, path, staged, empty))
+}
+
+/// Turn raw `git diff` bytes into the panel's line list, capped and classified.
+pub fn render_diff(raw: Vec<u8>, path: &str, staged: bool, empty_reason: &str) -> FileDiff {
     let is_binary = raw.contains(&0)
         || String::from_utf8_lossy(&raw[..raw.len().min(4096)]).contains("Binary files ");
     if is_binary {
-        return Ok(FileDiff {
+        return FileDiff {
             path: path.to_string(),
             staged,
             lines: Vec::new(),
@@ -1000,7 +1052,7 @@ pub async fn file_diff(repo_path: &str, path: &str, staged: bool, untracked: boo
             added: 0,
             removed: 0,
             empty_reason: Some("Binary file — no text diff to show.".into()),
-        });
+        };
     }
 
     let too_big = raw.len() > MAX_DIFF_BYTES;
@@ -1026,17 +1078,7 @@ pub async fn file_diff(repo_path: &str, path: &str, staged: bool, untracked: boo
         });
     }
 
-    let empty_reason = if lines.is_empty() {
-        Some(if staged {
-            "Nothing staged for this file.".into()
-        } else {
-            "No unstaged changes for this file.".into()
-        })
-    } else {
-        None
-    };
-
-    Ok(FileDiff {
+    FileDiff {
         path: path.to_string(),
         staged,
         lines,
@@ -1045,8 +1087,58 @@ pub async fn file_diff(repo_path: &str, path: &str, staged: bool, untracked: boo
         total_lines,
         added,
         removed,
-        empty_reason,
-    })
+        empty_reason: if lines_is_empty(total_lines) { Some(empty_reason.to_string()) } else { None },
+    }
+}
+
+fn lines_is_empty(total: usize) -> bool {
+    total == 0
+}
+
+fn guard_rev(rev: &str) -> Result<(), AppError> {
+    if rev.is_empty() || rev.starts_with('-') || rev.chars().any(|c| c.is_whitespace() || c == '\0') {
+        return Err(AppError::Command(format!("not a valid revision: {:?}", rev)));
+    }
+    Ok(())
+}
+
+/// The diff of one path between two revisions.
+pub async fn rev_diff(repo_path: &str, from: &str, to: &str, path: &str) -> Result<FileDiff, AppError> {
+    guard_rev(from)?;
+    guard_rev(to)?;
+    let literal = format!(":(literal){}", path);
+    let out = GitCmd::at(repo_path)
+        .args(["diff", "--no-color", "--no-ext-diff", "--ignore-submodules=none", from, to, "--", &literal])
+        .run()
+        .await?;
+    if !out.ok() && out.stdout.is_empty() && !out.stderr.is_empty() {
+        return Err(AppError::Command(format!("git diff failed: {}", out.stderr.trim())));
+    }
+    Ok(render_diff(out.stdout, path, false, "No changes to this file between those commits."))
+}
+
+/// What one commit did to one file: the first-parent diff (also for merges,
+/// where `git show` would give an often-empty combined diff); a root commit
+/// is shown against nothing.
+pub async fn commit_file_diff(repo_path: &str, sha: &str, path: &str) -> Result<FileDiff, AppError> {
+    guard_rev(sha)?;
+    let parents = GitCmd::at(repo_path)
+        .args(["rev-list", "--parents", "-n1", sha])
+        .text()
+        .await?;
+    let has_parent = parents.split_whitespace().count() > 1;
+    if has_parent {
+        return rev_diff(repo_path, &format!("{}^1", sha), sha, path).await;
+    }
+    let literal = format!(":(literal){}", path);
+    let out = GitCmd::at(repo_path)
+        .args(["show", "--no-color", "--no-ext-diff", "--format=", sha, "--", &literal])
+        .run()
+        .await?;
+    if !out.ok() && out.stdout.is_empty() && !out.stderr.is_empty() {
+        return Err(AppError::Command(format!("git show failed: {}", out.stderr.trim())));
+    }
+    Ok(render_diff(out.stdout, path, false, "This commit did not change this file."))
 }
 
 #[cfg(test)]
@@ -1236,6 +1328,32 @@ mod tests {
         assert_eq!(map.get("new.ts"), Some(&(Some(10), Some(0), false)));
         assert!(!map.contains_key("old.ts"));
         assert_eq!(map.get("logo.png"), Some(&(None, None, true)));
+    }
+
+    #[test]
+    fn conflict_sides_are_named_in_the_users_words_and_swapped_for_a_rebase() {
+        let m = sides_for("merge", Some("main"), Some("origin/main"), None);
+        assert_eq!(m.mine, "main");
+        assert_eq!(m.theirs, "the branch being merged in");
+        // During a rebase "mine" is the commit being replayed, "theirs" the base.
+        let r = sides_for("rebase", Some("main"), Some("origin/main"), Some("refs/remotes/origin/main"));
+        assert_eq!(r.mine, "your commit being replayed");
+        assert_eq!(r.theirs, "origin/main");
+        let c = sides_for("cherry-pick", None, None, None);
+        assert_eq!(c.mine, "your branch");
+        assert_eq!(c.theirs, "the picked commit");
+    }
+
+    #[test]
+    fn a_rendered_diff_reports_its_empty_reason_and_binaries() {
+        let d = render_diff(Vec::new(), "a.txt", false, "nothing here");
+        assert_eq!(d.empty_reason.as_deref(), Some("nothing here"));
+        assert_eq!(d.total_lines, 0);
+        let b = render_diff(b"Binary files a and b differ\n".to_vec(), "x.png", false, "n/a");
+        assert!(b.is_binary);
+        let t = render_diff(b"@@ -1 +1 @@\n-old\n+new\n".to_vec(), "a.txt", true, "n/a");
+        assert_eq!((t.added, t.removed), (1, 1));
+        assert!(t.empty_reason.is_none());
     }
 
     #[test]

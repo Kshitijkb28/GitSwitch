@@ -6,7 +6,7 @@
 //! read one `PROBE_OUT <json>` line back — the real backend, driven from
 //! outside, against throwaway repositories.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::git_ops::{self, PullMode};
     use crate::git_status;
 
@@ -23,15 +23,15 @@ mod tests {
             .collect()
     }
 
-    fn emit<T: serde::Serialize>(value: &T) {
+    pub(crate) fn emit<T: serde::Serialize>(value: &T) {
         println!("PROBE_OUT {}", serde_json::to_string(value).unwrap());
     }
 
-    fn emit_err(e: impl std::fmt::Display) {
+    pub(crate) fn emit_err(e: impl std::fmt::Display) {
         println!("PROBE_OUT {{\"error\":{:?}}}", e.to_string());
     }
 
-    fn show(r: Result<git_ops::OpResult, crate::error::AppError>) {
+    pub(crate) fn show(r: Result<git_ops::OpResult, crate::error::AppError>) {
         match r {
             Ok(o) => emit(&serde_json::json!({
                 "ok": o.ok,
@@ -45,6 +45,12 @@ mod tests {
                 "submodules": o.submodules,
                 "lfs": o.lfs,
                 "sync": o.sync,
+                "tree": o.tree,
+                "stash": o.stash,
+                "conflict_source": o.status.as_ref().and_then(|s| s.conflict_source.clone()),
+                "detached": o.status.as_ref().map(|s| s.detached),
+                "stash_count": o.status.as_ref().map(|s| s.stash_count),
+                "head": o.status.as_ref().and_then(|s| s.head_oid.clone()),
                 "staged": o.status.as_ref().map(|s| s.staged_count),
                 "unstaged": o.status.as_ref().map(|s| s.unstaged_count),
                 "untracked": o.status.as_ref().map(|s| s.untracked_count),
@@ -87,10 +93,23 @@ mod tests {
                 show(git_ops::commit(&repo(), first, amend).await)
             }
             "push" => show(git_ops::push(&repo(), first == "upstream").await),
+            // PROBE_ARGS: "<mode>[,lfs][,autostash]"
             "pull" => {
-                let with_lfs = a.get(1).map(|s| s == "lfs").unwrap_or(false);
-                show(git_ops::pull(&repo(), PullMode::parse(first).unwrap(), with_lfs).await)
+                let with_lfs = a.iter().skip(1).any(|s| s == "lfs");
+                let autostash = a.iter().skip(1).any(|s| s == "autostash");
+                show(git_ops::pull(&repo(), PullMode::parse(first).unwrap(), with_lfs, autostash).await)
             }
+            "sub_statuses" => match crate::submodules::submodule_statuses(&repo()).await {
+                Ok(r) => emit(&r),
+                Err(e) => emit_err(e),
+            },
+            // PROBE_ARGS: "<sha>,<path>"
+            "commit_diff" => match git_status::commit_file_diff(&repo(), first, a.get(1).map(|s| s.as_str()).unwrap_or("")).await {
+                Ok(d) => emit(&d),
+                Err(e) => emit_err(e),
+            },
+            op if op.starts_with("tree_") => crate::tree::probe(op, &repo(), &a).await,
+            op if op.starts_with("stash_") => crate::stash::probe(op, &repo(), &a).await,
             "submodule" => show(git_ops::submodule_update(&repo()).await),
             "abort" => show(git_ops::abort(&repo()).await),
             "continue" => show(git_ops::continue_op(&repo()).await),

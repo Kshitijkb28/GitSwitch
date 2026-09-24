@@ -1,7 +1,7 @@
 import { ReactNode } from "react";
-import { Plus, Minus, Undo2, FileText, Box } from "lucide-react";
+import { Plus, Minus, Undo2, FileText, Box, CornerDownRight } from "lucide-react";
 import { Button } from "../Button";
-import type { ChangeEntry } from "../../lib/api";
+import type { ChangeEntry, Sides } from "../../lib/api";
 
 /** git's one-letter codes, in words. */
 export function codeLabel(code: string): string {
@@ -64,6 +64,15 @@ interface Props {
   onUnstage?: (paths: string[]) => void;
   onDiscard?: (paths: string[]) => void;
   accent?: "default" | "danger";
+  /** Conflicts only: take one whole side for the given files. */
+  onResolveSide?: (paths: string[], side: "mine" | "theirs") => void;
+  /** What "mine" and "theirs" mean for the operation in progress. */
+  sides?: Sides;
+  /** A sentence under the header — e.g. where these conflicts came from. */
+  caption?: ReactNode;
+  /** Submodule rows with their own section on the page get a jump link. */
+  jumpableSubmodules?: string[];
+  onJumpToSubmodule?: (path: string) => void;
 }
 
 export function ChangesList({
@@ -79,8 +88,17 @@ export function ChangesList({
   onUnstage,
   onDiscard,
   accent = "default",
+  onResolveSide,
+  sides,
+  caption,
+  jumpableSubmodules,
+  onJumpToSubmodule,
 }: Props) {
   if (entries.length === 0 && !emptyText) return null;
+
+  const mine = sides?.mine ?? "mine";
+  const theirs = sides?.theirs ?? "theirs";
+  const resolvable = entries.filter((e) => !e.is_submodule).map((e) => e.path);
 
   return (
     <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40">
@@ -92,8 +110,45 @@ export function ChangesList({
           <h3 className="text-sm font-medium text-zinc-200 truncate min-w-0">{title}</h3>
           <span className="text-xs text-zinc-500 shrink-0">{entries.length}</span>
         </div>
-        {headerAction}
+        <div className="flex items-center gap-1 flex-wrap justify-end">
+          {onResolveSide && resolvable.length > 0 && (
+            <>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={busy}
+                onClick={() => onResolveSide(resolvable, "mine")}
+                title={`Keep mine (${mine}) for every conflicted file`}
+              >
+                Keep mine for all
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={busy}
+                onClick={() => onResolveSide(resolvable, "theirs")}
+                title={`Take theirs (${theirs}) for every conflicted file`}
+              >
+                Take theirs for all
+              </Button>
+            </>
+          )}
+          {headerAction}
+        </div>
       </div>
+
+      {caption && (
+        <div className="px-3 py-1.5 border-b border-zinc-700/50 text-xs text-amber-200/80 leading-relaxed">
+          {caption}
+        </div>
+      )}
+
+      {onResolveSide && entries.length > 0 && (
+        <p className="px-3 py-1.5 border-b border-zinc-700/50 text-xs text-zinc-500 leading-relaxed">
+          mine = <span className="text-zinc-300">{mine}</span> (what you had) · theirs ={" "}
+          <span className="text-zinc-300">{theirs}</span> (what&apos;s coming in)
+        </p>
+      )}
 
       {entries.length === 0 ? (
         <p className="px-3 py-3 text-xs text-zinc-500">{emptyText}</p>
@@ -103,11 +158,16 @@ export function ChangesList({
             const code = side === "staged" ? e.staged : e.unstaged;
             const added = side === "staged" ? e.staged_added : e.unstaged_added;
             const removed = side === "staged" ? e.staged_removed : e.unstaged_removed;
+            const jumpable =
+              e.is_submodule && !!onJumpToSubmodule && (jumpableSubmodules ?? []).includes(e.path);
             return (
-              <li key={`${side}:${e.path}`} className="flex items-center gap-2 px-3 py-1.5">
+              // flex-wrap + a minimum for the file part: with several row
+              // actions (conflicts) the action group drops under the path
+              // rather than squeezing the filename out of view.
+              <li key={`${side}:${e.path}`} className="flex flex-wrap items-center gap-2 px-3 py-1.5">
                 <button
                   onClick={() => onOpen(e)}
-                  className="flex items-center gap-2 min-w-0 flex-1 text-left cursor-pointer group"
+                  className="flex items-center gap-2 min-w-[10rem] flex-1 text-left cursor-pointer group"
                   title={
                     e.is_submodule
                       ? `Submodule — ${submoduleReason(e)}`
@@ -149,7 +209,43 @@ export function ChangesList({
                   )}
                 </button>
 
-                <div className="flex items-center gap-1 shrink-0">
+                <div className="flex items-center gap-1 shrink-0 ml-auto">
+                  {jumpable && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => onJumpToSubmodule?.(e.path)}
+                      title="Show the changes inside this submodule"
+                      className="px-1.5 text-sky-300"
+                    >
+                      <CornerDownRight size={12} />
+                      Inside ↓
+                    </Button>
+                  )}
+                  {onResolveSide && !e.is_submodule && (
+                    <>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy}
+                        onClick={() => onResolveSide([e.path], "mine")}
+                        title={`Keep mine (${mine})`}
+                        className="px-1.5"
+                      >
+                        Keep mine
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy}
+                        onClick={() => onResolveSide([e.path], "theirs")}
+                        title={`Take theirs (${theirs})`}
+                        className="px-1.5"
+                      >
+                        Take theirs
+                      </Button>
+                    </>
+                  )}
                   {onStage && (
                     <Button
                       size="sm"

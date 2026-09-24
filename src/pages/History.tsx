@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   GitBranch,
   GitMerge,
@@ -9,8 +10,7 @@ import {
   RefreshCw,
   CloudDownload,
   CheckCircle2,
-  FileText,
-  ShieldCheck,
+  Crosshair,
   X,
 } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
@@ -21,9 +21,15 @@ import { Badge } from "../components/Badge";
 import { Input } from "../components/Input";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
-import { usePersistedState } from "../lib/persist";
+import { ResultCard } from "../components/changes/ResultCard";
+import { CommitDetailPanel } from "../components/history/CommitDetailPanel";
+import { usePersistedState, writePersisted } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
+import { useGitJob } from "../lib/gitJobs";
 import * as api from "../lib/api";
+
+/** Refusals the detail panel answers inline (a note, a re-asked question) — it stays open for these. */
+const PANEL_HANDLES = new Set(["would-drop-pushed", "merge-commit-needs-mainline"]);
 
 const PAGE_SIZE = 50;
 const ROW_H = 46;
@@ -94,6 +100,7 @@ function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
 
 export function History() {
   const toast = useToast();
+  const navigate = useNavigate();
   const [repos, setRepos] = useState<api.RepoRef[]>([]);
   const [repo, setRepo] = usePersistedState("history.repo", "");
   const [account, setAccount] = usePersistedState("history.account", ""); // profile id, "" = all
@@ -107,6 +114,16 @@ export function History() {
   const [showRemote, setShowRemote] = usePersistedState("history.showRemote", false);
   const [mergeInfo, setMergeInfo] = useState<api.MergeInfo | null>(null);
   const [detail, setDetail] = useState<api.CommitDetail | null>(null);
+  /** What "Go to commit" resolved — carried into the panel so the chooser needn't ask again. */
+  const [target, setTarget] = useState<api.CommitTarget | null>(null);
+  const [repoStatus, setRepoStatus] = useState<api.RepoStatus | null>(null);
+  const [gotoText, setGotoText] = useState("");
+  const [gotoError, setGotoError] = useState<string | null>(null);
+  const [gotoBusy, setGotoBusy] = useState(false);
+  /** The outcome of the last action taken from the detail panel. */
+  const [result, setResult] = useState<api.OpResult | null>(null);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const job = useGitJob(repo);
   const [loadingRepos, setLoadingRepos] = useState(true);
   const [loadingBranches, setLoadingBranches] = useState(false);
   const [loadingPage, setLoadingPage] = useState(false);
@@ -185,6 +202,9 @@ export function History() {
   const loadBranches = useCallback(async (path: string) => {
     if (!path) return;
     setLoadingBranches(true);
+    // The repo status says which branch HEAD is on (or that it is detached) —
+    // the branch list alone can't tell a detached HEAD from an unborn one.
+    api.changesRepoStatus(path).then(setRepoStatus).catch(() => setRepoStatus(null));
     try {
       setBranches(await api.historyBranches(path));
     } catch (e) {
@@ -194,6 +214,88 @@ export function History() {
       setLoadingBranches(false);
     }
   }, []);
+
+  const currentBranch =
+    repoStatus?.branch ?? branches.find((b) => b.is_current && !b.is_remote)?.name ?? null;
+  const detached = repoStatus ? repoStatus.detached : branches.length > 0 && !currentBranch;
+
+  async function openCommit(hash: string, resolved: api.CommitTarget | null = null) {
+    try {
+      const d = await api.historyCommitDetail(repo, hash);
+      setTarget(resolved);
+      setDetail(d);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function closePanel() {
+    setDetail(null);
+    setTarget(null);
+  }
+
+  /** "Go to commit": any id, short id or ref the user typed. */
+  async function gotoCommit(e: React.FormEvent) {
+    e.preventDefault();
+    const text = gotoText.trim();
+    if (!text || !repo) return;
+    setGotoBusy(true);
+    setGotoError(null);
+    try {
+      const t = await api.historyResolve(repo, text);
+      if (!t) {
+        setGotoError(`No commit matches "${text}" in this repository.`);
+        return;
+      }
+      await openCommit(t.oid, t);
+    } catch (err) {
+      setGotoError(String(err));
+    } finally {
+      setGotoBusy(false);
+    }
+  }
+
+  const resolveCommit = useCallback(
+    async (hash: string) => {
+      const t = await api.historyResolve(repo, hash);
+      setTarget(t);
+      return t;
+    },
+    [repo]
+  );
+
+  /**
+   * One git operation from the detail panel. The panel closes and the outcome
+   * shows as a card under the header — except for the refusals the panel
+   * answers itself, which keep it open. Everything is re-read afterwards: a
+   * reset moves a branch, a revert adds a commit, a detach changes HEAD.
+   */
+  async function onAction(key: string, fn: () => Promise<api.OpResult>): Promise<api.OpResult | undefined> {
+    if (busyKey) return undefined;
+    if (job?.running) {
+      toast.error("Wait for the running operation");
+      return undefined;
+    }
+    setBusyKey(key);
+    setError(null);
+    try {
+      const r = await fn();
+      setResult(r);
+      if (r.ok) toast.success(r.headline);
+      else toast.error(r.refusal?.message ?? r.advice?.headline ?? r.headline);
+      if (!(r.refusal && PANEL_HANDLES.has(r.refusal.code))) closePanel();
+      await loadBranches(repo);
+      await loadSync(repo, rev);
+      setReloadKey((k) => k + 1);
+      return r;
+    } catch (e) {
+      setError(String(e));
+      toast.error(String(e));
+      return undefined;
+    } finally {
+      setBusyKey(null);
+    }
+  }
 
   // Switching repo resets the view (a branch from another repo would query the
   // wrong thing) — but returning to the page must NOT reset, or the restored
@@ -209,6 +311,11 @@ export function History() {
       setMergeInfo(null);
       setSearch("");
       setAppliedSearch("");
+      setGotoText("");
+      setGotoError(null);
+      setResult(null);
+      setDetail(null);
+      setTarget(null);
     }
     loadBranches(repo);
   }, [repo, loadBranches]);
@@ -321,13 +428,49 @@ export function History() {
             <RefreshCw size={16} className={loadingBranches ? "animate-spin" : ""} />
             Refresh
           </Button>
+          <form onSubmit={gotoCommit} className="flex items-center gap-2 min-w-0">
+            <Input
+              aria-label="Go to commit"
+              placeholder="commit id, short id or ref"
+              value={gotoText}
+              onChange={(e) => { setGotoText(e.target.value); if (gotoError) setGotoError(null); }}
+              disabled={!repo}
+              spellCheck={false}
+              containerClassName="w-56 max-w-full"
+              className="font-mono text-sm"
+            />
+            <Button type="submit" variant="secondary" disabled={!repo || gotoBusy || !gotoText.trim()} title="Open a commit by its id or a ref like main~3">
+              {gotoBusy ? <Loader2 size={16} className="animate-spin" /> : <Crosshair size={16} />}
+              Go
+            </Button>
+          </form>
         </div>
       </div>
+
+      {gotoError && (
+        <p className="text-sm text-red-400 break-words -mt-3">{gotoError}</p>
+      )}
 
       {error && (
         <div className="px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm break-words">
           {error}
         </div>
+      )}
+
+      {result && (
+        <ResultCard
+          result={result}
+          busy={busyKey !== null}
+          onDismiss={() => setResult(null)}
+          extraAction={{
+            label: "Open in Changes",
+            onClick: () => {
+              writePersisted("changes.repo", repo);
+              navigate("/changes");
+            },
+            primary: !result.ok || (result.status?.conflicted_count ?? 0) > 0,
+          }}
+        />
       )}
 
       {!loadingRepos && repos.length === 0 && (
@@ -618,13 +761,7 @@ export function History() {
                 {page?.commits.map((c) => (
                   <button
                     key={c.hash}
-                    onClick={async () => {
-                      try {
-                        setDetail(await api.historyCommitDetail(repo, c.hash));
-                      } catch (e) {
-                        setError(String(e));
-                      }
-                    }}
+                    onClick={() => openCommit(c.hash)}
                     className="w-full flex items-center gap-3 text-left hover:bg-zinc-800/40 transition-colors cursor-pointer min-w-0 px-1"
                     style={{ height: ROW_H }}
                   >
@@ -681,7 +818,20 @@ export function History() {
         </div>
       )}
 
-      {detail && <CommitDetailPanel detail={detail} onClose={() => setDetail(null)} />}
+      {detail && (
+        <CommitDetailPanel
+          key={detail.hash}
+          detail={detail}
+          target={target && target.oid === detail.hash ? target : null}
+          repoPath={repo}
+          currentBranch={currentBranch}
+          detached={detached}
+          busy={busyKey !== null}
+          onClose={closePanel}
+          onAction={onAction}
+          onResolve={resolveCommit}
+        />
+      )}
     </div>
   );
 }
@@ -731,96 +881,3 @@ function TipCard({
   );
 }
 
-function CommitDetailPanel({
-  detail,
-  onClose,
-}: {
-  detail: api.CommitDetail;
-  onClose: () => void;
-}) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-3xl max-h-[85vh] overflow-y-auto rounded-xl border border-zinc-700/50 bg-zinc-900 p-6 shadow-2xl">
-        <div className="flex items-start justify-between gap-3 mb-4">
-          <div className="min-w-0">
-            <h2 className="text-lg font-semibold text-zinc-100 break-words">
-              {detail.subject}
-            </h2>
-            <p className="text-xs text-zinc-500 font-mono mt-1 break-all">{detail.hash}</p>
-          </div>
-          <button
-            onClick={onClose}
-            className="p-1 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer shrink-0"
-          >
-            <X size={18} />
-          </button>
-        </div>
-
-        <div className="flex flex-wrap gap-2 mb-4">
-          {detail.parents.length > 1 && <Badge variant="success">merge commit</Badge>}
-          {detail.refs.map((r) => (
-            <Badge key={r} variant="default">{r}</Badge>
-          ))}
-          {detail.signature && (
-            <span className="inline-flex items-center gap-1 text-xs text-emerald-400">
-              <ShieldCheck size={13} />
-              {detail.signature}
-            </span>
-          )}
-        </div>
-
-        <div className="grid sm:grid-cols-2 gap-3 text-xs mb-4">
-          <div className="px-3 py-2 rounded-lg bg-zinc-800/50 border border-zinc-700/40 min-w-0">
-            <p className="text-zinc-500">Author</p>
-            <p className="text-zinc-200 truncate">{detail.author_name}</p>
-            <p className="text-zinc-500 font-mono truncate">{detail.author_email}</p>
-            <p className="text-zinc-600 mt-1">{detail.author_date.replace("T", " ").slice(0, 19)}</p>
-          </div>
-          <div className="px-3 py-2 rounded-lg bg-zinc-800/50 border border-zinc-700/40 min-w-0">
-            <p className="text-zinc-500">
-              Parent{detail.parents.length === 1 ? "" : "s"}
-              {detail.parents.length > 1 && " — this is where two branches joined"}
-            </p>
-            {detail.parents.length === 0 && (
-              <p className="text-zinc-400">none (root commit)</p>
-            )}
-            {detail.parents.map((p) => (
-              <p key={p} className="text-zinc-300 font-mono truncate">{p.slice(0, 12)}</p>
-            ))}
-          </div>
-        </div>
-
-        {detail.body && (
-          <pre className="p-3 rounded-lg bg-zinc-800/50 border border-zinc-700/40 text-xs text-zinc-300 whitespace-pre-wrap break-words mb-4 max-h-52 overflow-y-auto">
-            {detail.body}
-          </pre>
-        )}
-
-        <div className="flex items-center gap-2 mb-2">
-          <FileText size={14} className="text-zinc-500" />
-          <h3 className="text-sm font-medium text-zinc-300">
-            {detail.files.length} file{detail.files.length === 1 ? "" : "s"} changed
-          </h3>
-        </div>
-        <div className="space-y-1 max-h-64 overflow-y-auto pr-1">
-          {detail.files.map((f) => (
-            <div
-              key={f.path}
-              className="flex items-center gap-3 px-3 py-1.5 rounded-lg bg-zinc-800/40 border border-zinc-700/30 text-xs min-w-0"
-            >
-              <span className="font-mono text-zinc-300 truncate min-w-0 flex-1" title={f.path}>
-                {f.path}
-              </span>
-              <span className="text-emerald-400 shrink-0 tabular-nums">+{f.added}</span>
-              <span className="text-red-400 shrink-0 tabular-nums">−{f.removed}</span>
-            </div>
-          ))}
-          {detail.files.length === 0 && (
-            <p className="text-xs text-zinc-600">No file changes (empty or merge commit).</p>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}

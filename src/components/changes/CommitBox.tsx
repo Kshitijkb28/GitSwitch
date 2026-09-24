@@ -1,4 +1,4 @@
-import { GitCommit, ShieldCheck, ShieldAlert, PenLine, AlertTriangle } from "lucide-react";
+import { GitCommit, ShieldCheck, ShieldAlert, PenLine, AlertTriangle, GitBranch } from "lucide-react";
 import { Button } from "../Button";
 import { Checkbox } from "../Checkbox";
 import { Textarea } from "../Textarea";
@@ -12,6 +12,10 @@ interface Props {
   onAmend: (v: boolean) => void;
   busy: boolean;
   onCommit: () => void;
+  /** Offered next to the detached-HEAD blocker: opens the branch picker. */
+  onSwitchBranch?: () => void;
+  /** A submodule's path: the button says where the commit lands. */
+  scopeLabel?: string;
 }
 
 /**
@@ -52,11 +56,14 @@ export function CommitBox({
   onAmend,
   busy,
   onCommit,
+  onSwitchBranch,
+  scopeLabel,
 }: Props) {
   const blocker = commitBlocker(status, message, amend);
   const id = status.identity;
   const finishingMerge = status.operation?.kind === "merge";
   const firstLine = message.split("\n")[0] ?? "";
+  const inside = scopeLabel ? ` in ${scopeLabel}` : "";
 
   return (
     <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40 p-3 space-y-3">
@@ -67,6 +74,14 @@ export function CommitBox({
             Committing as{" "}
             <span className="font-medium text-zinc-100">{id.name || "?"}</span>{" "}
             <span className="font-mono text-xs text-zinc-400">&lt;{id.email || "unset"}&gt;</span>
+            {scopeLabel && (
+              <>
+                {" "}
+                <span className="text-zinc-400">
+                  inside <span className="font-mono text-xs text-zinc-300">{scopeLabel}</span>
+                </span>
+              </>
+            )}
           </p>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-xs">
             {id.profile_name && (
@@ -146,11 +161,17 @@ export function CommitBox({
             ? `Amend "${(status.head_subject ?? "").slice(0, 32)}${(status.head_subject ?? "").length > 32 ? "…" : ""}"`
             : "Amend (the last commit is already pushed)"}
         </label>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {blocker && <span className="text-xs text-zinc-500 max-w-xs">{blocker}</span>}
+          {status.detached && onSwitchBranch && (
+            <Button size="sm" variant="ghost" disabled={busy} onClick={onSwitchBranch}>
+              <GitBranch size={13} />
+              Choose a branch
+            </Button>
+          )}
           <Button size="sm" disabled={busy || blocker !== null} onClick={onCommit}>
             <PenLine size={14} />
-            {amend ? "Amend commit" : "Commit"}
+            {amend ? `Amend commit${inside}` : `Commit${inside}`}
           </Button>
         </div>
       </div>

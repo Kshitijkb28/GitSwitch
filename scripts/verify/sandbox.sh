@@ -193,6 +193,31 @@ ok "refuses rather than silently autostashing" "$(printf '%s' "$OUT" | jqf refus
 ok "  ff-only is still allowed with a dirty tree" "$(probe pull "$SB/work" "ff-only" | jqf refusal.code)" "None"
 git -C "$SB/work" checkout -q -- a.txt
 
+section "Pull: rebase with autostash on a dirty tree"
+cd "$SB/other"; git pull -q --rebase origin main 2>/dev/null; printf 'd\n' > d.txt; git add -A >/dev/null; git commit -qm "their d"; git push -q origin main 2>/dev/null
+printf 'dirty\n' >> "$SB/work/a.txt"
+OUT=$(probe pull "$SB/work" "rebase,autostash")
+ok "autostash lets the rebase run" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  the dirty edit is back" "$(git -C "$SB/work" status --porcelain -- a.txt)" " M a.txt"
+ok "  no stash was left behind" "$(git -C "$SB/work" stash list | wc -l | tr -d ' ')" "0"
+ok "  upstream's commit arrived" "$([ -e "$SB/work/d.txt" ] && echo present || echo missing)" "present"
+ok "  and the result does not claim a conflict" "$(printf '%s' "$OUT" | jqf pull.autostash_conflict)" "False"
+git -C "$SB/work" checkout -q -- a.txt
+cd "$SB/other"; printf 'theirs edit\n' >> a.txt; git add -A >/dev/null; git commit -qm "their a"; git push -q origin main 2>/dev/null
+printf 'my edit\n' >> "$SB/work/a.txt"
+OUT=$(probe pull "$SB/work" "rebase,autostash")
+ok "a stash that cannot be re-applied is reported, not hidden" "$(printf '%s' "$OUT" | jqf pull.autostash_conflict)" "True"
+ok "  the rebase itself finished" "$(printf '%s' "$OUT" | jqf operation)" "None"
+ok "  the file is conflicted" "$(printf '%s' "$OUT" | jqf conflicted)" "1"
+ok "  the status names the autostash as the source" "$(printf '%s' "$OUT" | jqf conflict_source)" "autostash"
+ok "  the stash entry is kept" "$(git -C "$SB/work" stash list | grep -c autostash)" "1"
+ok "  and the advice says the work is safe in the stash" "$(printf '%s' "$OUT" | jqf advice.guidance)" "stash@{0}"
+OUT=$(probe discard "$SB/work" "a.txt")
+ok "discarding the conflicted file is allowed when no operation is in progress" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  leaving a clean tree" "$(printf '%s' "$OUT" | jqf conflicted)" "0"
+ok "  with the stash still there to pop by hand" "$(git -C "$SB/work" stash list | grep -c autostash)" "1"
+git -C "$SB/work" stash drop -q
+
 section "Pull: merge and conflicts"
 git -C "$SB/work" push -q origin main 2>/dev/null
 cd "$SB/other"; git pull -q --rebase origin main 2>/dev/null; printf 'THEIRS\n' > conflict.txt; git add -A >/dev/null; git commit -qm "their conflict"; git push -q origin main 2>/dev/null

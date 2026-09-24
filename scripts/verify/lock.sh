@@ -43,6 +43,11 @@ else
     sudo -n true 2>/dev/null || { echo "LOCK_REAL=1 needs passwordless sudo (CI runners have it)"; exit 1; }
     SUDO="sudo -n"; export GITSWITCH_ELEVATE=sudo
   fi
+  # The lock covers Apple's git on macOS (its system scope is /etc/gitconfig);
+  # a Homebrew git reads /opt/homebrew/etc/gitconfig and is disclosed as not
+  # covered. CI runners put Homebrew first on PATH, so the terminal checks
+  # here use the git the lock is for.
+  if [ "$PLAT" = macos ]; then export PATH="/usr/bin:$PATH"; fi
 fi
 
 # Every managed path comes from the app's own layout, which honours the test
@@ -55,7 +60,7 @@ REG=$(printf '%s' "$ST" | jqf registry_dir)
 REMOTE_HELPER=$(printf '%s' "$ST" | jqf remote_helper_path)
 AUDIT=$(printf '%s' "$ST" | jqf audit_log)
 [ -n "$HELPER" ] && [ "$HELPER" != None ] || { echo "the app reports no lock layout on this platform"; exit 1; }
-echo "mode: $([ -n "$REAL" ] && echo REAL || echo test-root)  platform: $PLAT  registry: $REG  system gitconfig: $SYSCFG"
+echo "mode: $([ -n "$REAL" ] && echo REAL || echo test-root)  platform: $PLAT  registry: $REG  system gitconfig: $SYSCFG  git: $(command -v git)"
 export PATH="$(dirname "$REMOTE_HELPER"):$PATH"      # where the remote helper lands (unix); git's exec path on Windows
 JOB_SYSCFG=$([ -n "$REAL" ] && printf '%s' "$SYSCFG" || printf '/etc/gitconfig')
 
@@ -81,7 +86,14 @@ job() { mkdir -p "$SB/jobs"; local f="$SB/jobs/$1.json"
 sha() { sha256file "$1"; }
 # run <helper-binary> <job> [--bootstrap] -> sets OUT (stdout), RC, and writes stderr to $SB/err.txt
 run() { local bin="$1" j="$2" flag="${3:-}"
-  if [ -n "$flag" ]; then OUT=$($SUDO "$bin" "$flag" "$j" --sha256 "$(sha "$j")" 2>"$SB/err.txt"); else OUT=$($SUDO "$bin" "$j" --sha256 "$(sha "$j")" 2>"$SB/err.txt"); fi; RC=$?; }
+  if [ -n "$flag" ]; then OUT=$($SUDO "$bin" "$flag" "$j" --sha256 "$(sha "$j")" 2>"$SB/err.txt"); else OUT=$($SUDO "$bin" "$j" --sha256 "$(sha "$j")" 2>"$SB/err.txt"); fi; RC=$?
+  # In real mode a non-zero exit is a finding in itself: say what the helper
+  # said, so a CI log is enough to diagnose it (test-root mode provokes
+  # refusals on purpose and would only be noisier).
+  if [ "$RC" != 0 ] && [ -n "$REAL" ]; then
+    printf '     helper rc=%s stderr: %s\n' "$RC" "$(tr '\n' ' ' < "$SB/err.txt" | head -c 700)"
+    printf '     helper stdout: %s\n' "$(printf '%s' "$OUT" | head -c 700)"
+  fi; }
 LOCK_OPS="[{\"op\":\"bootstrap\"},{\"op\":\"lock\",\"repo\":\"$SB/work\",\"gitdir\":\"$SB/work/.git\",\"block_prefixes\":[\"git@github.com:\",\"https://github.com/\",\"$REMOTE_URL\"],\"label\":\"work\"}]"
 lower() { tr 'A-Z' 'a-z'; }
 
@@ -112,7 +124,12 @@ if [ -n "$REAL" ]; then
     linux) ok "REAL: the registry is root 755" "$(owner_mode "$REG")" "root 755"
            ok "REAL: the registry file is root 644" "$(owner_mode "$REG/locks.json")" "root 644"
            ok "REAL: the helper is root 755" "$(owner_mode "$HELPER")" "root 755"
-           ok "REAL: the polkit policy is installed" "$(cat /usr/share/polkit-1/actions/com.gitswitch.lock-helper.policy 2>/dev/null)" "auth_admin";;
+           if [ -d /usr/share/polkit-1 ]; then
+             # On failure the "got:" line carries the helper's own polkit note with the reason.
+             ok "REAL: the polkit policy is installed" "$(cat /usr/share/polkit-1/actions/com.gitswitch.lock-helper.policy 2>/dev/null || printf '%s' "$OUT" | jqf changed)" "auth_admin"
+           else
+             ok "REAL: without polkit the policy is skipped and said so" "$(printf '%s' "$OUT" | jqf changed)" "polkit is not installed"
+           fi;;
     windows) ACL=$(icacls "$(cygpath -w "$REG")" 2>/dev/null | tr -d '\r')
            ok "REAL: Administrators have full control of the registry" "$ACL" "Administrators:(OI)(CI)(F)"
            ok "REAL: Users can only read it" "$ACL" "Users:(OI)(CI)(RX)"

@@ -185,8 +185,8 @@ mod sys {
     use std::ptr::{null, null_mut};
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, GENERIC_WRITE, HANDLE, HLOCAL};
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS,
-        SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        NO_MULTIPLE_TRUSTEE, SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
         CreateWellKnownSid, GetAce, GetTokenInformation, IsWellKnownSid, TokenElevation, WinAuthenticatedUserSid,
@@ -290,13 +290,33 @@ mod sys {
         }
         Some(Security { owner, dacl, sd })
     }
+    /// Owned by BUILTIN\Administrators, SYSTEM, or the TrustedInstaller
+    /// service (which owns `C:\Program Files` and everything Windows Installer
+    /// puts there — Git for Windows' exec path included).
     pub fn admin_owned(p: &Path, _m: &Metadata) -> bool {
+        const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
         let Some(sec) = security(p) else { return false };
         if sec.owner.is_null() {
             return false;
         }
-        // SAFETY: owner points into sd, alive while `sec` is.
-        unsafe { IsWellKnownSid(sec.owner, WinBuiltinAdministratorsSid) != 0 || IsWellKnownSid(sec.owner, WinLocalSystemSid) != 0 }
+        // SAFETY: owner points into sd, alive while `sec` is; the string SID is
+        // LocalAlloc'd by the system and freed here.
+        unsafe {
+            if IsWellKnownSid(sec.owner, WinBuiltinAdministratorsSid) != 0 || IsWellKnownSid(sec.owner, WinLocalSystemSid) != 0 {
+                return true;
+            }
+            let mut s: *mut u16 = null_mut();
+            if ConvertSidToStringSidW(sec.owner, &mut s) == 0 || s.is_null() {
+                return false;
+            }
+            let mut len = 0usize;
+            while *s.add(len) != 0 {
+                len += 1;
+            }
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(s, len));
+            LocalFree(s as HLOCAL);
+            text.eq_ignore_ascii_case(TRUSTED_INSTALLER)
+        }
     }
     pub fn owned_by_current_user(_p: &Path, _m: &Metadata) -> bool {
         true
@@ -473,11 +493,31 @@ impl Ctx {
 
     /// Where the ownership walk stops: the filesystem root in real use, the
     /// test root in tests (its own ancestors belong to the user's temp dir).
-    fn trust_boundary(&self) -> PathBuf {
+    ///
+    /// Windows: `%ProgramData%` is the well-known container whose DACL
+    /// deliberately lets Users create entries — that is how every per-machine
+    /// application folder is born — so it can never pass a "not writable by
+    /// Users" test and is the boundary instead. Everything the helper creates
+    /// below it carries its own explicit DACL and is verified as usual; a
+    /// folder someone else planted there is caught by the ownership check.
+    fn trust_boundary(&self, dir: &Path) -> PathBuf {
         match &self.root {
             Some(r) => r.clone(),
             None => {
-                let mut p = self.layout.registry_dir.clone();
+                if cfg!(windows) {
+                    let mut p = dir.to_path_buf();
+                    while let Some(parent) = p.parent() {
+                        let is_program_data = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().eq_ignore_ascii_case("ProgramData"))
+                            .unwrap_or(false);
+                        if is_program_data {
+                            return p;
+                        }
+                        p = parent.to_path_buf();
+                    }
+                }
+                let mut p = dir.to_path_buf();
                 while let Some(parent) = p.parent() {
                     p = parent.to_path_buf();
                 }
@@ -492,7 +532,7 @@ impl Ctx {
     /// `/`, or the test root). Symlinks *above* `dir` are resolved first: on
     /// macOS `/etc` is itself a root-owned symlink to `/private/etc`.
     fn verify_dir_chain(&self, dir: &Path) -> R<()> {
-        let boundary = self.trust_boundary();
+        let boundary = self.trust_boundary(dir);
         let boundary = boundary.canonicalize().unwrap_or(boundary);
         let parent = dir.parent().ok_or_else(|| Fail::refused("managed directory has no parent"))?;
         // Components that do not exist yet will be created by us (root, 0755);
@@ -864,21 +904,27 @@ fn install_remote_helper(ctx: &Ctx, reg: &mut Registry, changes: &mut Vec<Change
     reg.remote_helper = Some(lc::RemoteHelperInfo { path: lc::path_str(link), dir_admin_owned, installed_at: ctx.now.clone() });
 }
 
-fn install_polkit_policy(ctx: &Ctx, errors: &mut Vec<String>) {
+/// The pkexec policy is a convenience (a graphical prompt instead of sudo or
+/// the manual command); the lock does not depend on it. So a machine without
+/// polkit, or one whose policy directory cannot be written, is reported as a
+/// `polkit` change with the reason — never as a failure of the job.
+fn install_polkit_policy(ctx: &Ctx, changes: &mut Vec<Change>, _errors: &mut Vec<String>) {
     let Some(policy) = &ctx.layout.polkit_policy else { return };
     let text = lc::render_polkit_policy(&lc::path_str(&ctx.layout.helper_path));
     if fs::read(policy).ok().as_deref() == Some(text.as_bytes()) {
         return;
     }
-    if let Some(dir) = policy.parent() {
-        if let Err(e) = ctx.ensure_dir(dir, 0o755, true) {
-            errors.push(e.msg);
-            return;
-        }
+    let Some(dir) = policy.parent() else { return };
+    let polkit_root = dir.parent().unwrap_or(dir);
+    if ctx.root.is_none() && !polkit_root.exists() {
+        changes.push(Change { op: "polkit".into(), repo: None, detail: "skipped: polkit is not installed on this machine".into() });
+        return;
     }
-    if let Err(e) = ctx.write_atomic(policy, text.as_bytes(), 0o644) {
-        errors.push(e.msg);
-    }
+    let note = match ctx.ensure_dir(dir, 0o755, true).and_then(|_| ctx.write_atomic(policy, text.as_bytes(), 0o644)) {
+        Ok(()) => format!("pkexec policy installed at {}", policy.display()),
+        Err(e) => format!("pkexec policy not installed ({}); the app uses sudo or the manual command instead", e.msg),
+    };
+    changes.push(Change { op: "polkit".into(), repo: None, detail: note });
 }
 
 fn append_audit(ctx: &Ctx, line: &str) {
@@ -1125,12 +1171,12 @@ fn run_job_inner(job_path: &Path, sha: &str, bootstrap: bool) -> R<i32> {
         match op {
             Op::Bootstrap => {
                 install_remote_helper(&ctx, &mut reg, &mut changes, &mut errors);
-                install_polkit_policy(&ctx, &mut errors);
+                install_polkit_policy(&ctx, &mut changes, &mut errors);
                 changes.push(Change { op: "bootstrap".into(), repo: None, detail: format!("helper {} at {}", VERSION, ctx.layout.helper_path.display()) });
             }
             Op::InstallRemoteHelper => {
                 install_remote_helper(&ctx, &mut reg, &mut changes, &mut errors);
-                install_polkit_policy(&ctx, &mut errors);
+                install_polkit_policy(&ctx, &mut changes, &mut errors);
             }
             Op::UpgradeHelper { source, sig, version } => {
                 let src = PathBuf::from(source);

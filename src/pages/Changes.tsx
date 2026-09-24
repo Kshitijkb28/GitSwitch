@@ -1,39 +1,38 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { RefreshCw, Loader2, ArrowUp, ArrowDown, GitBranch, Upload, Download, CheckCircle2, AlertTriangle, XCircle, FilePlus2, FileEdit, ShieldAlert, Ban, CircleSlash, Play } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { RefreshCw, Loader2, AlertTriangle, CircleSlash, Play } from "lucide-react";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
-import { Checkbox } from "../components/Checkbox";
 import { Select } from "../components/Select";
-import { Modal } from "../components/Modal";
 import { useToast } from "../components/Toast";
-import { ChangesList } from "../components/changes/ChangesList";
+import { TreeLists, type DiscardVariant } from "../components/changes/TreeLists";
 import { CommitBox } from "../components/changes/CommitBox";
 import { DiffPanel } from "../components/changes/DiffPanel";
-import { PullControl, whyDisabled } from "../components/changes/PullControl";
+import { BranchCard } from "../components/changes/BranchCard";
+import { BranchesModal } from "../components/changes/BranchesModal";
 import { PushAccessCard } from "../components/changes/PushAccessCard";
 import { SubmodulesCard } from "../components/changes/SubmodulesCard";
+import { SubmoduleSection, needsSection, sectionId } from "../components/changes/SubmoduleSection";
 import { LfsCard } from "../components/changes/LfsCard";
-import { SyncCard, SyncOutcomeView, SyncPausedCard } from "../components/changes/SyncCard";
+import { StashesCard } from "../components/changes/StashesCard";
+import { StashModal } from "../components/changes/StashModal";
+import { SyncCard, SyncPausedCard } from "../components/changes/SyncCard";
+import { ResultCard } from "../components/changes/ResultCard";
+import { DiscardConfirmModal } from "../components/changes/DiscardConfirmModal";
+import { ResetConfirmModal } from "../components/changes/ResetConfirmModal";
+import { DiscardAllModal } from "../components/changes/DiscardAllModal";
 import { baseName } from "../lib/paths";
-import { usePersistedState } from "../lib/persist";
+import { usePersistedState, writePersisted } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
 import { elapsedLabel, runJob, useGitJob, clearJob, type GitJobKind } from "../lib/gitJobs";
 import * as api from "../lib/api";
-import type { ChangeEntry, OpResult, PullMode, RepoRef, RepoStatus } from "../lib/api";
+import type { ChangeEntry, OpResult, PullMode, RepoRef, RepoStatus, SubmoduleStatus } from "../lib/api";
 
-/** "4 minutes ago" for the last fetch, so staleness is readable at a glance. */
-function agoLabel(secs: number | null): string {
-  if (secs === null) return "never fetched";
-  if (secs < 90) return "fetched just now";
-  const mins = Math.round(secs / 60);
-  if (mins < 60) return `fetched ${mins} min ago`;
-  const hours = Math.round(mins / 60);
-  if (hours < 48) return `fetched ${hours}h ago`;
-  return `fetched ${Math.round(hours / 24)} days ago`;
-}
+type DiscardRequest = { paths: string[]; variant: DiscardVariant; target?: string };
 
 export function Changes() {
   const toast = useToast();
+  const navigate = useNavigate();
   const [repos, setRepos] = useState<RepoRef[]>([]);
   const [account, setAccount] = usePersistedState("changes.account", ""); // "" = all
   const [repoPath, setRepoPath] = usePersistedState("changes.repo", "");
@@ -42,23 +41,33 @@ export function Changes() {
   // On by default: with LFS filters configured git already downloads large
   // files on pull, so this makes every repo behave the way people expect.
   const [pullLfs, setPullLfs] = usePersistedState("changes.pullLfs", true);
+  // Off by default: stashing around a rebase can leave conflicts behind, so
+  // it is a choice, not a surprise.
+  const [pullAutostash, setPullAutostash] = usePersistedState("changes.pullAutostash", false);
 
   // Deliberately not persisted: amending must be a fresh decision every time,
   // and status/results must always be re-read rather than restored.
   const [amend, setAmend] = useState(false);
   const [status, setStatus] = useState<RepoStatus | null>(null);
+  const [subStatuses, setSubStatuses] = useState<SubmoduleStatus[]>([]);
+  const [openSubs, setOpenSubs] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [result, setResult] = useState<OpResult | null>(null);
   const [diffFor, setDiffFor] = useState<ChangeEntry | null>(null);
-  const [confirmDiscard, setConfirmDiscard] = useState<string[] | null>(null);
+  const [confirmDiscard, setConfirmDiscard] = useState<DiscardRequest | null>(null);
+  const [branchesFor, setBranchesFor] = useState<string | null>(null);
+  const [stashOpen, setStashOpen] = useState(false);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [discardAllOpen, setDiscardAllOpen] = useState(false);
   const [tick, setTick] = useState(0);
   const [subRefresh, setSubRefresh] = useState(0);
   const [extraRepos, setExtraRepos] = useState<string[]>([]);
 
   const job = useGitJob(repoPath);
   const seq = useRef(0);
+  const subSeq = useRef(0);
 
   const accounts = useMemo(
     () =>
@@ -79,10 +88,28 @@ export function Changes() {
       .catch((e) => setError(String(e)));
   }, []);
 
+  /** Each submodule's own status, for its section. Only asked when there are any. */
+  const loadSubStatuses = useCallback((path: string, hasSubmodules: boolean) => {
+    const mine = ++subSeq.current;
+    if (!path || !hasSubmodules) {
+      setSubStatuses([]);
+      return;
+    }
+    api
+      .changesSubmoduleStatuses(path)
+      .then((list) => {
+        if (mine === subSeq.current) setSubStatuses(list);
+      })
+      .catch(() => {
+        if (mine === subSeq.current) setSubStatuses([]);
+      });
+  }, []);
+
   const loadStatus = useCallback(
     (path: string) => {
       if (!path) {
         setStatus(null);
+        setSubStatuses([]);
         return;
       }
       const mine = ++seq.current;
@@ -93,6 +120,7 @@ export function Changes() {
           if (mine !== seq.current) return; // a newer load already won
           setStatus(s);
           setError(null);
+          loadSubStatuses(path, s.has_submodules);
         })
         .catch((e) => {
           if (mine !== seq.current) return;
@@ -103,7 +131,7 @@ export function Changes() {
           if (mine === seq.current) setLoading(false);
         });
     },
-    []
+    [loadSubStatuses]
   );
 
   useEffect(loadRepos, [loadRepos]);
@@ -111,10 +139,19 @@ export function Changes() {
   // Switching repos must not show the previous repo's files for a moment.
   useEffect(() => {
     setStatus(null);
+    setSubStatuses([]);
+    setOpenSubs({});
     setResult(null);
     setAmend(false);
     loadStatus(repoPath);
   }, [repoPath, loadStatus]);
+
+  // After any operation the submodules may have moved too.
+  useEffect(() => {
+    if (subRefresh === 0) return;
+    loadSubStatuses(repoPath, !!status?.has_submodules);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subRefresh]);
 
   // If the chosen account doesn't own the current repo, move to one it does.
   useEffect(() => {
@@ -156,20 +193,28 @@ export function Changes() {
   const setMessage = (m: string) => setDrafts((d) => ({ ...d, [repoPath]: m }));
 
   const entries = status?.entries ?? [];
-  const conflicted = entries.filter((e) => e.kind === "conflicted");
-  const staged = entries.filter((e) => e.kind === "tracked" && e.staged !== ".");
-  const unstaged = entries.filter((e) => e.kind === "tracked" && e.unstaged !== ".");
-  const untracked = entries.filter((e) => e.kind === "untracked");
   const dirty = (status?.staged_count ?? 0) + (status?.unstaged_count ?? 0) > 0;
 
-  /** Apply a foreground operation and adopt the status it returns. */
-  const apply = async (key: string, fn: () => Promise<OpResult>) => {
+  /**
+   * Apply a foreground operation and adopt the status it returns. With a
+   * `target` (a submodule's path) the status belongs to that section, and the
+   * parent is re-read because its gitlink row just changed too.
+   */
+  const apply = async (key: string, fn: () => Promise<OpResult>, target?: string) => {
     setBusy(key);
     setError(null);
     try {
       const r = await fn();
       setResult(r);
-      if (r.status) setStatus(r.status);
+      if (r.status) {
+        const s = r.status;
+        if (target && target !== repoPath) {
+          setSubStatuses((list) => list.map((x) => (x.status.path === target ? { ...x, status: s } : x)));
+          loadStatus(repoPath);
+        } else {
+          setStatus(s);
+        }
+      }
       setSubRefresh((n) => n + 1);
       if (r.ok) {
         toast.success(r.headline);
@@ -210,23 +255,54 @@ export function Changes() {
     }
   };
 
-  const discardNow = async (paths: string[]) => {
+  const discardNow = async () => {
+    const c = confirmDiscard;
     setConfirmDiscard(null);
-    await apply("discard", () => api.changesDiscard(repoPath, paths));
+    if (!c) return;
+    await apply("discard", () => api.changesDiscard(c.target ?? repoPath, c.paths), c.target);
   };
 
-  const pullBlocked = status
-    ? whyDisabled(pullMode, status.ahead, status.behind, dirty)
-    : null;
   const running = job?.running ?? false;
   const anyBusy = busy !== null || running;
 
-  const confirmEntries = (confirmDiscard ?? []).map((p) =>
-    entries.find((e) => e.path === p)
-  );
-  const willDelete = confirmEntries.filter(
-    (e) => e && (e.kind === "untracked" || e.staged === "A")
-  ).length;
+  // The entries the discard confirmation describes: the parent's, or the submodule's.
+  const confirmEntries = confirmDiscard?.target
+    ? subStatuses.find((s) => s.status.path === confirmDiscard.target)?.status.entries ?? []
+    : entries;
+
+  // Submodules with something to do get a section; the rest are one line.
+  const sectionSubs = subStatuses.filter((s) => needsSection(s.status));
+  const quietSubs = subStatuses.length - sectionSubs.length;
+  const sectionPaths = sectionSubs.map((s) => s.path);
+  const isSubOpen = (s: SubmoduleStatus) =>
+    openSubs[s.path] ?? (s.status.conflicted_count > 0 || sectionSubs.length <= 2);
+  const jumpToSubmodule = (path: string) => {
+    setOpenSubs((o) => ({ ...o, [path]: true }));
+    // After the body has rendered, so the section lands at the top of the view.
+    setTimeout(() => {
+      document.getElementById(sectionId(path))?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 50);
+  };
+
+  // The branch picker can serve the parent or one submodule.
+  const branchesStatus =
+    branchesFor === null
+      ? null
+      : branchesFor === repoPath
+        ? status
+        : subStatuses.find((s) => s.status.path === branchesFor)?.status ?? null;
+
+  const refusalCode = result?.refusal?.code;
+  const historyAction =
+    refusalCode === "already-pushed" || refusalCode === "would-drop-pushed"
+      ? {
+          label: "Open in History",
+          onClick: () => {
+            writePersisted("history.repo", repoPath);
+            navigate("/history");
+          },
+        }
+      : undefined;
 
   return (
     <div className="max-w-6xl mx-auto space-y-5">
@@ -369,131 +445,54 @@ export function Changes() {
             </Card>
           )}
 
-          {/* Sync: where this branch stands, and the two ways to move it. */}
-          <Card>
-            <div className="flex flex-wrap items-start justify-between gap-4">
-              <div className="min-w-0 space-y-2">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <GitBranch size={15} className="text-zinc-400 shrink-0" />
-                  <span className="font-medium text-zinc-100">
-                    {status.detached ? "detached HEAD" : (status.branch ?? "no branch")}
-                  </span>
-                  {status.upstream ? (
-                    <span className="text-xs text-zinc-500">→ {status.upstream}</span>
-                  ) : (
-                    <span className="text-xs text-amber-400/90">not published yet</span>
-                  )}
-                  {status.ahead > 0 && (
-                    <span className="inline-flex items-center gap-0.5 text-xs text-emerald-400">
-                      <ArrowUp size={12} />
-                      {status.ahead}
-                    </span>
-                  )}
-                  {status.behind > 0 && (
-                    <span className="inline-flex items-center gap-0.5 text-xs text-sky-400">
-                      <ArrowDown size={12} />
-                      {status.behind}
-                    </span>
-                  )}
-                  <span className="text-xs text-zinc-600">
-                    {agoLabel(status.last_fetch_secs)}
-                  </span>
-                </div>
-                <PullControl
-                  mode={pullMode}
-                  onMode={setPullMode}
-                  ahead={status.ahead}
-                  behind={status.behind}
-                  dirty={dirty}
-                  upstream={status.upstream}
-                />
-                {status.uses_lfs && (
-                  <label
-                    className="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer"
-                    title="A plain pull only downloads large files when this repository's LFS filters are set up — otherwise they arrive as pointer stubs"
-                  >
-                    <Checkbox
-                      checked={pullLfs}
-                      onChange={setPullLfs}
-                      className="mt-0.5"
-                      aria-label="Also download LFS files when pulling"
-                    />
-                    <span className="leading-relaxed">
-                      Also download Git LFS files
-                      <span className="text-zinc-500">
-                        {" "}
-                        — otherwise large files arrive as pointer stubs
-                      </span>
-                    </span>
-                  </label>
-                )}
-              </div>
-
-              <div className="flex items-center gap-2 flex-wrap">
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  disabled={anyBusy || !repoPath}
-                  onClick={() =>
-                    runLong("fetch", "Fetching…", async () => {
-                      await api.historyFetch(repoPath);
-                      const s = await api.changesRepoStatus(repoPath);
-                      return {
-                        ok: true,
-                        headline: "Fetched.",
-                        detail: `${s.behind} commit(s) waiting to be pulled.`,
-                        status: s,
-                      };
-                    })
-                  }
-                  className="min-w-[5.5rem]"
-                >
-                  <RefreshCw size={13} />
-                  Fetch
-                </Button>
-                <Button
-                  size="sm"
-                  variant={status.behind > 0 ? "primary" : "secondary"}
-                  disabled={anyBusy || !status.upstream || pullBlocked !== null}
-                  title={pullBlocked ?? undefined}
-                  onClick={() =>
-                    runLong(
-                      "pull",
-                      status.uses_lfs && pullLfs
-                        ? `Pulling (${pullMode}) and downloading LFS files…`
-                        : `Pulling (${pullMode})…`,
-                      () => api.changesPull(repoPath, pullMode, status.uses_lfs && pullLfs)
-                    )
-                  }
-                  className="min-w-[8.5rem]"
-                >
-                  <Download size={13} />
-                  Pull ({pullMode === "ff-only" ? "fast-forward" : pullMode})
-                </Button>
-                <Button
-                  size="sm"
-                  variant={status.behind > 0 ? "secondary" : "primary"}
-                  disabled={anyBusy || status.push.blocked || status.detached || status.unborn}
-                  title={status.push.blocked ? status.push.reason : undefined}
-                  onClick={() =>
-                    runLong("push", "Pushing…", () =>
-                      api.changesPush(repoPath, !status.upstream)
-                    )
-                  }
-                  className="min-w-[8.5rem]"
-                >
-                  {status.push.blocked ? <Ban size={13} /> : <Upload size={13} />}
-                  {status.push.lock.locked
-                    ? "Push locked"
-                    : status.push.blocked
-                    ? "Push blocked"
-                    : status.upstream
-                      ? `Push${status.ahead ? ` (${status.ahead})` : ""}`
-                      : "Publish branch"}
-                </Button>
-              </div>
-            </div>
-          </Card>
+          {/* Where this branch stands, the two ways to move it, and the tidy-up strip. */}
+          <BranchCard
+            repoPath={repoPath}
+            status={status}
+            busy={anyBusy}
+            dirty={dirty}
+            pullMode={pullMode}
+            onPullMode={setPullMode}
+            pullLfs={pullLfs}
+            onPullLfs={setPullLfs}
+            pullAutostash={pullAutostash}
+            onPullAutostash={setPullAutostash}
+            onFetch={() =>
+              runLong("fetch", "Fetching…", async () => {
+                await api.historyFetch(repoPath);
+                const s = await api.changesRepoStatus(repoPath);
+                return {
+                  ok: true,
+                  headline: "Fetched.",
+                  detail: `${s.behind} commit(s) waiting to be pulled.`,
+                  status: s,
+                };
+              })
+            }
+            onPull={() =>
+              runLong(
+                "pull",
+                status.uses_lfs && pullLfs
+                  ? `Pulling (${pullMode}) and downloading LFS files…`
+                  : `Pulling (${pullMode})…`,
+                () =>
+                  api.changesPull(
+                    repoPath,
+                    pullMode,
+                    status.uses_lfs && pullLfs,
+                    pullMode === "rebase" && pullAutostash
+                  )
+              )
+            }
+            onPush={() =>
+              runLong("push", "Pushing…", () => api.changesPush(repoPath, !status.upstream))
+            }
+            onBranches={() => setBranchesFor(repoPath)}
+            onUndoCommit={() => apply("undo", () => api.changesUndoCommit(repoPath))}
+            onStash={() => setStashOpen(true)}
+            onReset={() => setResetOpen(true)}
+            onDiscardAll={() => setDiscardAllOpen(true)}
+          />
 
           {!status.unborn && !status.sync && (
             <SyncCard
@@ -505,76 +504,21 @@ export function Changes() {
                   api.changesSyncRun(repoPath, stash, bundles, fingerprint)
                 )
               }
+              onSwitchBranch={() => setBranchesFor(repoPath)}
             />
           )}
 
           {result && (
-            <Card
-              className={
-                result.ok ? "border-emerald-500/30 bg-emerald-500/5" : "border-red-500/30 bg-red-500/5"
-              }
-            >
-              <div className="flex items-start gap-2">
-                {result.ok ? (
-                  <CheckCircle2 size={16} className="text-emerald-400 shrink-0 mt-0.5" />
-                ) : (
-                  <XCircle size={16} className="text-red-400 shrink-0 mt-0.5" />
-                )}
-                <div className="min-w-0 flex-1 space-y-1">
-                  <p className={`text-sm ${result.ok ? "text-emerald-100" : "text-red-100"}`}>
-                    {result.headline}
-                  </p>
-                  {result.detail && (
-                    <p className="text-xs text-zinc-400 break-words">{result.detail}</p>
-                  )}
-                  {result.advice?.guidance && (
-                    <p className="text-xs text-zinc-300 break-words">{result.advice.guidance}</p>
-                  )}
-                  {result.pull?.recovery && (
-                    <p className="text-xs text-zinc-500 font-mono break-all">
-                      undo: {result.pull.recovery}
-                    </p>
-                  )}
-                  {result.submodules && result.submodules.listed > 0 && (
-                    <p className="text-xs text-zinc-400">
-                      Submodules: {result.submodules.downloaded} of {result.submodules.listed} up to date
-                      {result.submodules.failed_paths.length > 0 && ` — failed: ${result.submodules.failed_paths.join(", ")}`}.
-                    </p>
-                  )}
-                  {result.lfs && result.lfs.uses_lfs && (
-                    <p className="text-xs text-zinc-400">Git LFS: {result.lfs.summary}</p>
-                  )}
-                  {result.sync && (
-                    <SyncOutcomeView
-                      outcome={result.sync}
-                      busy={anyBusy}
-                      onRecordPointers={() =>
-                        apply("record", () => api.changesRecordPointers(repoPath))
-                      }
-                    />
-                  )}
-                  {result.advice?.git_said && (
-                    <details>
-                      <summary className="text-xs text-zinc-500 cursor-pointer hover:text-zinc-400 select-none">
-                        what git said
-                      </summary>
-                      <pre className="mt-1 text-xs text-zinc-500 whitespace-pre-wrap break-words">
-                        {result.advice.git_said}
-                      </pre>
-                    </details>
-                  )}
-                </div>
-                <button
-                  onClick={() => {
-                    setResult(null);
-                    clearJob(repoPath);
-                  }}
-                  className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer shrink-0"
-                >
-                  dismiss
-                </button>
-              </div>
-            </Card>
+            <ResultCard
+              result={result}
+              busy={anyBusy}
+              onDismiss={() => {
+                setResult(null);
+                clearJob(repoPath);
+              }}
+              onRecordPointers={() => apply("record", () => api.changesRecordPointers(repoPath))}
+              extraAction={historyAction}
+            />
           )}
 
           {/* items-start only in row mode: in the stacked (column) layout it is the
@@ -582,121 +526,19 @@ export function Changes() {
               file path widen the whole page. */}
           <div className="flex flex-col lg:flex-row gap-4 lg:items-start">
             <div className="flex-1 min-w-0 space-y-3">
-              {conflicted.length > 0 && (
-                <ChangesList
-                  title="Conflicts"
-                  icon={<ShieldAlert size={14} />}
-                  accent="danger"
-                  entries={conflicted}
-                  side="unstaged"
-                  busy={anyBusy}
-                  onOpen={setDiffFor}
-                  onStage={(paths) =>
-                    apply("stage", () => api.changesStage(repoPath, paths))
-                  }
-                />
-              )}
-
-              <ChangesList
-                title="Staged"
-                icon={<FileEdit size={14} />}
-                entries={staged}
-                side="staged"
+              <TreeLists
+                status={status}
                 busy={anyBusy}
-                emptyText="Nothing staged yet."
-                headerAction={
-                  staged.length > 0 ? (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      disabled={anyBusy}
-                      onClick={() =>
-                        apply("unstage", () =>
-                          api.changesUnstage(repoPath, staged.map((e) => e.path))
-                        )
-                      }
-                    >
-                      Unstage all
-                    </Button>
-                  ) : undefined
-                }
                 onOpen={setDiffFor}
+                onStage={(paths) => apply("stage", () => api.changesStage(repoPath, paths))}
                 onUnstage={(paths) => apply("unstage", () => api.changesUnstage(repoPath, paths))}
-              />
-
-              <ChangesList
-                title="Not staged"
-                icon={<FileEdit size={14} />}
-                entries={unstaged}
-                side="unstaged"
-                busy={anyBusy}
-                emptyText="No unstaged changes."
-                headerAction={
-                  unstaged.length > 0 ? (
-                    <div className="flex gap-1">
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        disabled={anyBusy}
-                        onClick={() => setConfirmDiscard(unstaged.map((e) => e.path))}
-                        className="hover:text-red-400"
-                      >
-                        Discard all
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        disabled={anyBusy}
-                        onClick={() =>
-                          apply("stage", () =>
-                            api.changesStage(repoPath, unstaged.map((e) => e.path))
-                          )
-                        }
-                      >
-                        Stage all
-                      </Button>
-                    </div>
-                  ) : undefined
+                onDiscard={(paths, variant) => setConfirmDiscard({ paths, variant })}
+                onResolveSide={(paths, side) =>
+                  apply("resolve", () => api.changesResolveSide(repoPath, paths, side))
                 }
-                onOpen={setDiffFor}
-                onStage={(paths) => apply("stage", () => api.changesStage(repoPath, paths))}
-                onDiscard={(paths) => setConfirmDiscard(paths)}
+                jumpableSubmodules={sectionPaths}
+                onJumpToSubmodule={jumpToSubmodule}
               />
-
-              <ChangesList
-                title="Untracked"
-                icon={<FilePlus2 size={14} />}
-                entries={untracked}
-                side="unstaged"
-                busy={anyBusy}
-                emptyText="No new files."
-                headerAction={
-                  untracked.length > 0 ? (
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      disabled={anyBusy}
-                      onClick={() =>
-                        apply("stage", () =>
-                          api.changesStage(repoPath, untracked.map((e) => e.path))
-                        )
-                      }
-                    >
-                      Stage all
-                    </Button>
-                  ) : undefined
-                }
-                onOpen={setDiffFor}
-                onStage={(paths) => apply("stage", () => api.changesStage(repoPath, paths))}
-                onDiscard={(paths) => setConfirmDiscard(paths)}
-              />
-
-              {status.untracked_truncated && (
-                <p className="text-xs text-amber-400/90">
-                  More than 2000 untracked files — only the first 2000 are shown. A
-                  .gitignore would make this folder much easier to work with.
-                </p>
-              )}
 
               <CommitBox
                 status={status}
@@ -706,7 +548,32 @@ export function Changes() {
                 onAmend={setAmend}
                 busy={anyBusy}
                 onCommit={onCommit}
+                onSwitchBranch={() => setBranchesFor(repoPath)}
               />
+
+              {sectionSubs.map((s) => (
+                <SubmoduleSection
+                  key={s.path}
+                  sub={s}
+                  parentRepoPath={repoPath}
+                  parentStatus={status}
+                  open={isSubOpen(s)}
+                  onToggle={() => setOpenSubs((o) => ({ ...o, [s.path]: !isSubOpen(s) }))}
+                  busy={anyBusy}
+                  draft={drafts[s.status.path] ?? ""}
+                  onDraft={(m) => setDrafts((d) => ({ ...d, [s.status.path]: m }))}
+                  apply={apply}
+                  onOpenRepo={openRepo}
+                  onDiscard={(paths, variant) => setConfirmDiscard({ paths, variant, target: s.status.path })}
+                  onSwitchBranch={() => setBranchesFor(s.status.path)}
+                />
+              ))}
+              {quietSubs > 0 && (
+                <p className="text-xs text-zinc-500">
+                  {quietSubs} {sectionSubs.length > 0 ? "other " : ""}submodule{quietSubs === 1 ? "" : "s"}{" "}
+                  {quietSubs === 1 ? "has" : "have"} nothing to commit.
+                </p>
+              )}
             </div>
 
             <div className="w-full lg:w-80 shrink-0 space-y-3">
@@ -737,16 +604,17 @@ export function Changes() {
                     api.changesSubmoduleUpdate(repoPath)
                   )
                 }
+                sectionPaths={sectionPaths}
+                onJumpToSection={jumpToSubmodule}
               />
 
-              {status.stash_count > 0 && (
-                <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40 p-3">
-                  <p className="text-xs text-zinc-400">
-                    {status.stash_count} stash{status.stash_count === 1 ? "" : "es"} in this
-                    repository.
-                  </p>
-                </div>
-              )}
+              <StashesCard
+                repoPath={repoPath}
+                status={status}
+                busy={anyBusy}
+                refreshKey={subRefresh}
+                run={(key, fn) => apply(key, fn)}
+              />
             </div>
           </div>
         </>
@@ -756,48 +624,57 @@ export function Changes() {
         <DiffPanel repoPath={repoPath} entry={diffFor} onClose={() => setDiffFor(null)} />
       )}
 
-      <Modal
+      <DiscardConfirmModal
         open={confirmDiscard !== null}
-        onClose={() => setConfirmDiscard(null)}
-        title="Discard these changes?"
-      >
-        <div className="space-y-3">
-          <p className="text-sm text-zinc-300">
-            {confirmDiscard?.length === 1
-              ? "This throws away the changes in 1 file."
-              : `This throws away the changes in ${confirmDiscard?.length ?? 0} files.`}{" "}
-            <span className="text-red-300">It cannot be undone.</span>
-          </p>
-          {willDelete > 0 && (
-            <p className="text-sm text-amber-300">
-              {willDelete} of them {willDelete === 1 ? "is a new file and will be" : "are new files and will be"}{" "}
-              deleted from disk.
-            </p>
-          )}
-          <ul className="max-h-40 overflow-y-auto text-xs font-mono text-zinc-400 space-y-0.5">
-            {(confirmDiscard ?? []).slice(0, 50).map((p) => (
-              <li key={p} className="truncate">
-                {p}
-              </li>
-            ))}
-            {(confirmDiscard?.length ?? 0) > 50 && (
-              <li className="text-zinc-500">…and {(confirmDiscard?.length ?? 0) - 50} more</li>
-            )}
-          </ul>
-          <div className="flex justify-end gap-2">
-            <Button variant="secondary" size="sm" onClick={() => setConfirmDiscard(null)}>
-              Keep them
-            </Button>
-            <Button
-              variant="danger"
-              size="sm"
-              onClick={() => discardNow(confirmDiscard ?? [])}
-            >
-              Discard
-            </Button>
-          </div>
-        </div>
-      </Modal>
+        paths={confirmDiscard?.paths ?? []}
+        entries={confirmEntries}
+        variant={confirmDiscard?.variant ?? "changes"}
+        onCancel={() => setConfirmDiscard(null)}
+        onConfirm={discardNow}
+      />
+
+      {status && (
+        <>
+          <StashModal
+            open={stashOpen}
+            status={status}
+            onCancel={() => setStashOpen(false)}
+            onConfirm={(msg, includeUntracked) => {
+              setStashOpen(false);
+              void apply("stash", () => api.changesStashPush(repoPath, msg, includeUntracked));
+            }}
+          />
+          <ResetConfirmModal
+            open={resetOpen}
+            status={status}
+            onCancel={() => setResetOpen(false)}
+            onConfirm={(stashFirst) => {
+              setResetOpen(false);
+              void apply("reset", () => api.changesReset(repoPath, "@{u}", "hard", stashFirst));
+            }}
+          />
+          <DiscardAllModal
+            open={discardAllOpen}
+            status={status}
+            onCancel={() => setDiscardAllOpen(false)}
+            onConfirm={(includeUntracked, stashFirst) => {
+              setDiscardAllOpen(false);
+              void apply("discard", () => api.changesDiscardAll(repoPath, includeUntracked, stashFirst));
+            }}
+          />
+        </>
+      )}
+
+      {branchesFor !== null && branchesStatus && (
+        <BranchesModal
+          open
+          onClose={() => setBranchesFor(null)}
+          repoPath={branchesFor}
+          status={branchesStatus}
+          busy={anyBusy}
+          run={(key, fn) => apply(key, fn, branchesFor === repoPath ? undefined : branchesFor)}
+        />
+      )}
 
       {/* tick keeps the elapsed timer honest without re-rendering anything else */}
       <span className="hidden">{tick}</span>

@@ -26,10 +26,16 @@ run "Regression"          bash "$HERE/regression.sh"
 run "Submodules"          bash "$HERE/submodules.sh"
 run "Git LFS"             bash "$HERE/lfs.sh"
 run "Sync"                bash "$HERE/sync.sh"
+run "Tree (branches, undo, reset, revert, conflicts)" bash "$HERE/tree.sh"
+run "Stashes"             bash "$HERE/stash.sh"
 run "Push lock"           bash "$HERE/lock.sh"
 if [ -d "$HERE/harness/node_modules/puppeteer-core" ] && [ -n "$JS" ]; then
-  run "Headless UI"       bash -c "cd '$HERE/harness' && $JS ui.mjs 2>&1 | tail -1 && $JS ui.mjs >/dev/null 2>&1"
-  run "Layout sweep"      bash -c "cd '$HERE/harness' && $JS sweep.mjs 2>&1 | tail -1 && $JS sweep.mjs >/dev/null 2>&1"
+  # One run each: the log's tail is the summary, its exit code the verdict
+  # (running twice for the two doubled the time and the exposure to a flaky Chrome start).
+  harness() { local out; out="$(mktemp)"; (cd "$HERE/harness" && $JS "$1" >"$out" 2>&1); local rc=$?; tail -n "$([ $rc -eq 0 ] && echo 1 || echo 12)" "$out"; rm -f "$out"; return $rc; }
+  run "Headless UI"           harness ui.mjs
+  run "Headless UI (History)" harness history.mjs
+  run "Layout sweep"          harness sweep.mjs
 else
   echo; echo "(headless UI skipped — run: cd scripts/verify/harness && npm install   (or: bun install))"
 fi

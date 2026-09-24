@@ -695,6 +695,12 @@ export interface ChangeEntry {
   is_binary: boolean;
 }
 
+/** The two sides of a conflict, named the way the user thinks of them. */
+export interface Sides {
+  mine: string;
+  theirs: string;
+}
+
 export interface InProgress {
   kind: string;
   label: string;
@@ -702,6 +708,7 @@ export interface InProgress {
   abort_command: string;
   /** What finishes it once conflicts are staged; null when only a commit or nothing can. */
   continue_command: string | null;
+  sides?: Sides | null;
 }
 
 /** A sync that is paused or running in this repository (or in its superproject). */
@@ -888,6 +895,8 @@ export interface RepoStatus {
   uses_lfs: boolean;
   /** A paused sync here or in the superproject this repo belongs to. */
   sync?: SyncSummary | null;
+  /** Conflicts with no operation in progress: "stash" or "autostash" re-apply left them. */
+  conflict_source?: string | null;
 }
 
 export interface MovedCommit {
@@ -1027,6 +1036,9 @@ export interface PullOutcome {
   files_changed: number;
   conflicts: string[];
   recovery: string | null;
+  /** A rebase with autostash finished but the stash could not be re-applied cleanly. */
+  autostash_conflict?: boolean;
+  autostash_left?: string | null;
 }
 
 /** What every git operation returns: the outcome plus the re-read repo state. */
@@ -1043,6 +1055,229 @@ export interface OpResult {
   submodules?: SubmoduleReport;
   lfs?: LfsStatus;
   sync?: SyncOutcome;
+  tree?: TreeOutcome;
+  stash?: StashOutcome;
+}
+
+// --- Tree management: branches, undo, reset, revert, cherry-pick, conflicts ----
+
+export interface TreeCommitRef {
+  oid: string;
+  short: string;
+  subject: string;
+}
+
+export interface StashRef {
+  ref: string;
+  oid: string;
+  message: string;
+}
+
+export interface TreeOutcome {
+  /** switch | create-branch | delete-branch | rename-branch | undo-commit | reset | detach | revert | cherry-pick | resolve-side | discard-all */
+  op: string;
+  head_before: string | null;
+  head_after: string | null;
+  branch_before: string | null;
+  branch_after: string | null;
+  commit: TreeCommitRef | null;
+  parents: TreeCommitRef[];
+  dropped: TreeCommitRef[];
+  dropped_total: number;
+  backup: SyncBackupRef | null;
+  stash: StashRef | null;
+  recovery: string | null;
+  submodule_mismatch: string[];
+  blocking_files: string[];
+  conflicts: string[];
+  mapping_note: string | null;
+  deleted_untracked: number;
+  restored_tracked: number;
+}
+
+/** A commit the user typed or picked, with what a reset to it would do. */
+export interface CommitTarget {
+  input: string;
+  oid: string;
+  short: string;
+  subject: string;
+  author: string;
+  date: string;
+  is_merge: boolean;
+  parents: TreeCommitRef[];
+  is_head: boolean;
+  contained_in_head: boolean;
+  dropped_if_reset: number;
+  would_drop_pushed: boolean;
+  on_remote: boolean;
+}
+
+export type ResetMode = "soft" | "mixed" | "hard";
+export type ConflictSide = "mine" | "theirs";
+
+/** One submodule's full status, for its own section on the Changes page. */
+export interface SubmoduleStatus {
+  /** Root-relative, byte-identical to the parent's gitlink row. */
+  path: string;
+  name: string | null;
+  listed: boolean;
+  recorded: string;
+  recorded_short: string;
+  status: RepoStatus;
+}
+
+export interface StashEntry {
+  index: number;
+  ref: string;
+  oid: string;
+  message: string;
+  branch: string | null;
+  date: string;
+  tracked_files: number;
+  untracked_files: number;
+  is_autostash: boolean;
+}
+
+export interface StashFile {
+  path: string;
+  /** M | A | D | R | untracked */
+  status: string;
+  added: number | null;
+  removed: number | null;
+}
+
+export interface StashDetail {
+  entry: StashEntry;
+  files: StashFile[];
+}
+
+export interface StashOutcome {
+  /** push | apply | pop | drop | restore */
+  action: string;
+  entry: StashRef | null;
+  stash_count: number;
+  conflicts: string[];
+  kept: boolean;
+  recovery: string | null;
+  not_stashed_submodules: string[];
+}
+
+export async function changesSubmoduleStatuses(repoPath: string): Promise<SubmoduleStatus[]> {
+  return invoke("changes_submodule_statuses", { repoPath });
+}
+
+export async function changesSwitchBranch(repoPath: string, name: string): Promise<OpResult> {
+  return invoke("changes_switch_branch", { repoPath, name });
+}
+
+/** `from` null = HEAD. A remote-tracking start point sets the upstream. */
+export async function changesCreateBranch(
+  repoPath: string,
+  name: string,
+  from: string | null,
+  switchTo: boolean
+): Promise<OpResult> {
+  return invoke("changes_create_branch", { repoPath, name, from, switchTo });
+}
+
+/** `force` deletes a branch whose commits no other branch holds (the count is in the refusal). */
+export async function changesDeleteBranch(repoPath: string, name: string, force: boolean): Promise<OpResult> {
+  return invoke("changes_delete_branch", { repoPath, name, force });
+}
+
+export async function changesRenameBranch(repoPath: string, oldName: string, newName: string): Promise<OpResult> {
+  return invoke("changes_rename_branch", { repoPath, oldName, newName });
+}
+
+/** Soft-reset HEAD~1: the last commit's changes come back staged. Refused when pushed. */
+export async function changesUndoCommit(repoPath: string): Promise<OpResult> {
+  return invoke("changes_undo_commit", { repoPath });
+}
+
+/** `target` is any commit id or ref, "@{u}" for the upstream. A backup branch is made when commits would leave. */
+export async function changesReset(
+  repoPath: string,
+  target: string,
+  mode: ResetMode,
+  stashFirst: boolean
+): Promise<OpResult> {
+  return invoke("changes_reset", { repoPath, target, mode, stashFirst });
+}
+
+/** Check out a commit without moving any branch (detached HEAD). */
+export async function changesDetach(repoPath: string, target: string): Promise<OpResult> {
+  return invoke("changes_detach", { repoPath, target });
+}
+
+/** `mainline` (1 or 2) is only needed for a merge commit; the refusal says so and lists the parents. */
+export async function changesRevert(repoPath: string, target: string, mainline: number | null): Promise<OpResult> {
+  return invoke("changes_revert", { repoPath, target, mainline });
+}
+
+export async function changesCherryPick(repoPath: string, target: string): Promise<OpResult> {
+  return invoke("changes_cherry_pick", { repoPath, target });
+}
+
+/** Resolve conflicted files by taking one side. "mine"/"theirs" are the user's words; the backend maps them per operation. */
+export async function changesResolveSide(repoPath: string, paths: string[], side: ConflictSide): Promise<OpResult> {
+  return invoke("changes_resolve_side", { repoPath, paths, side });
+}
+
+/** Everything back to HEAD; optionally deletes untracked files (never ignored ones) and stashes first. */
+export async function changesDiscardAll(
+  repoPath: string,
+  includeUntracked: boolean,
+  stashFirst: boolean
+): Promise<OpResult> {
+  return invoke("changes_discard_all", { repoPath, includeUntracked, stashFirst });
+}
+
+export async function changesStashList(repoPath: string): Promise<StashEntry[]> {
+  return invoke("changes_stash_list", { repoPath });
+}
+
+export async function changesStashShow(repoPath: string, index: number): Promise<StashDetail> {
+  return invoke("changes_stash_show", { repoPath, index });
+}
+
+export async function changesStashFileDiff(repoPath: string, index: number, path: string): Promise<FileDiff> {
+  return invoke("changes_stash_file_diff", { repoPath, index, path });
+}
+
+export async function changesStashPush(
+  repoPath: string,
+  message: string | null,
+  includeUntracked: boolean
+): Promise<OpResult> {
+  return invoke("changes_stash_push", { repoPath, message, includeUntracked });
+}
+
+export async function changesStashApply(
+  repoPath: string,
+  index: number,
+  pop: boolean,
+  restoreIndex: boolean
+): Promise<OpResult> {
+  return invoke("changes_stash_apply", { repoPath, index, pop, restoreIndex });
+}
+
+/** The result carries the undo command (`git stash store …`). */
+export async function changesStashDrop(repoPath: string, index: number): Promise<OpResult> {
+  return invoke("changes_stash_drop", { repoPath, index });
+}
+
+export async function changesStashRestoreFile(repoPath: string, index: number, path: string): Promise<OpResult> {
+  return invoke("changes_stash_restore_file", { repoPath, index, path });
+}
+
+/** The line diff of one file in one commit (first-parent diff for merges). */
+export async function historyCommitFileDiff(repoPath: string, hash: string, path: string): Promise<FileDiff> {
+  return invoke("history_commit_file_diff", { repoPath, hash, path });
+}
+
+/** A commit id, short id or ref typed by the user; null when nothing matches. */
+export async function historyResolve(repoPath: string, text: string): Promise<CommitTarget | null> {
+  return invoke("history_resolve", { repoPath, text });
 }
 
 // --- Sync: the latest from upstream with your commits on top -----------------
@@ -1229,13 +1464,14 @@ export async function changesPush(repoPath: string, setUpstream: boolean): Promi
   return invoke("changes_push", { repoPath, setUpstream });
 }
 
-/** `withLfs` also downloads LFS content — a plain pull leaves pointer stubs. */
+/** `withLfs` also downloads LFS content — a plain pull leaves pointer stubs. `autostash` lets a rebase pull run on a dirty tree. */
 export async function changesPull(
   repoPath: string,
   mode: PullMode,
-  withLfs: boolean
+  withLfs: boolean,
+  autostash: boolean
 ): Promise<OpResult> {
-  return invoke("changes_pull", { repoPath, mode, withLfs });
+  return invoke("changes_pull", { repoPath, mode, withLfs, autostash });
 }
 
 export async function changesSubmoduleUpdate(repoPath: string): Promise<OpResult> {
