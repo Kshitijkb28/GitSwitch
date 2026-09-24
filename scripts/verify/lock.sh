@@ -124,11 +124,13 @@ if [ -n "$REAL" ]; then
     linux) ok "REAL: the registry is root 755" "$(owner_mode "$REG")" "root 755"
            ok "REAL: the registry file is root 644" "$(owner_mode "$REG/locks.json")" "root 644"
            ok "REAL: the helper is root 755" "$(owner_mode "$HELPER")" "root 755"
-           if [ -d /usr/share/polkit-1 ]; then
-             # On failure the "got:" line carries the helper's own polkit note with the reason.
-             ok "REAL: the polkit policy is installed" "$(cat /usr/share/polkit-1/actions/com.gitswitch.lock-helper.policy 2>/dev/null || printf '%s' "$OUT" | jqf changed)" "auth_admin"
+           # The policy is written only into an administrator-only directory.
+           # GitHub's runner image makes /usr/share/polkit-1/actions writable
+           # by the runner user, so there the helper must refuse and say why.
+           if [ -f /usr/share/polkit-1/actions/com.gitswitch.lock-helper.policy ]; then
+             ok "REAL: the polkit policy is installed" "$(cat /usr/share/polkit-1/actions/com.gitswitch.lock-helper.policy)" "auth_admin"
            else
-             ok "REAL: without polkit the policy is skipped and said so" "$(printf '%s' "$OUT" | jqf changed)" "polkit is not installed"
+             ok "REAL: no policy written, and the result says why (no polkit, or a directory that is not administrator-only)" "$(printf '%s' "$OUT" | jqf changed)" "not installed"
            fi;;
     windows) ACL=$(icacls "$(cygpath -w "$REG")" 2>/dev/null | tr -d '\r')
            ok "REAL: Administrators have full control of the registry" "$ACL" "Administrators:(OI)(CI)(F)"
@@ -276,7 +278,14 @@ ok "the outcome is applied" "$(printf '%s' "$OUT" | jqf outcome)" "applied"
 ok "  and the helper was installed on the way (it was uninstalled above)" "$([ -x "$HELPER" ] && echo installed || echo missing)" "installed"
 ok "  the state says locked" "$(printf '%s' "$OUT" | jqf state.lock.locked)" "True"
 ok "  git's own measurement confirms the system-scope rewrite" "$(printf '%s' "$OUT" | jqf state.lock.system_rewrite_measured)" "True"
-ok "  no layer has drifted" "$(printf '%s' "$OUT" | jqf state.lock.drift)" "[]"
+# The remote helper lives in a PATH directory (/usr/local/bin). On CI runners
+# that directory belongs to the runner user, and the app must say so: that is
+# the disclosed "remote-helper-unprotected-dir" drift, and the only drift allowed.
+EXPECT_DRIFT="[]"
+if [ -n "$REAL" ] && [ "$PLAT" != windows ]; then
+  case "$(owner_mode "$(dirname "$REMOTE_HELPER")")" in root*) ;; *) EXPECT_DRIFT='["remote-helper-unprotected-dir"]';; esac
+fi
+ok "  no layer has drifted (beyond a disclosed unprotected remote-helper directory)" "$(printf '%s' "$OUT" | jqf state.lock.drift)" "$EXPECT_DRIFT"
 ok "  the mirrors are in place" "$(printf '%s' "$OUT" | jqf state.lock.mirrors)" "ok"
 ok "  the reason names the administrator password" "$(printf '%s' "$OUT" | jqf state.reason)" "administrator password"
 ok "  the pre-push hook is installed" "$(head -3 "$APP/.git/hooks/pre-push" | tr '\n' ' ')" "GitSwitch push guard"

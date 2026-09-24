@@ -634,10 +634,27 @@ impl Ctx {
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir_all(dir).map_err(|e| Fail::io(&format!("create {}", dir.display()), e))?;
-                sys::set_dir_mode(dir, mode).map_err(|e| Fail::io(&format!("chmod {}", dir.display()), e))?;
-                if self.root.is_none() {
-                    sys::lock_down(dir).map_err(|e| Fail::io(&format!("chown {}", dir.display()), e))?;
+                // Create every missing level ourselves, deepest last, and give
+                // each one the administrator-only ownership. `create_dir_all`
+                // would leave the intermediate directories with whatever their
+                // parent hands down — on Windows, `%ProgramData%` hands down
+                // "Users may create files", and the registry directory would
+                // then fail its own trust check on the very next run.
+                let mut missing: Vec<PathBuf> = Vec::new();
+                let mut p = dir.to_path_buf();
+                while !p.exists() {
+                    missing.push(p.clone());
+                    match p.parent() {
+                        Some(pp) => p = pp.to_path_buf(),
+                        None => break,
+                    }
+                }
+                for d in missing.iter().rev() {
+                    fs::create_dir(d).map_err(|e| Fail::io(&format!("create {}", d.display()), e))?;
+                    sys::set_dir_mode(d, mode).map_err(|e| Fail::io(&format!("chmod {}", d.display()), e))?;
+                    if self.root.is_none() {
+                        sys::lock_down(d).map_err(|e| Fail::io(&format!("chown {}", d.display()), e))?;
+                    }
                 }
                 Ok(())
             }
