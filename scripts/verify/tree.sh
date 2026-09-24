@@ -55,6 +55,15 @@ git -C "$SB/other" add -A >/dev/null; git -C "$SB/other" commit -qm "add uninit 
 git -C "$W" pull -q --ff-only 2>/dev/null
 PUSHED_TIP="$(head_of "$W")"
 
+section "origin/HEAD is a pointer, not a branch"
+git -C "$W" remote set-head origin main
+ok "the fixture has origin/HEAD, as every real clone does" "$(git -C "$W" symbolic-ref refs/remotes/origin/HEAD)" "refs/remotes/origin/main"
+ok "  whose short name is just 'origin' (the trap)" "$(git -C "$W" for-each-ref --format='%(refname:short)' refs/remotes/origin/HEAD)" "origin"
+OUT=$(probe branches "$W")
+ok "the branch list has no 'origin' row for it" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print([b["name"] for b in json.load(sys.stdin) if b["is_remote"]])')" "['origin/main']"
+OUT=$(probe merge_info "$W" "main")
+ok "  nor does the merged-into list" "$(printf '%s' "$OUT" | jqf merged_into)" "[\"origin/main\"]"
+
 section "Submodule statuses: the populated gitlinks, nothing invented"
 OUT=$(probe sub_statuses "$W")
 ok "exactly the populated gitlinks are listed" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(sorted(x["path"] for x in json.load(sys.stdin)))')" "['vendor/orphan', 'vendor/sub']"
@@ -107,6 +116,18 @@ ok "deleting a branch with its own commit is refused" "$(printf '%s' "$OUT" | jq
 ok "  with the count" "$(printf '%s' "$OUT" | jqf refusal.message)" "1 commit"
 ok "  and the branch still exists" "$(git -C "$W" branch --list feature | tr -d ' ')" "feature"
 FEATURE_TIP="$(git -C "$W" rev-parse feature)"
+# Merged into develop but not into main: git's own -d refuses, the app's gate
+# (no commit that nothing else holds) does not — and must not run -d.
+git -C "$W" branch develop feature
+ok "git's own -d still refuses it (merged into develop, not into main)" "$(git -C "$W" branch -d feature 2>&1; echo "rc=$?")" "not fully merged"
+OUT=$(probe tree_branch_delete "$W" "feature")
+ok "the app deletes it without force: another branch holds every commit" "$(printf '%s' "$OUT" | jqf headline)" "Deleted feature."
+ok "  git no longer lists it" "$(git -C "$W" branch --list feature | wc -l | tr -d ' ')" "0"
+ok "  develop still holds the commit" "$(git -C "$W" rev-parse develop)" "$FEATURE_TIP"
+ok "  running the recovery brings it back" "$(run_recovery "$(printf '%s' "$OUT" | jqf tree.recovery)")" "rc=0"
+git -C "$W" branch -q -D develop
+OUT=$(probe tree_branch_delete "$W" "feature")
+ok "with develop gone the commit is unique again, so it is refused again" "$(printf '%s' "$OUT" | jqf refusal.code)" "unmerged-branch"
 OUT=$(probe tree_branch_delete "$W" "feature,force")
 ok "confirming deletes it" "$(printf '%s' "$OUT" | jqf headline)" "Deleted feature."
 ok "  the recovery recreates it" "$(printf '%s' "$OUT" | jqf tree.recovery)" "git branch feature $FEATURE_TIP"
@@ -193,20 +214,29 @@ ok "  git is back at the merge, clean" "$(head_of "$W"):$(porcelain "$W")" "$MER
 git -C "$W" branch -q -D "$BK"
 printf 'dirt\n' >> "$W/b.txt"
 OUT=$(probe tree_reset "$W" "HEAD~1,hard")
-ok "a hard reset on a dirty tree is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "dirty-tree"
-ok "  HEAD did not move" "$(head_of "$W")" "$MERGE_SHA"
+ok "a hard reset without a stash on a dirty tree is the user's explicit choice: it runs" "$(printf '%s' "$OUT" | jqf headline)" "Reset to $(git -C "$W" rev-parse --short "$FIRST_PARENT") (hard)."
+ok "  the dirt is gone" "$(porcelain "$W")" "clean"
+ok "  HEAD moved" "$(head_of "$W")" "$FIRST_PARENT"
+ok "  no stash was made" "$(printf '%s' "$OUT" | jqf tree.stash):$(git -C "$W" stash list | wc -l | tr -d ' ')" "None:0"
+BK="$(printf '%s' "$OUT" | jqf tree.backup.branch)"
+ok "  the backup holds the old HEAD" "$(git -C "$W" rev-parse "$BK")" "$MERGE_SHA"
+ok "  running the recovery restores the merge" "$(run_recovery "$(printf '%s' "$OUT" | jqf tree.recovery)")" "rc=0"
+ok "  git is back at the merge, clean" "$(head_of "$W"):$(porcelain "$W")" "$MERGE_SHA:clean"
+git -C "$W" branch -q -D "$BK"
+printf 'dirt\n' >> "$W/b.txt"; printf 'new\n' > "$W/untracked.txt"
 OUT=$(probe tree_reset "$W" "HEAD~1,hard,stash")
-ok "with 'stash first' it succeeds" "$(printf '%s' "$OUT" | jqf headline)" "Reset to $(git -C "$W" rev-parse --short "$FIRST_PARENT") (hard)."
-ok "  the dirt is in stash@{0}" "$(git -C "$W" stash list --format=%gs -1)" "gitswitch before reset"
+ok "with 'stash first' the dirt is kept" "$(printf '%s' "$OUT" | jqf headline)" "Reset to $(git -C "$W" rev-parse --short "$FIRST_PARENT") (hard)."
+ok "  in stash@{0}" "$(git -C "$W" stash list --format=%gs -1)" "gitswitch before reset"
 ok "  the result names the stash" "$(printf '%s' "$OUT" | jqf tree.stash.ref)" "stash@{0}"
-ok "  the tree is clean" "$(porcelain "$W")" "clean"
+ok "  the untracked file stays on disk: no reset touches it" "$(porcelain "$W")" "?? untracked.txt|"
+ok "  and it is not in the stash (two parents, no untracked tree)" "$(git -C "$W" rev-list --parents -n1 'stash@{0}' | wc -w | tr -d ' ')" "3"
 BK="$(printf '%s' "$OUT" | jqf tree.backup.branch)"
 ok "  the backup holds the old HEAD" "$(git -C "$W" rev-parse "$BK")" "$MERGE_SHA"
 ok "  and its recovery is a hard reset to it" "$(printf '%s' "$OUT" | jqf tree.backup.recovery)" "reset --hard $BK"
 ok "  running it restores the merge" "$(run_recovery "$(printf '%s' "$OUT" | jqf tree.backup.recovery)")" "rc=0"
 git -C "$W" stash pop -q
 ok "  and the stash pops the dirt back" "$(git -C "$W" status --porcelain -- b.txt)" " M b.txt"
-git -C "$W" checkout -q -- b.txt; git -C "$W" branch -q -D "$BK"
+git -C "$W" checkout -q -- b.txt; rm -f "$W/untracked.txt"; git -C "$W" branch -q -D "$BK"
 OUT=$(probe tree_reset "$W" "origin/main~1,hard")
 ok "resetting below a pushed commit is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "would-drop-pushed"
 ok "  naming the upstream" "$(printf '%s' "$OUT" | jqf refusal.message)" "origin/main"
@@ -228,6 +258,27 @@ BK="$(printf '%s' "$OUT" | jqf tree.backup.branch)"
 ok "  the backup still holds the merge" "$(git -C "$W" rev-parse "$BK")" "$MERGE_SHA"
 OUT=$(probe tree_reset "$W" "HEAD,soft")
 ok "a reset to HEAD is nothing to do" "$(printf '%s' "$OUT" | jqf refusal.code)" "nothing-to-do"
+
+section "Pushed means on any remote branch — for reset and undo alike"
+printf 'elsewhere\n' > "$W/else.txt"; git -C "$W" add -A >/dev/null; git -C "$W" commit -qm "pushed elsewhere"
+git -C "$W" push -q origin main:refs/heads/backup 2>/dev/null
+ok "the fixture: HEAD is on origin/backup, not on the upstream" "$(git -C "$W" branch -r --contains HEAD | tr -d ' ' | tr '\n' '|'):$(git -C "$W" merge-base --is-ancestor HEAD origin/main; echo "rc=$?")" "origin/backup|:rc=1"
+OUT=$(probe tree_reset "$W" "HEAD~1,hard")
+ok "a reset that would drop it is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "would-drop-pushed"
+ok "  naming the branch that holds it, not the upstream" "$(printf '%s' "$OUT" | jqf refusal.message)" "\`origin/backup\` would be dropped"
+ok "  HEAD did not move" "$(subj "$W")" "pushed elsewhere"
+OUT=$(probe tree_resolve "$W" "HEAD~1")
+ok "the lookup gives the same answer" "$(printf '%s' "$OUT" | jqf would_drop_pushed)" "True"
+OUT=$(probe tree_undo_commit "$W")
+ok "and so does undo" "$(printf '%s' "$OUT" | jqf refusal.code)" "already-pushed"
+git -C "$W" push -q origin --delete backup 2>/dev/null; git -C "$W" fetch -q --prune origin 2>/dev/null
+ok "once no remote branch holds it" "$(git -C "$W" branch -r --contains HEAD | wc -l | tr -d ' ')" "0"
+OUT=$(probe tree_resolve "$W" "HEAD~1")
+ok "  the lookup says a reset drops nothing pushed" "$(printf '%s' "$OUT" | jqf would_drop_pushed)" "False"
+OUT=$(probe tree_reset "$W" "HEAD~1,hard")
+ok "  and the reset runs" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  back at the upstream tip" "$(head_of "$W")" "$(git -C "$W" rev-parse origin/main)"
+git -C "$W" branch -q -D "$(printf '%s' "$OUT" | jqf tree.backup.branch)"
 
 section "Detach, then start a branch there"
 TARGET="$(git -C "$W" rev-parse HEAD~1)"
@@ -314,6 +365,10 @@ probe abort "$W" >/dev/null
 git -C "$W" switch -q -c rb "$C_MINE~1"; printf 'RB\n' > "$W/c.txt"; git -C "$W" commit -qam "c rb"
 git -C "$W" rebase -q main >/dev/null 2>&1
 ok "the rebase conflicts" "$(git -C "$W" status --porcelain -- c.txt):$([ -d "$W/.git/rebase-merge" ] && echo rebasing || echo idle)" "UU c.txt:rebasing"
+ok "  git stores the base as a full id" "$(cat "$W/.git/rebase-merge/onto")" "$C_MINE"
+OUT=$(probe status "$W")
+ok "  the status names it by its branch instead" "[$(printf '%s' "$OUT" | jqf operation.sides.theirs)]" "[main]"
+ok "  in the banner too" "$(printf '%s' "$OUT" | jqf operation.detail)" "rb onto main"
 OUT=$(probe tree_resolve_side "$W" "theirs,c.txt")
 ok "Take theirs during a rebase takes the upstream's content" "$(cat "$W/c.txt")" "MINE"
 ok "  and explains the swap" "$(printf '%s' "$OUT" | jqf tree.mapping_note)" "During a rebase git calls your commit 'theirs', so Take theirs ran \`git checkout --ours\`"
@@ -360,10 +415,19 @@ ok "  the submodule's inner change survives" "$(git -C "$W/vendor/sub" status --
 ok "  and is named" "$(printf '%s' "$OUT" | jqf detail)" "Changes inside submodules were not touched: vendor/sub"
 ok "  the junk is gone" "$([ -e "$W/junk.txt" ] && echo present || echo gone)" "gone"
 git -C "$W/vendor/sub" checkout -q -- file.txt
-printf 'mod\n' >> "$W/a.txt"
+printf 'mod\n' >> "$W/a.txt"; printf 'keep me\n' > "$W/keep-new.txt"
 OUT=$(probe tree_discard_all "$W" "stash")
 ok "with a stash first the change is kept" "$(printf '%s' "$OUT" | jqf tree.stash.ref)" "stash@{0}"
 ok "  git has it in stash@{0}" "$(git -C "$W" stash show --name-only 'stash@{0}')" "a.txt"
+ok "  the new file was not asked to be deleted, so it stays on disk" "$(porcelain "$W")" "?? keep-new.txt|"
+ok "  and is not in the stash (two parents, no untracked tree)" "$(git -C "$W" rev-list --parents -n1 'stash@{0}' | wc -w | tr -d ' ')" "3"
+ok "  the detail says it was left in place" "$(printf '%s' "$OUT" | jqf detail)" "1 untracked file(s) were left in place"
+git -C "$W" stash drop -q
+printf 'mod\n' >> "$W/a.txt"
+OUT=$(probe tree_discard_all "$W" "untracked,stash")
+ok "asked to delete new files, the stash takes them first (a third parent)" "$(git -C "$W" rev-list --parents -n1 'stash@{0}' | wc -w | tr -d ' ')" "4"
+ok "  holding the new file" "$(git -C "$W" ls-tree -r --name-only 'stash@{0}^3')" "keep-new.txt"
+ok "  which is gone from disk" "$([ -e "$W/keep-new.txt" ] && echo present || echo gone)" "gone"
 ok "  and the tree is clean" "$(porcelain "$W")" "clean"
 git -C "$W" stash drop -q
 OUT=$(probe tree_discard_all "$W")
@@ -385,5 +449,19 @@ ok "the root commit diffs against nothing" "$(printf '%s' "$OUT" | "$PY" -c 'imp
 OUT=$(probe commit_diff "$W" "$RV_MERGE,r.txt")
 ok "a merge commit shows its first-parent diff" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(" ".join(l["text"] for l in json.load(sys.stdin)["lines"] if l["kind"]=="add"))')" "+r"
 ok "  which git's combined diff would have hidden" "$(git -C "$W" show --format= "$RV_MERGE" -- r.txt | wc -l | tr -d ' ')" "0"
+# A rename git detects (mostly-unchanged content, same directory): its numstat
+# prints one row in `dir/{old => new}` notation, which is not a path.
+mkdir -p "$W/docs"; seq 1 40 > "$W/docs/big.txt"; git -C "$W" add -A >/dev/null; git -C "$W" commit -qm "big file"
+git -C "$W" mv docs/big.txt docs/renamed.txt; printf 'renamed edit\n' >> "$W/docs/renamed.txt"; git -C "$W" add -A >/dev/null; git -C "$W" commit -qm "rename big"
+RENAME_SHA="$(head_of "$W")"
+ok "git itself prints the rename as one row in its own notation" "$(git -C "$W" show --numstat --format= "$RENAME_SHA" | cut -f3)" "docs/{big.txt => renamed.txt}"
+OUT=$(probe commit_detail "$W" "$RENAME_SHA")
+ok "the commit's file list carries real paths instead" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(sorted(f["path"] for f in json.load(sys.stdin)["files"]))')" "['docs/big.txt', 'docs/renamed.txt']"
+OUT=$(probe commit_diff "$W" "$RENAME_SHA,docs/renamed.txt")
+ok "  so the new path's diff shows the content" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(" ".join(l["text"] for l in json.load(sys.stdin)["lines"] if l["kind"]=="add"))')" "+renamed edit"
+OUT=$(probe commit_diff "$W" "$RENAME_SHA,docs/big.txt")
+ok "  and the old path's diff shows the deletion" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(" ".join(l["text"] for l in json.load(sys.stdin)["lines"] if l["kind"]=="meta"))')" "deleted file mode"
+OUT=$(probe commit_diff "$W" "$RENAME_SHA,docs/{big.txt => renamed.txt}")
+ok "  git's notation, sent back as a path, is an empty diff rather than an error" "$(printf '%s' "$OUT" | jqf empty_reason)" "No changes to this file"
 
 verify_result

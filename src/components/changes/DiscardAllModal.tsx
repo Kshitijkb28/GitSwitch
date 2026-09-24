@@ -11,7 +11,12 @@ type Props = {
   onConfirm: (includeUntracked: boolean, stashFirst: boolean) => void;
 };
 
-/** Everything back to HEAD. New files stay unless asked; a stash is offered instead of losing it all. */
+/**
+ * Everything back to HEAD. New files stay unless asked; a stash is offered
+ * instead of losing it all. The counts name only what the operation touches:
+ * the parent's own tracked and conflicted files, and new files when ticked —
+ * never a submodule row, which the backend leaves alone.
+ */
 export function DiscardAllModal({ open, status, onCancel, onConfirm }: Props) {
   const [includeUntracked, setIncludeUntracked] = useState(false);
   const [stashFirst, setStashFirst] = useState(false);
@@ -22,18 +27,50 @@ export function DiscardAllModal({ open, status, onCancel, onConfirm }: Props) {
     }
   }, [open]);
 
-  const n = status.entries.length;
-  const a = status.staged_count;
-  const b = status.unstaged_count;
+  const files = status.entries.filter((e) => !e.is_submodule);
+  const staged = files.filter((e) => e.kind === "tracked" && e.staged !== ".");
+  const unstaged = files.filter((e) => e.kind === "tracked" && e.unstaged !== ".");
+  const conflicted = files.filter((e) => e.kind === "conflicted");
+  const a = staged.length;
+  const b = unstaged.length;
+  const x = conflicted.length;
   const c = status.untracked_count;
+  // A file changed on both sides is one file.
+  const tracked = new Set([...staged, ...unstaged, ...conflicted].map((e) => e.path)).size;
+  const deleting = includeUntracked && c > 0;
+  const n = tracked + (deleting ? c : 0);
+  const submodules = status.entries
+    .filter((e) => e.is_submodule && (e.kind === "conflicted" || e.staged !== "." || e.unstaged !== "."))
+    .map((e) => e.path);
+  const nothing = n === 0;
+  const confirmTitle = nothing
+    ? c > 0
+      ? "Nothing to discard unless the new files are deleted too — tick the box above"
+      : "Nothing to discard"
+    : undefined;
+
+  const plural = (k: number) => (k === 1 ? "" : "s");
 
   return (
     <Modal open={open} onClose={onCancel} title="Discard everything?">
       <div className="space-y-3">
-        <p className="text-sm text-zinc-300">
-          This throws away the changes in {n} file{n === 1 ? "" : "s"} ({a} staged, {b} not staged, {c} new).{" "}
-          {!stashFirst && <span className="text-red-300">It cannot be undone.</span>}
-        </p>
+        {nothing ? (
+          <p className="text-sm text-zinc-300">
+            There are no tracked changes to discard
+            {c > 0 ? ` — only ${c} new file${plural(c)}, which stay${c === 1 ? "s" : ""} unless asked below` : ""}.
+          </p>
+        ) : (
+          <p className="text-sm text-zinc-300">
+            This throws away the changes in {n} file{plural(n)} ({a} staged, {b} not staged
+            {x > 0 ? `, ${x} conflicted` : ""}){deleting ? ` and deletes ${c} new file${plural(c)}` : ""}.{" "}
+            {!stashFirst && <span className="text-red-300">It cannot be undone.</span>}
+          </p>
+        )}
+        {submodules.length > 0 && (
+          <p className="text-xs text-zinc-500 break-words">
+            Changes inside submodules ({submodules.join(", ")}) are never touched.
+          </p>
+        )}
         {c > 0 && (
           <label className="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer">
             <Checkbox
@@ -43,7 +80,7 @@ export function DiscardAllModal({ open, status, onCancel, onConfirm }: Props) {
               aria-label="Also delete new files"
             />
             <span className="leading-relaxed">
-              Also delete {c} new file{c === 1 ? "" : "s"}
+              Also delete {c} new file{plural(c)}
               <span className="text-zinc-500"> — ignored files are never touched</span>
             </span>
           </label>
@@ -64,7 +101,13 @@ export function DiscardAllModal({ open, status, onCancel, onConfirm }: Props) {
           <Button variant="secondary" size="sm" onClick={onCancel}>
             Keep them
           </Button>
-          <Button variant="danger" size="sm" onClick={() => onConfirm(c > 0 && includeUntracked, stashFirst)}>
+          <Button
+            variant="danger"
+            size="sm"
+            disabled={nothing}
+            title={confirmTitle}
+            onClick={() => onConfirm(deleting, stashFirst)}
+          >
             Discard everything
           </Button>
         </div>

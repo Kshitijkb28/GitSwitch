@@ -182,7 +182,7 @@ ok "fast-forward refuses on a diverged branch" "$(printf '%s' "$OUT" | jqf advic
 ok "  and explains both remaining choices" "$(printf '%s' "$OUT" | jqf advice.guidance)" "Rebase"
 ok "  nothing moved" "$(git -C "$SB/work" log -1 --format=%s)" "my commit"
 OUT=$(probe pull "$SB/work" "rebase")
-ok "rebase replays local work on top" "$(printf '%s' "$OUT" | jqf headline)" "Pulled"
+ok "rebase replays local work on top, counting only the upstream commit (not the replayed one)" "$(printf '%s' "$OUT" | jqf headline)" "Pulled 1 commit(s) with rebase."
 ok "  history is now linear" "$(git -C "$SB/work" log --oneline -3 | head -1 | sed 's/^[a-f0-9]* //')" "my commit"
 ok "  and the rebase was a fast-forward over their commit" "$(git -C "$SB/work" log --format=%s -3 | tr '\n' '|')" "my commit|their commit"
 
@@ -216,6 +216,18 @@ OUT=$(probe discard "$SB/work" "a.txt")
 ok "discarding the conflicted file is allowed when no operation is in progress" "$(printf '%s' "$OUT" | jqf ok)" "True"
 ok "  leaving a clean tree" "$(printf '%s' "$OUT" | jqf conflicted)" "0"
 ok "  with the stash still there to pop by hand" "$(git -C "$SB/work" stash list | grep -c autostash)" "1"
+# That leftover must not poison the next pull: with it still in the list, a
+# clean autostash pull is reported as clean.
+cd "$SB/other"; printf 'e\n' > e.txt; git add -A >/dev/null; git commit -qm "their e"; git push -q origin main 2>/dev/null
+cd "$SB/work"; printf 'edit elsewhere\n' >> "$SB/work/keep.txt"
+OUT=$(probe pull "$SB/work" "rebase,autostash")
+ok "an old 'autostash' entry does not make a clean autostash pull look failed" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  autostash_conflict is false" "$(printf '%s' "$OUT" | jqf pull.autostash_conflict)" "False"
+ok "  the headline counts the one upstream commit" "$(printf '%s' "$OUT" | jqf headline)" "Pulled 1 commit(s) with rebase."
+ok "  the edit is back in the tree" "$(git -C "$SB/work" status --porcelain -- keep.txt)" " M keep.txt"
+ok "  the old entry is untouched" "$(git -C "$SB/work" stash list --format=%gs | tr '\n' '|')" "autostash|"
+ok "  and their commit arrived" "$([ -e "$SB/work/e.txt" ] && echo present || echo missing)" "present"
+git -C "$SB/work" checkout -q -- keep.txt
 git -C "$SB/work" stash drop -q
 
 section "Pull: merge and conflicts"
@@ -254,6 +266,8 @@ OUT=$(probe pull "$SB/work" "rebase")
 ok "the rebase stops on the conflict" "$(printf '%s' "$OUT" | jqf advice.action)" "resolve-conflicts"
 OUT=$(probe status "$SB/work")
 ok "  status names the continue command" "$(printf '%s' "$OUT" | jqf operation.continue_command)" "git rebase --continue"
+ok "  and the side coming in by its upstream name, not the id git stores" "[$(printf '%s' "$OUT" | jqf operation.sides.theirs)]" "[origin/main]"
+ok "  in the banner too" "$(printf '%s' "$OUT" | jqf operation.detail)" "main onto origin/main"
 OUT=$(probe continue "$SB/work")
 ok "continue is refused while the file is conflicted" "$(printf '%s' "$OUT" | jqf refusal.code)" "unmerged-paths"
 printf 'BOTH\n' > "$SB/work/conflict.txt"; git -C "$SB/work" add conflict.txt

@@ -41,7 +41,8 @@ export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAct
         <div className="min-w-0 flex-1 space-y-1">
           <p className={`text-sm ${result.ok ? "text-emerald-100" : "text-red-100"}`}>{result.headline}</p>
           {result.detail && <p className="text-xs text-zinc-400 break-words">{result.detail}</p>}
-          {result.advice?.guidance && (
+          {/* A failed result carries the guidance in `detail` too (for readers without advice) — say it once. */}
+          {result.advice?.guidance && result.advice.guidance !== result.detail && (
             <p className="text-xs text-zinc-300 break-words">{result.advice.guidance}</p>
           )}
           {extraAction && (

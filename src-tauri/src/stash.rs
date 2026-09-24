@@ -45,7 +45,9 @@ pub struct StashEntry {
     pub date: String,
     pub tracked_files: usize,
     pub untracked_files: usize,
-    /// Made by a rebase's --autostash (a sync or a pull), not by hand.
+    /// Stored by a rebase's --autostash (a sync or a pull) when it could not
+    /// re-apply the stash: the subject is exactly `autostash`. A hand-made
+    /// stash that merely mentions the word is not one.
     pub is_autostash: bool,
 }
 
@@ -109,6 +111,8 @@ fn no_stash() -> Refusal {
     refuse("no-stash", "That stash no longer exists — the list may be out of date.")
 }
 
+const MOVED: &str = "That stash moved or was dropped — the list is out of date.";
+
 /// The pure gate for every stash operation. Order: busy → the entry exists →
 /// conflicts → anything to stash.
 pub fn check_stash(intent: &StashIntent, f: &StatusFacts) -> Option<Refusal> {
@@ -143,7 +147,13 @@ pub fn check_stash(intent: &StashIntent, f: &StatusFacts) -> Option<Refusal> {
                 ));
             }
             if f.staged + f.unstaged == 0 && (!include_untracked || f.untracked == 0) {
-                return Some(refuse("nothing-to-stash", "Nothing to stash — the working tree is clean."));
+                // Same code either way; the words say what is actually there.
+                let msg = if f.untracked > 0 {
+                    "Only new files here — tick Include untracked files to stash them."
+                } else {
+                    "Nothing to stash — the working tree is clean."
+                };
+                return Some(refuse("nothing-to-stash", msg));
             }
             None
         }
@@ -228,9 +238,11 @@ pub fn parse_stash_list(raw: &[u8]) -> Vec<StashRecord> {
 /// Split a stash subject into (branch, message, is_autostash). Git writes
 /// "WIP on <branch>: <short> <subject>" for an unnamed stash and
 /// "On <branch>: <message>" for a named one; anything else (a rebase's
-/// "autostash", a hand-stored entry) is kept whole as the message.
+/// "autostash", a hand-stored entry) is kept whole as the message. Only the
+/// exact subject `autostash` — what `git rebase --autostash` stores when the
+/// re-apply fails — counts as an autostash.
 pub fn parse_subject(subject: &str) -> (Option<String>, String, bool) {
-    let is_autostash = subject.contains("autostash");
+    let is_autostash = crate::sync::is_autostash_subject(subject);
     let rest = subject
         .strip_prefix("WIP on ")
         .or_else(|| subject.strip_prefix("On "));
@@ -579,30 +591,74 @@ pub async fn stash_push(repo_path: &str, message: Option<&str>, include_untracke
     })
 }
 
-/// Facts about `stash@{index}` for the pure check: it exists only when the
-/// list is long enough *and* the ref resolves.
-async fn locate(repo_path: &str, index: usize, stash_count: usize) -> Result<Option<StashRecord>, AppError> {
-    if index >= stash_count {
-        return Ok(None);
+/// Where `stash@{index}` stands, for the pure check.
+enum Located {
+    /// The entry the caller meant is at that index.
+    Found(StashRecord),
+    /// The list is shorter than that, or the ref does not resolve.
+    Missing,
+    /// Something is at that index, but not the entry the caller saw: the list
+    /// shifted underneath (a pop or drop elsewhere) since it was read.
+    Moved,
+}
+
+impl Located {
+    fn record(&self) -> Option<&StashRecord> {
+        match self {
+            Located::Found(r) => Some(r),
+            _ => None,
+        }
     }
-    let rec = find_record(repo_path, index).await?;
-    Ok(match rec {
-        Some(r) if oid_at(repo_path, index).await.as_deref() == Some(r.oid.as_str()) => Some(r),
-        _ => None,
-    })
+
+    /// `no-stash` says which of the two it was.
+    fn explain(&self, r: Refusal) -> Refusal {
+        if r.code == "no-stash" && matches!(self, Located::Moved) {
+            refuse("no-stash", MOVED)
+        } else {
+            r
+        }
+    }
+}
+
+/// The caller's oid names the entry; a short form of at least seven hex digits
+/// is accepted for the shell suites.
+fn oid_matches(rec: &StashRecord, want: &str) -> bool {
+    let want = want.trim();
+    !want.is_empty() && (rec.oid == want || (want.len() >= 7 && rec.oid.starts_with(want)))
+}
+
+/// Facts about `stash@{index}` for the pure check: it exists only when the
+/// list is long enough *and* the ref resolves *and*, when the caller says
+/// which commit it showed (`expected_oid`), that is what sits there now.
+async fn locate(repo_path: &str, index: usize, stash_count: usize, expected_oid: Option<&str>) -> Result<Located, AppError> {
+    if index >= stash_count {
+        return Ok(Located::Missing);
+    }
+    let Some(rec) = find_record(repo_path, index).await? else {
+        return Ok(Located::Missing);
+    };
+    if oid_at(repo_path, index).await.as_deref() != Some(rec.oid.as_str()) {
+        return Ok(Located::Missing);
+    }
+    match expected_oid.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(want) if !oid_matches(&rec, want) => Ok(Located::Moved),
+        _ => Ok(Located::Found(rec)),
+    }
 }
 
 /// `git stash apply|pop [--index] stash@{n}`. A conflict leaves the conflicted
 /// files in the tree and the entry in the list (git does the same); the
-/// result says so and names the files.
-pub async fn stash_apply(repo_path: &str, index: usize, pop: bool, restore_index: bool) -> Result<OpResult, AppError> {
+/// result says so and names the files. `oid`, when given, must be the entry's
+/// commit id as the list showed it — otherwise `no-stash`, so a stale list
+/// never applies a neighbour.
+pub async fn stash_apply(repo_path: &str, index: usize, pop: bool, restore_index: bool, oid: Option<&str>) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
-    let rec = locate(repo_path, index, before.stash_count).await?;
-    let intent = StashIntent::Apply { exists: rec.is_some(), pop };
+    let located = locate(repo_path, index, before.stash_count, oid).await?;
+    let intent = StashIntent::Apply { exists: located.record().is_some(), pop };
     if let Some(r) = git_ops::check(&Intent::Stash(intent), &StatusFacts::from(&before)) {
-        return Ok(OpResult::refused(r, before));
+        return Ok(OpResult::refused(located.explain(r), before));
     }
-    let rec = rec.expect("checked above");
+    let Located::Found(rec) = located else { unreachable!("checked above") };
     let sel = selector(index);
     // Counted before the command: a pop drops the reflog entry.
     let entry = entry_for(repo_path, &rec).await;
@@ -675,15 +731,16 @@ pub async fn stash_apply(repo_path: &str, index: usize, pop: bool, restore_index
 }
 
 /// `git stash drop stash@{n}`, with the way back: the commit object survives
-/// until git prunes it, and `git stash store` re-lists it.
-pub async fn stash_drop(repo_path: &str, index: usize) -> Result<OpResult, AppError> {
+/// until git prunes it, and `git stash store` re-lists it. `oid` as for
+/// `stash_apply`.
+pub async fn stash_drop(repo_path: &str, index: usize, oid: Option<&str>) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
-    let rec = locate(repo_path, index, before.stash_count).await?;
-    let intent = StashIntent::Drop { exists: rec.is_some() };
+    let located = locate(repo_path, index, before.stash_count, oid).await?;
+    let intent = StashIntent::Drop { exists: located.record().is_some() };
     if let Some(r) = git_ops::check(&Intent::Stash(intent), &StatusFacts::from(&before)) {
-        return Ok(OpResult::refused(r, before));
+        return Ok(OpResult::refused(located.explain(r), before));
     }
-    let rec = rec.expect("checked above");
+    let Located::Found(rec) = located else { unreachable!("checked above") };
     let sel = selector(index);
     let recovery = format!("git stash store -m {} {}", shell_quote(&rec.subject), rec.oid);
 
@@ -745,23 +802,24 @@ pub async fn stash_drop(repo_path: &str, index: usize) -> Result<OpResult, AppEr
 /// the stash commit (tracked) or its third parent (untracked). Both sides are
 /// always restored: a worktree-only restore is refused on an unmerged path,
 /// and an unmerged path left by a failed pop is exactly the recovery case.
-pub async fn stash_restore_file(repo_path: &str, index: usize, path: &str) -> Result<OpResult, AppError> {
+/// `oid` as for `stash_apply`.
+pub async fn stash_restore_file(repo_path: &str, index: usize, path: &str, oid: Option<&str>) -> Result<OpResult, AppError> {
     validate_repo_path(path)?;
     let before = snapshot(repo_path).await?;
-    let rec = locate(repo_path, index, before.stash_count).await?;
-    let files = match &rec {
+    let located = locate(repo_path, index, before.stash_count, oid).await?;
+    let files = match located.record() {
         Some(r) => stash_files(repo_path, r).await?,
         None => Vec::new(),
     };
     let file = files.iter().find(|f| f.path == path).cloned();
-    let intent = StashIntent::RestoreFile { exists: rec.is_some(), in_stash: file.is_some() };
+    let intent = StashIntent::RestoreFile { exists: located.record().is_some(), in_stash: file.is_some() };
     if let Some(mut r) = git_ops::check(&Intent::Stash(intent), &StatusFacts::from(&before)) {
         if r.code == "not-in-stash" {
             r.message = format!("{} isn't in that stash.", path);
         }
-        return Ok(OpResult::refused(r, before));
+        return Ok(OpResult::refused(located.explain(r), before));
     }
-    let rec = rec.expect("checked above");
+    let Located::Found(rec) = located else { unreachable!("checked above") };
     let file = file.expect("checked above");
     let sel = selector(index);
     let untracked = file.status == "untracked";
@@ -854,14 +912,18 @@ pub async fn stash_restore_file(repo_path: &str, index: usize, path: &str) -> Re
 /// - `stash_diff <n>,<path>`
 /// - `stash_push [<msg>][,untracked]` — an empty first arg means no message
 /// - `stash_push_paths <msg>|-,<path>[,<path>…][,untracked]` — `-` means no message
-/// - `stash_apply <n>[,pop][,index]`
-/// - `stash_drop <n>`
-/// - `stash_restore <n>,<path>`
+/// - `stash_apply <n>[,pop][,index][,<oid>]`
+/// - `stash_drop <n>[,<oid>]`
+/// - `stash_restore <n>,<path>[,<oid>]`
+///
+/// The optional trailing `<oid>` is the commit id the caller saw at that index
+/// (as the UI sends it); the operation is refused when the entry moved.
 #[cfg(test)]
 pub(crate) async fn probe(op: &str, repo: &str, args: &[String]) {
     use crate::probe::tests::{emit, emit_err, show};
     let first = args.first().map(|s| s.as_str()).unwrap_or("");
     let second = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    let third = args.get(2).map(|s| s.as_str());
     let untracked = args.iter().any(|s| s == "untracked");
     let index = || first.parse::<usize>();
     match op {
@@ -896,16 +958,17 @@ pub(crate) async fn probe(op: &str, repo: &str, args: &[String]) {
             Ok(n) => {
                 let pop = args.iter().skip(1).any(|s| s == "pop");
                 let restore_index = args.iter().skip(1).any(|s| s == "index");
-                show(stash_apply(repo, n, pop, restore_index).await)
+                let oid = args.iter().skip(1).find(|s| *s != "pop" && *s != "index").map(|s| s.as_str());
+                show(stash_apply(repo, n, pop, restore_index, oid).await)
             }
             Err(_) => emit_err("stash index must be a number"),
         },
         "stash_drop" => match index() {
-            Ok(n) => show(stash_drop(repo, n).await),
+            Ok(n) => show(stash_drop(repo, n, args.get(1).map(|s| s.as_str())).await),
             Err(_) => emit_err("stash index must be a number"),
         },
         "stash_restore" => match index() {
-            Ok(n) => show(stash_restore_file(repo, n, second).await),
+            Ok(n) => show(stash_restore_file(repo, n, second, third).await),
             Err(_) => emit_err("stash index must be a number"),
         },
         other => emit_err(format!("unknown stash op {}", other)),
@@ -976,9 +1039,11 @@ mod tests {
             parse_subject("On main: fix: colons: everywhere"),
             (Some("main".into()), "fix: colons: everywhere".into(), false)
         );
-        // A rebase's autostash has no prefix at all; sync's own stashes name it too.
+        // A rebase's failed autostash pop stores exactly this subject, no prefix.
         assert_eq!(parse_subject("autostash"), (None, "autostash".into(), true));
-        assert!(parse_subject("On main: gitswitch autostash before sync").2);
+        // A stash that merely mentions the word is a person's, not a rebase's.
+        assert!(!parse_subject("On main: gitswitch autostash before sync").2);
+        assert!(!parse_subject("On main: fix autostash bug").2);
         assert!(!parse_subject("On main: fix header").2);
         // Detached HEAD has no branch to report.
         assert_eq!(parse_subject("WIP on (no branch): 7a38086 other").0, None);
@@ -1042,7 +1107,11 @@ mod tests {
         assert_eq!(check_stash(&push(false), &clean()).unwrap().code, "nothing-to-stash");
         assert_eq!(check_stash(&push(true), &clean()).unwrap().code, "nothing-to-stash");
         let only_untracked = StatusFacts { untracked: 2, ..clean() };
-        assert_eq!(check_stash(&push(false), &only_untracked).unwrap().code, "nothing-to-stash");
+        let r = check_stash(&push(false), &only_untracked).unwrap();
+        assert_eq!(r.code, "nothing-to-stash");
+        // Same code, but the words name the new files rather than calling the tree clean.
+        assert!(r.message.contains("Only new files here"), "{}", r.message);
+        assert!(check_stash(&push(false), &clean()).unwrap().message.contains("working tree is clean"));
         assert!(check_stash(&push(true), &only_untracked).is_none());
         assert!(check_stash(&push(false), &StatusFacts { staged: 1, ..clean() }).is_none());
         assert!(check_stash(&push(false), &StatusFacts { unstaged: 1, ..clean() }).is_none());
@@ -1070,6 +1139,23 @@ mod tests {
         );
         // Dropping does not touch the tree, so conflicts do not stop it.
         assert!(check_stash(&StashIntent::Drop { exists: true }, &StatusFacts { conflicted: 2, ..clean() }).is_none());
+    }
+
+    #[test]
+    fn the_callers_oid_must_be_the_entry_at_that_index() {
+        let rec = StashRecord { index: 0, oid: "b3982e7d79c7836a3e53e712c57b36f058a6b9e2".into(), parents: 2, date: String::new(), subject: "On main: x".into() };
+        assert!(oid_matches(&rec, "b3982e7d79c7836a3e53e712c57b36f058a6b9e2"));
+        assert!(oid_matches(&rec, "b3982e7"), "a short id of seven or more digits is accepted");
+        assert!(!oid_matches(&rec, "b3982e"), "too short to be an id");
+        assert!(!oid_matches(&rec, "0123456789abcdef0123456789abcdef01234567"));
+        assert!(!oid_matches(&rec, ""));
+        // Only a moved entry gets the "moved" wording; a missing one keeps the plain refusal.
+        let r = Located::Moved.explain(no_stash());
+        assert_eq!(r.code, "no-stash");
+        assert!(r.message.contains("moved or was dropped"));
+        assert!(Located::Missing.explain(no_stash()).message.contains("no longer exists"));
+        // Other refusals pass through untouched.
+        assert_eq!(Located::Moved.explain(refuse("unmerged-paths", "x")).code, "unmerged-paths");
     }
 
     #[test]

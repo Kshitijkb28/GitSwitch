@@ -149,9 +149,17 @@ export function SubmoduleSection({
               <AlertTriangle size={14} className="text-amber-400 shrink-0" />
               <p className="text-xs text-amber-100 flex-1 min-w-0 break-words">
                 {op.label} inside <span className="font-mono">{sub.path}</span>
-                <span className="text-amber-200/70"> — {op.detail || "Finish it, or abort to go back."}</span>
+                <span className="text-amber-200/70">
+                  {" — "}
+                  {st.sync
+                    ? // The sync owns this rebase: the backend refuses a plain
+                      // continue/abort here, the same way the parent's own
+                      // banner yields to the sync card.
+                      "it belongs to the paused sync. Finish it with Continue sync / Abort sync above."
+                    : op.detail || "Finish it, or abort to go back."}
+                </span>
               </p>
-              {op.continue_command && op.kind !== "merge" && (
+              {!st.sync && op.continue_command && op.kind !== "merge" && (
                 <Button
                   size="sm"
                   variant="primary"
@@ -163,16 +171,18 @@ export function SubmoduleSection({
                   Continue in {sub.path}
                 </Button>
               )}
-              <Button
-                size="sm"
-                variant="secondary"
-                disabled={busy}
-                title={op.abort_command}
-                onClick={() => apply("abort", () => api.changesAbort(path), path)}
-              >
-                <CircleSlash size={13} />
-                Abort in {sub.path}
-              </Button>
+              {!st.sync && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={busy}
+                  title={op.abort_command}
+                  onClick={() => apply("abort", () => api.changesAbort(path), path)}
+                >
+                  <CircleSlash size={13} />
+                  Abort in {sub.path}
+                </Button>
+              )}
             </div>
           )}
 

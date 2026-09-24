@@ -68,14 +68,19 @@ export function BranchCard({
   );
   const opTitle = status.operation ? `Finish or abort the ${status.operation.kind} first` : null;
   const uncommitted = status.staged_count + status.unstaged_count + status.untracked_count;
+  // Discard everything also clears conflicts left behind by a stash pop — the
+  // backend allows exactly that when no operation is in progress.
+  const discardable = uncommitted + status.conflicted_count;
   const level = status.ahead === 0 && status.behind === 0;
 
+  // `can_amend` is false when ANY remote-tracking ref holds HEAD — not
+  // necessarily the upstream — so the tooltip must not name one.
   const undoTitle = status.unborn
     ? "There is no commit to undo yet"
     : opTitle
       ? opTitle
       : !status.can_amend
-        ? `The last commit is already on ${status.upstream ?? "the remote"} — revert it from History instead`
+        ? "The last commit is already on a remote branch — revert it from History instead"
         : null;
   const stashTitle = uncommitted === 0 ? "Nothing to stash" : null;
   const resetTitle = !status.upstream
@@ -83,7 +88,7 @@ export function BranchCard({
     : level
       ? `Already level with ${status.upstream}`
       : opTitle;
-  const discardTitle = uncommitted === 0 ? "Nothing to discard" : null;
+  const discardTitle = discardable === 0 ? "Nothing to discard" : null;
 
   return (
     <Card>
@@ -91,7 +96,17 @@ export function BranchCard({
         <div className="min-w-0 space-y-2">
           <div className="flex items-center gap-2 flex-wrap">
             <GitBranch size={15} className="text-zinc-400 shrink-0" />
-            {status.detached ? (
+            {status.detached && status.operation ? (
+              // A rebase (or a stopped cherry-pick/revert) detaches HEAD on
+              // purpose; saying "not on a branch" here would send people to
+              // the branch picker, where every switch is refused.
+              <span className="font-medium text-amber-300">
+                {status.operation.label}
+                {status.operation.detail && (
+                  <span className="font-normal text-xs text-amber-200/70"> · {status.operation.detail}</span>
+                )}
+              </span>
+            ) : status.detached ? (
               <span className="font-medium text-amber-300">
                 detached HEAD at {(status.head_oid ?? "").slice(0, 7) || "?"} — you&apos;re not on a branch
               </span>

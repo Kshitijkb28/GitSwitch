@@ -292,7 +292,8 @@ try {
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_reset"), { timeout: 4000 });
     const r = await lastCall(page, "changes_reset");
     ok('  sends changes_reset mode "mixed"', r?.args.mode === "mixed" && r?.args.target === C2 && r?.args.repoPath === REPO, JSON.stringify(r?.args));
-    ok("  stashing first, since the tree is dirty", r?.args.stashFirst === true);
+    // A mixed reset leaves the working tree alone, so nothing needs setting aside — even on a dirty tree.
+    ok("  without a stash, dirty tree or not (nothing in the tree is touched)", r?.args.stashFirst === false);
     await page.close();
   }
   {
@@ -301,7 +302,9 @@ try {
     await openChooser(page);
     ok("Do it on the soft row", await clickInRow(page, "keep later changes staged", { text: "Do it" }));
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_reset"), { timeout: 4000 });
-    ok('  sends changes_reset mode "soft"', (await lastCall(page, "changes_reset"))?.args.mode === "soft");
+    const r = await lastCall(page, "changes_reset");
+    ok('  sends changes_reset mode "soft"', r?.args.mode === "soft");
+    ok("  without a stash either", r?.args.stashFirst === false);
     await page.close();
   }
 
@@ -488,6 +491,9 @@ try {
     const b = await button(page, "Cherry-pick");
     ok("with a detached HEAD the cherry-pick button is disabled", b !== null && (await b.evaluate((el) => el.disabled)));
     ok('  saying "Switch to a branch first"', (await b.evaluate((el) => el.title)) === "Switch to a branch first");
+    // A revert makes a commit too, and the backend refuses it the same way — so it is gated the same way.
+    const rv = await button(page, "Undo this commit (revert)");
+    ok("and so is Undo this commit (revert), for the same reason", rv !== null && (await rv.evaluate((el) => el.disabled && el.title === "Switch to a branch first")));
     await page.close();
   }
 
@@ -529,6 +535,27 @@ try {
     await sleep(100);
     s = await text(page);
     ok("clicking it again collapses the diff", !s.includes("@@ -1,3 +1,4 @@"));
+    ok("a binary file's row says binary instead of +- −-", s.includes("logo.png") && s.includes("binary") && !s.includes("+-") && !s.includes("−-"));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("The Merge status card follows the branch");
+  {
+    const page = await open();
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.title === "main").click());
+    await page.waitForFunction(() => document.body.innerText.includes("Merge status"), { timeout: 4000 });
+    const first = await calls(page, "history_branch_merges");
+    ok("selecting a branch asks which branches contain it", first.length === 1 && first[0].args.branch === "main" && first[0].args.repoPath === REPO);
+    await openPanel(page, C2);
+    await (await button(page, "Undo this commit (revert)")).click();
+    await page.waitForFunction((s) => document.body.innerText.includes(`Revert ${s}?`), { timeout: 4000 }, SHORT);
+    await (await button(page, "Revert")).click();
+    await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Open in Changes"), { timeout: 4000 });
+    await sleep(200);
+    const after = await calls(page, "history_branch_merges");
+    ok("  and asks again after an action (a reset or a new branch changes the answer)", after.length === 2 && after[1].args.branch === "main");
+    ok("  the card is still there", (await text(page)).includes("Merge status"));
     await page.close();
   }
 

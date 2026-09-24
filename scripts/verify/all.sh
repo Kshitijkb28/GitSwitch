@@ -36,6 +36,8 @@ if [ -d "$HERE/harness/node_modules/puppeteer-core" ] && [ -n "$JS" ]; then
   run "Headless UI"           harness ui.mjs
   run "Headless UI (History)" harness history.mjs
   run "Layout sweep"          harness sweep.mjs
+  # The two pages against the REAL backend (probe's `invoke` op) in a sandbox: needs git, cargo and Chrome.
+  run "Live UI ↔ backend"     harness live.mjs
 else
   echo; echo "(headless UI skipped — run: cd scripts/verify/harness && npm install   (or: bun install))"
 fi

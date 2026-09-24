@@ -9,7 +9,7 @@ import { TreeLists, type DiscardVariant } from "../components/changes/TreeLists"
 import { CommitBox } from "../components/changes/CommitBox";
 import { DiffPanel } from "../components/changes/DiffPanel";
 import { BranchCard } from "../components/changes/BranchCard";
-import { BranchesModal } from "../components/changes/BranchesModal";
+import { BranchesModal, type RunOptions } from "../components/changes/BranchesModal";
 import { PushAccessCard } from "../components/changes/PushAccessCard";
 import { SubmodulesCard } from "../components/changes/SubmodulesCard";
 import { SubmoduleSection, needsSection, sectionId } from "../components/changes/SubmoduleSection";
@@ -191,6 +191,9 @@ export function Changes() {
 
   const message = drafts[repoPath] ?? "";
   const setMessage = (m: string) => setDrafts((d) => ({ ...d, [repoPath]: m }));
+  // What the box shows is what gets committed: with nothing typed, a merge in
+  // progress commits with git's own MERGE_MSG rather than an empty message.
+  const commitMessage = message || (status?.merge_message ?? "");
 
   const entries = status?.entries ?? [];
   const dirty = (status?.staged_count ?? 0) + (status?.unstaged_count ?? 0) > 0;
@@ -198,14 +201,17 @@ export function Changes() {
   /**
    * Apply a foreground operation and adopt the status it returns. With a
    * `target` (a submodule's path) the status belongs to that section, and the
-   * parent is re-read because its gitlink row just changed too.
+   * parent is re-read because its gitlink row just changed too. A refusal the
+   * caller named in `opts.quietRefusal` is a question it answers itself (a
+   * confirm step), so it gets neither a toast nor a result card.
    */
-  const apply = async (key: string, fn: () => Promise<OpResult>, target?: string) => {
+  const apply = async (key: string, fn: () => Promise<OpResult>, target?: string, opts?: RunOptions) => {
     setBusy(key);
     setError(null);
     try {
       const r = await fn();
-      setResult(r);
+      const quiet = !r.ok && !!opts?.quietRefusal && r.refusal?.code === opts.quietRefusal;
+      if (!quiet) setResult(r);
       if (r.status) {
         const s = r.status;
         if (target && target !== repoPath) {
@@ -218,6 +224,8 @@ export function Changes() {
       setSubRefresh((n) => n + 1);
       if (r.ok) {
         toast.success(r.headline);
+      } else if (quiet) {
+        // the caller asks the question in its own dialog
       } else if (r.refusal) {
         toast.error(r.refusal.message);
       } else if (r.advice) {
@@ -248,7 +256,7 @@ export function Changes() {
   };
 
   const onCommit = async () => {
-    const r = await apply("commit", () => api.changesCommit(repoPath, message, amend));
+    const r = await apply("commit", () => api.changesCommit(repoPath, commitMessage, amend));
     if (r?.ok) {
       setDrafts((d) => ({ ...d, [repoPath]: "" }));
       setAmend(false);
@@ -542,7 +550,7 @@ export function Changes() {
 
               <CommitBox
                 status={status}
-                message={message || (status.merge_message ?? "")}
+                message={commitMessage}
                 onMessage={setMessage}
                 amend={amend}
                 onAmend={setAmend}
@@ -672,7 +680,7 @@ export function Changes() {
           repoPath={branchesFor}
           status={branchesStatus}
           busy={anyBusy}
-          run={(key, fn) => apply(key, fn, branchesFor === repoPath ? undefined : branchesFor)}
+          run={(key, fn, opts) => apply(key, fn, branchesFor === repoPath ? undefined : branchesFor, opts)}
         />
       )}
 

@@ -142,6 +142,13 @@ pub struct MergeInfo {
     pub merges: Vec<HistoryCommit>,
 }
 
+/// `refs/remotes/<remote>/HEAD`: a remote's symbolic pointer at its default
+/// branch, not a branch. Its short name is just the remote's ("origin"), so
+/// it has to be recognised by the full ref.
+pub(crate) fn is_remote_head(full_ref: &str) -> bool {
+    full_ref.starts_with("refs/remotes/") && full_ref.ends_with("/HEAD")
+}
+
 fn git(repo: &Path, args: &[&str]) -> Result<String, AppError> {
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -297,8 +304,7 @@ pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
         }
         let full_ref = f[0];
         let name = f[1].to_string();
-        // origin/HEAD is a symbolic pointer, not a real branch.
-        if name.ends_with("/HEAD") {
+        if is_remote_head(full_ref) {
             continue;
         }
         let upstream = if f[2].is_empty() { None } else { Some(f[2].to_string()) };
@@ -481,8 +487,11 @@ pub fn commit_detail(repo_path: &str, hash: &str) -> Result<CommitDetail, AppErr
         return Err(AppError::NotFound(format!("Commit {} not found", hash)));
     }
 
-    // --numstat gives machine-readable per-file add/remove counts.
-    let stat = git(&repo, &["show", "--numstat", "--format=", hash]).unwrap_or_default();
+    // --numstat gives machine-readable per-file add/remove counts. Without
+    // rename detection: a rename would otherwise print `dir/{old => new}`,
+    // which is not a path the file diff can be asked for; as a deletion plus
+    // an addition both rows carry real paths.
+    let stat = git(&repo, &["show", "--numstat", "--no-renames", "--format=", hash]).unwrap_or_default();
     let files = stat
         .lines()
         .filter_map(|l| {
@@ -535,14 +544,18 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
     let repo = PathBuf::from(repo_path);
     let tip = git(&repo, &["rev-parse", branch])?;
 
+    // Full ref names, so each remote's symbolic HEAD (short name: just
+    // "origin") can be recognised and left out.
     let merged_into: Vec<String> = git(
         &repo,
-        &["branch", "--all", "--contains", &tip, "--format=%(refname:short)"],
+        &["for-each-ref", &format!("--contains={}", tip), "--format=%(refname)", "refs/heads", "refs/remotes"],
     )
     .unwrap_or_default()
     .lines()
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty() && s != branch && !s.ends_with("/HEAD"))
+    .map(str::trim)
+    .filter(|r| !r.is_empty() && !is_remote_head(r))
+    .map(|r| r.trim_start_matches("refs/heads/").trim_start_matches("refs/remotes/").to_string())
+    .filter(|s| s != branch)
     .collect();
 
     let page = history_page(repo_path, branch, 0, 400, None, None)?;

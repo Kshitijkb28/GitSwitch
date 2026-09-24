@@ -423,10 +423,16 @@ export const SCENARIOS = {
 
   merging: status({ operation: MERGE_OP, merge_message: "Merge branch 'origin/main'", staged_count: 0, can_amend: false }),
 
-  rebasing: status({ operation: REBASE_OP, staged_count: 1, can_amend: false }),
+  // A rebase detaches HEAD for its whole duration (porcelain v2 prints
+  // `branch.head (detached)` and no upstream line), so the page must not send
+  // people to the branch picker — every switch is refused until it is done.
+  rebasing: status({ operation: REBASE_OP, staged_count: 1, can_amend: false, branch: null, detached: true, upstream: null }),
 
   rebasingConflicted: status({
     operation: REBASE_OP,
+    branch: null,
+    detached: true,
+    upstream: null,
     entries: [entry({ path: "conflict.txt", kind: "conflicted", staged: "U", unstaged: "U", conflict: "both modified", stage_modes: ["100644", "100644", "100644"], stage_oids: ["a".repeat(40), "b".repeat(40), "c".repeat(40)] })],
     conflicted_count: 1,
     staged_count: 0,
@@ -445,6 +451,12 @@ export const SCENARIOS = {
     entries: [entry({ path: "junk.txt", kind: "untracked", staged: ".", unstaged: "?" })],
     untracked_count: 1,
     untracked_truncated: true,
+  }),
+
+  // Nothing but new files: discard_all only has work if they are to be deleted.
+  untrackedOnly: status({
+    entries: [entry({ path: "notes.md", kind: "untracked", staged: ".", unstaged: "?", unstaged_added: null, unstaged_removed: null })],
+    untracked_count: 1,
   }),
 
   submodules: status({ has_submodules: true, submodule_dirty_count: 2 }),
@@ -775,6 +787,25 @@ export const SUB_STATUSES = [
     }),
   },
 ];
+
+/** A's section while the superproject's sync is paused inside A: the rebase belongs to the sync. */
+export const SUB_SYNC_PAUSED = {
+  path: "A",
+  name: "A",
+  listed: true,
+  recorded: "a535d05aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  recorded_short: "a535d05",
+  status: SCENARIOS.syncPausedChild,
+};
+
+/** Fifty entries — the backend's listing cap — for a repository that holds more. */
+export const STASHES_CAPPED = Array.from({ length: 50 }, (_, i) => ({
+  ...STASHES[0],
+  index: i,
+  ref: `stash@{${i}}`,
+  oid: i.toString(16).padStart(40, "0"),
+  message: `wip ${i}`,
+}));
 
 /** A submodule with nothing to do: summarised in one line, no section. */
 export const SUB_QUIET = {

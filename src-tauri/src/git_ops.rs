@@ -1145,12 +1145,14 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
 
     let after = snapshot(repo_path).await?;
     // An autostash that git could not re-apply leaves conflicted files with
-    // no rebase in progress, and keeps the entry in the stash. Git may still
-    // exit 0 here, so this is measured rather than read from the exit code.
+    // no rebase in progress, and stores the entry in the stash list (a clean
+    // re-apply stores nothing). Git may still exit 0 here, so this is measured
+    // — against `before`, so an old entry named "autostash" from an earlier
+    // pull cannot make a clean pull look failed.
     let autostash_conflict = mode == PullMode::Rebase
         && autostash
         && after.operation.is_none()
-        && (after.conflicted_count > 0 || crate::sync::has_autostash_entry(&PathBuf::from(repo_path)).await);
+        && (after.conflicted_count > 0 || after.stash_count > before.stash_count);
     let head_after = after.head_oid.clone().unwrap_or_default();
     let conflicts: Vec<String> = after
         .entries
@@ -1166,6 +1168,8 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
             .await
             .map(|o| o.ok())
             .unwrap_or(false);
+    // The upstream commits that came in — not `head_before..head_after`, which
+    // would also count the local commits a rebase replayed or the merge commit.
     let commits_pulled = if head_before == head_after {
         0
     } else {
@@ -1173,7 +1177,7 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
             .args([
                 "rev-list",
                 "--count",
-                &format!("{}..{}", head_before, head_after),
+                &format!("{}..{}", head_before, upstream_ref),
             ])
             .ok_text()
             .await
@@ -1592,8 +1596,9 @@ pub async fn continue_op(repo_path: &str) -> Result<OpResult, AppError> {
         return Ok(OpResult::failed(a, after));
     }
     // A rebase started with --autostash pops the stash when it finishes; a pop
-    // that conflicts leaves conflicted files behind with no rebase in progress.
-    if op.kind.contains("rebase") && after.operation.is_none() && after.conflicted_count > 0 {
+    // that conflicts leaves conflicted files behind with no rebase in progress
+    // and stores the stash as a new list entry (a clean pop stores nothing).
+    if op.kind.contains("rebase") && after.operation.is_none() && (after.conflicted_count > 0 || after.stash_count > before.stash_count) {
         let a = git_advice::explain(
             GitOp::Rebase,
             &format!("Applying autostash resulted in conflicts\n{}\n{}", out.text(), out.stderr),

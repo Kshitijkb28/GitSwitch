@@ -37,6 +37,7 @@ ok "  and says so in plain words" "$(printf '%s' "$OUT" | jqf refusal.message)" 
 printf 'u\n' > "$W/only-new.txt"
 OUT=$(probe stash_push "$W" "")
 ok "an untracked file alone is nothing to stash without asking for new files" "$(printf '%s' "$OUT" | jqf refusal.code)" "nothing-to-stash"
+ok "  and the words name the new files rather than calling the tree clean" "$(printf '%s' "$OUT" | jqf refusal.message)" "Only new files here"
 rm "$W/only-new.txt"
 printf 'dirty inside\n' >> "$W/vendor/sub/s.txt"
 OUT=$(probe stash_push "$W" "")
@@ -86,11 +87,16 @@ OUT=$(probe stash_diff "$W" "0,c.txt")
 ok "a file that isn't in the stash is an error, not an empty diff" "$OUT" "isn't in that stash"
 OUT=$(probe stash_show "$W" "7")
 ok "showing a stale index says the list is out of date" "$OUT" "isn't there any more"
-printf 'x\n' >> "$W/c.txt"; git -C "$W" stash push -q -m autostash
+# Exactly what a rebase's failed autostash pop does: `git stash store -m autostash <commit>`.
+printf 'x\n' >> "$W/c.txt"; git -C "$W" stash store -q -m autostash "$(git -C "$W" stash create)"
+# A person's stash that merely mentions the word.
+git -C "$W" stash push -q -m "fix autostash bug"
 OUT=$(probe stash_list "$W")
-ok "an entry named by a rebase's autostash is flagged" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["is_autostash"])')" "True"
-ok "  the hand-made one is not" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[1]["is_autostash"])')" "False"
-git -C "$W" stash pop -q; git -C "$W" checkout -q -- c.txt
+ok "the entry a rebase's autostash stores is flagged" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[1]["is_autostash"])')" "True"
+ok "  git wrote its subject bare" "$(git -C "$W" stash list --format=%gs | sed -n 2p)" "autostash"
+ok "  a stash that merely mentions the word is not" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["is_autostash"])')" "False"
+ok "  nor is the hand-made one" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[2]["is_autostash"])')" "False"
+git -C "$W" stash drop -q; git -C "$W" stash drop -q; git -C "$W" checkout -q -- c.txt
 
 section "Push only the selected files"
 printf 'line1\nline2 only-a\nline3\n' > "$W/a.txt"; printf 'b-part\n' >> "$W/b.txt"
@@ -201,6 +207,22 @@ ok "so is dropping it" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-stash"
 OUT=$(probe stash_restore "$W" "7,a.txt")
 ok "and restoring from it" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-stash"
 ok "  nothing changed" "$(count_stashes)" "2"
+# The list the UI shows carries each entry's commit id; an operation that names
+# it is refused when a different entry now sits at that index.
+OID0="$(git -C "$W" rev-parse 'stash@{0}')"; OID1="$(git -C "$W" rev-parse 'stash@{1}')"
+OUT=$(probe stash_drop "$W" "0,$OID1")
+ok "dropping index 0 while naming the entry that used to be there is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-stash"
+ok "  saying the list moved" "$(printf '%s' "$OUT" | jqf refusal.message)" "moved or was dropped"
+ok "  and nothing was dropped" "$(count_stashes):$(git -C "$W" rev-parse 'stash@{0}')" "2:$OID0"
+OUT=$(probe stash_apply "$W" "0,pop,$OID1")
+ok "the same guard on pop" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-stash"
+OUT=$(probe stash_restore "$W" "0,b.txt,$OID1")
+ok "and on restore" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-stash"
+ok "  the tree is untouched" "$(porcelain)" " M vendor/sub|"
+OUT=$(probe stash_restore "$W" "0,b.txt,$OID0")
+ok "with the id that is really there the operation runs" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  a short id is accepted too" "$(probe stash_restore "$W" "0,b.txt,$(git -C "$W" rev-parse --short=8 'stash@{0}')" | jqf ok)" "True"
+tidy
 
 section "Busy: a merge in progress"
 git -C "$W" switch -q -c side; printf 'side\n' > "$W/a.txt"; git -C "$W" commit -qam "side"

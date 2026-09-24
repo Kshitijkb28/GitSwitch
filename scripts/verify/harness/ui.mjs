@@ -23,6 +23,8 @@ import {
   STASH_DETAIL,
   SUB_STATUSES,
   SUB_QUIET,
+  SUB_SYNC_PAUSED,
+  STASHES_CAPPED,
   SUBMODULE_A,
   TREE_RESET_OUTCOME,
   STASH_DROP_OUTCOME,
@@ -628,6 +630,13 @@ try {
     const s0 = await text(page);
     ok("a stopped rebase offers Continue", s0.includes("Rebase in progress") && (await button(page, "Continue")) !== null);
     ok("  enabled when nothing is conflicted", !(await (await button(page, "Continue")).evaluate((b) => b.disabled)));
+    // HEAD is detached for the whole rebase; the remedy is Continue/Abort, not the branch picker.
+    ok("  the header names the rebase, not a detached HEAD", s0.split("Rebase in progress").length >= 3 && !s0.includes("not on a branch"));
+    ok("  nobody is told to switch branches", !s0.includes("Switch to a branch") && !s0.includes("Check out a branch first"));
+    ok("  and no Choose a branch is offered", (await page.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Choose a branch").length)) === 0);
+    ok("  the sync card says to finish or abort the rebase", s0.includes("Finish or abort the rebase first"));
+    // The backend allows a plain commit during a rebase (it is one way to finish a stopped step), so the box asks for a message, not for a branch.
+    ok("  the commit box asks for a message, not for a branch", s0.includes("A commit needs a message.") && !s0.includes("Switch to a branch before committing"));
     await (await button(page, "Continue")).click();
     await sleep(300);
     ok("  and continuing reports its outcome", (await text(page)).includes("continue ok"));
@@ -1088,6 +1097,8 @@ try {
     const s = await text(page);
     ok("an unmerged branch asks again, naming the commits it would drop", s.includes("Delete feature/login?") && s.includes("3 commit"));
     ok("  and promises the undo command", s.includes("undo command is shown afterwards"));
+    // The refusal is the question, not a failure: no red toast, no failed-operation card behind the dialog.
+    ok("  asked once — no error toast and no result card for the question", s.split("would drop 3 commit(s)").length === 2 && (await button(page, "dismiss")) === null);
     const first = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_delete_branch"));
     ok("  the first attempt was not forced", first.length === 1 && first[0].args.force === false);
     await (await button(page, "Delete anyway")).click();
@@ -1174,10 +1185,53 @@ try {
     await sleep(300);
     const ap = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_stash_apply"));
     ok("  and applies without popping", ap?.args?.index === 0 && ap?.args?.pop === false);
+    ok("  naming the row's commit, so a shifted list is refused rather than acted on", ap?.args?.oid === STASHES[0].oid);
     await clickInRow(page, "fix header", { title: "Apply this stash and remove it" });
     await sleep(300);
     const pop = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_stash_apply")[1]);
-    ok("Pop applies and removes", pop?.args?.index === 0 && pop?.args?.pop === true);
+    ok("Pop applies and removes", pop?.args?.index === 0 && pop?.args?.pop === true && pop?.args?.oid === STASHES[0].oid);
+    await page.close();
+  }
+  {
+    // The status carries a fresh stash count on every read (Refresh, focus); the list follows it.
+    const page = await open(SCENARIOS.withStashes, { stashes: STASHES });
+    await page.waitForFunction(() => document.body.innerText.includes("fix header"), { timeout: 4000 });
+    const lists = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_stash_list").length);
+    const before = await lists();
+    await page.evaluate(() => {
+      window.__SCENARIO__ = { ...window.__SCENARIO__, stash_count: 3 };
+    });
+    await (await button(page, "Refresh")).click();
+    await sleep(400);
+    ok("a Refresh that finds a different stash count re-reads the list", (await lists()) > before);
+    ok("  and the header trusts the status's count over the rows it has", (await text(page)).includes("Stashes 3"));
+    await page.close();
+  }
+  {
+    const page = await open({ ...SCENARIOS.withStashes, stash_count: 60 }, { stashes: STASHES_CAPPED });
+    await page.waitForFunction(() => document.body.innerText.includes("wip 49"), { timeout: 4000 });
+    const s = await text(page);
+    ok("with more stashes than the backend lists, the header shows the real total", s.includes("Stashes 60"));
+    ok("  and says the list is cut", s.includes("Showing the first 50 of 60 stashes"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.withStashes, {
+      stashes: STASHES,
+      refuse: { changes_stash_drop: { code: "no-stash", message: "stash@{0} is no longer that entry — the list may be out of date." } },
+    });
+    await page.waitForFunction(() => document.body.innerText.includes("fix header"), { timeout: 4000 });
+    const lists = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_stash_list").length);
+    const before = await lists();
+    await clickInRow(page, "fix header", { title: "Drop this stash" });
+    await page.waitForFunction(() => document.body.innerText.includes("Drop this stash?"), { timeout: 4000 });
+    await (await button(page, "Drop")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("out of date"), { timeout: 4000 });
+    const dr = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_stash_drop"));
+    ok("Drop names the row's commit", dr?.args?.index === 0 && dr?.args?.oid === STASHES[0].oid);
+    ok("  a no-stash refusal says the list was stale", (await text(page)).includes("The list was out of date"));
+    await sleep(200);
+    ok("  and the list was re-read", (await lists()) > before);
     await page.close();
   }
   {
@@ -1196,10 +1250,16 @@ try {
     await page.waitForFunction(() => document.body.innerText.includes("Restore file"), { timeout: 4000 });
     const s2 = await text(page);
     ok("  with each path and an untracked marker", s2.includes("src/header.ts") && s2.includes("notes.txt"));
+    const shows = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_stash_show").length);
+    const shown = await shows();
     await clickInRow(page, "fix header", { title: "Restore only this file from the stash" });
-    await sleep(300);
+    await sleep(400);
     const rf = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_stash_restore_file"));
     ok("  Restore file sends the index and that path only", rf?.args?.index === 0 && rf?.args?.path === "src/header.ts");
+    ok("  with the row's commit", rf?.args?.oid === STASHES[0].oid);
+    // The operation re-reads the list; an open file list must be re-read with it, not left spinning.
+    const s3 = await text(page);
+    ok("  afterwards the open file list is re-read, not left at 'Reading the stash…'", (await shows()) === shown + 1 && s3.includes("src/header.ts") && !s3.includes("Reading the stash…"));
     await page.close();
   }
   {
@@ -1226,7 +1286,8 @@ try {
     const page = await open(SCENARIOS.pushedAlready);
     const b = await buttonState(page, "Undo last commit");
     ok("a pushed commit can't be undone here", b?.disabled === true);
-    ok("  and the tooltip points at History", (b?.title ?? "").includes("History") && (b?.title ?? "").includes("origin/main"));
+    // can_amend is false when ANY remote branch holds HEAD, so the tooltip must not name the upstream.
+    ok("  and the tooltip points at History without naming the upstream", (b?.title ?? "").includes("History") && (b?.title ?? "").includes("a remote branch") && !(b?.title ?? "").includes("origin/main"));
     await page.close();
   }
   {
@@ -1276,6 +1337,20 @@ try {
     await page.close();
   }
   {
+    // Unticking the box is the consent the backend honours: the changes are thrown away.
+    const page = await open({ ...SCENARIOS.diverged, entries: SCENARIOS.dirty.entries, staged_count: 2, unstaged_count: 3, untracked_count: 1 });
+    await (await button(page, "Reset to origin/main…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Reset to origin/main?"), { timeout: 4000 });
+    await page.$eval('input[aria-label="Stash uncommitted changes first"]', (el) => el.click());
+    await sleep(100);
+    ok("with the stash box unticked Reset stays enabled (the red warning is the consent)", (await buttonState(page, "Reset"))?.disabled === false);
+    await (await button(page, "Reset")).click();
+    await sleep(300);
+    const rs = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_reset"));
+    ok("  and sends stashFirst false", rs?.args?.mode === "hard" && rs?.args?.stashFirst === false);
+    await page.close();
+  }
+  {
     const page = await open(SCENARIOS.clean);
     const b = await buttonState(page, "Reset to origin/main…");
     ok("level with upstream: Reset is disabled", b?.disabled === true);
@@ -1294,9 +1369,15 @@ try {
     await (await button(page, "Discard everything…")).click();
     await page.waitForFunction(() => document.body.innerText.includes("Discard everything?"), { timeout: 4000 });
     const s = await text(page);
-    ok("Discard everything asks first, with the counts", s.includes("(2 staged, 3 not staged, 1 new)") && s.includes("cannot be undone"));
+    // Four distinct files carry the 2 staged + 3 unstaged changes; the new file is not among them until ticked.
+    ok("Discard everything asks first, counting only what it touches", s.includes("changes in 4 files (2 staged, 3 not staged)") && s.includes("cannot be undone"));
     ok("  new files are kept unless asked", await page.$eval('input[aria-label="Also delete new files"]', (el) => !el.checked));
     ok("  a stash is offered instead", (await page.$('input[aria-label="Stash them first"]')) !== null);
+    await page.$eval('input[aria-label="Also delete new files"]', (el) => el.click());
+    await sleep(100);
+    ok("  ticking it adds the new file to what is thrown away", (await text(page)).includes("changes in 5 files (2 staged, 3 not staged) and deletes 1 new file"));
+    await page.$eval('input[aria-label="Also delete new files"]', (el) => el.click());
+    await sleep(100);
     await (await button(page, "Discard everything")).click();
     await sleep(300);
     const da = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_discard_all"));
@@ -1306,6 +1387,33 @@ try {
   {
     const page = await open(SCENARIOS.clean);
     ok("on a clean tree Discard everything… is disabled", (await buttonState(page, "Discard everything…"))?.disabled === true);
+    await page.close();
+  }
+  {
+    // Only new files: the backend refuses "nothing to discard" unless they are to be deleted.
+    const page = await open(SCENARIOS.untrackedOnly);
+    ok("with only new files Discard everything… is offered", (await buttonState(page, "Discard everything…"))?.disabled === false);
+    await (await button(page, "Discard everything…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Discard everything?"), { timeout: 4000 });
+    const b = await buttonState(page, "Discard everything");
+    ok("  but confirming waits for the new files to be ticked, saying so", b?.disabled === true && b.title.includes("tick the box"));
+    ok("  and the dialog says only new files are here", (await text(page)).includes("only 1 new file"));
+    await page.$eval('input[aria-label="Also delete new files"]', (el) => el.click());
+    await sleep(100);
+    ok("  ticking it enables Discard everything", (await buttonState(page, "Discard everything"))?.disabled === false);
+    await (await button(page, "Discard everything")).click();
+    await sleep(300);
+    const da = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_discard_all"));
+    ok("  which sends includeUntracked", da?.args?.includeUntracked === true);
+    await page.close();
+  }
+  {
+    // Conflicts left by a stash pop, nothing else: the backend allows discarding them in one go.
+    const page = await open(SCENARIOS.stashConflict);
+    ok("leftover stash conflicts alone keep Discard everything… enabled", (await buttonState(page, "Discard everything…"))?.disabled === false);
+    await (await button(page, "Discard everything…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Discard everything?"), { timeout: 4000 });
+    ok("  and the dialog counts them", (await text(page)).includes("changes in 1 file (0 staged, 0 not staged, 1 conflicted)"));
     await page.close();
   }
   {
@@ -1376,6 +1484,14 @@ try {
     ok("B's rebase is shown inside its section", s.includes("Rebase in progress inside B") && (await button(page, "Abort in B")) !== null);
     ok("  with Continue disabled while the conflict remains", (await buttonState(page, "Continue in B"))?.disabled === true);
     ok("  and its conflict names the sides", s.includes("mine = your commit being replayed") && s.includes("theirs = origin/main"));
+    // A gitlink row can't be discarded from the parent (the backend refuses the whole request when one is selected).
+    const gitlink = await rowWith(page, "points at a different commit");
+    ok("the parent's gitlink rows offer no Discard", gitlink !== null && !gitlink.buttons.some((b) => b.title === "Discard — this cannot be undone"));
+    const discardAlls = await page.evaluate(() => ({
+      total: [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Discard all").length,
+      inA: [...document.querySelectorAll("#submodule-section-A button")].filter((b) => b.innerText.trim() === "Discard all").length,
+    }));
+    ok("  and with only gitlinks unstaged the parent has no Discard all (A's own list still does)", discardAlls.total === 1 && discardAlls.inA === 1, JSON.stringify(discardAlls));
     ok("staging a file inside A", await clickInRow(page, "long/name.ts", { title: "Stage" }));
     await sleep(300);
     const st = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_stage"));
@@ -1462,6 +1578,15 @@ try {
     await sleep(300);
     const s = await text(page);
     ok("with no submodule statuses no section renders", !s.includes("Inside A") && !s.includes("Inside B"));
+    await page.close();
+  }
+  {
+    // The sync paused inside A: its rebase belongs to the sync, and the backend refuses a plain continue/abort there.
+    const page = await open(SCENARIOS.syncPausedInSub, { submoduleStatuses: [SUB_SYNC_PAUSED] });
+    await page.waitForFunction(() => document.body.innerText.includes("Inside A"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a rebase that belongs to the paused sync shows no Continue in A / Abort in A", s.includes("Rebase in progress inside A") && (await button(page, "Continue in A")) === null && (await button(page, "Abort in A")) === null);
+    ok("  and points at the sync card's own buttons", s.includes("Finish it with Continue sync / Abort sync above") && (await button(page, "Abort sync")) !== null);
     await page.close();
   }
 

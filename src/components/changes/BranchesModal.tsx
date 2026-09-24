@@ -12,6 +12,12 @@ import type { BranchInfo, OpResult, RepoStatus } from "../../lib/api";
 /** The "start from" value meaning HEAD itself, when no branch names it. */
 const HEAD = "@HEAD";
 
+/** Options for the page's `apply`. */
+export type RunOptions = {
+  /** A refusal with this code is a question this dialog answers itself — the page shows no toast and no result card for it. */
+  quietRefusal?: string;
+};
+
 type Props = {
   open: boolean;
   onClose: () => void;
@@ -20,7 +26,7 @@ type Props = {
   busy: boolean;
   onResult?: (r: OpResult) => void;
   /** The page's `apply`: runs the operation, adopts the status, shows the result. */
-  run: (key: string, fn: () => Promise<OpResult>) => Promise<OpResult | undefined>;
+  run: (key: string, fn: () => Promise<OpResult>, opts?: RunOptions) => Promise<OpResult | undefined>;
 };
 
 function errorText(r: OpResult): { line: string; guidance: string | null } {
@@ -116,7 +122,13 @@ export function BranchesModal({ open, onClose, repoPath, status, busy, onResult,
 
   const del = async (branch: string, force: boolean) => {
     setError(null);
-    const r = await run("branch", () => api.changesDeleteBranch(repoPath, branch, force));
+    // The first, unforced attempt may come back as the `unmerged-branch`
+    // question; that is this dialog's confirmation step, not a failure.
+    const r = await run(
+      "branch",
+      () => api.changesDeleteBranch(repoPath, branch, force),
+      force ? undefined : { quietRefusal: "unmerged-branch" }
+    );
     if (!r) return;
     onResult?.(r);
     if (r.ok) {

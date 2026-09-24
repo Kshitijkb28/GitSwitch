@@ -28,7 +28,9 @@ export function commitBlocker(status: RepoStatus, message: string, amend: boolea
   if (status.conflicted_count > 0) {
     return `${status.conflicted_count} file${status.conflicted_count === 1 ? "" : "s"} still have conflicts. Resolve and stage them first.`;
   }
-  if (status.detached) {
+  // A rebase detaches HEAD for its whole duration, and committing is how a
+  // stopped step can be finished — so only a bare detached HEAD is the blocker.
+  if (status.detached && !status.operation) {
     return "You're not on a branch (detached HEAD). Switch to a branch before committing.";
   }
   if (!status.identity.matches_profile) {
@@ -163,7 +165,7 @@ export function CommitBox({
         </label>
         <div className="flex items-center gap-2 flex-wrap">
           {blocker && <span className="text-xs text-zinc-500 max-w-xs">{blocker}</span>}
-          {status.detached && onSwitchBranch && (
+          {status.detached && !status.operation && onSwitchBranch && (
             <Button size="sm" variant="ghost" disabled={busy} onClick={onSwitchBranch}>
               <GitBranch size={13} />
               Choose a branch

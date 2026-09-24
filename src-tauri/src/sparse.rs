@@ -331,11 +331,13 @@ pub struct SubmoduleReport {
 /// either: it aborts on the first entry with no address in .gitmodules —
 /// some repos have dozens — and downloads nothing.)
 pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, key: Option<&str>, url: &str) -> SubmoduleReport {
-    let listed: Vec<String> = run_git(Some(repo), &["config", "-f", ".gitmodules", "--get-regexp", r"\.path$"])
+    // `-z` (`key\nvalue\0` records): a submodule's name defaults to its path,
+    // and a path with a space would otherwise split the key in the middle.
+    let listed: Vec<String> = run_git(Some(repo), &["config", "-f", ".gitmodules", "--get-regexp", "-z", r"\.path$"])
         .await
         .map(|out| {
-            out.lines()
-                .filter_map(|l| l.split_once(' ').map(|(_, p)| p.trim().to_string()))
+            out.split('\0')
+                .filter_map(|rec| rec.split_once('\n').map(|(_, p)| p.trim().to_string()))
                 .filter(|p| !p.is_empty())
                 .collect()
         })

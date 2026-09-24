@@ -16,6 +16,9 @@ type Props = {
   run: (key: string, fn: () => Promise<OpResult>) => Promise<OpResult | undefined>;
 };
 
+/** The backend lists at most this many entries; `status.stash_count` is the true total. */
+const MAX_LISTED = 50;
+
 /** "YYYY-MM-DD" from whatever date string git gave. */
 function day(d: string): string {
   if (/^\d{4}-\d{2}-\d{2}/.test(d)) return d.slice(0, 10);
@@ -29,14 +32,21 @@ type Detail = { state: "loading" } | { state: "error"; error: string } | { state
  * The stash list, with the two ways back (Apply keeps the entry, Pop removes
  * it) and a way to pull a single file out. Dropping asks first, because the
  * only undo is a commit id nobody wrote down.
+ *
+ * Every action names the row's commit as well as its index: indices shift
+ * whenever an entry is popped or dropped — in the app or in a terminal — and
+ * the backend refuses (`no-stash`) rather than act on whatever now sits there.
  */
 export function StashesCard({ repoPath, status, busy, refreshKey, run }: Props) {
   const [list, setList] = useState<StashEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [details, setDetails] = useState<Record<number, Detail>>({});
-  const [openFiles, setOpenFiles] = useState<Record<number, boolean>>({});
+  // Keyed by oid, not index: an entry keeps its commit when its neighbours go.
+  const [details, setDetails] = useState<Record<string, Detail>>({});
+  const [openFiles, setOpenFiles] = useState<Record<string, boolean>>({});
   const [dropFor, setDropFor] = useState<StashEntry | null>(null);
+  /** The backend said the row we showed no longer sits at that index. */
+  const [stale, setStale] = useState(false);
 
   const load = useCallback(() => {
     if (!repoPath) return;
@@ -48,8 +58,8 @@ export function StashesCard({ repoPath, status, busy, refreshKey, run }: Props) 
         if (cancelled) return;
         setList(s);
         setError(null);
-        // Indices shift when an entry is popped or dropped: what was loaded
-        // for stash@{1} is now stash@{0}'s neighbour, so re-read on demand.
+        // A file list belongs to an index that may have shifted; the effect
+        // below re-reads it for every row that is still open.
         setDetails({});
       })
       .catch((e) => {
@@ -63,28 +73,45 @@ export function StashesCard({ repoPath, status, busy, refreshKey, run }: Props) 
     };
   }, [repoPath]);
 
-  useEffect(load, [load, refreshKey]);
+  // Re-read after any in-app operation, and whenever the status (Refresh,
+  // window focus) reports a different count — a terminal `git stash` counts.
+  useEffect(load, [load, refreshKey, status.stash_count]);
 
-  const count = list.length > 0 ? list.length : status.stash_count;
-  if (count === 0 && list.length === 0 && !error) return null;
-
-  const toggleFiles = (e: StashEntry) => {
-    const next = !openFiles[e.index];
-    setOpenFiles((o) => ({ ...o, [e.index]: next }));
-    if (next && !details[e.index]) {
-      setDetails((d) => ({ ...d, [e.index]: { state: "loading" } }));
+  // Fetch the file list for every open row that has none — on first open, and
+  // again after a reload cleared them — with the row's current index.
+  useEffect(() => {
+    for (const e of list) {
+      if (!openFiles[e.oid] || details[e.oid]) continue;
+      setDetails((d) => ({ ...d, [e.oid]: { state: "loading" } }));
       api
         .changesStashShow(repoPath, e.index)
-        .then((detail) => setDetails((d) => ({ ...d, [e.index]: { state: "ok", detail } })))
-        .catch((err) => setDetails((d) => ({ ...d, [e.index]: { state: "error", error: String(err) } })));
+        .then((detail) => setDetails((d) => ({ ...d, [e.oid]: { state: "ok", detail } })))
+        .catch((err) => setDetails((d) => ({ ...d, [e.oid]: { state: "error", error: String(err) } })));
     }
+  }, [list, openFiles, details, repoPath]);
+
+  // The list is capped; the status carries the real total.
+  const count = Math.max(list.length, status.stash_count);
+  const capped = !loading && list.length >= MAX_LISTED && status.stash_count > list.length;
+  if (count === 0 && !error) return null;
+
+  const toggleFiles = (e: StashEntry) => {
+    setOpenFiles((o) => ({ ...o, [e.oid]: !o[e.oid] }));
+  };
+
+  /** One stash operation; a `no-stash` refusal means our list was out of date (the page's `apply` already re-reads it). */
+  const act = async (fn: () => Promise<OpResult>) => {
+    const r = await run("stash", fn);
+    if (r?.refusal?.code === "no-stash") setStale(true);
+    else if (r?.ok) setStale(false);
+    return r;
   };
 
   const drop = async () => {
     const e = dropFor;
     setDropFor(null);
     if (!e) return;
-    await run("stash", () => api.changesStashDrop(repoPath, e.index));
+    await act(() => api.changesStashDrop(repoPath, e.index, e.oid));
   };
 
   return (
@@ -98,11 +125,22 @@ export function StashesCard({ repoPath, status, busy, refreshKey, run }: Props) 
       </div>
 
       {error && <p className="px-3 py-2 text-xs text-red-400 break-words">{error}</p>}
+      {stale && (
+        <p className="px-3 py-2 text-xs text-amber-300/90 break-words border-b border-zinc-700/50">
+          The list was out of date — a stash was added or removed outside the app. It has been re-read; nothing was
+          changed.
+        </p>
+      )}
+      {capped && (
+        <p className="px-3 py-2 text-xs text-zinc-500 break-words border-b border-zinc-700/50">
+          Showing the first {list.length} of {count} stashes.
+        </p>
+      )}
 
       <ul className="max-h-96 overflow-y-auto divide-y divide-zinc-800/70">
         {list.map((e) => {
           const files = e.tracked_files + e.untracked_files;
-          const d = details[e.index];
+          const d = details[e.oid];
           return (
             <li key={e.oid} className="px-3 py-2 space-y-1">
               <div className="flex items-center gap-2 min-w-0">
@@ -133,7 +171,7 @@ export function StashesCard({ repoPath, status, busy, refreshKey, run }: Props) 
                     disabled={busy}
                     className="px-1.5"
                     title="Apply this stash and keep it in the list"
-                    onClick={() => run("stash", () => api.changesStashApply(repoPath, e.index, false, false))}
+                    onClick={() => act(() => api.changesStashApply(repoPath, e.index, false, false, e.oid))}
                   >
                     Apply
                   </Button>
@@ -143,7 +181,7 @@ export function StashesCard({ repoPath, status, busy, refreshKey, run }: Props) 
                     disabled={busy}
                     className="px-1.5"
                     title="Apply this stash and remove it"
-                    onClick={() => run("stash", () => api.changesStashApply(repoPath, e.index, true, false))}
+                    onClick={() => act(() => api.changesStashApply(repoPath, e.index, true, false, e.oid))}
                   >
                     Pop
                   </Button>
@@ -160,7 +198,7 @@ export function StashesCard({ repoPath, status, busy, refreshKey, run }: Props) 
                 </div>
               </div>
 
-              {openFiles[e.index] && (
+              {openFiles[e.oid] && (
                 <div className="pt-1">
                   {(!d || d.state === "loading") && (
                     <p className="flex items-center gap-1.5 text-xs text-zinc-500">
@@ -186,7 +224,7 @@ export function StashesCard({ repoPath, status, busy, refreshKey, run }: Props) 
                             className="px-1.5 ml-auto"
                             title="Restore only this file from the stash"
                             onClick={() =>
-                              run("stash", () => api.changesStashRestoreFile(repoPath, e.index, f.path))
+                              act(() => api.changesStashRestoreFile(repoPath, e.index, f.path, e.oid))
                             }
                           >
                             Restore file

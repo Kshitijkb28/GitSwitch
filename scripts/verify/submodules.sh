@@ -113,4 +113,36 @@ OUT=$(probe submodule "$SB/super")
 ok "the unmapped gitlink is reported, not fatal" "$OUT" "up to date"
 ok "  and the count of unfetchable ones is honest" "$(printf '%s' "$OUT" | jqf submodules.unlisted)" "1"
 
+section "A submodule path with a space and a non-ASCII character"
+git init -q --bare "$SB/uml.git"
+git clone -q "$SB/uml.git" "$SB/uml_work" 2>/dev/null
+cd "$SB/uml_work"; echo "uml v1" > file.txt; git add -A >/dev/null; git commit -qm "uml initial"; git push -q origin main 2>/dev/null
+cd "$SB/super"
+git submodule add -q "$SB/uml.git" "vendor/süb mod" 2>/dev/null
+git add -A >/dev/null; git commit -qm "add a submodule with an awkward path"
+ok "without -z, git C-quotes the path (the trap)" "$(git ls-files -s | grep -c 'vendor/s\\303\\274b mod' || true)" "1"
+ok "  with -z it is the raw path" "$(git ls-files -s -z | tr '\0' '\n' | PYTHONIOENCODING=utf-8 python3 -c 'import sys;print("vendor/süb mod" in sys.stdin.read())')" "True"
+OUT=$(probe submodules_list "$SB/super")
+ok "the app lists it under its real path" "$(printf '%s' "$OUT" | PYTHONIOENCODING=utf-8 python3 -c 'import sys,json;print("vendor/süb mod" in [x["path"] for x in json.load(sys.stdin)])')" "True"
+ok "  as initialised, mapped and clean" "$(printf '%s' "$OUT" | PYTHONIOENCODING=utf-8 python3 -c 'import sys,json;m=[x for x in json.load(sys.stdin) if x["path"]=="vendor/süb mod"][0];print(m["initialised"],m["listed"],m["state"])')" "True True clean"
+OUT=$(probe sub_statuses "$SB/super")
+ok "  and it gets a section, keyed by the same bytes as the parent's row" "$(printf '%s' "$OUT" | PYTHONIOENCODING=utf-8 python3 -c 'import sys,json;print("vendor/süb mod" in [x["path"] for x in json.load(sys.stdin)])')" "True"
+echo "inside" >> "$SB/super/vendor/süb mod/file.txt"
+OUT=$(probe status "$SB/super")
+ok "  the parent's gitlink row uses those bytes" "$(printf '%s' "$OUT" | PYTHONIOENCODING=utf-8 python3 -c 'import sys,json;print([e["sub_tracked_changes"] for e in json.load(sys.stdin)["entries"] if e["path"]=="vendor/süb mod"])')" "[True]"
+git -C "$SB/super/vendor/süb mod" checkout -q -- file.txt
+
+section "A populated gitlink with no .gitmodules at all still counts as a submodule"
+git init -q "$SB/embed"; cd "$SB/embed"; echo root > README.md; git add -A >/dev/null; git commit -qm "root"
+git clone -q "$SB/orphan.git" "$SB/embed/nested" 2>/dev/null
+# `git add` of a nested repository records a gitlink and writes no .gitmodules.
+git add nested 2>/dev/null; git commit -qm "embed a repository"
+ok "the fixture: a gitlink, no .gitmodules, a clean tree" "$(git ls-files -s nested | cut -c1-6):$([ -e .gitmodules ] && echo present || echo none):$(git status --porcelain | wc -l | tr -d ' ')" "160000:none:0"
+OUT=$(probe status "$SB/embed")
+ok "status says there are submodules" "$(printf '%s' "$OUT" | jqf has_submodules)" "True"
+OUT=$(probe sub_statuses "$SB/embed")
+ok "  and the section list has it" "$(printf '%s' "$OUT" | python3 -c 'import sys,json;print([x["path"] for x in json.load(sys.stdin)])')" "['nested']"
+ok "  flagged as having no .gitmodules entry" "$(printf '%s' "$OUT" | sub nested listed)" "false"
+ok "  with its own branch" "$(printf '%s' "$OUT" | sub nested status | jqf branch)" "main"
+
 verify_result

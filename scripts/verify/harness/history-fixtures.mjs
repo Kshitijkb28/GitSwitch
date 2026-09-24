@@ -99,6 +99,8 @@ export const COMMIT_DETAIL = {
   files: [
     { path: "src/app.ts", added: "3", removed: "1" },
     { path: "README.md", added: "10", removed: "0" },
+    // numstat prints "-" for both columns of a binary file.
+    { path: "logo.png", added: "-", removed: "-" },
   ],
   signature: "",
 };

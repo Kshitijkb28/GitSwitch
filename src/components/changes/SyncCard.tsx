@@ -40,9 +40,11 @@ function actionLabel(s: SyncSubPlan): string {
 
 function whyNoAssess(status: RepoStatus): string | null {
   if (status.unborn) return "No commits yet.";
+  // Before the detached check: a rebase detaches HEAD, and the remedy for that
+  // is to finish or abort it, not to switch branches.
+  if (status.operation) return `Finish or abort the ${status.operation.kind} first.`;
   if (status.detached) return "Check out a branch first — a detached HEAD has nothing to replay onto.";
   if (!status.upstream) return "This branch has no upstream to sync from. Publish it first.";
-  if (status.operation) return `Finish or abort the ${status.operation.kind} first.`;
   if (status.conflicted_count > 0) return "Resolve the conflicts first.";
   return null;
 }
@@ -127,7 +129,7 @@ export function SyncCard({ repoPath, status, busy, onSync, onSwitchBranch }: Pro
         {blocked && !plan && (
           <div className="flex flex-wrap items-center gap-2">
             <p className="text-xs text-amber-400/90">{blocked}</p>
-            {status.detached && onSwitchBranch && (
+            {status.detached && !status.operation && onSwitchBranch && (
               <Button size="sm" variant="ghost" disabled={busy} onClick={onSwitchBranch}>
                 <GitBranch size={13} />
                 Choose a branch
