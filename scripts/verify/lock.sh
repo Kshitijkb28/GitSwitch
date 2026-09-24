@@ -283,7 +283,9 @@ ok "  git's own measurement confirms the system-scope rewrite" "$(printf '%s' "$
 # the disclosed "remote-helper-unprotected-dir" drift, and the only drift allowed.
 EXPECT_DRIFT="[]"
 if [ -n "$REAL" ] && [ "$PLAT" != windows ]; then
-  case "$(owner_mode "$(dirname "$REMOTE_HELPER")")" in root*) ;; *) EXPECT_DRIFT='["remote-helper-unprotected-dir"]';; esac
+  # Same rule as the app: protected means root-owned with no group/other write bit.
+  read -r rh_owner rh_mode <<<"$(owner_mode "$(dirname "$REMOTE_HELPER")")"
+  if [ "$rh_owner" != root ] || [ $(( 8#$rh_mode & 8#22 )) -ne 0 ]; then EXPECT_DRIFT='["remote-helper-unprotected-dir"]'; fi
 fi
 ok "  no layer has drifted (beyond a disclosed unprotected remote-helper directory)" "$(printf '%s' "$OUT" | jqf state.lock.drift)" "$EXPECT_DRIFT"
 ok "  the mirrors are in place" "$(printf '%s' "$OUT" | jqf state.lock.mirrors)" "ok"
