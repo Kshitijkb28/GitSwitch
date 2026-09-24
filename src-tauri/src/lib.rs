@@ -166,6 +166,7 @@ pub fn run() {
             commands::full_clone,
             commands::repo_accounts,
             commands::list_remote_repos,
+            commands::list_remote_repos_page,
             commands::local_clone_index,
             commands::path_exists,
             commands::ssh_certificate_info,

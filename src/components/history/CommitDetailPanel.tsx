@@ -197,7 +197,7 @@ export function CommitDetailPanel({
       : notBehind
         ? `This commit is not behind ${branch}`
         : pushed
-          ? "Those commits are already on the upstream"
+          ? "Those commits are already on a remote branch"
           : atHead
             ? `${branch} is already here`
             : null;
@@ -392,7 +392,7 @@ export function CommitDetailPanel({
                 <p className="flex items-start gap-2 text-xs text-amber-300 break-words">
                   <AlertTriangle size={14} className="shrink-0 mt-0.5" />
                   <span>
-                    Moving {branch} back would drop commits already on the upstream, which needs a
+                    Moving {branch} back would drop commits already on a remote branch, which needs a
                     force-push — GitSwitch never does that.
                   </span>
                 </p>

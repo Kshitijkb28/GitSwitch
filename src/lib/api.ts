@@ -529,6 +529,18 @@ export async function listRemoteRepos(account: string): Promise<RepoListing> {
   return invoke("list_remote_repos", { account });
 }
 
+/** One page of the listing; `listing.repos` is that page only, `login` is filled on page 1. */
+export interface RepoPage {
+  listing: RepoListing;
+  page: number;
+  per_page: number;
+  has_more: boolean;
+}
+
+export async function listRemoteReposPage(account: string, page: number, perPage: number): Promise<RepoPage> {
+  return invoke("list_remote_repos_page", { account, page, perPage });
+}
+
 export interface CertInfo {
   path: string;
   exists: boolean;

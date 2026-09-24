@@ -321,6 +321,57 @@ async function buttonState(page, label) {
   return h.evaluate((b) => ({ disabled: b.disabled, title: b.title, text: b.innerText.trim() }));
 }
 
+/** The Repositories page with its own mock bridge: two accounts, page-by-page listings. */
+async function openReposPage(browser, server, opts = {}) {
+  const cfg = { firstDelayBob: opts.firstDelayBob ?? 700, restDelay: opts.restDelay ?? 400 };
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    localStorage.setItem("gitswitch:repos.account", JSON.stringify("gh:alice"));
+    const repo = (owner, i) => ({
+      full_name: `${owner}/${owner[0]}-${i}`, owner, name: `${owner[0]}-${i}`, owner_is_org: false, description: null,
+      private: i % 2 === 0, archived: false, fork: false, default_branch: "main", clone_url: `git@github.com:${owner}/${owner[0]}-${i}.git`,
+      pushed_at: new Date(Date.now() - i * 3600e3).toISOString(), permission: "write", local_path: null, suggested_profile_id: null,
+    });
+    const listing = (login, repos, truncated = false) => ({ account: `gh:${login}`, login, suggested_profile_id: null, repos, truncated, sso_hidden_orgs: 0 });
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (cmd, args) => {
+        window.__CALLS__.push({ cmd, args });
+        switch (cmd) {
+          case "repo_accounts":
+            return [{ key: "gh:alice", label: "alice", source: "gh" }, { key: "gh:bob", label: "bob", source: "gh" }];
+          case "get_profiles":
+            return [];
+          case "local_clone_index":
+            return { clones: {}, owner_profiles: {}, org_ssh_users: {} };
+          case "path_exists":
+            return true;
+          case "list_remote_repos_page": {
+            const login = args.account === "gh:alice" ? "alice" : "bob";
+            const total = 30;
+            if (args.perPage === 10) {
+              if (login === "bob") await wait(cfg.firstDelayBob);
+              return { listing: listing(login, Array.from({ length: 10 }, (_, i) => repo(login, i + 1))), page: 1, per_page: 10, has_more: true };
+            }
+            await wait(cfg.restDelay);
+            const start = (args.page - 1) * 100;
+            const repos = Array.from({ length: Math.max(0, Math.min(100, total - start)) }, (_, i) => repo(login, start + i + 1));
+            return { listing: listing(login, repos), page: args.page, per_page: 100, has_more: start + 100 < total };
+          }
+          default:
+            return null;
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}/repos`, { waitUntil: "networkidle0" });
+  await page.waitForFunction(() => document.body.innerText.includes("Repositories"), { timeout: 5000 });
+  return page;
+}
+
 /** The Clone page with its own mock bridge: it asks different questions than Changes. */
 async function openClonePage(browser, server, opts = {}) {
   const cfg = {
@@ -975,6 +1026,34 @@ try {
   }
 
   // -----------------------------------------------------------------
+  section("Repositories page: first repositories at once, the rest in the background; an account switch clears the list");
+  {
+    // The rest of the listing takes a while on purpose, so the "loading more" state is observable.
+    const page = await openReposPage(browser, server, { restDelay: 1500 });
+    await page.waitForFunction(() => document.body.innerText.includes("alice / a-1"), { timeout: 5000 });
+    let s = await text(page);
+    ok("the first page paints as soon as the first 10 arrive", s.includes("alice / a-1") && s.includes("alice / a-10"));
+    ok("  and says more are loading", s.includes("loading more…") && s.includes("signed in as alice"));
+    const calls0 = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "list_remote_repos_page").map((c) => [c.args.page, c.args.perPage]));
+    ok("  the first request asked for 10, the next for 100", JSON.stringify(calls0[0]) === "[1,10]" && JSON.stringify(calls0[1]) === "[1,100]");
+    await page.waitForFunction(() => !document.body.innerText.includes("loading more…"), { timeout: 5000 });
+    s = await text(page);
+    ok("once the rest arrived the count is complete", s.includes("of 30") && s.includes("alice / a-1"));
+    ok("  with no duplicates from the overlapping first page", (s.match(/alice \/ a-3\b/g) || []).length === 1);
+    // Switch to bob, whose first page takes a moment: alice's list must not linger.
+    await (await button(page, "alice")).click();
+    await sleep(100);
+    await (await button(page, "bob")).click();
+    await sleep(150);
+    s = await text(page);
+    ok("switching accounts clears the other account's list at once", !s.includes("alice / a-1") && !s.includes("signed in as alice"));
+    ok("  and shows the loading placeholder in the list area", s.includes("Loading every repository this account can reach"));
+    await page.waitForFunction(() => document.body.innerText.includes("bob / b-1"), { timeout: 5000 });
+    s = await text(page);
+    ok("  then bob's repositories appear, signed in as bob", s.includes("bob / b-1") && s.includes("signed in as bob") && !s.includes("alice / a-1"));
+    await page.close();
+  }
+
   section("Clone page: Git LFS option");
   const CLONED_LFS = {
     path: "/repos/big-data",
@@ -1291,10 +1370,10 @@ try {
     await page.close();
   }
   {
-    const page = await open(SCENARIOS.clean, { refuse: { changes_undo_commit: { code: "already-pushed", message: "The last commit is already on origin/main. Revert it instead." } } });
+    const page = await open(SCENARIOS.clean, { refuse: { changes_undo_commit: { code: "already-pushed", message: "The last commit is already on a remote branch. Revert it instead." } } });
     await (await button(page, "Undo last commit")).click();
     await page.waitForFunction(() => document.body.innerText.includes("Open in History"), { timeout: 4000 });
-    ok("a refusal because it was pushed offers to open History", (await text(page)).includes("already on origin/main"));
+    ok("a refusal because it was pushed offers to open History", (await text(page)).includes("already on a remote branch"));
     await page.close();
   }
   {

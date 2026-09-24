@@ -725,7 +725,7 @@ try {
     await page.waitForSelector('[role="radiogroup"][aria-label="Go back mode"]', { timeout: WAIT });
     await waitGone(page, "Checking where this commit sits");
     s = await text(page);
-    ok("  the chooser knows the commits after it are on the upstream", s.includes("would drop commits already on the upstream"));
+    ok("  the chooser knows the commits after it are on a remote branch", s.includes("would drop commits already on a remote branch"));
     const look = await rowWith(page, "Look at it");
     ok("  Look at it stays available", look !== null && look.buttons.some((b) => b.text === "Do it" && !b.disabled));
     ok("  Do it", await clickInRow(page, "Look at it", { text: "Do it" }));
