@@ -254,12 +254,14 @@ section "Uninstall removes every trace"
 J=$(job n14 "$LOCK_OPS"); run "$HELPER" "$J"
 J=$(job n15 '[{"op":"uninstall-all"}]'); run "$HELPER" "$J"
 ok "uninstall exits 0" "$RC" "0"
-ok "  the registry directory is gone" "$([ -e "$REG" ] && echo present || echo gone)" "gone"
+# On Windows the helper lives inside the registry and, being the running
+# process, is renamed aside and deleted at reboot; everything else is gone.
+reg_left() { if [ ! -e "$REG" ]; then echo gone; elif [ "$PLAT" = windows ] && [ "$(find "$REG" -type f ! -name '*.old' | wc -l | tr -d ' ')" = 0 ]; then echo gone; else echo present; fi; }
+ok "  the registry directory is gone" "$(reg_left)" "gone"
 ok "  the remote helper is gone" "$([ -e "$REMOTE_HELPER" ] && echo present || echo gone)" "gone"
+ok "  the helper removed itself" "$([ -e "$HELPER" ] && echo present || echo gone)" "gone"
 if [ "$PLAT" = windows ]; then
-  ok "  the helper is scheduled for removal at reboot (a running exe cannot delete itself)" "$([ -e "$HELPER" ] && echo present || echo gone)" "present"
-else
-  ok "  the helper removed itself" "$([ -e "$HELPER" ] && echo present || echo gone)" "gone"
+  ok "  the running exe was moved aside for deletion at reboot" "$(ls "$(dirname "$HELPER")"/*.old 2>/dev/null | wc -l | tr -d ' ')" "1"
 fi
 ok "  the foreign system gitconfig is intact" "$(cmp -s "$SYSCFG" "$SB/foreign.before" && echo identical || echo differs)" "identical"
 ok "  git no longer sees a lock" "$(git -C "$SB/work" config --get gitswitch.locked || echo unset)" "unset"
@@ -441,12 +443,8 @@ ok "  and vouched for" "$(printf '%s' "$OUT" | jqf helper)" "ok"
 ok "  the registry is ok" "$(printf '%s' "$OUT" | jqf registry)" "ok"
 OUT=$(probe lock_uninstall "$APP")
 ok "uninstall from the app applies" "$(printf '%s' "$OUT" | jqf outcome)" "applied"
-if [ "$PLAT" = windows ]; then
-  ok "  the helper is scheduled for removal" "$([ -e "$HELPER" ] && echo present || echo gone)" "present"
-else
-  ok "  the helper is gone" "$([ -e "$HELPER" ] && echo present || echo gone)" "gone"
-fi
-ok "  the registry is gone" "$([ -e "$REG" ] && echo present || echo gone)" "gone"
+ok "  the helper is gone" "$([ -e "$HELPER" ] && echo present || echo gone)" "gone"
+ok "  the registry is gone" "$(reg_left)" "gone"
 
 # Real mode: leave the machine as it was found.
 if [ -n "$REAL" ]; then

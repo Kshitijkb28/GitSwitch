@@ -476,8 +476,16 @@ mod sys {
         None
     }
     /// A running executable cannot be deleted; remove it at the next reboot.
+    /// A running executable cannot be deleted, but it can be renamed: move it
+    /// aside so the path is free for a fresh install right away, and have
+    /// Windows delete the renamed copy at the next reboot. Scheduling the
+    /// original path instead would delete whatever is installed there later.
     pub fn remove_self_binary(p: &Path) -> io::Result<()> {
-        let w = wide(p.as_os_str());
+        let mut old = p.as_os_str().to_owned();
+        old.push(format!(".{}.old", std::process::id()));
+        let old = std::path::PathBuf::from(old);
+        std::fs::rename(p, &old)?;
+        let w = wide(old.as_os_str());
         // SAFETY: documented call with a valid NUL-terminated path.
         if unsafe { MoveFileExW(w.as_ptr(), null(), MOVEFILE_DELAY_UNTIL_REBOOT) } == 0 {
             return Err(io::Error::last_os_error());
@@ -1300,23 +1308,54 @@ fn uninstall_all(ctx: &Ctx, reg: &mut Registry, changes: &mut Vec<Change>, error
     if let Some(p) = &ctx.layout.polkit_policy {
         let _ = fs::remove_file(p);
     }
+    // The registry tree is removed file by file, skipping the helper binary
+    // itself: on Windows it lives inside the registry and is this very
+    // process, which cannot delete itself (remove_self_binary handles it).
     if ctx.layout.registry_dir.exists() {
-        if let Err(e) = fs::remove_dir_all(&ctx.layout.registry_dir) {
-            errors.push(format!("remove {}: {}", ctx.layout.registry_dir.display(), e));
-        }
+        let keep = fs::canonicalize(&ctx.layout.helper_path).unwrap_or(ctx.layout.helper_path.clone());
+        remove_tree_except(&ctx.layout.registry_dir, &keep, errors);
+        let _ = fs::remove_dir(&ctx.layout.registry_dir);
     }
     if ctx.layout.helper_path.exists() {
         if let Err(e) = sys::remove_self_binary(&ctx.layout.helper_path) {
             errors.push(format!("remove {}: {}", ctx.layout.helper_path.display(), e));
         }
     }
+    // Empty parents go too (best effort; on Windows the renamed old binary
+    // keeps its directory until the reboot that deletes it).
     if let Some(dir) = ctx.layout.helper_path.parent() {
-        if dir.ends_with("gitswitch") {
-            let _ = fs::remove_dir(dir);
+        let _ = fs::remove_dir(dir);
+        if let Some(up) = dir.parent() {
+            if up != ctx.layout.registry_dir {
+                let _ = fs::remove_dir(up);
+            }
         }
+        let _ = fs::remove_dir(&ctx.layout.registry_dir);
     }
     changes.push(Change { op: "uninstall-all".into(), repo: None, detail: "marker block, registry, remote helper and helper removed".into() });
     if errors.is_empty() { exit::OK } else { exit::IO }
+}
+
+/// Delete everything under `dir` except the file `keep` (compared by real
+/// path), collecting what could not be removed. Directories are removed once
+/// empty; a directory still holding `keep` is left in place.
+fn remove_tree_except(dir: &Path, keep: &Path, errors: &mut Vec<String>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let is_real_dir = entry.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false);
+        if is_real_dir {
+            remove_tree_except(&p, keep, errors);
+            let _ = fs::remove_dir(&p);
+            continue;
+        }
+        if fs::canonicalize(&p).map(|c| c == keep).unwrap_or(false) {
+            continue;
+        }
+        if let Err(e) = fs::remove_file(&p) {
+            errors.push(format!("remove {}: {}", p.display(), e));
+        }
+    }
 }
 
 fn run_uninstall_command() -> R<i32> {
