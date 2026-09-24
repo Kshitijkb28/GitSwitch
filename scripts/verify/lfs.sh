@@ -61,9 +61,23 @@ OUT=$(probe lfs_pull "$SB/plain")
 ok "pull is refused by name, not by a git error" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-lfs"
 
 section "git-lfs missing from this machine"
-# git lives in /usr/bin; git-lfs is a separate binary found via PATH.
-LFS_DIR="$(dirname "$(command -v git-lfs)")"
-STRIPPED="$(echo "$PATH" | tr ':' '\n' | grep -vx "$LFS_DIR" | paste -sd: -)"
+# git-lfs is a separate binary git finds via PATH. Every PATH directory that
+# holds one is replaced by a shadow directory linking to everything else in
+# it, so git (which may live in the same /usr/bin, as on Ubuntu) keeps working
+# while `git lfs` becomes "not a git command" — the real missing-tool state.
+NOLFS="$SB/nolfs"; mkdir -p "$NOLFS"; STRIPPED=""
+while IFS= read -r d; do
+  [ -n "$d" ] || continue
+  if [ -x "$d/git-lfs" ] || [ -x "$d/git-lfs.exe" ]; then
+    shadow="$NOLFS/$(printf '%s' "$d" | tr '/:' '__')"; mkdir -p "$shadow"
+    for f in "$d"/*; do b="$(basename "$f")"; case "$b" in git-lfs*) ;; *) ln -s "$f" "$shadow/$b" 2>/dev/null || true;; esac; done
+    STRIPPED="$STRIPPED:$shadow"
+  else
+    STRIPPED="$STRIPPED:$d"
+  fi
+done <<<"$(printf '%s' "$PATH" | tr ':' '\n')"
+STRIPPED="${STRIPPED#:}"
+ok "the shadow PATH still finds git but not git-lfs" "$(PATH="$STRIPPED" command -v git >/dev/null && echo git-yes || echo git-no) $(PATH="$STRIPPED" command -v git-lfs >/dev/null && echo lfs-yes || echo lfs-no)" "git-yes lfs-no"
 OUT=$(PATH="$STRIPPED" probe lfs_status "$SB/work")
 ok "the status says git-lfs is not installed" "$(printf '%s' "$OUT" | jqf installed)" "False"
 ok "  in words a person can act on" "$(printf '%s' "$OUT" | jqf summary)" "isn't installed"
