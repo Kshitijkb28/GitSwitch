@@ -26,7 +26,9 @@ mod remote_repos;
 mod repo_scan;
 mod sparse;
 mod submodules;
+mod stash;
 mod sync;
+mod tree;
 mod signing;
 mod ssh_keys;
 mod tray;
@@ -111,6 +113,27 @@ pub fn run() {
             commands::changes_sync_continue,
             commands::changes_sync_abort,
             commands::changes_record_pointers,
+            commands::changes_submodule_statuses,
+            commands::changes_switch_branch,
+            commands::changes_create_branch,
+            commands::changes_delete_branch,
+            commands::changes_rename_branch,
+            commands::changes_undo_commit,
+            commands::changes_reset,
+            commands::changes_detach,
+            commands::changes_revert,
+            commands::changes_cherry_pick,
+            commands::changes_resolve_side,
+            commands::changes_discard_all,
+            commands::changes_stash_list,
+            commands::changes_stash_show,
+            commands::changes_stash_file_diff,
+            commands::changes_stash_push,
+            commands::changes_stash_apply,
+            commands::changes_stash_drop,
+            commands::changes_stash_restore_file,
+            commands::history_commit_file_diff,
+            commands::history_resolve,
             commands::changes_file_diff,
             commands::changes_push_state,
             commands::changes_set_push_mode,

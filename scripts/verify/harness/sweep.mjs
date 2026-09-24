@@ -3,7 +3,7 @@
 // and documentElement never reports overflow — measuring the wrong element once
 // hid a page that was visibly clipped.
 import { launch, serve, DIST_OK } from "./browser.mjs";
-import { REPOS, SCENARIOS, DIFF_TEXT } from "./fixtures.mjs";
+import { REPOS, SCENARIOS, DIFF_TEXT, SUB_STATUSES, STASHES } from "./fixtures.mjs";
 
 if (!DIST_OK) {
   console.error("dist/ is missing — run `npm run build` first");
@@ -16,10 +16,14 @@ const status = {
   entries: [
     { ...SCENARIOS.dirty.entries[2], path: "packages/worker/src/infrastructure/persistence/repositories/very-long-name.ts" },
     { ...SCENARIOS.dirty.entries[2], path: ".seed/gate-receipts/local-e297545bea5310a95a353cc6867072e3cfab5cca.json", kind: "untracked", unstaged: "?" },
+    // A gitlink with a long path: the row gets a submodule reason and no line counts.
+    { ...SCENARIOS.dirty.entries[2], path: "vendor/forge-tooling/aggregation/testing-harness/fixtures/very-long-submodule-name", is_submodule: true, sub_commit_changed: true, sub_tracked_changes: true, unstaged_added: null, unstaged_removed: null },
   ],
   staged_count: 0,
-  unstaged_count: 1,
+  unstaged_count: 2,
   untracked_count: 1,
+  has_submodules: true,
+  stash_count: 2,
 };
 const PAGES = ["Profiles", "SSH Keys", "GitHub Auth", "Repositories", "Clone", "Changes", "Auto Assign", "Doctor", "History", "Commit Audit", "Settings"];
 
@@ -31,7 +35,7 @@ try {
     console.log(`\n\x1b[1m${width}px (half screen)\x1b[0m`);
     const page = await browser.newPage();
     await page.setViewport({ width, height: 900 });
-    await page.evaluateOnNewDocument((repos, st, d1) => {
+    await page.evaluateOnNewDocument((repos, st, d1, subs, stashes) => {
       localStorage.clear();
       localStorage.setItem("gitswitch:changes.repo", JSON.stringify("/repos/gitswitch"));
       localStorage.setItem("gitswitch:history.repo", JSON.stringify("/repos/gitswitch"));
@@ -45,6 +49,8 @@ try {
             case "get_profiles": return Promise.resolve(profiles);
             case "history_list_repos": return Promise.resolve(repos);
             case "changes_repo_status": return Promise.resolve(st);
+            case "changes_submodule_statuses": return Promise.resolve(subs);
+            case "changes_stash_list": return Promise.resolve(stashes);
             case "changes_file_diff": return Promise.resolve(d1);
             case "get_current_git_config": return Promise.resolve("[user]\n\tname = Me\n\temail = me@personal.test");
             case "allowed_signers_path": return Promise.resolve("/Users/me/.ssh/allowed_signers");
@@ -56,7 +62,7 @@ try {
           }
         },
       };
-    }, REPOS, status, DIFF_TEXT);
+    }, REPOS, status, DIFF_TEXT, SUB_STATUSES, STASHES);
     await page.goto(`${server.url}/`, { waitUntil: "networkidle0" });
 
     for (const name of PAGES) {

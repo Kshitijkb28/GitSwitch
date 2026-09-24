@@ -10,6 +10,72 @@ interface Props {
 }
 
 /**
+ * The body of a diff: the coloured line list plus its loading, error, empty
+ * (binary / nothing to show) and truncated states. Shared by the Changes
+ * page's overlay and the History page's inline per-file view, so a hunk looks
+ * the same wherever it appears.
+ */
+export function DiffView({
+  diff,
+  loading,
+  error,
+}: {
+  diff: FileDiff | null;
+  loading: boolean;
+  error: string | null;
+}) {
+  return (
+    <>
+      {loading && (
+        <div className="flex items-center gap-2 p-6 text-sm text-zinc-400">
+          <Loader2 size={16} className="animate-spin" />
+          Loading diff…
+        </div>
+      )}
+      {error && <p className="p-6 text-sm text-red-400 break-words">{error}</p>}
+      {!loading && !error && diff && (
+        <>
+          {diff.empty_reason && (
+            <div className="flex items-start gap-2 p-6 text-sm text-zinc-400">
+              <FileWarning size={16} className="shrink-0 mt-0.5 text-amber-400" />
+              <span>{diff.empty_reason}</span>
+            </div>
+          )}
+          {diff.lines.length > 0 && (
+            <pre className="text-xs font-mono leading-relaxed">
+              {diff.lines.map((l, i) => (
+                <div
+                  key={i}
+                  className={`px-4 whitespace-pre-wrap break-all ${
+                    l.kind === "add"
+                      ? "bg-emerald-500/10 text-emerald-300"
+                      : l.kind === "del"
+                        ? "bg-red-500/10 text-red-300"
+                        : l.kind === "hunk"
+                          ? "bg-zinc-800 text-sky-300 mt-1"
+                          : l.kind === "meta"
+                            ? "text-zinc-500"
+                            : "text-zinc-300"
+                  }`}
+                >
+                  {l.text || " "}
+                </div>
+              ))}
+            </pre>
+          )}
+          {diff.truncated && (
+            <p className="px-4 py-3 text-xs text-amber-400/90 border-t border-zinc-800">
+              Showing the first {diff.lines.length} of {diff.total_lines} lines — open
+              the file in your editor to see all of it.
+            </p>
+          )}
+        </>
+      )}
+    </>
+  );
+}
+
+/**
  * Read-only. Staged and unstaged versions of a file are shown separately
  * because that is how git sees them: a file can be `MM` — one set of changes in
  * the index and a different set in the worktree — and collapsing the two would
@@ -100,51 +166,7 @@ export function DiffPanel({ repoPath, entry, onClose }: Props) {
         </div>
 
         <div className="flex-1 overflow-auto">
-          {loading && (
-            <div className="flex items-center gap-2 p-6 text-sm text-zinc-400">
-              <Loader2 size={16} className="animate-spin" />
-              Loading diff…
-            </div>
-          )}
-          {error && <p className="p-6 text-sm text-red-400 break-words">{error}</p>}
-          {!loading && !error && diff && (
-            <>
-              {diff.empty_reason && (
-                <div className="flex items-start gap-2 p-6 text-sm text-zinc-400">
-                  <FileWarning size={16} className="shrink-0 mt-0.5 text-amber-400" />
-                  <span>{diff.empty_reason}</span>
-                </div>
-              )}
-              {diff.lines.length > 0 && (
-                <pre className="text-xs font-mono leading-relaxed">
-                  {diff.lines.map((l, i) => (
-                    <div
-                      key={i}
-                      className={`px-4 whitespace-pre-wrap break-all ${
-                        l.kind === "add"
-                          ? "bg-emerald-500/10 text-emerald-300"
-                          : l.kind === "del"
-                            ? "bg-red-500/10 text-red-300"
-                            : l.kind === "hunk"
-                              ? "bg-zinc-800 text-sky-300 mt-1"
-                              : l.kind === "meta"
-                                ? "text-zinc-500"
-                                : "text-zinc-300"
-                      }`}
-                    >
-                      {l.text || " "}
-                    </div>
-                  ))}
-                </pre>
-              )}
-              {diff.truncated && (
-                <p className="px-4 py-3 text-xs text-amber-400/90 border-t border-zinc-800">
-                  Showing the first {diff.lines.length} of {diff.total_lines} lines — open
-                  the file in your editor to see all of it.
-                </p>
-              )}
-            </>
-          )}
+          <DiffView diff={diff} loading={loading} error={error} />
         </div>
       </div>
     </div>

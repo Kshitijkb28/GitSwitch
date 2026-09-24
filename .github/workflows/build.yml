@@ -62,7 +62,7 @@ jobs:
         env:
           LOCK_REAL: "1"
         run: bash scripts/verify/lock.sh
-      - name: Git suites (Changes sandbox, regression, submodules, LFS)
+      - name: Git suites (Changes sandbox, regression, submodules, LFS, sync, tree, stashes)
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
@@ -70,6 +70,9 @@ jobs:
           bash scripts/verify/regression.sh
           bash scripts/verify/submodules.sh
           bash scripts/verify/lfs.sh
+          bash scripts/verify/sync.sh
+          bash scripts/verify/tree.sh
+          bash scripts/verify/stash.sh
 
   build:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'

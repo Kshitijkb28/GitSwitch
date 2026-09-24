@@ -4,6 +4,7 @@ import {
   ArrowDownUp,
   CheckCircle2,
   CircleSlash,
+  GitBranch,
   Loader2,
   Play,
   RefreshCw,
@@ -52,6 +53,8 @@ type Props = {
   busy: boolean;
   /** Runs the plan as a long job; the result arrives through the page's result card. */
   onSync: (stash: boolean, bundles: boolean, fingerprint: [string, string][]) => void;
+  /** Offered next to "Check out a branch first": opens the branch picker. */
+  onSwitchBranch?: () => void;
 };
 
 /**
@@ -59,7 +62,7 @@ type Props = {
  * included. Two steps on purpose: Assess fetches and shows exactly what would
  * happen; Sync now does it. Nothing here ever pushes.
  */
-export function SyncCard({ repoPath, status, busy, onSync }: Props) {
+export function SyncCard({ repoPath, status, busy, onSync, onSwitchBranch }: Props) {
   const [stash, setStash] = usePersistedState("changes.syncStash", true);
   const [bundles, setBundles] = usePersistedState("changes.syncBundles", false);
   const [plan, setPlan] = useState<SyncPlan | null>(null);
@@ -121,7 +124,17 @@ export function SyncCard({ repoPath, status, busy, onSync }: Props) {
           </Button>
         </div>
 
-        {blocked && !plan && <p className="text-xs text-amber-400/90">{blocked}</p>}
+        {blocked && !plan && (
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-xs text-amber-400/90">{blocked}</p>
+            {status.detached && onSwitchBranch && (
+              <Button size="sm" variant="ghost" disabled={busy} onClick={onSwitchBranch}>
+                <GitBranch size={13} />
+                Choose a branch
+              </Button>
+            )}
+          </div>
+        )}
         {error && <p className="text-xs text-red-300 break-words">{error}</p>}
 
         {plan && sup && (

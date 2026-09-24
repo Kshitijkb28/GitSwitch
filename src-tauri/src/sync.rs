@@ -373,7 +373,7 @@ fn own_count(f: &SubFacts) -> usize {
     f.own_commits_moving_gitlink.max(1)
 }
 
-fn short(oid: &str) -> String {
+pub(crate) fn short(oid: &str) -> String {
     oid.chars().take(7).collect()
 }
 
@@ -484,11 +484,11 @@ fn g(repo: &Path) -> GitCmd {
     GitCmd::at(repo).pinned()
 }
 
-async fn oid(repo: &Path, rev: &str) -> Option<String> {
+pub(crate) async fn oid(repo: &Path, rev: &str) -> Option<String> {
     g(repo).args(["rev-parse", "--verify", "--quiet", rev]).ok_text().await.filter(|s| !s.is_empty())
 }
 
-async fn is_ancestor(repo: &Path, a: &str, b: &str) -> bool {
+pub(crate) async fn is_ancestor(repo: &Path, a: &str, b: &str) -> bool {
     g(repo).args(["merge-base", "--is-ancestor", a, b]).run().await.map(|o| o.ok()).unwrap_or(false)
 }
 
@@ -813,11 +813,11 @@ pub struct RunOptions {
     pub fingerprint: Vec<(String, String)>,
 }
 
-fn stamp() -> String {
+pub(crate) fn stamp() -> String {
     chrono::Utc::now().format("%Y%m%d%H%M%S").to_string()
 }
 
-async fn make_backup(repo: &Path, name: &str) -> Result<String, AppError> {
+pub(crate) async fn make_backup(repo: &Path, name: &str) -> Result<String, AppError> {
     let out = g(repo).args(["branch", "--", name]).timeout(LOCAL_TIMEOUT).run().await?;
     if !out.ok() {
         return Err(AppError::Command(format!(
@@ -837,7 +837,7 @@ async fn rebase_in_progress(repo: &Path) -> bool {
     }
 }
 
-async fn unmerged(repo: &Path) -> Vec<git_status::ChangeEntry> {
+pub(crate) async fn unmerged(repo: &Path) -> Vec<git_status::ChangeEntry> {
     let Ok(out) = GitCmd::at(repo)
         .args(["status", "--porcelain=v2", "-z", "--untracked-files=no", "--ignore-submodules=none"])
         .run()
@@ -852,7 +852,7 @@ async fn unmerged(repo: &Path) -> Vec<git_status::ChangeEntry> {
         .collect()
 }
 
-async fn has_autostash_entry(repo: &Path) -> bool {
+pub(crate) async fn has_autostash_entry(repo: &Path) -> bool {
     g(repo)
         .args(["stash", "list", "--format=%gs"])
         .ok_text()
@@ -1089,7 +1089,7 @@ fn recovery(repo: &Path, branch: &str) -> String {
     format!("git -C {} reset --hard {}", shell_quote(&repo.to_string_lossy()), branch)
 }
 
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':')) {
         s.to_string()
     } else {

@@ -21,6 +21,11 @@ pub enum GitOp {
     Merge,
     Rebase,
     Lfs,
+    CherryPick,
+    Revert,
+    Branch,
+    Reset,
+    Stash,
 }
 
 impl GitOp {
@@ -34,6 +39,11 @@ impl GitOp {
             GitOp::Merge => "merge",
             GitOp::Rebase => "rebase",
             GitOp::Lfs => "LFS download",
+            GitOp::CherryPick => "cherry-pick",
+            GitOp::Revert => "revert",
+            GitOp::Branch => "branch change",
+            GitOp::Reset => "reset",
+            GitOp::Stash => "stash",
         }
     }
 }
@@ -155,7 +165,31 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
                 );
             }
         }
-        GitOp::Pull | GitOp::Merge | GitOp::Rebase => {
+        GitOp::Pull | GitOp::Merge | GitOp::Rebase | GitOp::CherryPick | GitOp::Revert | GitOp::Reset => {
+            if has("is a merge but no -m option was given") {
+                return advice(
+                    "That's a merge commit — choose which side to keep.",
+                    "Reverting or picking a merge needs a mainline parent. Parent 1 keeps your branch's side and undoes what the merge brought in.",
+                    Some("choose-mainline"),
+                    s,
+                );
+            }
+            if has("bad revision") || has("unknown revision") || has("Not a valid object name") {
+                return advice(
+                    "That isn't a commit in this repository.",
+                    "Check the id — it may belong to another repository, or the commit was never fetched here.",
+                    None,
+                    s,
+                );
+            }
+            if has("needs merge") || has("you need to resolve your current index first") || has("You have unmerged files") {
+                return advice(
+                    "There are still conflicts to resolve.",
+                    "Resolve and stage every conflicted file first, then try again.",
+                    Some("resolve-conflicts"),
+                    s,
+                );
+            }
             if has("Not possible to fast-forward") || has("divergent branches") {
                 return advice(
                     "Fast-forward isn't possible — the branches have diverged.",
@@ -281,8 +315,40 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
                 );
             }
         }
-        GitOp::Checkout => {
-            if has("would be overwritten by checkout") || has("Please commit your changes") {
+        GitOp::Checkout | GitOp::Branch => {
+            if has("invalid reference") || has("did not match any file(s) known to git") {
+                return advice(
+                    "That branch doesn't exist here.",
+                    "Pick one from the list. A branch that only exists on the remote has to be checked out as a local branch first.",
+                    None,
+                    s,
+                );
+            }
+            if has("is already checked out at") || has("is already used by worktree") {
+                return advice(
+                    "That branch is checked out in another worktree.",
+                    "git keeps one checkout per branch. Switch there, or create a new branch from it here.",
+                    None,
+                    s,
+                );
+            }
+            if has("Cannot delete branch") && has("checked out") {
+                return advice(
+                    "That's the branch you're on.",
+                    "Switch to another branch first, then delete this one.",
+                    None,
+                    s,
+                );
+            }
+            if has("is not fully merged") {
+                return advice(
+                    "This branch has commits nothing else holds.",
+                    "Deleting it would drop them. Confirm the deletion to do it anyway — the undo command is shown afterwards.",
+                    None,
+                    s,
+                );
+            }
+            if has("would be overwritten by checkout") || has("Please commit your changes") || has("would be overwritten by") {
                 let files = blocking_files(s);
                 let list = if files.is_empty() {
                     String::new()
@@ -300,6 +366,53 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
                 return advice(
                     "A branch with that name already exists.",
                     "Pick a different name, or switch to the existing branch.",
+                    None,
+                    s,
+                );
+            }
+        }
+        GitOp::Stash => {
+            if has("No local changes to save") {
+                return advice("Nothing to stash.", "The working tree is clean.", None, s);
+            }
+            if has("conflicts in index. Try without --index") {
+                return advice(
+                    "The stash's staged/unstaged split couldn't be restored.",
+                    "Apply it without restoring the index: the changes come back unstaged.",
+                    Some("retry-without-index"),
+                    s,
+                );
+            }
+            if has("would be overwritten by") {
+                let files = blocking_files(s);
+                let list = if files.is_empty() { String::new() } else { format!(" In the way: {}.", files.join(", ")) };
+                return advice(
+                    "Your uncommitted changes are in the way.",
+                    &format!("Commit or stash them first, then apply this stash.{}", list),
+                    Some("stash-first"),
+                    s,
+                );
+            }
+            if has("CONFLICT (") || has("The stash entry is kept") || has("Merge conflict in") {
+                return advice(
+                    "The stash conflicts with what's here now.",
+                    "Resolve the conflicted files (Keep mine / Take theirs works), stage them, and the change is applied. The stash entry is still in the list until you drop it.",
+                    Some("resolve-conflicts"),
+                    s,
+                );
+            }
+            if has("is not a valid reference") || has("No stash entries found") || has("is not a stash-like commit") {
+                return advice(
+                    "That stash isn't there any more.",
+                    "The list was out of date — refresh it.",
+                    None,
+                    s,
+                );
+            }
+            if has("Could not restore untracked files from stash") || has("already exists, no checkout") {
+                return advice(
+                    "The stash's new files couldn't be written.",
+                    "A file with the same name already exists in the tree. Move or delete it, then apply the stash again.",
                     None,
                     s,
                 );
@@ -571,5 +684,47 @@ mod tests {
         assert!(a.guidance.is_empty());
         assert_eq!(a.git_said, "fatal: something nobody has seen before");
         assert!(all_text(&a).contains("something nobody has seen before"));
+    }
+
+    #[test]
+    fn reverting_a_merge_asks_for_a_mainline() {
+        let a = explain(GitOp::Revert, "error: commit abc is a merge but no -m option was given.\nfatal: revert failed", &AdviceCtx::default());
+        assert_eq!(a.action.as_deref(), Some("choose-mainline"));
+        assert!(a.guidance.contains("Parent 1"));
+    }
+
+    #[test]
+    fn an_unknown_commit_is_named_as_such() {
+        let a = explain(GitOp::Reset, "fatal: ambiguous argument 'zzz': unknown revision or path not in the working tree.", &AdviceCtx::default());
+        assert!(a.headline.contains("isn't a commit"));
+        assert!(a.action.is_none());
+    }
+
+    #[test]
+    fn a_missing_branch_and_a_branch_in_another_worktree_are_explained() {
+        let a = explain(GitOp::Branch, "fatal: invalid reference: nope", &AdviceCtx::default());
+        assert!(a.headline.contains("doesn't exist"));
+        let b = explain(GitOp::Branch, "fatal: 'feature' is already checked out at '/tmp/wt'", &AdviceCtx::default());
+        assert!(b.headline.contains("another worktree"));
+        let c = explain(GitOp::Branch, "error: the branch 'feature' is not fully merged", &AdviceCtx::default());
+        assert!(c.guidance.contains("undo command"));
+    }
+
+    #[test]
+    fn stash_failures_say_what_to_do_and_never_drop_anything() {
+        let a = explain(GitOp::Stash, "No local changes to save", &AdviceCtx::default());
+        assert_eq!(a.headline, "Nothing to stash.");
+        let b = explain(GitOp::Stash, "Auto-merging a.txt\nCONFLICT (content): Merge conflict in a.txt\nThe stash entry is kept in case you need it again.", &AdviceCtx::default());
+        assert_eq!(b.action.as_deref(), Some("resolve-conflicts"));
+        assert!(b.guidance.contains("still in the list"));
+        let c = explain(GitOp::Stash, "error: could not restore untracked files from stash\nCould not restore untracked files from stash", &AdviceCtx::default());
+        assert!(c.guidance.contains("same name already exists"));
+        let d = explain(GitOp::Stash, "fatal: log for 'stash' only has 1 entries\nstash@{3} is not a valid reference", &AdviceCtx::default());
+        assert!(d.headline.contains("isn't there any more"));
+        let e = explain(GitOp::Stash, "error: Your local changes to the following files would be overwritten by merge:\n\ta.txt\nPlease commit your changes or stash them before you merge.", &AdviceCtx::default());
+        assert_eq!(e.action.as_deref(), Some("stash-first"));
+        assert!(e.guidance.contains("a.txt"));
+        let f = explain(GitOp::Stash, "error: conflicts in index. Try without --index.", &AdviceCtx::default());
+        assert_eq!(f.action.as_deref(), Some("retry-without-index"));
     }
 }

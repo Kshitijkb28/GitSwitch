@@ -18,6 +18,15 @@ import {
   SYNC_PLAN_NOTHING,
   SYNC_OUTCOME,
   SYNC_OUTCOME_UNRECORDED,
+  BRANCHES,
+  STASHES,
+  STASH_DETAIL,
+  SUB_STATUSES,
+  SUB_QUIET,
+  SUBMODULE_A,
+  TREE_RESET_OUTCOME,
+  STASH_DROP_OUTCOME,
+  BRANCH_DELETE_OUTCOME,
 } from "./fixtures.mjs";
 
 if (!DIST_OK) {
@@ -41,6 +50,16 @@ async function openPage(browser, server, scenario, opts = {}) {
     syncPlan: opts.syncPlan ?? SYNC_PLAN,
     syncPlanNoStash: opts.syncPlanNoStash ?? SYNC_PLAN_NOSTASH,
     syncOutcome: opts.syncOutcome ?? SYNC_OUTCOME,
+    submoduleStatuses: opts.submoduleStatuses ?? [],
+    branches: opts.branches ?? BRANCHES,
+    stashes: opts.stashes ?? [],
+    stashDetail: opts.stashDetail ?? STASH_DETAIL,
+    /** {[cmd]: {code, message, guidance}} — that command answers with a refusal. */
+    refuse: opts.refuse ?? {},
+    autostash: opts.autostash ?? false,
+    treeReset: TREE_RESET_OUTCOME,
+    stashDrop: STASH_DROP_OUTCOME,
+    branchDelete: BRANCH_DELETE_OUTCOME,
   };
   const page = await browser.newPage();
   await page.setViewport({ width: cfg.width, height: 900 });
@@ -53,20 +72,77 @@ async function openPage(browser, server, scenario, opts = {}) {
       if (cfg.pullMode) {
         localStorage.setItem("gitswitch:changes.pullMode", JSON.stringify(cfg.pullMode));
       }
-      const done = (headline) =>
-        Promise.resolve({ ok: true, headline, detail: "", status: window.__SCENARIO__ });
+      if (cfg.autostash) {
+        localStorage.setItem("gitswitch:changes.pullAutostash", JSON.stringify(true));
+      }
+      // An operation inside a submodule answers with that submodule's status.
+      const statusFor = (p) =>
+        (p && p !== "/repos/gitswitch" && (cfg.submoduleStatuses.find((s) => s.status.path === p) || {}).status) ||
+        window.__SCENARIO__;
+      const done = (headline, p) =>
+        Promise.resolve({ ok: true, headline, detail: "", status: statusFor(p) });
       window.__TAURI_INTERNALS__ = {
         invoke: (cmd, args) => {
           window.__CALLS__.push({ cmd, args });
+          // Forcing a delete is the answer to its own refusal, so it goes through.
+          const refusal = cfg.refuse[cmd];
+          if (refusal && !(cmd === "changes_delete_branch" && args && args.force)) {
+            return Promise.resolve({
+              ok: false,
+              headline: refusal.message,
+              detail: "",
+              refusal: { code: refusal.code, message: refusal.message },
+              advice: { headline: refusal.message, guidance: refusal.guidance ?? "", action: null, git_said: "" },
+              status: statusFor(args && args.repoPath),
+            });
+          }
           switch (cmd) {
             case "history_list_repos":
               return Promise.resolve(repos);
-            case "changes_repo_status":
+            case "changes_repo_status": {
+              const sub = args.repoPath && cfg.submoduleStatuses.find((s) => s.status.path === args.repoPath);
+              if (sub) return Promise.resolve(sub.status);
               // A submodule path asks for that submodule's own status.
               return Promise.resolve(
                 args.repoPath && args.repoPath.includes("/staging") && cfg.subInner
                   ? cfg.subInner
                   : window.__SCENARIO__
+              );
+            }
+            case "changes_submodule_statuses":
+              return Promise.resolve(cfg.submoduleStatuses);
+            case "history_branches":
+              return Promise.resolve(cfg.branches);
+            case "changes_stash_list":
+              return Promise.resolve(cfg.stashes);
+            case "changes_stash_show":
+              return Promise.resolve(cfg.stashDetail);
+            case "changes_reset":
+              return done("Reset main to origin/main.", args.repoPath).then((r) => ({ ...r, tree: cfg.treeReset }));
+            case "changes_stash_drop":
+              return done("Dropped stash@{0}.", args.repoPath).then((r) => ({ ...r, stash: cfg.stashDrop }));
+            case "changes_delete_branch":
+              return done(`Deleted ${args.name}.`, args.repoPath).then((r) => ({ ...r, tree: cfg.branchDelete }));
+            case "changes_commit":
+              return done("commit ok", args.repoPath).then((r) =>
+                args.repoPath === "/repos/gitswitch"
+                  ? r
+                  : {
+                      ...r,
+                      commit: {
+                        hash: "9f1e2d3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        short: "9f1e2d3",
+                        subject: args.message,
+                        author_name: "Me",
+                        author_email: "me@personal.test",
+                        signature: "",
+                        signed: false,
+                        amended: !!args.amend,
+                        files_changed: 1,
+                        insertions: 5,
+                        deletions: 1,
+                      },
+                    }
               );
             case "changes_submodules":
               return Promise.resolve(cfg.submodules);
@@ -100,10 +176,18 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "changes_stage":
             case "changes_unstage":
             case "changes_discard":
-            case "changes_commit":
             case "changes_abort":
             case "changes_continue":
-              return done(cmd.replace("changes_", "") + " ok");
+            case "changes_switch_branch":
+            case "changes_create_branch":
+            case "changes_rename_branch":
+            case "changes_undo_commit":
+            case "changes_resolve_side":
+            case "changes_discard_all":
+            case "changes_stash_push":
+            case "changes_stash_apply":
+            case "changes_stash_restore_file":
+              return done(cmd.replace("changes_", "") + " ok", args.repoPath);
             case "changes_set_push_mode": {
               const cur = window.__SCENARIO__.push;
               if (cfg.lockOutcome !== "applied") {
@@ -192,35 +276,47 @@ async function openPage(browser, server, scenario, opts = {}) {
 const text = (page) => page.evaluate(() => document.body.innerText);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Find a button by its visible label. */
+/** Find a button by its visible label: an exact match wins, else the first one starting with it. */
 async function button(page, label) {
+  let prefix = null;
   for (const h of await page.$$("button")) {
     const b = (await h.evaluate((el) => el.innerText)).trim();
-    if (b === label || b.startsWith(label)) return h;
+    if (b === label) return h;
+    if (!prefix && b.startsWith(label)) prefix = h;
   }
-  return null;
+  return prefix;
 }
 
-/** Click a button inside the <li> whose text mentions `rowText`. */
+/** Click a button inside the first <li> whose text mentions `rowText` and that has the button. */
 async function clickInRow(page, rowText, pick) {
   return page.evaluate(
     (rowText, pick) => {
-      const row = [...document.querySelectorAll("li")].find((r) => r.innerText.includes(rowText));
-      if (!row) return false;
-      const buttons = [...row.querySelectorAll("button")];
-      const b =
-        pick.title !== undefined
-          ? buttons.find((x) => x.title === pick.title)
-          : pick.text !== undefined
-            ? buttons.find((x) => x.innerText.trim() === pick.text)
-            : buttons[pick.index];
-      if (!b) return false;
-      b.click();
-      return true;
+      const rows = [...document.querySelectorAll("li")].filter((r) => r.innerText.includes(rowText));
+      for (const row of rows) {
+        const buttons = [...row.querySelectorAll("button")];
+        const b =
+          pick.title !== undefined
+            ? buttons.find((x) => x.title === pick.title)
+            : pick.text !== undefined
+              ? buttons.find((x) => x.innerText.trim() === pick.text)
+              : buttons[pick.index];
+        if (b) {
+          b.click();
+          return true;
+        }
+      }
+      return false;
     },
     rowText,
     pick
   );
+}
+
+/** A button's disabled state and tooltip, by its visible label. */
+async function buttonState(page, label) {
+  const h = await button(page, label);
+  if (!h) return null;
+  return h.evaluate((b) => ({ disabled: b.disabled, title: b.title, text: b.innerText.trim() }));
 }
 
 /** The Clone page with its own mock bridge: it asks different questions than Changes. */
@@ -937,6 +1033,480 @@ try {
   }
 
   // -----------------------------------------------------------------
+  section("Branches");
+  const openBranches = async (page) => {
+    await (await button(page, "Branches")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("feature/login"), { timeout: 4000 });
+  };
+  const rowWith = (page, needle) =>
+    page.evaluate((n) => {
+      const row = [...document.querySelectorAll("li")].find((r) => r.innerText.includes(n));
+      if (!row) return null;
+      return {
+        text: row.innerText,
+        buttons: [...row.querySelectorAll("button")].map((b) => ({ text: b.innerText.trim(), title: b.title, disabled: b.disabled })),
+      };
+    }, needle);
+  {
+    const page = await open(SCENARIOS.clean);
+    await openBranches(page);
+    const s = await text(page);
+    ok("Branches opens a dialog listing the local branches", s.includes("Branches") && s.includes("feature/login") && s.includes("old-experiment"));
+    ok("  saying how far ahead each one is", s.includes("↑3"));
+    ok("  remote-tracking refs are not rows", !(await rowWith(page, "origin/main"))?.text.startsWith("origin/main"));
+    const head = await rowWith(page, "HEAD");
+    ok("  the current branch carries a HEAD badge", head !== null && head.text.includes("main"));
+    ok("  and has no Switch button", head !== null && !head.buttons.some((b) => b.title === "Switch to this branch"));
+    const del = head?.buttons.find((b) => b.text === "Delete…");
+    ok("  its Delete… is disabled and says why", del?.disabled === true && del.title.includes("branch you're on"));
+    ok("Switch is offered on the other rows", await clickInRow(page, "feature/login", { title: "Switch to this branch" }));
+    await sleep(300);
+    const sw = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_switch_branch"));
+    ok("  and sends the branch name", sw?.args?.repoPath === "/repos/gitswitch" && sw?.args?.name === "feature/login");
+    ok("  success closes the dialog", !(await text(page)).includes("Create branch"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    await openBranches(page);
+    ok("Create branch waits for a name", (await buttonState(page, "Create branch"))?.disabled === true);
+    await page.type('input[aria-label="New branch name"]', "feature/signup");
+    ok("  the switch checkbox is on by default", await page.$eval('input[aria-label="Switch to the new branch"]', (el) => el.checked));
+    await (await button(page, "Create branch")).click();
+    await sleep(300);
+    const cr = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_branch"));
+    ok("  and sends the name, the start point and the switch choice", cr?.args?.name === "feature/signup" && cr?.args?.from === "main" && cr?.args?.switchTo === true);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean, {
+      refuse: { changes_delete_branch: { code: "unmerged-branch", message: "Deleting `feature/login` would drop 3 commit(s) that no other branch has." } },
+    });
+    await openBranches(page);
+    ok("Delete… is offered", await clickInRow(page, "feature/login", { title: "Delete this branch" }));
+    await page.waitForFunction(() => document.body.innerText.includes("Delete feature/login?"), { timeout: 4000 });
+    const s = await text(page);
+    ok("an unmerged branch asks again, naming the commits it would drop", s.includes("Delete feature/login?") && s.includes("3 commit"));
+    ok("  and promises the undo command", s.includes("undo command is shown afterwards"));
+    const first = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_delete_branch"));
+    ok("  the first attempt was not forced", first.length === 1 && first[0].args.force === false);
+    await (await button(page, "Delete anyway")).click();
+    await sleep(300);
+    const calls = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_delete_branch"));
+    ok("  Delete anyway re-sends with force", calls.length === 2 && calls[1].args.force === true && calls[1].args.name === "feature/login");
+    ok("  and the result carries the undo command", (await text(page)).includes("undo: git -C /repos/gitswitch branch feature/login"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.dirty, {
+      refuse: { changes_switch_branch: { code: "dirty-tree", message: "Switching would overwrite your uncommitted changes.", guidance: "Commit or stash these files first: src/app.ts" } },
+    });
+    await openBranches(page);
+    await clickInRow(page, "feature/login", { title: "Switch to this branch" });
+    await page.waitForFunction(() => document.body.innerText.includes("src/app.ts"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a refused switch keeps the dialog open", s.includes("Create branch"));
+    ok("  with git's reason and the blocking files", s.includes("overwrite your uncommitted changes") && s.includes("src/app.ts"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.detached);
+    const s = await text(page);
+    ok("a detached HEAD is said in words, with the commit", s.includes("detached HEAD at 1a2b3c4") && s.includes("not on a branch"));
+    ok("  and publishing is disabled (nothing to push from)", (await buttonState(page, "Publish branch"))?.disabled === true);
+    const offers = await page.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Choose a branch").length);
+    ok("  the sync card and the commit box both offer to choose a branch", offers === 2);
+    await (await button(page, "Choose a branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("this commit (detached HEAD)"), { timeout: 4000 });
+    ok("  which opens the dialog starting from this commit", true);
+    await page.type('input[aria-label="New branch name"]', "rescue");
+    await (await button(page, "Create branch")).click();
+    await sleep(300);
+    const cr = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_branch"));
+    ok("  creating from there sends no start point (HEAD)", cr?.args?.name === "rescue" && cr?.args?.from === null);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    await openBranches(page);
+    await clickInRow(page, "feature/login", { title: "Rename this branch" });
+    await page.waitForSelector('input[aria-label="Rename to"]', { timeout: 4000 });
+    await page.evaluate(() => {
+      const i = document.querySelector('input[aria-label="Rename to"]');
+      i.focus();
+      i.select();
+    });
+    await page.keyboard.type("feature/signin");
+    ok("Rename… turns the row into a field with Save", await clickInRow(page, "feature/login", { text: "Save" }));
+    await sleep(300);
+    const rn = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_rename_branch"));
+    ok("  and Save sends the old and new names", rn?.args?.oldName === "feature/login" && rn?.args?.newName === "feature/signin");
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.rebasing);
+    const b = await buttonState(page, "Branches");
+    ok("during a rebase Branches is disabled", b?.disabled === true);
+    ok("  saying to finish or abort first", (b?.title ?? "").includes("Finish or abort the rebase first"));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Stashes");
+  {
+    const page = await open(SCENARIOS.withStashes, { stashes: STASHES });
+    await page.waitForFunction(() => document.body.innerText.includes("fix header"), { timeout: 4000 });
+    const s = await text(page);
+    ok("the stash list is a card with its count", s.includes("Stashes 2") && s.includes("fix header"));
+    ok("  each entry names its ref, branch and date", s.includes("stash@{0}") && s.includes("on main") && s.includes("2026-09-23"));
+    ok("  the passive note is gone", !s.includes("stashes in this repository"));
+    await (await button(page, "Stash changes…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Stash changes"), { timeout: 4000 });
+    const s1 = await text(page);
+    ok("Stash changes… explains what it sets aside, with counts", s1.includes("5 uncommitted changes") && s1.includes("(2 staged, 2 not staged, 1 new)"));
+    ok("  the untracked choice is offered and on", await page.$eval('input[aria-label="Include untracked files"]', (el) => el.checked));
+    await page.type('input[aria-label="Stash message"]', "wip");
+    await (await button(page, "Stash")).click();
+    await sleep(300);
+    const push = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_stash_push"));
+    ok("  Stash sends the message and the untracked choice", push?.args?.message === "wip" && push?.args?.includeUntracked === true);
+    ok("Apply is offered", await clickInRow(page, "fix header", { title: "Apply this stash and keep it in the list" }));
+    await sleep(300);
+    const ap = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_stash_apply"));
+    ok("  and applies without popping", ap?.args?.index === 0 && ap?.args?.pop === false);
+    await clickInRow(page, "fix header", { title: "Apply this stash and remove it" });
+    await sleep(300);
+    const pop = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_stash_apply")[1]);
+    ok("Pop applies and removes", pop?.args?.index === 0 && pop?.args?.pop === true);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.withStashes, { stashes: STASHES });
+    await page.waitForFunction(() => document.body.innerText.includes("fix header"), { timeout: 4000 });
+    ok("Drop… is offered", await clickInRow(page, "fix header", { title: "Drop this stash" }));
+    await page.waitForFunction(() => document.body.innerText.includes("Drop this stash?"), { timeout: 4000 });
+    const s = await text(page);
+    ok("dropping asks first, naming the entry", s.includes("Drop this stash?") && s.includes("stash@{0}") && s.includes("4 files"));
+    ok("  and says the commit can be recovered", s.includes("can be recovered"));
+    ok("  nothing was dropped yet", (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_stash_drop").length)) === 0);
+    await (await button(page, "Drop")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("undo: git -C"), { timeout: 4000 });
+    ok("  after Drop the undo command is shown", (await text(page)).includes("stash store -m 'fix header'"));
+    ok("the files can be listed", await clickInRow(page, "fix header", { text: "4 files" }));
+    await page.waitForFunction(() => document.body.innerText.includes("Restore file"), { timeout: 4000 });
+    const s2 = await text(page);
+    ok("  with each path and an untracked marker", s2.includes("src/header.ts") && s2.includes("notes.txt"));
+    await clickInRow(page, "fix header", { title: "Restore only this file from the stash" });
+    await sleep(300);
+    const rf = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_stash_restore_file"));
+    ok("  Restore file sends the index and that path only", rf?.args?.index === 0 && rf?.args?.path === "src/header.ts");
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    const b = await buttonState(page, "Stash changes…");
+    ok("on a clean tree Stash changes… is disabled", b?.disabled === true);
+    ok("  saying there is nothing to stash", b?.title === "Nothing to stash");
+    ok("  and no Stashes card appears", !(await text(page)).includes("Stashes"));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Tidy up");
+  {
+    const page = await open(SCENARIOS.dirty);
+    ok("Undo last commit is offered", (await buttonState(page, "Undo last commit"))?.disabled === false);
+    await (await button(page, "Undo last commit")).click();
+    await sleep(300);
+    const undo = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_undo_commit"));
+    ok("  and runs without a confirmation", undo?.args?.repoPath === "/repos/gitswitch");
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.pushedAlready);
+    const b = await buttonState(page, "Undo last commit");
+    ok("a pushed commit can't be undone here", b?.disabled === true);
+    ok("  and the tooltip points at History", (b?.title ?? "").includes("History") && (b?.title ?? "").includes("origin/main"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean, { refuse: { changes_undo_commit: { code: "already-pushed", message: "The last commit is already on origin/main. Revert it instead." } } });
+    await (await button(page, "Undo last commit")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Open in History"), { timeout: 4000 });
+    ok("a refusal because it was pushed offers to open History", (await text(page)).includes("already on origin/main"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.diverged);
+    const b = await buttonState(page, "Reset to origin/main…");
+    ok("Reset names the upstream on the button", b !== null && b.disabled === false);
+    await (await button(page, "Reset to origin/main…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Reset to origin/main?"), { timeout: 4000 });
+    const s = await text(page);
+    ok("resetting asks first, counting the unpushed commits", s.includes("Reset to origin/main?") && s.includes("2 unpushed"));
+    ok("  and promises a backup branch", s.includes("gitswitch-before-reset-"));
+    ok("  a clean tree offers no stash choice", (await page.$('input[aria-label="Stash uncommitted changes first"]')) === null);
+    ok("  nothing was reset yet", (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_reset").length)) === 0);
+    await (await button(page, "Reset")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("undo: git -C"), { timeout: 4000 });
+    const rs = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_reset"));
+    ok("  Reset is a hard reset to @{u} without stashing", rs?.args?.target === "@{u}" && rs?.args?.mode === "hard" && rs?.args?.stashFirst === false);
+    const s2 = await text(page);
+    ok("  the result names the backup branch and the undo command", s2.includes("gitswitch-before-reset-20260923120000") && s2.includes("undo: git -C /repos/gitswitch reset --hard"));
+    ok("  and which commits left the branch", s2.includes("seal work"));
+    await page.close();
+  }
+  {
+    const page = await open({ ...SCENARIOS.diverged, entries: SCENARIOS.dirty.entries, staged_count: 2, unstaged_count: 3, untracked_count: 1 });
+    await (await button(page, "Reset to origin/main…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Reset to origin/main?"), { timeout: 4000 });
+    const box = await page.$('input[aria-label="Stash uncommitted changes first"]');
+    ok("a dirty tree offers to stash first", box !== null);
+    ok("  checked by default", await box.evaluate((el) => el.checked));
+    ok("  counting the changes", (await text(page)).includes("Stash my 5 uncommitted changes first"));
+    await box.evaluate((el) => el.click());
+    await sleep(100);
+    ok("  unchecking warns that they are thrown away", (await text(page)).includes("Without stashing, your 5 uncommitted changes are thrown away"));
+    await box.evaluate((el) => el.click());
+    await sleep(100);
+    await (await button(page, "Reset")).click();
+    await sleep(300);
+    const rs = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_reset"));
+    ok("  Reset sends stashFirst", rs?.args?.target === "@{u}" && rs?.args?.mode === "hard" && rs?.args?.stashFirst === true);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    const b = await buttonState(page, "Reset to origin/main…");
+    ok("level with upstream: Reset is disabled", b?.disabled === true);
+    ok("  saying so", (b?.title ?? "").includes("Already level with origin/main"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.unpublished);
+    const b = await buttonState(page, "Reset to upstream…");
+    ok("without an upstream the button says upstream and is disabled", b !== null && b.disabled === true);
+    ok("  with the reason", b?.title === "This branch has no upstream");
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.dirty);
+    await (await button(page, "Discard everything…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Discard everything?"), { timeout: 4000 });
+    const s = await text(page);
+    ok("Discard everything asks first, with the counts", s.includes("(2 staged, 3 not staged, 1 new)") && s.includes("cannot be undone"));
+    ok("  new files are kept unless asked", await page.$eval('input[aria-label="Also delete new files"]', (el) => !el.checked));
+    ok("  a stash is offered instead", (await page.$('input[aria-label="Stash them first"]')) !== null);
+    await (await button(page, "Discard everything")).click();
+    await sleep(300);
+    const da = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_discard_all"));
+    ok("  and sends the defaults", da?.args?.includeUntracked === false && da?.args?.stashFirst === false);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    ok("on a clean tree Discard everything… is disabled", (await buttonState(page, "Discard everything…"))?.disabled === true);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.dirty);
+    await (await button(page, "Delete all untracked")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Delete these new files?"), { timeout: 4000 });
+    const s = await text(page);
+    ok("Delete all untracked asks first", s.includes("This deletes 1 untracked file from disk") && s.includes("cannot be undone"));
+    ok("  and says ignored files are safe", s.includes("Ignored files are never touched"));
+    ok("  listing the file", s.includes("new file.txt"));
+    await (await button(page, "Delete")).click();
+    await sleep(300);
+    const d = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_discard"));
+    ok("  Delete sends only the untracked paths", Array.isArray(d?.args?.paths) && d.args.paths.length === 1 && d.args.paths[0] === "new file.txt");
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.dirty, { pullMode: "rebase" });
+    ok("rebase on a dirty tree: Pull is disabled", (await buttonState(page, "Pull"))?.disabled === true);
+    const box = await page.$('input[aria-label="Stash changes around the rebase"]');
+    ok("  and autostash is offered, off", box !== null && !(await box.evaluate((el) => el.checked)));
+    ok("  the refusal mentions it", (await text(page)).includes("turn on autostash below"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.dirty, { pullMode: "rebase", autostash: true });
+    ok("with autostash on, Pull is enabled", (await buttonState(page, "Pull"))?.disabled === false);
+    await (await button(page, "Pull")).click();
+    await sleep(300);
+    const pull = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_pull"));
+    ok("  and the pull asks for autostash", pull?.args?.mode === "rebase" && pull?.args?.autostash === true);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.dirty, { pullMode: "merge", autostash: true });
+    ok("autostash only shows for rebase", (await page.$('input[aria-label="Stash changes around the rebase"]')) === null);
+    await (await button(page, "Pull")).click();
+    await sleep(300);
+    const pull = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_pull"));
+    ok("  and is not sent for a merge", pull?.args?.autostash === false);
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Submodule sections");
+  const header = (page, path) =>
+    page.evaluate((p) => {
+      const b = document.querySelector(`button[aria-label="Toggle submodule ${p}"]`);
+      return b ? { text: b.innerText, expanded: b.getAttribute("aria-expanded") } : null;
+    }, path);
+  const subOpts = { submodules: [...SUBMODULES, SUBMODULE_A], subInner: SUB_INNER, submoduleStatuses: SUB_STATUSES };
+  {
+    const page = await open(SCENARIOS.subSections, subOpts);
+    await page.waitForFunction(() => document.body.innerText.includes("Inside B"), { timeout: 4000 });
+    const s = await text(page);
+    ok("each submodule with work gets its own section", s.includes("Inside A") && s.includes("Inside B"));
+    const a = await header(page, "A");
+    const b = await header(page, "B");
+    ok("A's header says where it is and how far ahead", a !== null && a.text.includes("on main") && a.text.includes("↑1"));
+    ok("  and how much changed", a.text.includes("2 changed"));
+    ok("B's header flags the detached HEAD and the rebase", b !== null && b.text.includes("detached") && b.text.includes("rebase in progress"));
+    ok("  and its conflict", b.text.includes("1 conflict"));
+    ok("B is open by default (it has a conflict)", b.expanded === "true");
+    ok("A is open too (two sections or fewer)", a.expanded === "true");
+    ok("A's files are listed", s.includes("inside/a.ts"));
+    ok("  with a Commit in A button", (await button(page, "Commit in A")) !== null);
+    ok("  while the parent's own Commit button is still there", (await buttonState(page, "Commit"))?.text === "Commit");
+    ok("B's rebase is shown inside its section", s.includes("Rebase in progress inside B") && (await button(page, "Abort in B")) !== null);
+    ok("  with Continue disabled while the conflict remains", (await buttonState(page, "Continue in B"))?.disabled === true);
+    ok("  and its conflict names the sides", s.includes("mine = your commit being replayed") && s.includes("theirs = origin/main"));
+    ok("staging a file inside A", await clickInRow(page, "long/name.ts", { title: "Stage" }));
+    await sleep(300);
+    const st = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_stage"));
+    ok("  runs in A's repository", st?.args?.repoPath === "/repos/gitswitch/A" && st.args.paths[0].endsWith("long/name.ts"));
+    ok("unstaging a file inside A", await clickInRow(page, "inside/a.ts", { title: "Unstage" }));
+    await sleep(300);
+    const un = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_unstage"));
+    ok("  runs in A's repository too", un?.args?.repoPath === "/repos/gitswitch/A" && un.args.paths[0] === "inside/a.ts");
+    ok("  and the parent was re-read afterwards", (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status" && c.args.repoPath === "/repos/gitswitch").length)) >= 2);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.subSections, subOpts);
+    await page.waitForFunction(() => document.body.innerText.includes("Inside A"), { timeout: 4000 });
+    await page.type("#submodule-section-A textarea", "Fix the header inside A");
+    await (await button(page, "Commit in A")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Stage pointer"), { timeout: 4000 });
+    const cm = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_commit"));
+    ok("Commit in A commits inside A with its draft", cm?.args?.repoPath === "/repos/gitswitch/A" && cm.args.message === "Fix the header inside A");
+    const s = await text(page);
+    ok("  then the footer says the parent still records the old commit", s.includes("Committed 9f1e2d3 inside A") && s.includes("still records the old commit for A"));
+    ok("  offering both ways to record it", (await button(page, "Stage pointer")) !== null && (await button(page, "Record submodule pointers")) !== null);
+    await (await button(page, "Stage pointer")).click();
+    await sleep(300);
+    const sp = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_stage").pop());
+    ok("  Stage pointer stages the gitlink in the parent", sp?.args?.repoPath === "/repos/gitswitch" && sp.args.paths.length === 1 && sp.args.paths[0] === "A");
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.subSections, subOpts);
+    await page.waitForFunction(() => document.body.innerText.includes("Inside A"), { timeout: 4000 });
+    const row = await rowWith(page, "points at a different commit");
+    ok("the parent's gitlink row for A has an Inside link", row !== null && row.buttons.some((b) => b.title === "Show the changes inside this submodule"));
+    await page.evaluate(() => document.querySelector('button[aria-label="Toggle submodule A"]').click());
+    await sleep(100);
+    ok("  the section can be collapsed", (await header(page, "A"))?.expanded === "false");
+    await clickInRow(page, "points at a different commit", { title: "Show the changes inside this submodule" });
+    await sleep(200);
+    ok("  and Inside opens it again", (await header(page, "A"))?.expanded === "true");
+    await page.waitForFunction(() => document.body.innerText.includes("moved 1 commit ahead"), { timeout: 4000 });
+    const before = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status" && c.args.repoPath === "/repos/gitswitch/A").length);
+    await clickInRow(page, "moved 1 commit ahead", { text: "Show what changed" });
+    await sleep(300);
+    const s = await text(page);
+    ok("the side card's row for A links to the section instead of re-reading it", s.includes("See the changes inside") && /commits it moved through/i.test(s));
+    const after = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status" && c.args.repoPath === "/repos/gitswitch/A").length);
+    ok("  without a second status read", after === before);
+    await clickInRow(page, "staging", { text: "Show what changed" });
+    await page.waitForFunction(() => document.body.innerText.includes("Changed inside"), { timeout: 4000 });
+    const readOnly = await page.evaluate(() => {
+      const row = [...document.querySelectorAll("li")].find((r) => r.innerText.includes("inside/changed.ts"));
+      if (!row) return "row missing";
+      const titles = [...row.querySelectorAll("button")].map((b) => b.title);
+      return titles.some((x) => /Stage|Discard|Unstage/.test(x)) ? "has actions" : "read-only";
+    });
+    ok("a submodule without a section keeps the read-only inner list", readOnly === "read-only", readOnly);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.subSections, subOpts);
+    await page.waitForFunction(() => document.body.innerText.includes("Inside A"), { timeout: 4000 });
+    await (await button(page, "Open as its own repository")).click();
+    await sleep(500);
+    const picked = await page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:changes.repo") ?? '""'));
+    ok("Open as its own repository switches the page to A", picked === "/repos/gitswitch/A", picked);
+    ok("  reading A as the main repository", await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "changes_repo_status" && c.args.repoPath === "/repos/gitswitch/A")));
+    ok("  which has no sections of its own", !(await text(page)).includes("Inside A"));
+    await page.close();
+  }
+  {
+    const resolvedB = { ...SUB_STATUSES[1], status: { ...SUB_STATUSES[1].status, entries: [], conflicted_count: 0 } };
+    const page = await open(SCENARIOS.subSections, { ...subOpts, submoduleStatuses: [SUB_STATUSES[0], resolvedB, SUB_QUIET] });
+    await page.waitForFunction(() => document.body.innerText.includes("Inside B"), { timeout: 4000 });
+    ok("a submodule with nothing to do is one line, not a section", (await text(page)).includes("1 other submodule has nothing to commit") && !(await text(page)).includes("Inside C"));
+    ok("once resolved, Continue in B is enabled", (await buttonState(page, "Continue in B"))?.disabled === false);
+    await (await button(page, "Continue in B")).click();
+    await sleep(300);
+    const c = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_continue"));
+    ok("  and continues the rebase inside B", c?.args?.repoPath === "/repos/gitswitch/B");
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.subSections, { submodules: SUBMODULES, subInner: SUB_INNER });
+    await sleep(300);
+    const s = await text(page);
+    ok("with no submodule statuses no section renders", !s.includes("Inside A") && !s.includes("Inside B"));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Conflict helpers");
+  {
+    const page = await open(SCENARIOS.conflicted);
+    const s = await text(page);
+    ok("a merge conflict says what mine and theirs mean", s.includes("mine = main") && s.includes("theirs = the branch being merged in"));
+    const row = await rowWith(page, "conflict.txt");
+    ok("each row offers Keep mine and Take theirs, naming the sides", row !== null && row.buttons.some((b) => b.title === "Keep mine (main)") && row.buttons.some((b) => b.title === "Take theirs (the branch being merged in)"));
+    ok("  next to Mark resolved", row.buttons.some((b) => b.title === "Mark resolved"));
+    await clickInRow(page, "conflict.txt", { title: "Take theirs (the branch being merged in)" });
+    await sleep(300);
+    const th = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_resolve_side"));
+    ok("Take theirs resolves that file with theirs", th?.args?.paths?.length === 1 && th.args.paths[0] === "conflict.txt" && th.args.side === "theirs");
+    await (await button(page, "Keep mine for all")).click();
+    await sleep(300);
+    const all = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_resolve_side")[1]);
+    ok("Keep mine for all sends every conflicted path with mine", all?.args?.side === "mine" && all.args.paths.length === 1 && all.args.paths[0] === "conflict.txt");
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.rebasingConflicted);
+    const s = await text(page);
+    ok("in a rebase, mine is the commit being replayed", s.includes("mine = your commit being replayed") && s.includes("theirs = origin/main"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.syncPausedInSub);
+    const row = await rowWith(page, "both modified");
+    ok("a conflicted gitlink row has no side buttons (the sync finishes it)", row !== null && !row.buttons.some((b) => b.title.startsWith("Keep mine") || b.title.startsWith("Take theirs")));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.stashConflict);
+    const s = await text(page);
+    ok("conflicts from a stash say so", s.includes("came from applying a stash") && s.includes("still in the list"));
+    ok("  with no operation banner to continue or abort", !s.includes("in progress"));
+    const row = await rowWith(page, "conflict.txt");
+    ok("  and Discard is the third way out", row !== null && row.buttons.some((b) => b.title === "Discard — this cannot be undone"));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
   section("Layout");
   // Measure <main>, not documentElement: main has overflow-y-auto, so it
   // scrolls horizontally on its own and the document never reports overflow.
@@ -949,7 +1519,7 @@ try {
     ],
   };
   for (const width of [700, 760, 900, 1024, 1280]) {
-    const page = await open(longPathStatus, { width, submodules: SUBMODULES, lfs: LFS_POINTERS });
+    const page = await open({ ...longPathStatus, has_submodules: true }, { width, submodules: SUBMODULES, lfs: LFS_POINTERS, submoduleStatuses: SUB_STATUSES, stashes: STASHES });
     await sleep(300);
     const overflow = await page.evaluate(() => {
       const m = document.querySelector("main");
@@ -967,6 +1537,23 @@ try {
     );
     ok("a long file path truncates instead of stretching the layout", truncated);
     ok("the side column is still reachable when narrow", await page.evaluate(() => [...document.querySelectorAll("h3")].some((h) => h.innerText === "Push access")));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.subSections, { width: 700, submodules: [...SUBMODULES, SUBMODULE_A], subInner: SUB_INNER, submoduleStatuses: SUB_STATUSES, stashes: STASHES });
+    await page.waitForFunction(() => document.body.innerText.includes("Inside A"), { timeout: 4000 });
+    await sleep(300);
+    const overflow = await page.evaluate(() => {
+      const m = document.querySelector("main");
+      return { need: m.scrollWidth, have: m.clientWidth };
+    });
+    ok("submodule sections don't overflow at 700px", overflow.need <= overflow.have + 1, `main needs ${overflow.need}px but has ${overflow.have}px`);
+    const truncated = await page.evaluate(() =>
+      [...document.querySelectorAll("span")]
+        .filter((s) => s.textContent.includes("long/name.ts"))
+        .some((s) => s.scrollWidth > s.clientWidth + 1)
+    );
+    ok("  and a long path inside a submodule truncates", truncated);
     await page.close();
   }
 } finally {

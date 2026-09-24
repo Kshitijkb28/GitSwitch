@@ -161,6 +161,7 @@ export function status(over = {}) {
     has_submodules: false,
     uses_lfs: false,
     sync: null,
+    conflict_source: null,
   };
   return { ...base, ...over };
 }
@@ -279,12 +280,13 @@ export const SYNC_PAUSED_IN_SUB = {
 };
 
 
-const MERGE_OP = {
+export const MERGE_OP = {
   kind: "merge",
   label: "Merge in progress",
   detail: "Finish it with one commit, or abort.",
   abort_command: "git merge --abort",
   continue_command: "git commit --no-edit",
+  sides: { mine: "main", theirs: "the branch being merged in" },
 };
 
 export const REBASE_OP = {
@@ -293,6 +295,7 @@ export const REBASE_OP = {
   detail: "step 2 of 3, main onto origin/main",
   abort_command: "git rebase --abort",
   continue_command: "git rebase --continue",
+  sides: { mine: "your commit being replayed", theirs: "origin/main" },
 };
 
 export const SCENARIOS = {
@@ -479,6 +482,42 @@ export const SCENARIOS = {
     can_amend: false,
     head_subject: "already on the remote",
   }),
+
+  // Checked out a commit, not a branch: nothing can be committed or synced here.
+  detached: status({ detached: true, branch: null, head_oid: "1a2b3c4d5e6f7a8b9c0d1a2b3c4d5e6f7a8b9c0d", upstream: null }),
+
+  withStashes: status({
+    entries: [
+      entry({ path: "src/staged.ts", staged: "M", unstaged: ".", staged_added: 10, staged_removed: 2 }),
+      entry({ path: "src/both.ts", staged: "M", unstaged: "M" }),
+      entry({ path: "src/mod.ts" }),
+      entry({ path: "new file.txt", kind: "untracked", staged: ".", unstaged: "?", unstaged_added: null, unstaged_removed: null }),
+    ],
+    staged_count: 2,
+    unstaged_count: 2,
+    untracked_count: 1,
+    stash_count: 2,
+  }),
+
+  // A superproject whose submodules A and B each have work of their own.
+  subSections: status({
+    has_submodules: true,
+    submodule_dirty_count: 2,
+    entries: [
+      entry({ path: "A", is_submodule: true, sub_commit_changed: true, staged: ".", unstaged: "M", unstaged_added: null, unstaged_removed: null }),
+      entry({ path: "B", is_submodule: true, sub_tracked_changes: true, staged: ".", unstaged: "M", unstaged_added: null, unstaged_removed: null }),
+    ],
+    unstaged_count: 2,
+  }),
+
+  // Conflicts left by `git stash apply`: no operation to continue or abort.
+  stashConflict: status({
+    entries: [entry({ path: "conflict.txt", kind: "conflicted", staged: "U", unstaged: "U", conflict: "both modified" })],
+    conflicted_count: 1,
+    operation: null,
+    conflict_source: "stash",
+    stash_count: 1,
+  }),
 };
 
 export const DIFF_TEXT = {
@@ -632,4 +671,185 @@ export const LFS_NOT_INSTALLED = {
   pointers: 0,
   pointer_paths: [],
   summary: "This repository uses Git LFS, but git-lfs isn't installed on this Mac — large files will stay as pointer stubs until it is.",
+};
+
+// --- Branches, stashes, submodule sections, tree outcomes --------------------
+
+function branch(over = {}) {
+  return {
+    name: "main",
+    is_current: false,
+    is_remote: false,
+    upstream: null,
+    ahead: 0,
+    behind: 0,
+    tip: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+    short_tip: "aaaa111",
+    last_author: "Me",
+    last_date: "2026-09-20T10:00:00Z",
+    last_subject: "the last commit",
+    ...over,
+  };
+}
+
+/** Local branches as history_branches reports them (one remote-tracking ref mixed in). */
+export const BRANCHES = [
+  branch({ name: "main", is_current: true, upstream: "origin/main", ahead: 2, behind: 0 }),
+  branch({ name: "feature/login", ahead: 3, tip: "abc1234abc1234abc1234abc1234abc1234abc12", short_tip: "abc1234", last_subject: "Add login form" }),
+  branch({ name: "hotfix/typo", last_subject: "Fix a typo in the README" }),
+  branch({ name: "old-experiment", last_date: "2025-11-02T09:00:00Z", last_subject: "Try the other parser" }),
+  branch({ name: "origin/main", is_remote: true, tip: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222", short_tip: "bbbb222" }),
+];
+
+export const STASHES = [
+  {
+    index: 0,
+    ref: "stash@{0}",
+    oid: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    message: "fix header",
+    branch: "main",
+    date: "2026-09-23T12:00:00Z",
+    tracked_files: 3,
+    untracked_files: 1,
+    is_autostash: false,
+  },
+  {
+    index: 1,
+    ref: "stash@{1}",
+    oid: "cafebabecafebabecafebabecafebabecafebabe",
+    message: "spike: a much longer stash message that goes on and on about what it was trying to do here",
+    branch: "feature/login",
+    date: "2026-09-21T08:30:00Z",
+    tracked_files: 2,
+    untracked_files: 0,
+    is_autostash: false,
+  },
+];
+
+export const STASH_DETAIL = {
+  entry: STASHES[0],
+  files: [
+    { path: "src/header.ts", status: "M", added: 4, removed: 1 },
+    { path: "src/nav.ts", status: "M", added: 2, removed: 2 },
+    { path: "styles/header.css", status: "M", added: 9, removed: 0 },
+    { path: "notes.txt", status: "untracked", added: null, removed: null },
+  ],
+};
+
+/** A: on a branch, one commit ahead, two changed files. B: detached, mid-rebase, one conflict. */
+export const SUB_STATUSES = [
+  {
+    path: "A",
+    name: "A",
+    listed: true,
+    recorded: "a535d05aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    recorded_short: "a535d05",
+    status: status({
+      path: "/repos/gitswitch/A",
+      name: "A",
+      ahead: 1,
+      entries: [
+        entry({ path: "inside/a.ts", staged: "M", unstaged: ".", staged_added: 5, staged_removed: 1 }),
+        entry({ path: "inside/very/long/path/that/keeps/going/and/going/to/a/file/with/a/long/name.ts" }),
+      ],
+      staged_count: 1,
+      unstaged_count: 1,
+    }),
+  },
+  {
+    path: "B",
+    name: "B",
+    listed: true,
+    recorded: "84d0861aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    recorded_short: "84d0861",
+    status: status({
+      path: "/repos/gitswitch/B",
+      name: "B",
+      branch: null,
+      detached: true,
+      upstream: null,
+      operation: REBASE_OP,
+      entries: [entry({ path: "inside/b.txt", kind: "conflicted", staged: "U", unstaged: "U", conflict: "both modified" })],
+      conflicted_count: 1,
+      can_amend: false,
+    }),
+  },
+];
+
+/** A submodule with nothing to do: summarised in one line, no section. */
+export const SUB_QUIET = {
+  path: "C",
+  name: "C",
+  listed: true,
+  recorded: "0c0c0c0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  recorded_short: "0c0c0c0",
+  status: status({ path: "/repos/gitswitch/C", name: "C" }),
+};
+
+/** The side card's row for A, so its "Show what changed" becomes a jump link. */
+export const SUBMODULE_A = sub({
+  path: "A",
+  name: "A",
+  recorded: "a535d05aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  recorded_short: "a535d05",
+  actual: "9f1e2d3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  actual_short: "9f1e2d3",
+  ahead: 1,
+  moved_commits: [{ short: "9f1e2d3", subject: "work inside A" }],
+  dirty_tracked: 2,
+  state: "moved-and-dirty",
+  summary: "moved 1 commit ahead of what this repo records; 2 changed files inside; on main",
+});
+
+export const TREE_RESET_OUTCOME = {
+  op: "reset",
+  head_before: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+  head_after: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+  branch_before: "main",
+  branch_after: "main",
+  commit: null,
+  parents: [],
+  dropped: [
+    { oid: "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "1111111", subject: "local unrelated" },
+    { oid: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "2222222", subject: "seal work" },
+  ],
+  dropped_total: 2,
+  backup: {
+    repo: "/repos/gitswitch",
+    branch: "gitswitch-before-reset-20260923120000",
+    oid: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+    recovery: "git -C /repos/gitswitch reset --hard gitswitch-before-reset-20260923120000",
+  },
+  stash: { ref: "stash@{0}", oid: "feedfacefeedfacefeedfacefeedfacefeedface", message: "gitswitch: before reset to origin/main" },
+  recovery: "git -C /repos/gitswitch reset --hard gitswitch-before-reset-20260923120000",
+  submodule_mismatch: [],
+  blocking_files: [],
+  conflicts: [],
+  mapping_note: null,
+  deleted_untracked: 0,
+  restored_tracked: 0,
+};
+
+export const STASH_DROP_OUTCOME = {
+  action: "drop",
+  entry: { ref: "stash@{0}", oid: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", message: "fix header" },
+  stash_count: 1,
+  conflicts: [],
+  kept: false,
+  recovery: "git -C /repos/gitswitch stash store -m 'fix header' deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+  not_stashed_submodules: [],
+};
+
+export const BRANCH_DELETE_OUTCOME = {
+  ...TREE_RESET_OUTCOME,
+  op: "delete-branch",
+  head_after: TREE_RESET_OUTCOME.head_before,
+  branch_before: "feature/login",
+  branch_after: null,
+  commit: { oid: "abc1234abc1234abc1234abc1234abc1234abc12", short: "abc1234", subject: "Add login form" },
+  dropped: [],
+  dropped_total: 3,
+  backup: null,
+  stash: null,
+  recovery: "git -C /repos/gitswitch branch feature/login abc1234abc1234abc1234abc1234abc1234abc12",
 };

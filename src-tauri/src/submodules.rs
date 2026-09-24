@@ -679,3 +679,77 @@ mod tests {
         assert!(msg.contains("no entry in .gitmodules"), "{}", msg);
     }
 }
+
+
+/// One populated submodule's full status, for its own section on the Changes
+/// page. `path` is root-relative and byte-identical to the parent's gitlink
+/// row, so the page can match the two.
+#[derive(Debug, Serialize, Clone)]
+pub struct SubmoduleStatus {
+    pub path: String,
+    pub name: Option<String>,
+    /// Has a .gitmodules entry. A populated-but-unmapped one is still shown:
+    /// a person can commit inside it even though git cannot fetch it.
+    pub listed: bool,
+    pub recorded: String,
+    pub recorded_short: String,
+    pub status: crate::git_status::RepoStatus,
+}
+
+/// The full status of every populated submodule. Built the same way as
+/// `list_submodules` (never `git submodule status`, which aborts on the first
+/// unmapped gitlink): uninitialised gitlinks cost one `exists()` each, nested
+/// submodules are not descended, and the statuses are read four at a time.
+pub async fn submodule_statuses(repo_path: &str) -> Result<Vec<SubmoduleStatus>, AppError> {
+    let repo = PathBuf::from(repo_path);
+    if !repo.is_dir() {
+        return Err(AppError::NotFound(format!("{} no longer exists on disk", repo_path)));
+    }
+    let listing = GitCmd::at(&repo)
+        .args(["ls-files", "-s"])
+        .text()
+        .await
+        .unwrap_or_default();
+    let gitlinks = parse_gitlinks(&listing);
+    if gitlinks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cfg_out = GitCmd::at(&repo)
+        .args(["config", "-f", ".gitmodules", "--get-regexp", r"\.(path|url|branch)$"])
+        .ok_text()
+        .await
+        .unwrap_or_default();
+    let cfg = parse_gitmodules(&cfg_out);
+
+    let mut candidates: Vec<(String, String, Option<String>, bool, PathBuf)> = Vec::new();
+    for (recorded, path) in gitlinks {
+        let sub_dir = repo.join(&path);
+        // `.git` is a file inside a submodule; a gitfile whose target is gone
+        // is caught by rev-parse below.
+        if !sub_dir.join(".git").exists() {
+            continue;
+        }
+        if GitCmd::at(&sub_dir).args(["rev-parse", "--git-dir"]).ok_text().await.is_none() {
+            continue;
+        }
+        let module = cfg.get(&path);
+        candidates.push((recorded, path.clone(), module.map(|m| m.name.clone()), module.is_some(), sub_dir));
+    }
+
+    let mut out = Vec::with_capacity(candidates.len());
+    for chunk in candidates.chunks(4) {
+        let mut tasks = Vec::new();
+        for (recorded, path, name, listed, sub_dir) in chunk.iter().cloned() {
+            tasks.push(tokio::spawn(async move {
+                let status = crate::git_status::repo_status(&sub_dir.to_string_lossy()).await;
+                (recorded, path, name, listed, status)
+            }));
+        }
+        for t in tasks {
+            if let Ok((recorded, path, name, listed, Ok(status))) = t.await {
+                out.push(SubmoduleStatus { recorded_short: short(&recorded), recorded, path, name, listed, status });
+            }
+        }
+    }
+    Ok(out)
+}

@@ -50,10 +50,12 @@ for v in /Volumes/dmg.*; do
 done
 
 echo "▸ Fixing Launch Services registrations…"
-"$LSREG" -dump 2>/dev/null \
+# `grep -v` exits 1 when there is nothing stale to remove, which under
+# `pipefail` would abort the script before the app is launched.
+{ "$LSREG" -dump 2>/dev/null \
   | grep -oE '/[^ ]*GitSwitch.app' | sort -u \
-  | grep -v "^${APP_DST}$" \
-  | while read -r p; do "$LSREG" -u "$p" 2>/dev/null || true; done
+  | grep -v "^${APP_DST}$" || true; } \
+  | while read -r p; do [ -n "$p" ] && "$LSREG" -u "$p" 2>/dev/null || true; done
 "$LSREG" -f "$APP_DST" 2>/dev/null || true
 
 echo "▸ Launching…"
