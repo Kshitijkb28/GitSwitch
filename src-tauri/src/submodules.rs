@@ -91,16 +91,21 @@ pub struct SubmoduleInfo {
 
 const MAX_MOVED: usize = 10;
 
-/// Parse `git ls-files -s`, keeping only gitlinks.
+/// Parse `git ls-files -s -z`, keeping only gitlinks.
 ///
-/// Format is `<mode> <object> <stage>\t<path>`; mode `160000` is a gitlink.
-/// A tab separates the path, so paths containing spaces survive.
-pub fn parse_gitlinks(out: &str) -> Vec<(String, String)> {
+/// Each NUL-terminated record is `<mode> <object> <stage>\t<path>`; mode
+/// `160000` is a gitlink. A tab separates the path, so spaces survive, and
+/// `-z` is what keeps the path byte-identical to the status entries: without
+/// it git C-quotes any path holding a non-ASCII byte, a quote or a backslash
+/// (`"donn\303\251es/lib"`), and nothing would match the parent's rows.
+pub fn parse_gitlinks(raw: &[u8]) -> Vec<(String, String)> {
     let mut found = Vec::new();
-    for line in out.lines() {
-        let Some((meta, path)) = line.split_once('\t') else {
+    for rec in raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let Some(tab) = rec.iter().position(|b| *b == b'\t') else {
             continue;
         };
+        let meta = String::from_utf8_lossy(&rec[..tab]);
+        let path = String::from_utf8_lossy(&rec[tab + 1..]);
         let mut parts = meta.split_whitespace();
         let (Some(mode), Some(oid)) = (parts.next(), parts.next()) else {
             continue;
@@ -112,17 +117,54 @@ pub fn parse_gitlinks(out: &str) -> Vec<(String, String)> {
     found
 }
 
-/// Parse `git config -f .gitmodules --get-regexp '\.(path|url|branch)$'` into a
-/// map keyed by **path**, which is how every other part of git refers to a
-/// submodule. A name may contain dots, so the key is taken between the
-/// `submodule.` prefix and the final `.path` / `.url` / `.branch`.
-pub fn parse_gitmodules(out: &str) -> HashMap<String, ModuleCfg> {
+/// Does the listing hold any gitlink at all? No per-entry allocation, so the
+/// status read can afford it on a large index.
+pub fn any_gitlink(raw: &[u8]) -> bool {
+    raw.split(|b| *b == 0).any(|r| r.starts_with(b"160000 "))
+}
+
+/// `git ls-files -s -z`, raw. Empty when git fails (not a repository).
+pub(crate) async fn index_listing(repo: &Path) -> Vec<u8> {
+    match GitCmd::at(repo).args(["ls-files", "-s", "-z"]).run().await {
+        Ok(o) if o.ok() => o.stdout,
+        _ => Vec::new(),
+    }
+}
+
+/// The index records at least one gitlink — a submodule, mapped in
+/// `.gitmodules` or not.
+pub async fn has_gitlinks(repo: &Path) -> bool {
+    any_gitlink(&index_listing(repo).await)
+}
+
+/// `.gitmodules` as `parse_gitmodules` reads it. Absent is normal (every
+/// gitlink is then unmapped) and comes back empty.
+async fn gitmodules_listing(repo: &Path) -> Vec<u8> {
+    match GitCmd::at(repo)
+        .args(["config", "-f", ".gitmodules", "--get-regexp", "-z", r"\.(path|url|branch)$"])
+        .run()
+        .await
+    {
+        Ok(o) if o.ok() => o.stdout,
+        _ => Vec::new(),
+    }
+}
+
+/// Parse `git config -f .gitmodules --get-regexp -z '\.(path|url|branch)$'`
+/// into a map keyed by **path**, which is how every other part of git refers
+/// to a submodule. Each NUL-terminated record is `<key>\n<value>`: `-z` is
+/// required because a submodule's name defaults to its path, and a path with
+/// a space (`vendor/my lib`) would otherwise be split in the middle of the key.
+/// A name may contain dots, so the key is taken between the `submodule.`
+/// prefix and the final `.path` / `.url` / `.branch`.
+pub fn parse_gitmodules(raw: &[u8]) -> HashMap<String, ModuleCfg> {
     /// path, url, branch — collected per name before being keyed by path.
     type Fields = (Option<String>, Option<String>, Option<String>);
     let mut by_name: HashMap<String, Fields> = HashMap::new();
 
-    for line in out.lines() {
-        let Some((key, value)) = line.split_once(' ') else {
+    for rec in raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let rec = String::from_utf8_lossy(rec);
+        let Some((key, value)) = rec.split_once('\n') else {
             continue;
         };
         let Some(rest) = key.strip_prefix("submodule.") else {
@@ -344,29 +386,12 @@ pub async fn list_submodules(repo_path: &str) -> Result<Vec<SubmoduleInfo>, AppE
         )));
     }
 
-    let listing = GitCmd::at(&repo)
-        .args(["ls-files", "-s"])
-        .text()
-        .await
-        .unwrap_or_default();
-    let gitlinks = parse_gitlinks(&listing);
+    let gitlinks = parse_gitlinks(&index_listing(&repo).await);
     if gitlinks.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Absent .gitmodules is normal: every gitlink is then unmapped.
-    let cfg_out = GitCmd::at(&repo)
-        .args([
-            "config",
-            "-f",
-            ".gitmodules",
-            "--get-regexp",
-            r"\.(path|url|branch)$",
-        ])
-        .ok_text()
-        .await
-        .unwrap_or_default();
-    let cfg = parse_gitmodules(&cfg_out);
+    let cfg = parse_gitmodules(&gitmodules_listing(&repo).await);
 
     let mut out = Vec::with_capacity(gitlinks.len());
     for (recorded, path) in gitlinks {
@@ -525,42 +550,61 @@ mod tests {
 
     #[test]
     fn gitlinks_are_picked_out_of_ls_files() {
-        let out = "100644 aaa0000 0\tREADME.md\n\
-                   160000 dceaf0bd6574d6ea9a551a5374a0188d229b23e0 0\ttrinity\n\
-                   100644 bbb0000 0\tsrc/main.rs\n\
-                   160000 9ce37bdd5c866dd944eb9ce50bb9a235a88fe17b 0\tstaging\n";
+        let out = b"100644 aaa0000 0\tREADME.md\0\
+                    160000 dceaf0bd6574d6ea9a551a5374a0188d229b23e0 0\ttrinity\0\
+                    100644 bbb0000 0\tsrc/main.rs\0\
+                    160000 9ce37bdd5c866dd944eb9ce50bb9a235a88fe17b 0\tstaging\0";
         let links = parse_gitlinks(out);
         assert_eq!(links.len(), 2);
         assert_eq!(links[0].1, "trinity");
         assert_eq!(links[0].0, "dceaf0bd6574d6ea9a551a5374a0188d229b23e0");
         assert_eq!(links[1].1, "staging");
+        assert!(any_gitlink(out));
+        assert!(!any_gitlink(b"100644 aaa0000 0\tREADME.md\0"));
+        assert!(!any_gitlink(b""));
     }
 
     #[test]
-    fn a_path_with_spaces_survives_because_a_tab_separates_it() {
-        let links = parse_gitlinks("160000 abc123 0\tvendor/my lib\n");
+    fn a_path_with_spaces_and_non_ascii_survives_verbatim() {
+        // -z output: the raw bytes, never the C-quoted `"vendor/s\303\274b mod"`.
+        let links = parse_gitlinks("160000 abc123 0\tvendor/my lib\x00160000 def456 0\tvendor/süb mod\x00".as_bytes());
         assert_eq!(links[0].1, "vendor/my lib");
+        assert_eq!(links[1].1, "vendor/süb mod");
     }
 
     #[test]
-    fn nested_and_malformed_lines_do_not_derail_the_parse() {
-        let out = "160000 abc 0\tforge-tooling/aggtest/astropy\n\
-                   garbage\n\
-                   \n\
-                   160000 def 0\tdeep/nested/sub\n";
+    fn nested_and_malformed_records_do_not_derail_the_parse() {
+        let out = b"160000 abc 0\tforge-tooling/aggtest/astropy\0\
+                    garbage\0\
+                    \0\
+                    160000 def 0\tdeep/nested/sub\0";
         let links = parse_gitlinks(out);
         assert_eq!(links.len(), 2);
         assert_eq!(links[1].1, "deep/nested/sub");
     }
 
+    /// `git config --get-regexp -z` output: `key\nvalue\0` per record.
+    fn cfg_z(pairs: &[(&str, &str)]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (k, val) in pairs {
+            v.extend_from_slice(k.as_bytes());
+            v.push(b'\n');
+            v.extend_from_slice(val.as_bytes());
+            v.push(0);
+        }
+        v
+    }
+
     #[test]
     fn gitmodules_is_keyed_by_path_not_name() {
-        let out = "submodule.trinity.path trinity\n\
-                   submodule.trinity.url org-302118749@github.com:EtharaOrion/trinity.git\n\
-                   submodule.trinity.branch main\n\
-                   submodule.staging.path staging\n\
-                   submodule.staging.url org-302118749@github.com:EtharaOrion/staging.git\n";
-        let cfg = parse_gitmodules(out);
+        let out = cfg_z(&[
+            ("submodule.trinity.path", "trinity"),
+            ("submodule.trinity.url", "org-302118749@github.com:EtharaOrion/trinity.git"),
+            ("submodule.trinity.branch", "main"),
+            ("submodule.staging.path", "staging"),
+            ("submodule.staging.url", "org-302118749@github.com:EtharaOrion/staging.git"),
+        ]);
+        let cfg = parse_gitmodules(&out);
         assert_eq!(cfg.len(), 2);
         let t = &cfg["trinity"];
         assert_eq!(t.name, "trinity");
@@ -572,22 +616,35 @@ mod tests {
 
     #[test]
     fn a_submodule_name_containing_dots_still_parses() {
-        let cfg = parse_gitmodules(
-            "submodule.vendor.lib.v2.path vendor/lib\nsubmodule.vendor.lib.v2.url git@h:o/r.git\n",
-        );
+        let cfg = parse_gitmodules(&cfg_z(&[
+            ("submodule.vendor.lib.v2.path", "vendor/lib"),
+            ("submodule.vendor.lib.v2.url", "git@h:o/r.git"),
+        ]));
         assert_eq!(cfg["vendor/lib"].name, "vendor.lib.v2");
+    }
+
+    #[test]
+    fn a_submodule_whose_name_and_path_hold_spaces_and_non_ascii_still_parses() {
+        // The name defaults to the path; a space in it is why the listing is -z.
+        let cfg = parse_gitmodules(&cfg_z(&[
+            ("submodule.vendor/süb mod.path", "vendor/süb mod"),
+            ("submodule.vendor/süb mod.url", "/srv/uml.git"),
+        ]));
+        let m = &cfg["vendor/süb mod"];
+        assert_eq!(m.name, "vendor/süb mod");
+        assert_eq!(m.url.as_deref(), Some("/srv/uml.git"));
     }
 
     #[test]
     fn an_entry_with_no_path_is_dropped_rather_than_guessed() {
         // A url without a path can't be matched to a gitlink.
-        let cfg = parse_gitmodules("submodule.orphan.url git@h:o/r.git\n");
+        let cfg = parse_gitmodules(&cfg_z(&[("submodule.orphan.url", "git@h:o/r.git")]));
         assert!(cfg.is_empty());
     }
 
     #[test]
     fn an_absent_gitmodules_leaves_every_gitlink_unmapped() {
-        assert!(parse_gitmodules("").is_empty());
+        assert!(parse_gitmodules(b"").is_empty());
     }
 
     #[test]
@@ -705,21 +762,11 @@ pub async fn submodule_statuses(repo_path: &str) -> Result<Vec<SubmoduleStatus>,
     if !repo.is_dir() {
         return Err(AppError::NotFound(format!("{} no longer exists on disk", repo_path)));
     }
-    let listing = GitCmd::at(&repo)
-        .args(["ls-files", "-s"])
-        .text()
-        .await
-        .unwrap_or_default();
-    let gitlinks = parse_gitlinks(&listing);
+    let gitlinks = parse_gitlinks(&index_listing(&repo).await);
     if gitlinks.is_empty() {
         return Ok(Vec::new());
     }
-    let cfg_out = GitCmd::at(&repo)
-        .args(["config", "-f", ".gitmodules", "--get-regexp", r"\.(path|url|branch)$"])
-        .ok_text()
-        .await
-        .unwrap_or_default();
-    let cfg = parse_gitmodules(&cfg_out);
+    let cfg = parse_gitmodules(&gitmodules_listing(&repo).await);
 
     let mut candidates: Vec<(String, String, Option<String>, bool, PathBuf)> = Vec::new();
     for (recorded, path) in gitlinks {

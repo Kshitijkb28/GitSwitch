@@ -852,12 +852,33 @@ pub(crate) async fn unmerged(repo: &Path) -> Vec<git_status::ChangeEntry> {
         .collect()
 }
 
+/// The reflog subject a rebase writes when it cannot re-apply its autostash
+/// (`git stash store -m autostash`): exactly this word, no branch prefix. A
+/// hand-made stash whose message mentions the word is "On main: …autostash…"
+/// and is not one.
+pub(crate) const AUTOSTASH_SUBJECT: &str = "autostash";
+
+pub(crate) fn is_autostash_subject(subject: &str) -> bool {
+    subject.trim() == AUTOSTASH_SUBJECT
+}
+
+/// Any entry in the stash list that a rebase's failed autostash pop stored.
 pub(crate) async fn has_autostash_entry(repo: &Path) -> bool {
     g(repo)
         .args(["stash", "list", "--format=%gs"])
         .ok_text()
         .await
-        .is_some_and(|s| s.lines().any(|l| l.contains("autostash")))
+        .is_some_and(|s| s.lines().any(is_autostash_subject))
+}
+
+/// The newest stash entry is one a rebase's failed autostash pop stored — the
+/// entry conflicts left behind with no operation in progress came from.
+pub(crate) async fn autostash_on_top(repo: &Path) -> bool {
+    g(repo)
+        .args(["stash", "list", "-n1", "--format=%gs"])
+        .ok_text()
+        .await
+        .is_some_and(|s| is_autostash_subject(&s))
 }
 
 /// The state machine's single step: called after the superproject rebase

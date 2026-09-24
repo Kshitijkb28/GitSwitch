@@ -270,7 +270,8 @@ export function ChangesList({
                       <Minus size={13} />
                     </Button>
                   )}
-                  {onDiscard && (
+                  {/* Not for a gitlink: the backend refuses, and the changes live in the submodule. */}
+                  {onDiscard && !e.is_submodule && (
                     <Button
                       size="sm"
                       variant="ghost"

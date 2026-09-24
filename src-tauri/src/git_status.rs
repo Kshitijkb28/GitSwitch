@@ -87,16 +87,35 @@ pub struct Sides {
     pub theirs: String,
 }
 
+/// A full object id — what git writes into `rebase-merge/onto`.
+fn is_full_oid(s: &str) -> bool {
+    s.len() >= 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Seven characters of a full id; anything else (a ref name) untouched.
+fn short_oid(s: &str) -> String {
+    if is_full_oid(s) {
+        s[..7].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 /// Which words describe each side of a conflict for this kind of operation.
+/// For a rebase "theirs" is the base being replayed onto: its ref name when
+/// one is known (`origin/main`), else the upstream's, else the short id — never
+/// the 40-character id git stores.
 pub fn sides_for(kind: &str, branch: Option<&str>, upstream: Option<&str>, onto: Option<&str>) -> Sides {
     let mine_branch = branch.map(|b| b.to_string()).unwrap_or_else(|| "your branch".to_string());
     match kind {
         "rebase" | "rebase-interactive" | "am" => Sides {
             mine: "your commit being replayed".into(),
-            theirs: onto
-                .or(upstream)
-                .map(|s| s.trim_start_matches("refs/remotes/").to_string())
-                .unwrap_or_else(|| "the base it is replayed onto".into()),
+            theirs: match (onto, upstream) {
+                (Some(o), _) if !is_full_oid(o) => o.trim_start_matches("refs/remotes/").to_string(),
+                (_, Some(u)) => u.trim_start_matches("refs/remotes/").to_string(),
+                (Some(o), None) => short_oid(o),
+                (None, None) => "the base it is replayed onto".into(),
+            },
         },
         "cherry-pick" => Sides { mine: mine_branch, theirs: "the picked commit".into() },
         "revert" => Sides { mine: mine_branch, theirs: "the revert".into() },
@@ -463,7 +482,7 @@ pub fn parse_in_progress(p: &OpPresence) -> Option<InProgress> {
         .map(|(a, b)| format!("step {} of {}", a, b))
         .unwrap_or_default();
     let branch_text = match (&p.head_name, &p.onto) {
-        (Some(h), Some(o)) => format!("{} onto {}", h.trim_start_matches("refs/heads/"), o),
+        (Some(h), Some(o)) => format!("{} onto {}", h.trim_start_matches("refs/heads/"), short_oid(o)),
         (Some(h), None) => h.trim_start_matches("refs/heads/").to_string(),
         _ => String::new(),
     };
@@ -665,6 +684,44 @@ pub(crate) fn presence_from_disk(p: &GitPaths) -> OpPresence {
     }
 }
 
+/// The name a person would use for the commit a rebase replays onto, when a
+/// ref points exactly at it: the rebased branch's upstream first (a
+/// `pull --rebase` or Sync: "origin/main"), then any remote-tracking branch,
+/// then any other local branch. `None` when only the id names it.
+async fn onto_name(repo: &Path, head_name: Option<&str>, onto: &str) -> Option<String> {
+    let branch = head_name.map(|h| h.trim_start_matches("refs/heads/"));
+    if let Some(b) = branch {
+        let upstream = GitCmd::at(repo)
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", &format!("{}@{{upstream}}", b)])
+            .ok_text()
+            .await
+            .filter(|s| !s.is_empty());
+        if let Some(up) = upstream {
+            let at = GitCmd::at(repo)
+                .args(["rev-parse", "--verify", "--quiet", &format!("{}^{{commit}}", up)])
+                .ok_text()
+                .await;
+            if at.as_deref() == Some(onto) {
+                return Some(up);
+            }
+        }
+    }
+    let refs = GitCmd::at(repo)
+        .args(["for-each-ref", &format!("--points-at={}", onto), "--format=%(refname)", "refs/remotes", "refs/heads"])
+        .ok_text()
+        .await?;
+    let names: Vec<&str> = refs
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && !crate::git_history::is_remote_head(r))
+        .collect();
+    names
+        .iter()
+        .find(|r| r.starts_with("refs/remotes/"))
+        .or_else(|| names.iter().find(|r| r.strip_prefix("refs/heads/").is_some_and(|n| Some(n) != branch)))
+        .map(|r| r.trim_start_matches("refs/remotes/").trim_start_matches("refs/heads/").to_string())
+}
+
 /// What git will actually sign and stamp on the next commit, plus how that
 /// compares with the folder's profile.
 async fn read_identity(repo: &Path, hooks: &Path) -> RepoIdentity {
@@ -832,7 +889,13 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
     }
 
     let paths = git_paths(&repo).await?;
-    let presence = presence_from_disk(&paths);
+    let mut presence = presence_from_disk(&paths);
+    // git stores the rebase base as a full id; a person knows it by name.
+    if let Some(onto) = presence.onto.clone().filter(|o| is_full_oid(o)) {
+        if let Some(name) = onto_name(&repo, presence.head_name.as_deref(), &onto).await {
+            presence.onto = Some(name);
+        }
+    }
     let mut operation = parse_in_progress(&presence);
     if let Some(op) = operation.as_mut() {
         op.sides = Some(sides_for(&op.kind, parsed.branch.as_deref(), parsed.upstream.as_deref(), presence.onto.as_deref()));
@@ -869,7 +932,13 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         .unwrap_or(false);
     let can_amend = !parsed.unborn && head_subject.is_some() && !published && operation.is_none();
 
-    let has_submodules = repo.join(".gitmodules").exists();
+    // "There are submodules" — a `.gitmodules` file, a gitlink row in the
+    // status, or (a clean, populated gitlink nobody mapped) any gitlink in the
+    // index. The UI asks for submodule statuses exactly when this is true, and
+    // a populated-but-unmapped submodule must get its section too.
+    let has_submodules = repo.join(".gitmodules").exists()
+        || parsed.entries.iter().any(|e| e.is_submodule)
+        || crate::submodules::has_gitlinks(&repo).await;
     let uses_lfs = crate::lfs::repo_uses_lfs(&repo).await;
 
     let staged_count = parsed.entries.iter().filter(|e| e.kind == "tracked" && e.is_staged()).count();
@@ -886,8 +955,12 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         .filter(|e| e.is_submodule && (e.sub_commit_changed || e.sub_tracked_changes || e.sub_untracked))
         .count();
 
+    // Conflicts with nothing in progress came from re-applying a stash. It was
+    // a rebase's autostash exactly when the newest entry is the one git stored
+    // for it (`autostash`, no prefix); an older leftover elsewhere in the list
+    // says nothing about these conflicts.
     let conflict_source = if conflicted_count > 0 && operation.is_none() {
-        Some(if crate::sync::has_autostash_entry(&repo).await { "autostash".to_string() } else { "stash".to_string() })
+        Some(if crate::sync::autostash_on_top(&repo).await { "autostash".to_string() } else { "stash".to_string() })
     } else {
         None
     };
@@ -1058,7 +1131,9 @@ pub fn render_diff(raw: Vec<u8>, path: &str, staged: bool, empty_reason: &str) -
     let too_big = raw.len() > MAX_DIFF_BYTES;
     let text = String::from_utf8_lossy(&raw[..raw.len().min(MAX_DIFF_BYTES)]);
     let all: Vec<&str> = text.lines().collect();
-    let total_lines = all.len();
+    // "first N of M": M is the whole diff's line count, even when the cut
+    // happened on bytes before the line cap was reached.
+    let total_lines = if too_big { count_lines(&raw) } else { all.len() };
     let truncated = too_big || total_lines > MAX_DIFF_LINES;
     let shown = all.iter().take(MAX_DIFF_LINES);
 
@@ -1093,6 +1168,17 @@ pub fn render_diff(raw: Vec<u8>, path: &str, staged: bool, empty_reason: &str) -
 
 fn lines_is_empty(total: usize) -> bool {
     total == 0
+}
+
+/// Lines in a byte buffer, the way `str::lines` would count them: one per
+/// newline, plus the last line when it has no newline of its own.
+fn count_lines(raw: &[u8]) -> usize {
+    let newlines = raw.iter().filter(|b| **b == b'\n').count();
+    match raw.last() {
+        None => 0,
+        Some(b'\n') => newlines,
+        Some(_) => newlines + 1,
+    }
 }
 
 fn guard_rev(rev: &str) -> Result<(), AppError> {
@@ -1339,6 +1425,14 @@ mod tests {
         let r = sides_for("rebase", Some("main"), Some("origin/main"), Some("refs/remotes/origin/main"));
         assert_eq!(r.mine, "your commit being replayed");
         assert_eq!(r.theirs, "origin/main");
+        // git writes the base as a full id: a known upstream name is preferred,
+        // else the id is shortened — never shown whole.
+        let oid = "a1e67a9f0b2c3d4e5f60718293a4b5c6d7e8f901";
+        assert_eq!(sides_for("rebase", None, Some("origin/main"), Some(oid)).theirs, "origin/main");
+        assert_eq!(sides_for("rebase", None, None, Some(oid)).theirs, "a1e67a9");
+        assert_eq!(sides_for("rebase", None, None, None).theirs, "the base it is replayed onto");
+        // A name resolved for the base wins over the upstream (a `git rebase develop`).
+        assert_eq!(sides_for("rebase", Some("main"), Some("origin/main"), Some("develop")).theirs, "develop");
         let c = sides_for("cherry-pick", None, None, None);
         assert_eq!(c.mine, "your branch");
         assert_eq!(c.theirs, "the picked commit");
@@ -1354,6 +1448,25 @@ mod tests {
         let t = render_diff(b"@@ -1 +1 @@\n-old\n+new\n".to_vec(), "a.txt", true, "n/a");
         assert_eq!((t.added, t.removed), (1, 1));
         assert!(t.empty_reason.is_none());
+    }
+
+    #[test]
+    fn a_diff_cut_by_bytes_still_reports_the_whole_line_count() {
+        // Long lines: the byte cap fires well before the line cap, and
+        // "first N of M" must count M over the whole diff, not the kept prefix.
+        let line = format!("+{}\n", "x".repeat(999));
+        let n = MAX_DIFF_BYTES / line.len() + 50;
+        let raw: Vec<u8> = line.repeat(n).into_bytes();
+        let d = render_diff(raw, "big.txt", false, "n/a");
+        assert!(d.truncated);
+        assert_eq!(d.total_lines, n);
+        assert!(d.lines.len() < d.total_lines, "{} shown of {}", d.lines.len(), d.total_lines);
+        // Under the byte cap the count is the text's own.
+        let small = render_diff(b"+a\n+b\n+c".to_vec(), "s.txt", false, "n/a");
+        assert_eq!(small.total_lines, 3);
+        assert_eq!(count_lines(b"a\nb\n"), 2);
+        assert_eq!(count_lines(b"a\nb"), 2);
+        assert_eq!(count_lines(b""), 0);
     }
 
     #[test]
@@ -1396,6 +1509,15 @@ mod tests {
         assert_eq!(op.kind, "rebase");
         assert_eq!(op.detail, "step 3 of 7, feature onto main");
         assert_eq!(op.abort_command, "git rebase --abort");
+        // What git actually writes into rebase-merge/onto is the full id.
+        let raw = OpPresence {
+            rebase_merge: true,
+            step: Some((1, 1)),
+            head_name: Some("refs/heads/main".into()),
+            onto: Some("a1e67a9f0b2c3d4e5f60718293a4b5c6d7e8f901".into()),
+            ..Default::default()
+        };
+        assert_eq!(parse_in_progress(&raw).unwrap().detail, "step 1 of 1, main onto a1e67a9");
 
         let interactive = OpPresence {
             rebase_merge: true,

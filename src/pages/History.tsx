@@ -153,6 +153,19 @@ export function History() {
     }
   }, []);
 
+  /** The Merge status card: which branches contain `r`. Only for a single branch, and re-read after anything that moved one. */
+  const loadMergeInfo = useCallback(async (path: string, r: string) => {
+    if (!path || r === "--all" || r.includes("..")) {
+      setMergeInfo(null);
+      return;
+    }
+    try {
+      setMergeInfo(await api.historyBranchMerges(path, r));
+    } catch {
+      setMergeInfo(null);
+    }
+  }, []);
+
   /** git fetch — updates remote refs only; the working tree is never touched. */
   async function doFetch(path = repo, silent = false) {
     if (!path) return;
@@ -162,6 +175,7 @@ export function History() {
       const res = await api.historyFetch(path);
       await loadBranches(path);
       await loadSync(path, rev);
+      await loadMergeInfo(path, rev);
       setReloadKey((k) => k + 1); // re-read the commit page with fresh refs
       if (!silent) toast.success(res.message);
     } catch (e) {
@@ -286,6 +300,8 @@ export function History() {
       if (!(r.refusal && PANEL_HANDLES.has(r.refusal.code))) closePanel();
       await loadBranches(repo);
       await loadSync(repo, rev);
+      // A reset or a new branch changes which branches contain this one.
+      await loadMergeInfo(repo, rev);
       setReloadKey((k) => k + 1);
       return r;
     } catch (e) {
@@ -363,13 +379,7 @@ export function History() {
     setRev(name);
     setOffset(0);
     setMergeInfo(null);
-    if (name !== "--all" && !name.includes("..")) {
-      try {
-        setMergeInfo(await api.historyBranchMerges(repo, name));
-      } catch {
-        setMergeInfo(null);
-      }
-    }
+    await loadMergeInfo(repo, name);
   }
 
   const visibleBranches = branches.filter((b) => b.is_remote === showRemote);

@@ -848,20 +848,25 @@ pub async fn changes_stash_push(repo_path: String, message: Option<String>, incl
     crate::stash::stash_push(&repo_path, message.as_deref(), include_untracked, None).await
 }
 
+/// `oid`, when given, is the commit id the UI showed for that row: the
+/// operation is refused (`no-stash`) if `stash@{index}` now holds a different
+/// entry, so a list that went stale never acts on a neighbour.
 #[tauri::command]
-pub async fn changes_stash_apply(repo_path: String, index: usize, pop: bool, restore_index: bool) -> Result<OpResult, AppError> {
-    crate::stash::stash_apply(&repo_path, index, pop, restore_index).await
+pub async fn changes_stash_apply(repo_path: String, index: usize, pop: bool, restore_index: bool, oid: Option<String>) -> Result<OpResult, AppError> {
+    crate::stash::stash_apply(&repo_path, index, pop, restore_index, oid.as_deref()).await
 }
 
 /// The result carries `git stash store …` so a dropped entry can be put back.
+/// `oid` as for `changes_stash_apply`.
 #[tauri::command]
-pub async fn changes_stash_drop(repo_path: String, index: usize) -> Result<OpResult, AppError> {
-    crate::stash::stash_drop(&repo_path, index).await
+pub async fn changes_stash_drop(repo_path: String, index: usize, oid: Option<String>) -> Result<OpResult, AppError> {
+    crate::stash::stash_drop(&repo_path, index, oid.as_deref()).await
 }
 
+/// `oid` as for `changes_stash_apply`.
 #[tauri::command]
-pub async fn changes_stash_restore_file(repo_path: String, index: usize, path: String) -> Result<OpResult, AppError> {
-    crate::stash::stash_restore_file(&repo_path, index, &path).await
+pub async fn changes_stash_restore_file(repo_path: String, index: usize, path: String, oid: Option<String>) -> Result<OpResult, AppError> {
+    crate::stash::stash_restore_file(&repo_path, index, &path, oid.as_deref()).await
 }
 
 /// What one commit did to one file (first-parent diff for merges).

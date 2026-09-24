@@ -64,6 +64,158 @@ pub(crate) mod tests {
         }
     }
 
+    // --- `invoke`: the frontend's IPC, forwarded to the real commands ---------
+    //
+    // `PROBE_OP=invoke PROBE_CMD=<tauri command> PROBE_JSON=<args as the UI
+    // sends them, camelCase>` calls the same `#[tauri::command]` function the
+    // app would and prints `{"ok":true,"value":<return>}` or
+    // `{"ok":false,"error":<AppError>}` — the raw shape, not `show()`'s
+    // flattening, so the live UI harness can hand it straight back to the page.
+
+    /// `repo_path` → `repoPath`: the key Tauri's default argument casing expects.
+    fn camel(snake: &str) -> String {
+        let mut out = String::with_capacity(snake.len());
+        let mut up = false;
+        for ch in snake.chars() {
+            if ch == '_' {
+                up = true;
+            } else if up {
+                out.extend(ch.to_uppercase());
+                up = false;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// One parameter, by its Rust name. Missing or `null` deserialises to `None`
+    /// for an `Option<T>` and is an error for anything else — as in Tauri.
+    fn arg<T: serde::de::DeserializeOwned>(args: &serde_json::Value, snake: &str) -> Result<T, String> {
+        let key = camel(snake);
+        let v = args
+            .get(&key)
+            .or_else(|| args.get(snake))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        serde_json::from_value(v).map_err(|e| format!("invalid argument `{}` for this command: {}", key, e))
+    }
+
+    fn reply<T: serde::Serialize>(r: Result<T, crate::error::AppError>) {
+        match r {
+            Ok(v) => emit(&serde_json::json!({ "ok": true, "value": v })),
+            Err(e) => reply_err(e.to_string()),
+        }
+    }
+
+    fn reply_err(message: String) {
+        emit(&serde_json::json!({ "ok": false, "error": message }));
+    }
+
+    /// `forward!(c::changes_stage, args, repo_path, paths)`: read each named
+    /// parameter from the JSON object, call the command, print the outcome.
+    macro_rules! forward {
+        ($f:path, $args:expr $(, $p:ident)*) => {{
+            $( let $p = match arg(&$args, stringify!($p)) { Ok(v) => v, Err(e) => return reply_err(e) }; )*
+            reply($f($($p),*).await)
+        }};
+    }
+
+    /// Commands that return a plain value rather than a `Result`.
+    macro_rules! forward_plain {
+        ($f:path, $args:expr $(, $p:ident)*) => {{
+            $( let $p = match arg(&$args, stringify!($p)) { Ok(v) => v, Err(e) => return reply_err(e) }; )*
+            reply(Ok::<_, crate::error::AppError>($f($($p),*).await))
+        }};
+    }
+
+    pub(crate) async fn invoke() {
+        use crate::commands as c;
+        let cmd = std::env::var("PROBE_CMD").unwrap_or_default();
+        let raw = std::env::var("PROBE_JSON").unwrap_or_else(|_| "{}".into());
+        let args: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => return reply_err(format!("PROBE_JSON is not JSON: {}", e)),
+        };
+        match cmd.as_str() {
+            // profiles / repositories
+            "get_profiles" => reply(c::get_profiles()),
+            "history_list_repos" => forward!(c::history_list_repos, args),
+            "path_exists" => {
+                let path: String = match arg(&args, "path") { Ok(v) => v, Err(e) => return reply_err(e) };
+                reply(Ok::<_, crate::error::AppError>(c::path_exists(path)))
+            }
+            // Changes page: state and diffs
+            "changes_repo_status" => forward!(c::changes_repo_status, args, repo_path),
+            "changes_file_diff" => forward!(c::changes_file_diff, args, repo_path, path, staged, untracked),
+            "changes_submodules" => forward!(c::changes_submodules, args, repo_path),
+            "changes_submodule_statuses" => forward!(c::changes_submodule_statuses, args, repo_path),
+            "changes_lfs_status" => forward!(c::changes_lfs_status, args, repo_path),
+            "lfs_available" => forward_plain!(c::lfs_available, args),
+            // Changes page: operations
+            "changes_stage" => forward!(c::changes_stage, args, repo_path, paths),
+            "changes_stage_all" => forward!(c::changes_stage_all, args, repo_path),
+            "changes_unstage" => forward!(c::changes_unstage, args, repo_path, paths),
+            "changes_discard" => forward!(c::changes_discard, args, repo_path, paths),
+            "changes_commit" => forward!(c::changes_commit, args, repo_path, message, amend),
+            "changes_push" => forward!(c::changes_push, args, repo_path, set_upstream),
+            "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash),
+            "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path),
+            "changes_lfs_pull" => forward!(c::changes_lfs_pull, args, repo_path),
+            "changes_continue" => forward!(c::changes_continue, args, repo_path),
+            "changes_abort" => forward!(c::changes_abort, args, repo_path),
+            // sync
+            "changes_sync_plan" => forward!(c::changes_sync_plan, args, repo_path, stash, fetch),
+            "changes_sync_run" => forward!(c::changes_sync_run, args, repo_path, stash, bundles, fingerprint),
+            "changes_sync_continue" => forward!(c::changes_sync_continue, args, repo_path),
+            "changes_sync_abort" => forward!(c::changes_sync_abort, args, repo_path),
+            "changes_record_pointers" => forward!(c::changes_record_pointers, args, repo_path),
+            // push access
+            "changes_push_state" => forward!(c::changes_push_state, args, repo_path),
+            "changes_set_push_mode" => forward!(c::changes_set_push_mode, args, repo_path, mode),
+            "changes_repair_push_lock" => forward!(c::changes_repair_push_lock, args, repo_path),
+            "changes_repair_push_block" => forward!(c::changes_repair_push_block, args, repo_path),
+            "push_lock_helper_status" => forward_plain!(c::push_lock_helper_status, args),
+            "push_lock_finish_manual" => forward_plain!(c::push_lock_finish_manual, args, nonce),
+            // tree: branches, undo, reset, revert, conflicts
+            "changes_switch_branch" => forward!(c::changes_switch_branch, args, repo_path, name),
+            "changes_create_branch" => forward!(c::changes_create_branch, args, repo_path, name, from, switch_to),
+            "changes_delete_branch" => forward!(c::changes_delete_branch, args, repo_path, name, force),
+            "changes_rename_branch" => forward!(c::changes_rename_branch, args, repo_path, old_name, new_name),
+            "changes_undo_commit" => forward!(c::changes_undo_commit, args, repo_path),
+            "changes_reset" => forward!(c::changes_reset, args, repo_path, target, mode, stash_first),
+            "changes_detach" => forward!(c::changes_detach, args, repo_path, target),
+            "changes_revert" => forward!(c::changes_revert, args, repo_path, target, mainline),
+            "changes_cherry_pick" => forward!(c::changes_cherry_pick, args, repo_path, target),
+            "changes_resolve_side" => forward!(c::changes_resolve_side, args, repo_path, paths, side),
+            "changes_discard_all" => forward!(c::changes_discard_all, args, repo_path, include_untracked, stash_first),
+            // stashes
+            "changes_stash_list" => forward!(c::changes_stash_list, args, repo_path),
+            "changes_stash_show" => forward!(c::changes_stash_show, args, repo_path, index),
+            "changes_stash_file_diff" => forward!(c::changes_stash_file_diff, args, repo_path, index, path),
+            "changes_stash_push" => forward!(c::changes_stash_push, args, repo_path, message, include_untracked),
+            "changes_stash_apply" => forward!(c::changes_stash_apply, args, repo_path, index, pop, restore_index, oid),
+            "changes_stash_drop" => forward!(c::changes_stash_drop, args, repo_path, index, oid),
+            "changes_stash_restore_file" => forward!(c::changes_stash_restore_file, args, repo_path, index, path, oid),
+            // History page
+            "history_branches" => forward!(c::history_branches, args, repo_path),
+            "history_page" => forward!(c::history_page, args, repo_path, rev, offset, limit, search, author),
+            "history_commit_detail" => forward!(c::history_commit_detail, args, repo_path, hash),
+            "history_branch_merges" => forward!(c::history_branch_merges, args, repo_path, branch),
+            "history_fetch" => forward!(c::history_fetch, args, repo_path),
+            "history_sync_status" => forward!(c::history_sync_status, args, repo_path, branch),
+            "history_commit_file_diff" => forward!(c::history_commit_file_diff, args, repo_path, hash, path),
+            "history_resolve" => forward!(c::history_resolve, args, repo_path, text),
+            // These take a `tauri::AppHandle` (tray label updates) and cannot run outside the app.
+            "create_profile" | "update_profile" | "delete_profile" | "set_default_profile" | "sparse_clone"
+            | "full_clone" => reply_err(format!(
+                "`{}` needs a Tauri AppHandle, which the probe cannot supply",
+                cmd
+            )),
+            other => reply_err(format!("unknown command `{}`", other)),
+        }
+    }
+
     #[tokio::test]
     #[ignore]
     async fn probe() {
@@ -71,6 +223,8 @@ pub(crate) mod tests {
         let a = args();
         let first = a.first().map(|s| s.as_str()).unwrap_or("");
         match op.as_str() {
+            // --- the UI's IPC, forwarded (scripts/verify/harness/live.mjs) ---
+            "invoke" => invoke().await,
             // --- Changes page ---
             "status" => match git_status::repo_status(&repo()).await {
                 Ok(s) => emit(&s),
@@ -105,6 +259,16 @@ pub(crate) mod tests {
             },
             // PROBE_ARGS: "<sha>,<path>"
             "commit_diff" => match git_status::commit_file_diff(&repo(), first, a.get(1).map(|s| s.as_str()).unwrap_or("")).await {
+                Ok(d) => emit(&d),
+                Err(e) => emit_err(e),
+            },
+            // PROBE_ARGS: "<sha>"
+            "commit_detail" => match crate::git_history::commit_detail(&repo(), first) {
+                Ok(d) => emit(&d),
+                Err(e) => emit_err(e),
+            },
+            // PROBE_ARGS: "<branch>"
+            "merge_info" => match crate::git_history::branch_merge_info(&repo(), first) {
                 Ok(d) => emit(&d),
                 Err(e) => emit_err(e),
             },

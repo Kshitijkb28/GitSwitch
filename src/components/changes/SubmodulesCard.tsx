@@ -57,6 +57,7 @@ function SubmoduleRow({
   onOpenRepo,
   hasSection,
   onJumpToSection,
+  refreshKey,
 }: {
   repoPath: string;
   sub: SubmoduleInfo;
@@ -65,6 +66,7 @@ function SubmoduleRow({
   /** The main column already shows this submodule's files — link there instead of re-reading them. */
   hasSection: boolean;
   onJumpToSection?: (path: string) => void;
+  refreshKey: number;
 }) {
   const [open, setOpen] = useState(false);
   const [inner, setInner] = useState<RepoStatus | null>(null);
@@ -74,6 +76,15 @@ function SubmoduleRow({
 
   const absolute = `${repoPath.replace(/\/+$/, "")}/${sub.path}`;
   const hasInnerChanges = sub.dirty_tracked > 0 || sub.dirty_untracked > 0;
+  const canToggle = sub.moved_commits.length > 0 || (sub.initialised && hasInnerChanges);
+
+  // The file list is a snapshot of one state of the submodule. When the
+  // backend's facts about it change, or anything ran, it is stale: drop it and
+  // let the effect below re-read it if the row is still open.
+  useEffect(() => {
+    setInner(null);
+    setError(null);
+  }, [sub.actual, sub.dirty_tracked, sub.dirty_untracked, refreshKey]);
 
   // Read the submodule's own files only when asked: cheap per submodule
   // (~70 ms) but pointless for every one of them at once.
@@ -123,7 +134,7 @@ function SubmoduleRow({
             </p>
           )}
 
-          {(sub.moved_commits.length > 0 || (sub.initialised && hasInnerChanges)) && (
+          {canToggle && (
             <button
               onClick={() => setOpen((o) => !o)}
               className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer mt-1"
@@ -132,7 +143,8 @@ function SubmoduleRow({
             </button>
           )}
 
-          {open && (
+          {/* Only while the toggle exists: once the submodule is clean there is nothing to keep showing. */}
+          {open && canToggle && (
             <div className="mt-2 space-y-2">
               {sub.moved_commits.length > 0 && (
                 <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/40 p-2">
@@ -280,6 +292,7 @@ export function SubmodulesCard({
             onOpenRepo={onOpenRepo}
             hasSection={sectionPaths.includes(s.path)}
             onJumpToSection={onJumpToSection}
+            refreshKey={refreshKey}
           />
         ))}
       </ul>

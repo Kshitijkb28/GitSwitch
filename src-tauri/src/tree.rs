@@ -331,13 +331,10 @@ pub fn check_tree(intent: &TreeIntent, f: &StatusFacts) -> Option<Refusal> {
             _ => {}
         }
     }
+    // A hard reset on a dirty tree without `stash_first` is not refused: the
+    // caller's dialog has already said the changes are thrown away, and that
+    // explicit choice is honoured — exactly as "Discard everything" is.
     match intent {
-        Reset { mode: ResetMode::Hard, stash_first: false, .. } if f.staged + f.unstaged > 0 => {
-            return Some(refuse(
-                "dirty-tree",
-                "A hard reset throws away uncommitted changes. Commit or stash them first, or choose 'stash first'.",
-            ));
-        }
         Reset { mode, target_is_head: true, .. } if *mode != ResetMode::Hard || f.staged + f.unstaged == 0 => {
             return Some(refuse("nothing-to-do", "The branch is already at that commit."));
         }
@@ -483,8 +480,11 @@ pub struct CommitTarget {
     pub contained_in_head: bool,
     /// How many commits would leave the branch on a reset to it.
     pub dropped_if_reset: usize,
-    /// Some of those commits are already on the upstream — a reset is refused.
+    /// Some of those commits are already on a remote branch (the upstream or
+    /// any other) — a reset is refused, since taking them back would need a
+    /// force-push. The same definition `can_amend` / `already-pushed` use.
     pub would_drop_pushed: bool,
+    /// The commit itself is on some remote branch.
     pub on_remote: bool,
 }
 
@@ -615,24 +615,76 @@ async fn parents_of(repo: &str, oid: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn has_upstream(repo: &str) -> bool {
-    sync::oid(Path::new(repo), "@{upstream}").await.is_some()
+/// Commits in `oid..HEAD` that some remote-tracking branch already holds, and
+/// which branches those are. "Pushed" means the same thing everywhere in this
+/// app — on *any* remote branch, not only the upstream — because a commit a
+/// remote has can only be taken back with a force-push, which GitSwitch never
+/// does. `can_amend` / `already-pushed` use the same definition (any ref under
+/// `refs/remotes` containing HEAD). Measured exactly, so a branch that has
+/// diverged from, or fallen behind, its upstream is judged right too.
+#[derive(Debug, Default)]
+struct PushedDropped {
+    count: usize,
+    /// The remote branches holding at least one of those commits (short names).
+    on: Vec<String>,
 }
 
-/// How many commits in `oid..HEAD` the upstream already has. Those are the
-/// ones a reset would have to force-push away, so any of them refuses it.
-/// Measured exactly (not just "is the upstream still contained") so a branch
-/// that has diverged from, or fallen behind, its upstream is judged right too.
-async fn pushed_dropped(repo: &str, oid: &str) -> usize {
-    if !has_upstream(repo).await {
-        return 0;
-    }
+async fn pushed_dropped(repo: &str, oid: &str) -> PushedDropped {
     let total = count(repo, &[&format!("{}..HEAD", oid)]).await;
     if total == 0 {
-        return 0;
+        return PushedDropped::default();
     }
-    let unpushed = count(repo, &["HEAD", &format!("^{}", oid), "^@{upstream}"]).await;
-    total.saturating_sub(unpushed)
+    let unpushed = count(repo, &["HEAD", &format!("^{}", oid), "--not", "--remotes"]).await;
+    let pushed = total.saturating_sub(unpushed);
+    if pushed == 0 {
+        return PushedDropped::default();
+    }
+    // Name the branches: the newest dropped commit that is not among the
+    // unpushed ones is on some remote; ask which. Bounded lists — a reset
+    // dropping more than 200 commits is named by its newest ones.
+    let dropped = g(repo).args(["rev-list", "-n200", &format!("{}..HEAD", oid)]).ok_text().await.unwrap_or_default();
+    let unpushed_list = g(repo)
+        .args(["rev-list", "-n200", "HEAD", &format!("^{}", oid), "--not", "--remotes"])
+        .ok_text()
+        .await
+        .unwrap_or_default();
+    let unpushed_set: std::collections::HashSet<&str> = unpushed_list.lines().map(str::trim).collect();
+    let on = match dropped.lines().map(str::trim).find(|c| !c.is_empty() && !unpushed_set.contains(c)) {
+        Some(c) => remote_branches_containing(repo, c).await,
+        None => Vec::new(),
+    };
+    PushedDropped { count: pushed, on }
+}
+
+/// Short names of the remote-tracking branches that contain `commit`
+/// (`origin/main`), skipping each remote's symbolic `HEAD`.
+async fn remote_branches_containing(repo: &str, commit: &str) -> Vec<String> {
+    g(repo)
+        .args(["for-each-ref", &format!("--contains={}", commit), "--format=%(refname)", "refs/remotes"])
+        .ok_text()
+        .await
+        .map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|r| !r.is_empty() && !r.ends_with("/HEAD"))
+                .map(|r| r.trim_start_matches("refs/remotes/").to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `would-drop-pushed` sentence with the branches that actually hold the
+/// commits; the pure check only knows the upstream.
+fn would_drop_pushed_message(on: &[String], upstream: Option<&str>) -> String {
+    let where_ = match (on.is_empty(), upstream) {
+        (false, _) => on.iter().map(|b| format!("`{}`", b)).collect::<Vec<_>>().join(", "),
+        (true, Some(u)) => format!("`{}`", u),
+        (true, None) => "the remote".to_string(),
+    };
+    format!(
+        "Commits already on {} would be dropped, and GitSwitch never force-pushes. Look at that commit (detached), start a branch there, or Revert instead.",
+        where_
+    )
 }
 
 fn conflicted_paths(s: &RepoStatus) -> Vec<String> {
@@ -684,12 +736,16 @@ async fn free_backup_name(repo: &str, prefix: &str) -> String {
 }
 
 /// `git stash push` for a safety copy, verified by the stash count growing.
-async fn safety_stash(repo: &str, before: &RepoStatus, message: &str) -> Result<Result<StashRef, String>, AppError> {
-    let out = g(repo)
-        .args(["stash", "push", "--quiet", "--include-untracked", "-m", message])
-        .timeout(LOCAL_TIMEOUT)
-        .run()
-        .await?;
+/// Untracked files go in only when `include_untracked` — the caller is about
+/// to delete them; otherwise they stay on disk, where neither a hard reset nor
+/// a discard of tracked changes touches them.
+async fn safety_stash(repo: &str, before: &RepoStatus, message: &str, include_untracked: bool) -> Result<Result<StashRef, String>, AppError> {
+    let mut args = vec!["stash", "push", "--quiet"];
+    if include_untracked {
+        args.push("--include-untracked");
+    }
+    args.extend(["-m", message]);
+    let out = g(repo).args(args).timeout(LOCAL_TIMEOUT).run().await?;
     if !out.ok() {
         return Ok(Err(said(&out)));
     }
@@ -822,8 +878,12 @@ pub async fn create_branch(repo_path: &str, name: &str, from: Option<&str>, swit
     Ok(OpResult { tree: Some(tree), ..OpResult::done(headline, detail, after) })
 }
 
-/// `git branch -d`, or `-D` once the user has confirmed the count of commits
-/// only this branch holds. The local ref only; a remote branch is never touched.
+/// `git branch -D`, once the app's own gate has passed: no commit is lost when
+/// every commit of the branch is held by some other ref (branch, remote-tracking
+/// branch, tag or stash), or the user has confirmed the count of commits only
+/// this branch holds. Git's `-d` judges "merged into HEAD or the upstream",
+/// which refuses a branch merged only into another branch — so it is not used.
+/// The local ref only; a remote branch is never touched.
 pub async fn delete_branch(repo_path: &str, name: &str, force: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     let valid = validate_branch_name(name).is_ok();
@@ -842,11 +902,7 @@ pub async fn delete_branch(repo_path: &str, name: &str, force: bool) -> Result<O
     }
     let tip = tip.unwrap_or_default();
 
-    let out = g(repo_path)
-        .args(["branch", if force { "-D" } else { "-d" }, "--", name])
-        .timeout(LOCAL_TIMEOUT)
-        .run()
-        .await?;
+    let out = g(repo_path).args(["branch", "-D", "--", name]).timeout(LOCAL_TIMEOUT).run().await?;
     let after = snapshot(repo_path).await?;
     let mut tree = outcome("delete-branch", &before, &after);
     tree.commit = Some(commit_ref(repo_path, &tip).await);
@@ -949,19 +1005,26 @@ pub async fn undo_commit(repo_path: &str) -> Result<OpResult, AppError> {
 }
 
 /// Move the branch to `target`. Commits that would leave it are kept on a
-/// backup branch first; commits the upstream already has are never dropped.
+/// backup branch first; commits any remote branch already has are never
+/// dropped. `stash_first` stashes the staged and unstaged changes before the
+/// move (untracked files are left on disk: no reset touches them).
 pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_first: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     let target = target.trim();
     let oid = resolve_oid(repo_path, target).await?;
     let target_is_head = oid.is_some() && oid == before.head_oid;
-    let (dropped_total, drops_pushed) = match &oid {
-        Some(o) if !before.unborn => (count(repo_path, &[&format!("{}..HEAD", o)]).await, pushed_dropped(repo_path, o).await > 0),
-        _ => (0, false),
+    let (dropped_total, pushed) = match &oid {
+        Some(o) if !before.unborn => (count(repo_path, &[&format!("{}..HEAD", o)]).await, pushed_dropped(repo_path, o).await),
+        _ => (0, PushedDropped::default()),
     };
-    let intent = TreeIntent::Reset { mode, target_valid: oid.is_some(), target_is_head, drops_pushed, stash_first };
+    let intent = TreeIntent::Reset { mode, target_valid: oid.is_some(), target_is_head, drops_pushed: pushed.count > 0, stash_first };
     if let Some(r) = check(&Intent::Tree(intent), &StatusFacts::from(&before)) {
-        return Ok(OpResult::refused(name_target(r, target), before));
+        let r = if r.code == "would-drop-pushed" {
+            refuse("would-drop-pushed", would_drop_pushed_message(&pushed.on, before.upstream.as_deref()))
+        } else {
+            name_target(r, target)
+        };
+        return Ok(OpResult::refused(r, before));
     }
     let oid = oid.unwrap_or_default();
     let head_before = before.head_oid.clone().unwrap_or_default();
@@ -984,8 +1047,9 @@ pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_firs
         );
     }
 
-    if stash_first && before.staged_count + before.unstaged_count + before.untracked_count > 0 {
-        match safety_stash(repo_path, &before, &format!("gitswitch before reset to {}", target_ref.short)).await? {
+    // Untracked files are not stashed: a reset of any mode leaves them alone.
+    if stash_first && before.staged_count + before.unstaged_count > 0 {
+        match safety_stash(repo_path, &before, &format!("gitswitch before reset to {}", target_ref.short), false).await? {
             Ok(s) => tree.stash = Some(s),
             Err(said) => {
                 let after = snapshot(repo_path).await?;
@@ -1319,7 +1383,9 @@ pub async fn resolve_side(repo_path: &str, paths: Vec<String>, side: Side) -> Re
 }
 
 /// Everything back to HEAD: tracked changes restored, new files left untracked
-/// unless asked to delete them, ignored files never touched (no `-x`).
+/// unless asked to delete them, ignored files never touched (no `-x`). The
+/// safety stash takes the new files only when they are about to be deleted;
+/// otherwise they stay exactly where they are.
 pub async fn discard_all(repo_path: &str, include_untracked: bool, stash_first: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     let intent = TreeIntent::DiscardAll { include_untracked, stash_first };
@@ -1332,7 +1398,7 @@ pub async fn discard_all(repo_path: &str, include_untracked: bool, stash_first: 
     tree.restored_tracked = restored_tracked;
 
     if stash_first {
-        match safety_stash(repo_path, &before, "gitswitch before discard").await? {
+        match safety_stash(repo_path, &before, "gitswitch before discard", include_untracked).await? {
             Ok(s) => tree.stash = Some(s),
             Err(said) => {
                 let after = snapshot(repo_path).await?;
@@ -1422,13 +1488,8 @@ pub async fn resolve_commit(repo_path: &str, text: &str) -> Result<Option<Commit
     let is_head = head.as_deref() == Some(oid.as_str());
     let contained_in_head = head.is_some() && sync::is_ancestor(repo, &oid, "HEAD").await;
     let dropped_if_reset = if head.is_some() { count(repo_path, &[&format!("{}..HEAD", oid)]).await } else { 0 };
-    let would_drop_pushed = head.is_some() && pushed_dropped(repo_path, &oid).await > 0;
-    let on_remote = g(repo_path)
-        .args(["for-each-ref", &format!("--contains={}", oid), "--format=%(refname)", "refs/remotes"])
-        .ok_text()
-        .await
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
+    let would_drop_pushed = head.is_some() && pushed_dropped(repo_path, &oid).await.count > 0;
+    let on_remote = !remote_branches_containing(repo_path, &oid).await.is_empty();
     Ok(Some(CommitTarget {
         input: text.to_string(),
         oid: oid.clone(),
@@ -1513,16 +1574,24 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_refuses_pushed_commits_before_it_worries_about_dirt() {
+    fn a_reset_refuses_pushed_commits_and_honours_a_hard_reset_of_a_dirty_tree() {
         let dirty = StatusFacts { unstaged: 2, staged: 1, ..clean() };
+        // would-drop-pushed beats everything else about the tree.
         assert_eq!(code(reset(ResetMode::Hard, true, false), &dirty), "would-drop-pushed");
+        assert_eq!(code(reset(ResetMode::Hard, true, true), &dirty), "would-drop-pushed");
         let r = check(&Intent::Tree(reset(ResetMode::Hard, true, false)), &dirty).unwrap();
         assert!(r.message.contains("origin/main") && r.message.contains("never force-pushes"));
-        assert_eq!(code(reset(ResetMode::Hard, false, false), &dirty), "dirty-tree");
-        // Stashing first, or a mode that keeps the changes, lets it through.
+        // A hard reset without a stash on a dirty tree is the user's explicit
+        // choice (the dialog said the changes are thrown away): not refused.
+        assert_eq!(code(reset(ResetMode::Hard, false, false), &dirty), "ok");
         assert_eq!(code(reset(ResetMode::Hard, false, true), &dirty), "ok");
         assert_eq!(code(reset(ResetMode::Soft, false, false), &dirty), "ok");
         assert_eq!(code(reset(ResetMode::Mixed, false, false), &dirty), "ok");
+        // The operation names the remote branches that hold the commits; the
+        // pure check only knows the upstream.
+        assert!(would_drop_pushed_message(&["origin/backup".into()], Some("origin/main")).contains("`origin/backup`"));
+        assert!(would_drop_pushed_message(&[], Some("origin/main")).contains("`origin/main`"));
+        assert!(would_drop_pushed_message(&[], None).contains("the remote"));
         // Unknown targets and empty repositories are named first.
         assert_eq!(code(Reset { mode: ResetMode::Soft, target_valid: false, target_is_head: false, drops_pushed: false, stash_first: false }, &clean()), "not-a-commit");
         assert_eq!(code(reset(ResetMode::Soft, false, false), &StatusFacts { unborn: true, ..clean() }), "unborn-head");
@@ -1536,8 +1605,8 @@ mod tests {
         assert_eq!(code(at_head(ResetMode::Hard), &clean()), "nothing-to-do");
         let dirty = StatusFacts { unstaged: 1, ..clean() };
         assert_eq!(code(at_head(ResetMode::Mixed), &dirty), "nothing-to-do");
-        // Hard at HEAD on a dirty tree is "throw my changes away": allowed once stashed.
-        assert_eq!(code(at_head(ResetMode::Hard), &dirty), "dirty-tree");
+        // Hard at HEAD on a dirty tree is "throw my changes away": allowed, stash or not.
+        assert_eq!(code(at_head(ResetMode::Hard), &dirty), "ok");
         assert_eq!(code(Reset { mode: ResetMode::Hard, target_valid: true, target_is_head: true, drops_pushed: false, stash_first: true }, &dirty), "ok");
     }
 

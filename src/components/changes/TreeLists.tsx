@@ -67,6 +67,10 @@ export function TreeLists({
   const conflicted = entries.filter((e) => e.kind === "conflicted");
   const staged = entries.filter((e) => e.kind === "tracked" && e.staged !== ".");
   const unstaged = entries.filter((e) => e.kind === "tracked" && e.unstaged !== ".");
+  // A gitlink row cannot be discarded from here — the backend refuses the whole
+  // request when one is selected — so Discard all skips them (and ChangesList
+  // shows no Discard button on such a row).
+  const discardable = unstaged.filter((e) => !e.is_submodule);
   const untracked = entries.filter((e) => e.kind === "untracked");
   const sides = sidesFor(status);
   const caption = conflictCaption(status);
@@ -129,15 +133,17 @@ export function TreeLists({
         headerAction={
           unstaged.length > 0 ? (
             <div className="flex gap-1">
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={busy}
-                onClick={() => onDiscard(unstaged.map((e) => e.path), "changes")}
-                className="hover:text-red-400"
-              >
-                Discard all
-              </Button>
+              {discardable.length > 0 && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy}
+                  onClick={() => onDiscard(discardable.map((e) => e.path), "changes")}
+                  className="hover:text-red-400"
+                >
+                  Discard all
+                </Button>
+              )}
               <Button
                 size="sm"
                 variant="ghost"

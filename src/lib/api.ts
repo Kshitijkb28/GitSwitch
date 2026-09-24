@@ -1252,22 +1252,34 @@ export async function changesStashPush(
   return invoke("changes_stash_push", { repoPath, message, includeUntracked });
 }
 
+/**
+ * `oid` is the commit of the row the user saw. The list can go stale (a
+ * terminal `git stash pop` shifts every index), so the backend refuses with
+ * `no-stash` when stash@{index} is no longer that commit; null skips the check.
+ */
 export async function changesStashApply(
   repoPath: string,
   index: number,
   pop: boolean,
-  restoreIndex: boolean
+  restoreIndex: boolean,
+  oid: string | null
 ): Promise<OpResult> {
-  return invoke("changes_stash_apply", { repoPath, index, pop, restoreIndex });
+  return invoke("changes_stash_apply", { repoPath, index, pop, restoreIndex, oid });
 }
 
-/** The result carries the undo command (`git stash store …`). */
-export async function changesStashDrop(repoPath: string, index: number): Promise<OpResult> {
-  return invoke("changes_stash_drop", { repoPath, index });
+/** The result carries the undo command (`git stash store …`). `oid` as for apply. */
+export async function changesStashDrop(repoPath: string, index: number, oid: string | null): Promise<OpResult> {
+  return invoke("changes_stash_drop", { repoPath, index, oid });
 }
 
-export async function changesStashRestoreFile(repoPath: string, index: number, path: string): Promise<OpResult> {
-  return invoke("changes_stash_restore_file", { repoPath, index, path });
+/** `oid` as for apply. */
+export async function changesStashRestoreFile(
+  repoPath: string,
+  index: number,
+  path: string,
+  oid: string | null
+): Promise<OpResult> {
+  return invoke("changes_stash_restore_file", { repoPath, index, path, oid });
 }
 
 /** The line diff of one file in one commit (first-parent diff for merges). */

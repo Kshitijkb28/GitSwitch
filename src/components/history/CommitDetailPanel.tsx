@@ -47,10 +47,13 @@ type Props = {
 
 type Mode = null | "goback" | "branch";
 
-/** Anything a hard reset would throw away. */
+/**
+ * What a hard reset would throw away — and what "stash first" sets aside.
+ * New files are touched by neither, so they don't count.
+ */
 function isDirty(s: RepoStatus | null): boolean {
   if (!s) return false;
-  return s.staged_count + s.unstaged_count + s.untracked_count + s.conflicted_count > 0;
+  return s.staged_count + s.unstaged_count > 0;
 }
 
 /** Clipboard write with a fallback for webviews that hide `navigator.clipboard`. */
@@ -249,7 +252,9 @@ export function CommitDetailPanel({
 
   async function reset(m: ResetMode) {
     setHardConfirm(false);
-    afterAction(await onAction("reset", () => api.changesReset(repoPath, detail.hash, m, stash)));
+    // Only a hard reset touches the working tree, so only it offers (and
+    // sends) the safety stash; soft and mixed leave your edits where they are.
+    afterAction(await onAction("reset", () => api.changesReset(repoPath, detail.hash, m, m === "hard" && stash)));
   }
 
   async function createBranch(e: FormEvent) {
@@ -284,8 +289,10 @@ export function CommitDetailPanel({
     else toast.error("Could not copy the hash");
   }
 
-  const cherryDisabled = locked || detached || !currentBranch;
-  const cherryTitle = lockTitle ?? (detached || !currentBranch ? "Switch to a branch first" : undefined);
+  // Revert and cherry-pick both make a commit, which the backend refuses on a
+  // detached HEAD — so both are gated here rather than after a confirm dialog.
+  const needsBranch = locked || detached || !currentBranch;
+  const needsBranchTitle = lockTitle ?? (detached || !currentBranch ? "Switch to a branch first" : undefined);
 
   const dropped = resolved && resolved.oid === detail.hash ? resolved.dropped_if_reset : null;
 
@@ -332,11 +339,11 @@ export function CommitDetailPanel({
             <GitBranchPlus size={13} />
             Start a branch here
           </Button>
-          <Button size="sm" variant="ghost" disabled={locked} title={lockTitle} onClick={openRevert}>
+          <Button size="sm" variant="ghost" disabled={needsBranch} title={needsBranchTitle} onClick={openRevert}>
             <RotateCcw size={13} />
             Undo this commit (revert)
           </Button>
-          <Button size="sm" variant="ghost" disabled={cherryDisabled} title={cherryTitle} onClick={cherryPick}>
+          <Button size="sm" variant="ghost" disabled={needsBranch} title={needsBranchTitle} onClick={cherryPick}>
             <Cherry size={13} />
             Cherry-pick onto {currentBranch ?? "a branch"}
           </Button>
@@ -390,7 +397,7 @@ export function CommitDetailPanel({
                   </span>
                 </p>
                 <div className="flex flex-wrap gap-1.5 mt-2">
-                  <Button size="sm" variant="secondary" disabled={locked} title={lockTitle} onClick={openRevert}>
+                  <Button size="sm" variant="secondary" disabled={needsBranch} title={needsBranchTitle} onClick={openRevert}>
                     <RotateCcw size={13} />
                     Undo this commit (revert)
                   </Button>
@@ -530,8 +537,15 @@ export function CommitDetailPanel({
                   <span className="font-mono text-zinc-300 truncate min-w-0 flex-1" title={f.path}>
                     {f.path}
                   </span>
-                  <span className="text-emerald-400 shrink-0 tabular-nums">+{f.added}</span>
-                  <span className="text-red-400 shrink-0 tabular-nums">−{f.removed}</span>
+                  {f.added === "-" ? (
+                    // numstat prints "-" for both columns of a binary file
+                    <span className="text-zinc-500 shrink-0">binary</span>
+                  ) : (
+                    <>
+                      <span className="text-emerald-400 shrink-0 tabular-nums">+{f.added}</span>
+                      <span className="text-red-400 shrink-0 tabular-nums">−{f.removed}</span>
+                    </>
+                  )}
                 </button>
                 {open && (
                   <div className="mt-1 mb-2 rounded-lg border border-zinc-700/40 bg-zinc-900/70 max-h-96 overflow-auto min-w-0">
