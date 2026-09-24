@@ -51,6 +51,9 @@ for folders that still use HTTPS.
   (owned, collaborator and organization), with search, filters and paging.
   Each one can be cloned in a click — straight into the Clone page with the
   right link and a suggested profile — or opened if it's already on disk.
+  The first ten repositories appear as soon as GitHub answers; the rest load in
+  the background (a "loading more" note shows until they are all in), and
+  switching accounts clears the previous account's list at once.
 - **Changes** — the everyday git loop, without leaving the app: see every
   changed file with its real diff, stage and unstage individual files, discard
   (with an explicit confirmation naming what gets deleted), commit as the

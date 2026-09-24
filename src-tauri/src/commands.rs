@@ -508,6 +508,13 @@ pub async fn repo_accounts() -> Result<Vec<RepoAccount>, AppError> {
     Ok(remote_repos::accounts().await)
 }
 
+/// One page of the listing (`per_page` ≤ 100): the page paints the first few
+/// at once and keeps loading the rest in the background.
+#[tauri::command]
+pub async fn list_remote_repos_page(account: String, page: u32, per_page: u32) -> Result<crate::remote_repos::RepoPage, AppError> {
+    crate::remote_repos::list_repos_page(&account, page, per_page).await
+}
+
 #[tauri::command]
 pub async fn list_remote_repos(account: String) -> Result<RepoListing, AppError> {
     remote_repos::list_repos(&account).await

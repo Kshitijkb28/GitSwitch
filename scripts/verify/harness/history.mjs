@@ -357,13 +357,13 @@ try {
   }
 
   // -----------------------------------------------------------------
-  section("Go back: commits already on the upstream");
+  section("Go back: commits already on a remote branch");
   {
     const page = await open({ resolved: RESOLVED_PUSHED });
     await openPanel(page, C2);
     await openChooser(page);
     const s = await text(page);
-    ok("the amber note explains a force-push would be needed", s.includes("Moving main back would drop commits already on the upstream, which needs a force-push — GitSwitch never does that."));
+    ok("the amber note explains a force-push would be needed", s.includes("Moving main back would drop commits already on a remote branch, which needs a force-push — GitSwitch never does that."));
     ok('  offering "Undo this commit (revert)"', (await buttonCount(page, "Undo this commit (revert)")) === 2);
     ok('  and "Start a branch here"', (await buttonCount(page, "Start a branch here")) === 2);
     const look = await rowState(page, "Look at it");

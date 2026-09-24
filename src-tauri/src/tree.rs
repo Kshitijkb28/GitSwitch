@@ -292,10 +292,9 @@ pub fn check_tree(intent: &TreeIntent, f: &StatusFacts) -> Option<Refusal> {
         Reset { drops_pushed: true, .. } => {
             return Some(refuse(
                 "would-drop-pushed",
-                format!(
-                    "Commits already on `{}` would be dropped, and GitSwitch never force-pushes. Look at that commit (detached), start a branch there, or Revert instead.",
-                    f.upstream.clone().unwrap_or_else(|| "the upstream".into())
-                ),
+                // The pure gate does not know which remote branch holds them;
+                // reset_to replaces this with the branch names it measured.
+                "Commits already on a remote branch would be dropped, and GitSwitch never force-pushes. Look at that commit (detached), start a branch there, or Revert instead.".to_string(),
             ));
         }
         DeleteBranch { unique_commits, force: false, .. } if *unique_commits > 0 => {
@@ -1580,7 +1579,7 @@ mod tests {
         assert_eq!(code(reset(ResetMode::Hard, true, false), &dirty), "would-drop-pushed");
         assert_eq!(code(reset(ResetMode::Hard, true, true), &dirty), "would-drop-pushed");
         let r = check(&Intent::Tree(reset(ResetMode::Hard, true, false)), &dirty).unwrap();
-        assert!(r.message.contains("origin/main") && r.message.contains("never force-pushes"));
+        assert!(r.message.contains("a remote branch") && r.message.contains("never force-pushes"));
         // A hard reset without a stash on a dirty tree is the user's explicit
         // choice (the dialog said the changes are thrown away): not refused.
         assert_eq!(code(reset(ResetMode::Hard, false, false), &dirty), "ok");

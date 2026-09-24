@@ -49,10 +49,48 @@ function scanLocalClones(): Promise<api.LocalClones> {
   return localInflight;
 }
 
-function fetchListing(key: string, force: boolean): Promise<api.RepoListing> {
+const FIRST_PAGE = 10;
+const PAGE_FETCH = 100;
+
+/**
+ * Fetch the listing progressively: the first few repositories arrive at once
+ * (one small request) and `onPartial` paints them; the rest follows in pages
+ * of 100 until GitHub has no more, each page painted as it lands. The returned
+ * promise resolves with the complete listing. Pages are merged by full name,
+ * so the small first page overlapping the first big one is harmless.
+ */
+async function loadProgressively(
+  key: string,
+  onPartial: (listing: api.RepoListing, moreComing: boolean) => void
+): Promise<api.RepoListing> {
+  const first = await api.listRemoteReposPage(key, 1, FIRST_PAGE);
+  let listing: api.RepoListing = { ...first.listing, repos: [...first.listing.repos] };
+  onPartial(listing, first.has_more);
+  if (!first.has_more) return listing;
+  const seen = new Set(listing.repos.map((r) => r.full_name));
+  for (let page = 1; ; page++) {
+    const p = await api.listRemoteReposPage(key, page, PAGE_FETCH);
+    const fresh = p.listing.repos.filter((r) => !seen.has(r.full_name));
+    for (const r of fresh) seen.add(r.full_name);
+    listing = {
+      ...listing,
+      repos: [...listing.repos, ...fresh],
+      truncated: listing.truncated || p.listing.truncated,
+      sso_hidden_orgs: Math.max(listing.sso_hidden_orgs, p.listing.sso_hidden_orgs),
+    };
+    onPartial(listing, p.has_more);
+    if (!p.has_more) return listing;
+  }
+}
+
+function fetchListing(
+  key: string,
+  force: boolean,
+  onPartial: (listing: api.RepoListing, moreComing: boolean) => void
+): Promise<api.RepoListing> {
   const running = inflight.get(key);
   if (running && !force) return running;
-  const p = api.listRemoteRepos(key).finally(() => {
+  const p = loadProgressively(key, onPartial).finally(() => {
     if (inflight.get(key) === p) inflight.delete(key);
   });
   inflight.set(key, p);
@@ -84,6 +122,8 @@ export function Repositories() {
   const [listing, setListing] = useState<api.RepoListing | null>(null);
   const [fetchedAt, setFetchedAt] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
+  /** The first repositories are on screen; the rest are still arriving. */
+  const [moreComing, setMoreComing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [search, setSearch] = usePersistedState("repos.search", "");
@@ -95,6 +135,8 @@ export function Repositories() {
   const [sort, setSort] = usePersistedState<"pushed" | "name">("repos.sort", "pushed");
   const [page, setPage] = useState(0);
   const loadSeq = useRef(0);
+  /** Which account the listing on screen belongs to. */
+  const listingKey = useRef<string>("");
 
   // Which repos are on disk is local, cheap and changes behind the app's back
   // (a folder deleted in Finder), so it is re-read on every visit and whenever
@@ -130,6 +172,7 @@ export function Repositories() {
     if (!key) return;
     const cached = listingCache.get(key);
     if (cached && !force) {
+      listingKey.current = key;
       setListing(cached.listing);
       setFetchedAt(cached.fetchedAt);
       setError(null);
@@ -138,17 +181,33 @@ export function Repositories() {
     const seq = ++loadSeq.current;
     setLoading(true);
     setError(null);
+    // Another account's list must not stay on screen while this one loads:
+    // the rows, the counts and "signed in as" would all describe the wrong
+    // account. A forced refresh of the SAME account keeps its list visible.
+    if (listingKey.current !== key) {
+      setListing(null);
+      setFetchedAt(null);
+    }
     try {
-      const l = await fetchListing(key, force);
+      const l = await fetchListing(key, force, (partial, more) => {
+        // Paint what has arrived so far — unless a newer load has taken over.
+        if (loadSeq.current !== seq) return;
+        listingKey.current = key;
+        setListing(partial);
+        setMoreComing(more);
+      });
       if (loadSeq.current !== seq) return;
       const now = Date.now();
       listingCache.set(key, { listing: l, fetchedAt: now });
+      listingKey.current = key;
       setListing(l);
+      setMoreComing(false);
       setFetchedAt(now);
     } catch (e) {
       if (loadSeq.current !== seq) return;
       setError(String(e));
       setListing(null);
+      setMoreComing(false);
     } finally {
       if (loadSeq.current === seq) setLoading(false);
     }
@@ -398,6 +457,13 @@ export function Repositories() {
                   {" · "}
                   {clonedCount.toLocaleString()} already on this Mac · signed in as{" "}
                   <span className="font-mono text-zinc-400">{listing.login}</span>
+                  {moreComing && (
+                    <span className="inline-flex items-center gap-1 text-emerald-400/90">
+                      {" · "}
+                      <Loader2 size={12} className="animate-spin" />
+                      loading more…
+                    </span>
+                  )}
                 </>
               ) : loading ? (
                 "Loading repositories…"

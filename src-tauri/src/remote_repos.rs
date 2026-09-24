@@ -367,7 +367,135 @@ pub async fn list_repos_with_token(account: &str, token: &str) -> Result<RepoLis
     let store = profiles::load_profiles()?;
     let idx = local_index(&store.profiles).await;
 
-    let repos: Vec<RemoteRepo> = api_repos
+    let repos = map_repos(api_repos, &idx);
+
+    // Deliberately NOT "wherever most of this account's repos live": an account
+    // that also sees a company's repos would then pull its personal repos
+    // toward the company profile.
+    let suggested_profile_id = store
+        .profiles
+        .iter()
+        .find(|p| p.git_name.trim().eq_ignore_ascii_case(&login))
+        .map(|p| p.id.clone());
+
+    Ok(RepoListing {
+        account: account.to_string(),
+        login,
+        suggested_profile_id,
+        repos,
+        truncated,
+        sso_hidden_orgs: sso_hidden,
+    })
+}
+
+/// One page of the listing, for a page that paints the first few repositories
+/// at once and keeps loading the rest in the background.
+#[derive(Debug, Serialize)]
+pub struct RepoPage {
+    /// `repos` holds THIS page only; `login`/`suggested_profile_id` are filled
+    /// on page 1 and empty afterwards (the caller keeps the first page's).
+    pub listing: RepoListing,
+    pub page: u32,
+    pub per_page: u32,
+    /// GitHub says there is a next page (and we have not hit MAX_PAGES).
+    pub has_more: bool,
+}
+
+/// The URL for one page of `/user/repos`, same ordering and affiliation as the
+/// full listing so pages compose.
+pub fn page_url(base: &str, page: u32, per_page: u32) -> String {
+    format!(
+        "{}/user/repos?per_page={}&page={}&sort=pushed&affiliation=owner,collaborator,organization_member",
+        base,
+        per_page.clamp(1, 100),
+        page.max(1)
+    )
+}
+
+pub async fn list_repos_page(account: &str, page: u32, per_page: u32) -> Result<RepoPage, AppError> {
+    let token = token_for(account).await?;
+    let client = crate::github::http_client()?;
+    let base = api_base();
+    let get = |url: String| {
+        client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("User-Agent", "GitSwitch/0.1.0")
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+    };
+
+    // The login is only needed once; later pages leave it empty.
+    let login = if page <= 1 {
+        let me = get(format!("{}/user", base))
+            .await
+            .map_err(|e| AppError::Command(format!("Couldn't reach GitHub: {}", e)))?;
+        if !me.status().is_success() {
+            return Err(api_error(me.status().as_u16(), "read this account"));
+        }
+        me.json::<ApiUser>()
+            .await
+            .map_err(|e| AppError::Command(format!("Unexpected reply from GitHub: {}", e)))?
+            .login
+    } else {
+        String::new()
+    };
+
+    let resp = get(page_url(&base, page, per_page))
+        .await
+        .map_err(|e| AppError::Command(format!("Couldn't reach GitHub: {}", e)))?;
+    if !resp.status().is_success() {
+        return Err(api_error(resp.status().as_u16(), "list repositories"));
+    }
+    let sso_hidden = resp
+        .headers()
+        .get("x-github-sso")
+        .and_then(|v| v.to_str().ok())
+        .map(sso_hidden_org_count)
+        .unwrap_or(0);
+    let next = resp
+        .headers()
+        .get("link")
+        .and_then(|v| v.to_str().ok())
+        .and_then(next_link)
+        .filter(|n| n.starts_with(&format!("{}/", base)));
+    let api_repos: Vec<ApiRepo> = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Command(format!("Unexpected reply from GitHub: {}", e)))?;
+    let truncated = next.is_some() && page as usize >= MAX_PAGES;
+    let has_more = next.is_some() && !truncated;
+
+    let store = profiles::load_profiles()?;
+    let idx = local_index(&store.profiles).await;
+    let repos = map_repos(api_repos, &idx);
+    let suggested_profile_id = if page <= 1 {
+        store
+            .profiles
+            .iter()
+            .find(|p| p.git_name.trim().eq_ignore_ascii_case(&login))
+            .map(|p| p.id.clone())
+    } else {
+        None
+    };
+    Ok(RepoPage {
+        listing: RepoListing {
+            account: account.to_string(),
+            login,
+            suggested_profile_id,
+            repos,
+            truncated,
+            sso_hidden_orgs: sso_hidden,
+        },
+        page: page.max(1),
+        per_page: per_page.clamp(1, 100),
+        has_more,
+    })
+}
+
+fn map_repos(api_repos: Vec<ApiRepo>, idx: &LocalIndex) -> Vec<RemoteRepo> {
+    api_repos
         .into_iter()
         .map(|r| {
             let owner_l = r.owner.login.to_ascii_lowercase();
@@ -389,30 +517,21 @@ pub async fn list_repos_with_token(account: &str, token: &str) -> Result<RepoLis
                 pushed_at: r.pushed_at,
             }
         })
-        .collect();
-
-    // Deliberately NOT "wherever most of this account's repos live": an account
-    // that also sees a company's repos would then pull its personal repos
-    // toward the company profile.
-    let suggested_profile_id = store
-        .profiles
-        .iter()
-        .find(|p| p.git_name.trim().eq_ignore_ascii_case(&login))
-        .map(|p| p.id.clone());
-
-    Ok(RepoListing {
-        account: account.to_string(),
-        login,
-        suggested_profile_id,
-        repos,
-        truncated,
-        sso_hidden_orgs: sso_hidden,
-    })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_urls_compose_with_the_full_listing_and_stay_in_range() {
+        assert_eq!(
+            page_url("https://api.github.com", 1, 10),
+            "https://api.github.com/user/repos?per_page=10&page=1&sort=pushed&affiliation=owner,collaborator,organization_member"
+        );
+        assert!(page_url("https://api.github.com", 0, 500).contains("per_page=100&page=1&"));
+    }
 
     #[test]
     fn follows_only_the_next_link() {

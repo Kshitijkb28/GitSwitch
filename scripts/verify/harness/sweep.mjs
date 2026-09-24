@@ -56,6 +56,7 @@ try {
             case "allowed_signers_path": return Promise.resolve("/Users/me/.ssh/allowed_signers");
             case "local_clone_index": return Promise.resolve({ by_path: {}, by_repo: {} });
             case "list_remote_repos": return Promise.resolve({ repos: [], sso_hidden_orgs: 0, truncated: false });
+            case "list_remote_repos_page": return Promise.resolve({ listing: { account: "a", login: "me", suggested_profile_id: null, repos: [], sso_hidden_orgs: 0, truncated: false }, page: 1, per_page: 10, has_more: false });
             case "history_branches": return Promise.resolve([{ name: "main", is_current: true, is_remote: false, upstream: "origin/main", ahead: 0, behind: 0, tip: "aaa", short_tip: "aaa", last_author: "Me", last_date: "2026-01-01T00:00:00Z", subject: "x" }]);
             case "history_page": return Promise.resolve({ commits: [], total: 0, has_more: false });
             default: return Promise.resolve([]);
