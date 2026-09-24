@@ -198,7 +198,7 @@ mod sys {
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-        FILE_GENERIC_READ, FILE_GENERIC_WRITE, MOVEFILE_DELAY_UNTIL_REBOOT, WRITE_DAC, WRITE_OWNER,
+        FILE_GENERIC_READ, MOVEFILE_DELAY_UNTIL_REBOOT, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Registry::{
         RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6432KEY, RRF_SUBKEY_WOW6464KEY,
@@ -327,7 +327,26 @@ mod sys {
         if sec.dacl.is_null() {
             return true; // a NULL DACL grants everything to everyone
         }
-        let write = FILE_GENERIC_WRITE | GENERIC_WRITE | DELETE | WRITE_DAC | WRITE_OWNER;
+        // Only rights that change something. FILE_GENERIC_WRITE would be
+        // wrong here: it carries READ_CONTROL and SYNCHRONIZE, which a plain
+        // read-and-execute ACE (our own Users entry) carries too, so every
+        // directory the helper locks down would count as writable.
+        const FILE_WRITE_DATA: u32 = 0x0002;
+        const FILE_APPEND_DATA: u32 = 0x0004;
+        const FILE_WRITE_EA: u32 = 0x0010;
+        const FILE_DELETE_CHILD: u32 = 0x0040;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        let write = FILE_WRITE_DATA
+            | FILE_APPEND_DATA
+            | FILE_WRITE_EA
+            | FILE_DELETE_CHILD
+            | FILE_WRITE_ATTRIBUTES
+            | DELETE
+            | WRITE_DAC
+            | WRITE_OWNER
+            | GENERIC_WRITE
+            | GENERIC_ALL;
         // SAFETY: dacl points into sd, alive while `sec` is; GetAce bounds-checks.
         unsafe {
             let count = (*sec.dacl).AceCount as u32;
