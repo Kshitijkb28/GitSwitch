@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { HardDriveDownload, Loader2, AlertTriangle, CheckCircle2 } from "lucide-react";
+import { HardDriveDownload, Loader2, AlertTriangle, CheckCircle2, FolderTree } from "lucide-react";
 import { Button } from "../Button";
 import * as api from "../../lib/api";
 import type { LfsStatus } from "../../lib/api";
@@ -10,6 +10,8 @@ interface Props {
   /** Bumped by the page after any operation, so the card re-reads. */
   refreshKey: number;
   onPull: () => void;
+  /** Open the file browser: pick one file or one folder instead of all of them. */
+  onBrowse: () => void;
 }
 
 /**
@@ -18,7 +20,7 @@ interface Props {
  * says so, which is why this card exists: it counts the stubs and offers the
  * one command that fixes them.
  */
-export function LfsCard({ repoPath, busy, refreshKey, onPull }: Props) {
+export function LfsCard({ repoPath, busy, refreshKey, onPull, onBrowse }: Props) {
   const [lfs, setLfs] = useState<LfsStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -111,22 +113,38 @@ export function LfsCard({ repoPath, busy, refreshKey, onPull }: Props) {
             </div>
           )}
 
-          <Button
-            size="sm"
-            variant={canPull ? "primary" : "secondary"}
-            disabled={busy || !canPull}
-            onClick={onPull}
-            title={
-              !lfs.installed
-                ? "git-lfs isn't installed"
-                : pointers === 0
-                  ? "Nothing to download"
-                  : "Runs git lfs pull — downloads the real content for every pointer stub"
-            }
-          >
-            <HardDriveDownload size={13} />
-            {pointers > 0 ? `Pull LFS files (${pointers})` : "Pull LFS files"}
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant={canPull ? "primary" : "secondary"}
+              disabled={busy || !canPull}
+              onClick={onPull}
+              title={
+                !lfs.installed
+                  ? "git-lfs isn't installed"
+                  : pointers === 0
+                    ? "Nothing to download"
+                    : "Runs git lfs pull — downloads the real content for every pointer stub"
+              }
+            >
+              <HardDriveDownload size={13} />
+              {pointers > 0 ? `Pull LFS files (${pointers})` : "Pull LFS files"}
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={busy || !lfs.installed || !lfs.uses_lfs}
+              onClick={onBrowse}
+              title={
+                lfs.installed
+                  ? "See every large file with its size, and download one file or one folder"
+                  : "git-lfs isn't installed"
+              }
+            >
+              <FolderTree size={13} />
+              Browse files…
+            </Button>
+          </div>
         </>
       )}
     </div>

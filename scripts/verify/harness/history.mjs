@@ -48,6 +48,7 @@ async function openHistoryPage(browser, server, opts = {}) {
     refuse: opts.refuse ?? {},
     hang: opts.hang ?? false,
     submodules: opts.submodules ?? [],
+    peek: opts.peek ?? { branch: "main", upstream: "origin/main", remote: "origin", remote_tip: "440d0af1234567890abcdef1234567890abcdef12", known_tip: "e81d1c51234567890abcdef1234567890abcdef12", changed: true, branch_gone: false, new_commits: 3, counted_by: "github", message: "3 new commits on origin/main since your last fetch (440d0af). Nothing was downloaded — Fetch to see them." },
   };
   const page = await browser.newPage();
   await page.setViewport({ width: cfg.width, height: 900 });
@@ -109,6 +110,8 @@ async function openHistoryPage(browser, server, opts = {}) {
               return Promise.resolve(cfg.status);
             case "changes_submodules":
               return Promise.resolve(cfg.submodules);
+            case "history_peek":
+              return Promise.resolve(cfg.peek);
             case "changes_detach":
             case "changes_reset":
             case "changes_create_branch":
@@ -611,6 +614,31 @@ try {
   }
 
   // -----------------------------------------------------------------
+  section("Check GitHub: what is new, without downloading anything");
+  {
+    const page = await openHistoryPage(browser, server);
+    const b = await button(page, "Check GitHub");
+    ok("the button is offered next to Fetch", b !== null && (await b.evaluate((x) => x.title)).includes("downloads nothing"));
+    await b.click();
+    await page.waitForFunction(() => document.body.innerText.includes("Nothing was downloaded"), { timeout: 5000 });
+    const s = await text(page);
+    ok("the answer names the count and says nothing was downloaded", s.includes("3 new commits on origin/main") && s.includes("Nothing was downloaded"));
+    const calls = await page.evaluate(() => window.__CALLS__.map((c) => c.cmd));
+    ok("  it asked the backend to peek, not to fetch", calls.includes("history_peek") && !calls.includes("history_fetch"));
+    ok("  and offers Fetch now", (await button(page, "Fetch now")) !== null);
+    await (await button(page, "Fetch now")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_fetch"), { timeout: 5000 });
+    ok("Fetch now fetches for real and clears the check", !(await text(page)).includes("Nothing was downloaded"));
+    await page.close();
+  }
+  {
+    const page = await openHistoryPage(browser, server, { peek: { branch: "main", upstream: "origin/main", remote: "origin", remote_tip: "e81d1c5", known_tip: "e81d1c5", changed: false, branch_gone: false, new_commits: null, counted_by: null, message: "Nothing new on origin/main since your last fetch." } });
+    await (await button(page, "Check GitHub")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Nothing new on origin/main"), { timeout: 5000 });
+    ok("when nothing moved it says so, with no Fetch now", (await button(page, "Fetch now")) === null);
+    await page.close();
+  }
+
   section("Submodules: a submodule's history from the same page");
   {
     const SUBS = [

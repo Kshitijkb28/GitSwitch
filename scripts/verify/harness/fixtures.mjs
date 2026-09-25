@@ -667,6 +667,36 @@ export const LFS_POINTERS = {
   summary: "5 of 5 LFS files are still a pointer stub — the real content hasn't been downloaded.",
 };
 
+/** The browser's view of the same repository: sizes, folders, what is here. */
+export const LFS_LISTING = {
+  installed: true,
+  version: "git-lfs/3.8.0",
+  uses_lfs: true,
+  filters_configured: true,
+  files: [
+    { path: "model.bin", dir: "", size: 4096, present: true, downloaded: true },
+    { path: "media/video/clip.bin", dir: "media/video", size: 3221225472, present: false, downloaded: false },
+    { path: "media/video/intro.bin", dir: "media/video", size: 1048576, present: false, downloaded: false },
+    { path: "media/audio/tone.bin", dir: "media/audio", size: 1536, present: false, downloaded: true },
+    { path: "touchstones/axios__axios_dataset.jsonl", dir: "touchstones", size: 524288, present: false, downloaded: false },
+  ],
+  folders: [
+    { path: "media", depth: 0, files: 3, missing: 3, bytes: 3222275584, missing_bytes: 3222275584 },
+    { path: "media/audio", depth: 1, files: 1, missing: 1, bytes: 1536, missing_bytes: 1536 },
+    { path: "media/video", depth: 1, files: 2, missing: 2, bytes: 3222274048, missing_bytes: 3222274048 },
+    { path: "touchstones", depth: 0, files: 1, missing: 1, bytes: 524288, missing_bytes: 524288 },
+  ],
+  total: 5,
+  present: 1,
+  missing: 4,
+  total_bytes: 3222799872,
+  missing_bytes: 3222795776,
+  sizes_known: true,
+  truncated: 0,
+  folders_truncated: 0,
+  summary: "4 of 5 LFS files are still a pointer stub — the real content hasn't been downloaded.",
+};
+
 export const LFS_PRESENT = {
   ...LFS_POINTERS,
   filters_configured: true,

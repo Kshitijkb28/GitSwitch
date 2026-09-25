@@ -260,7 +260,7 @@ pub async fn accounts() -> Vec<RepoAccount> {
     out
 }
 
-async fn token_for(account: &str) -> Result<String, AppError> {
+pub(crate) async fn token_for(account: &str) -> Result<String, AppError> {
     if let Some(name) = account.strip_prefix("gh:") {
         return crate::gh_cli::gh_get_token(name).await;
     }

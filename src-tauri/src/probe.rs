@@ -162,6 +162,8 @@ pub(crate) mod tests {
             "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash),
             "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path),
             "changes_lfs_pull" => forward!(c::changes_lfs_pull, args, repo_path),
+            "changes_lfs_files" => forward!(c::changes_lfs_files, args, repo_path),
+            "changes_lfs_pull_paths" => forward!(c::changes_lfs_pull_paths, args, repo_path, paths),
             "changes_continue" => forward!(c::changes_continue, args, repo_path),
             "changes_abort" => forward!(c::changes_abort, args, repo_path),
             // sync
@@ -253,6 +255,10 @@ pub(crate) mod tests {
                 let autostash = a.iter().skip(1).any(|s| s == "autostash");
                 show(git_ops::pull(&repo(), PullMode::parse(first).unwrap(), with_lfs, autostash).await)
             }
+            "peek" => match crate::peek::peek_remote(&repo()).await {
+                Ok(r) => emit(&r),
+                Err(e) => emit_err(e),
+            },
             "sub_statuses" => match crate::submodules::submodule_statuses(&repo()).await {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),
@@ -327,6 +333,17 @@ pub(crate) mod tests {
                 Err(e) => emit_err(e),
             },
             "lfs_pull" => show(git_ops::lfs_pull(&repo()).await),
+            "lfs_files" => match crate::lfs::lfs_files(&repo()).await {
+                Ok(r) => emit(&r),
+                Err(e) => emit_err(e),
+            },
+            // PROBE_ARGS: "<path>[,<path>…]" — a path holding a comma has to go
+            // through `PROBE_OP=invoke` instead, which takes real JSON.
+            "lfs_pull_paths" => show(git_ops::lfs_pull_paths(&repo(), a.clone()).await),
+            "lfs_progress" => match crate::lfs::read_progress(&repo()).await {
+                Some(p) => emit(&p),
+                None => emit(&serde_json::Value::Null),
+            },
             "submodules_list" => match crate::submodules::list_submodules(&repo()).await {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),

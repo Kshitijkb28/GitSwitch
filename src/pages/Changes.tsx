@@ -14,6 +14,7 @@ import { PushAccessCard } from "../components/changes/PushAccessCard";
 import { SubmodulesCard } from "../components/changes/SubmodulesCard";
 import { SubmoduleSection, needsSection, sectionId } from "../components/changes/SubmoduleSection";
 import { LfsCard } from "../components/changes/LfsCard";
+import { LfsFilesModal, formatBytes } from "../components/changes/LfsFilesModal";
 import { StashesCard } from "../components/changes/StashesCard";
 import { StashModal } from "../components/changes/StashModal";
 import { SyncCard, SyncPausedCard } from "../components/changes/SyncCard";
@@ -58,6 +59,8 @@ export function Changes() {
   const [diffFor, setDiffFor] = useState<ChangeEntry | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState<DiscardRequest | null>(null);
   const [branchesFor, setBranchesFor] = useState<string | null>(null);
+  const [lfsBrowser, setLfsBrowser] = useState(false);
+  const [lfsProgress, setLfsProgress] = useState<api.LfsProgress | null>(null);
   const [stashOpen, setStashOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const [discardAllOpen, setDiscardAllOpen] = useState(false);
@@ -172,6 +175,36 @@ export function Changes() {
     const id = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(id);
   }, [job?.running]);
+
+  // A large-file download can take a long time with nothing on screen moving,
+  // which is indistinguishable from the app having hung. git-lfs reports what
+  // it is transferring, so ask it rather than leave the person guessing.
+  useEffect(() => {
+    // Only operations that can download large files. Polling during a push
+    // would show the numbers a previous download left behind.
+    const downloads = job?.kind === "lfs" || job?.kind === "pull" || job?.kind === "sync";
+    if (!job?.running || !downloads || !repoPath) {
+      setLfsProgress(null);
+      return;
+    }
+    let stop = false;
+    const read = () =>
+      api
+        .changesLfsProgress(repoPath)
+        .then((p) => {
+          if (!stop) setLfsProgress(p);
+        })
+        .catch(() => {
+          /* the run may have finished between the poll and the read */
+        });
+    read();
+    const id = setInterval(read, 1000);
+    return () => {
+      stop = true;
+      clearInterval(id);
+      setLfsProgress(null);
+    };
+  }, [job?.running, job?.kind, job?.startedAt, repoPath]);
 
   // A job that finished while we were on another page: show it and refresh.
   const seenJob = useRef<number>(0);
@@ -383,6 +416,14 @@ export function Changes() {
             <Loader2 size={15} className="animate-spin shrink-0" />
             <span>{job.label}</span>
             <span className="text-xs text-sky-300/70">{elapsedLabel(job.startedAt)}</span>
+            {lfsProgress && (
+              <span className="min-w-0 truncate text-xs text-sky-300/90" title={lfsProgress.file}>
+                {/* git-lfs counts bytes per file, not across the transfer, so
+                    they are shown as that one file's progress. */}
+                · {lfsProgress.done} of {lfsProgress.total} files · {lfsProgress.file} (
+                {formatBytes(lfsProgress.bytes)} of {formatBytes(lfsProgress.total_bytes)})
+              </span>
+            )}
             <span className="text-xs text-zinc-500 ml-auto">
               keeps running if you leave this page
             </span>
@@ -599,6 +640,7 @@ export function Changes() {
                   onPull={() =>
                     runLong("lfs", "Downloading LFS files…", () => api.changesLfsPull(repoPath))
                   }
+                  onBrowse={() => setLfsBrowser(true)}
                 />
               )}
 
@@ -660,6 +702,22 @@ export function Changes() {
               setResetOpen(false);
               void apply("reset", () => api.changesReset(repoPath, "@{u}", "hard", stashFirst));
             }}
+          />
+          <LfsFilesModal
+            open={lfsBrowser}
+            repoPath={repoPath}
+            busy={anyBusy}
+            onClose={() => setLfsBrowser(false)}
+            onDownload={(paths) =>
+              runLong(
+                "lfs",
+                `Downloading ${paths.length === 1 ? paths[0] : `${paths.length} selected paths`}…`,
+                () => api.changesLfsPullPaths(repoPath, paths)
+              )
+            }
+            onDownloadAll={() =>
+              runLong("lfs", "Downloading LFS files…", () => api.changesLfsPull(repoPath))
+            }
           />
           <DiscardAllModal
             open={discardAllOpen}

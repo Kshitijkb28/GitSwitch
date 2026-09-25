@@ -52,6 +52,8 @@ try {
             case "changes_submodule_statuses": return Promise.resolve(subs);
             case "changes_stash_list": return Promise.resolve(stashes);
             case "changes_file_diff": return Promise.resolve(d1);
+            case "changes_lfs_progress": return Promise.resolve(null);
+            case "changes_lfs_files": return Promise.resolve({ installed: true, version: "git-lfs/3.8.0", uses_lfs: false, filters_configured: true, files: [], folders: [], total: 0, present: 0, missing: 0, total_bytes: 0, missing_bytes: 0, sizes_known: true, truncated: 0, folders_truncated: 0, summary: "This repository doesn't use Git LFS." });
             case "get_current_git_config": return Promise.resolve("[user]\n\tname = Me\n\temail = me@personal.test");
             case "allowed_signers_path": return Promise.resolve("/Users/me/.ssh/allowed_signers");
             case "local_clone_index": return Promise.resolve({ by_path: {}, by_repo: {} });

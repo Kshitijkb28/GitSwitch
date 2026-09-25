@@ -978,6 +978,71 @@ export async function changesLfsPull(repoPath: string): Promise<OpResult> {
   return invoke("changes_lfs_pull", { repoPath });
 }
 
+/** One LFS-tracked file in the checkout. */
+export interface LfsFile {
+  path: string;
+  /** The folder holding it, "" at the repository root. */
+  dir: string;
+  /** What the real content weighs, known even while the file is a stub. */
+  size: number;
+  /** The working file holds the real content. */
+  present: boolean;
+  /** The object is already in this clone, so it only needs writing out. */
+  downloaded: boolean;
+}
+
+/** A folder's totals, including everything nested beneath it. */
+export interface LfsFolder {
+  path: string;
+  depth: number;
+  files: number;
+  missing: number;
+  bytes: number;
+  missing_bytes: number;
+}
+
+export interface LfsListing {
+  installed: boolean;
+  version: string | null;
+  uses_lfs: boolean;
+  filters_configured: boolean;
+  files: LfsFile[];
+  folders: LfsFolder[];
+  total: number;
+  present: number;
+  missing: number;
+  total_bytes: number;
+  missing_bytes: number;
+  /** False on an older git-lfs that reports no sizes — don't print "0 B". */
+  sizes_known: boolean;
+  /** Files past the cap that were not sent; folder totals still count them. */
+  truncated: number;
+  folders_truncated: number;
+  summary: string;
+}
+
+/** How far a running download has got. */
+export interface LfsProgress {
+  file: string;
+  done: number;
+  total: number;
+  bytes: number;
+  total_bytes: number;
+}
+
+export async function changesLfsFiles(repoPath: string): Promise<LfsListing> {
+  return invoke("changes_lfs_files", { repoPath });
+}
+
+/** Download only these files and folders. */
+export async function changesLfsPullPaths(repoPath: string, paths: string[]): Promise<OpResult> {
+  return invoke("changes_lfs_pull_paths", { repoPath, paths });
+}
+
+export async function changesLfsProgress(repoPath: string): Promise<LfsProgress | null> {
+  return invoke("changes_lfs_progress", { repoPath });
+}
+
 export async function changesSubmodules(repoPath: string): Promise<SubmoduleInfo[]> {
   return invoke("changes_submodules", { repoPath });
 }
@@ -1297,6 +1362,25 @@ export async function changesStashRestoreFile(
 /** The line diff of one file in one commit (first-parent diff for merges). */
 export async function historyCommitFileDiff(repoPath: string, hash: string, path: string): Promise<FileDiff> {
   return invoke("history_commit_file_diff", { repoPath, hash, path });
+}
+
+/** What is new on the remote branch, without downloading anything. */
+export interface RemotePeek {
+  branch: string | null;
+  upstream: string | null;
+  remote: string | null;
+  remote_tip: string | null;
+  known_tip: string | null;
+  changed: boolean;
+  branch_gone: boolean;
+  new_commits: number | null;
+  /** "local" | "github" | null */
+  counted_by: string | null;
+  message: string;
+}
+
+export async function historyPeek(repoPath: string): Promise<RemotePeek> {
+  return invoke("history_peek", { repoPath });
 }
 
 /** A commit id, short id or ref typed by the user; null when nothing matches. */
