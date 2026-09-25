@@ -47,6 +47,7 @@ async function openHistoryPage(browser, server, opts = {}) {
     resolvedMerge: opts.resolvedMerge ?? RESOLVED_MERGE,
     refuse: opts.refuse ?? {},
     hang: opts.hang ?? false,
+    submodules: opts.submodules ?? [],
   };
   const page = await browser.newPage();
   await page.setViewport({ width: cfg.width, height: 900 });
@@ -106,6 +107,8 @@ async function openHistoryPage(browser, server, opts = {}) {
               return Promise.resolve({ message: "fetched", head_unchanged: true, worktree_unchanged: true, local_branches_unchanged: true, updated_remote_refs: 0 });
             case "changes_repo_status":
               return Promise.resolve(cfg.status);
+            case "changes_submodules":
+              return Promise.resolve(cfg.submodules);
             case "changes_detach":
             case "changes_reset":
             case "changes_create_branch":
@@ -608,6 +611,46 @@ try {
   }
 
   // -----------------------------------------------------------------
+  section("Submodules: a submodule's history from the same page");
+  {
+    const SUBS = [
+      { path: "staging", name: "staging", initialised: true, listed: true, gitdir_valid: true, own_ahead: 2, own_behind: 0, summary: "2 commits of yours not on its upstream" },
+      { path: "harness", name: "harness", initialised: true, listed: true, gitdir_valid: true, own_ahead: 0, own_behind: 1, summary: "1 commit behind its upstream" },
+      { path: "forge-tooling/x", name: "x", initialised: false, listed: false, gitdir_valid: false, own_ahead: 0, own_behind: 0, summary: "not initialised" },
+    ];
+    const page = await openHistoryPage(browser, server, { submodules: SUBS });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules:"), { timeout: 5000 });
+    let s = await text(page);
+    ok("populated, mapped submodules are listed as chips with their own ahead/behind", s.includes("staging ↑2") && s.includes("harness ↓1"));
+    ok("  an uninitialised gitlink is not offered", !s.includes("forge-tooling"));
+    ok("  the repository itself is what the page shows by default", !s.includes("Browsing inside"));
+    const subCallsBefore = await page.evaluate(() => window.__CALLS__.filter((c) => c.args?.repoPath === "/repos/gitswitch/staging").length);
+    ok("  nothing was read from the submodule yet", subCallsBefore === 0);
+    await (await button(page, "staging ↑2")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Browsing inside"), { timeout: 5000 });
+    s = await text(page);
+    ok("clicking a chip browses that submodule and says so", s.includes("Browsing inside") && s.includes("staging"));
+    const subCalls = await page.evaluate(() => window.__CALLS__.filter((c) => c.args?.repoPath === "/repos/gitswitch/staging").map((c) => c.cmd));
+    ok("  branches, status, sync and the commit page are read from the submodule", ["history_branches", "changes_repo_status", "history_sync_status", "history_page"].every((c) => subCalls.includes(c)));
+    await (await button(page, "Fetch")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_fetch"), { timeout: 5000 });
+    const fetched = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "history_fetch").map((c) => c.args.repoPath));
+    ok("  Fetch fetches inside the submodule", fetched.length === 1 && fetched[0] === "/repos/gitswitch/staging");
+    ok("  the Fetch button says which submodule it fetches", (await (await button(page, "Fetch")).evaluate((b) => b.title)).includes("staging"));
+    await (await button(page, "Back to the repository")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules:"), { timeout: 5000 });
+    ok("Back to the repository returns to the superproject", !(await text(page)).includes("Browsing inside"));
+    const back = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "history_page").map((c) => c.args.repoPath));
+    ok("  and re-reads the repository's own commits", back[back.length - 1] === "/repos/gitswitch");
+    await page.close();
+  }
+  {
+    const page = await openHistoryPage(browser, server);
+    await sleep(400);
+    ok("a repository without submodules shows no picker and no chips", !(await text(page)).includes("Submodules:") && (await button(page, "This repository")) === null);
+    await page.close();
+  }
+
   section("Layout");
   // Measure <main>, not documentElement: main has overflow-y-auto, so it
   // scrolls horizontally on its own and the document never reports overflow.

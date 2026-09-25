@@ -185,6 +185,11 @@ for folders that still use HTTPS.
     line diff of every file it touched. A reset that would drop commits already
     on the upstream is refused and the alternatives are offered instead.
     Anything that ends in a conflict hands you to the Changes page.
+  - **Submodules.** A repository's populated submodules are listed as chips
+    with their own ahead/behind; pick one and the page browses that submodule
+    (branches, commits, Fetch and every commit action belong to it) until you
+    go back to the repository. Fetch on the repository itself updates its
+    remote branches only; git fetches submodules on demand.
 - **Commit Audit** — finds commits authored with the wrong identity, rewrites the
   ones you haven't pushed (keeping a backup branch, never touching published
   history), and can install a `pre-commit` guard that blocks future mistakes.

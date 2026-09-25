@@ -12,6 +12,7 @@ import {
   CheckCircle2,
   Crosshair,
   X,
+  Box,
 } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
@@ -98,11 +99,24 @@ function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
   );
 }
 
+/** "staging ↑2 ↓1" — the submodule's own branch against its own upstream. */
+function subLabel(m: api.SubmoduleInfo): string {
+  const parts = [m.path];
+  if (m.own_ahead > 0) parts.push(`↑${m.own_ahead}`);
+  if (m.own_behind > 0) parts.push(`↓${m.own_behind}`);
+  return parts.join(" ");
+}
+
 export function History() {
   const toast = useToast();
   const navigate = useNavigate();
   const [repos, setRepos] = useState<api.RepoRef[]>([]);
-  const [repo, setRepo] = usePersistedState("history.repo", "");
+  const [superRepo, setSuperRepo] = usePersistedState("history.repo", "");
+  /** A submodule path inside `superRepo` being browsed instead of the repository itself. */
+  const [sub, setSub] = usePersistedState("history.sub", "");
+  const [subs, setSubs] = useState<api.SubmoduleInfo[]>([]);
+  /** Everything below works on this path: the repository, or the chosen submodule inside it. */
+  const repo = sub && superRepo ? `${superRepo}/${sub}` : superRepo;
   const [account, setAccount] = usePersistedState("history.account", ""); // profile id, "" = all
   const [onlyMine, setOnlyMine] = usePersistedState("history.onlyMine", false);
   const [branches, setBranches] = useState<api.BranchInfo[]>([]);
@@ -201,15 +215,35 @@ export function History() {
         if (cancelled) return;
         setRepos(r);
         // Keep the remembered repo only if it still exists.
-        setRepo((prev) =>
+        setSuperRepo((prev) =>
           prev && r.some((x) => x.path === prev) ? prev : r[0]?.path ?? ""
         );
       })
       .catch((e) => !cancelled && setError(String(e)))
       .finally(() => !cancelled && setLoadingRepos(false));
     return () => { cancelled = true; };
-  }, [setRepo]);
+  }, [setSuperRepo]);
   useEffect(loadRepos, [loadRepos]);
+
+  // The repository's populated, mapped submodules — each can be browsed as its
+  // own history. A remembered submodule that no longer exists falls back to the
+  // repository itself.
+  useEffect(() => {
+    if (!superRepo) {
+      setSubs([]);
+      return;
+    }
+    let cancelled = false;
+    api.changesSubmodules(superRepo)
+      .then((list) => {
+        if (cancelled) return;
+        const usable = list.filter((m) => m.initialised && m.listed && m.gitdir_valid);
+        setSubs(usable);
+        setSub((cur) => (cur && !usable.some((m) => m.path === cur) ? "" : cur));
+      })
+      .catch(() => !cancelled && setSubs([]));
+    return () => { cancelled = true; };
+  }, [superRepo, reloadKey, setSub]);
   // Repos get cloned and deleted outside the app; re-scan on return.
   useRefreshOnFocus(loadRepos);
 
@@ -341,10 +375,10 @@ export function History() {
   useEffect(() => {
     if (!account) return;
     const owned = repos.filter((r) => r.profile_id === account);
-    if (owned.length > 0 && !owned.some((r) => r.path === repo)) {
-      setRepo(owned[0].path);
+    if (owned.length > 0 && !owned.some((r) => r.path === superRepo)) {
+      setSuperRepo(owned[0].path);
     }
-  }, [account, repos, repo]);
+  }, [account, repos, superRepo]);
 
   useEffect(() => {
     if (!repo) return;
@@ -410,8 +444,8 @@ export function History() {
           </div>
           <div className="w-64 max-w-full">
             <Select
-              value={repo}
-              onChange={setRepo}
+              value={superRepo}
+              onChange={(v) => { setSuperRepo(v); setSub(""); }}
               placeholder={loadingRepos ? "Loading repos…" : "Pick a repository…"}
               optionIcon={<GitBranch size={14} />}
               options={visibleRepos.map((r) => ({
@@ -420,12 +454,30 @@ export function History() {
               }))}
             />
           </div>
+          {subs.length > 0 && (
+            <div className="w-56 max-w-full">
+              <Select
+                value={sub}
+                onChange={(v) => { setSub(v); setOffset(0); }}
+                placeholder="This repository"
+                optionIcon={<Box size={14} />}
+                options={[
+                  { value: "", label: "This repository" },
+                  ...subs.map((m) => ({ value: m.path, label: subLabel(m) })),
+                ]}
+              />
+            </div>
+          )}
           <Button
             variant="secondary"
             onClick={() => doFetch()}
             disabled={!repo || fetching}
             className="min-w-[8.25rem]" // fits "Fetching…" (≈125px), so the label swap never shifts Refresh
-            title="git fetch — updates remote branches only, never your working tree"
+            title={
+              sub
+                ? `git fetch inside ${sub} — updates that submodule's remote branches only`
+                : "git fetch — updates remote branches only, never your working tree; submodules are fetched on demand"
+            }
           >
             <CloudDownload size={16} className={fetching ? "animate-pulse" : ""} />
             {fetching ? "Fetching…" : "Fetch"}
@@ -459,6 +511,41 @@ export function History() {
 
       {gotoError && (
         <p className="text-sm text-red-400 break-words -mt-3">{gotoError}</p>
+      )}
+
+      {subs.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400 -mt-2">
+          {sub ? (
+            <>
+              <Box size={13} className="text-emerald-400 shrink-0" />
+              <span>
+                Browsing inside <span className="font-mono text-zinc-200">{sub}</span> — branches, commits, Fetch and every action here belong to this submodule.
+              </span>
+              <button
+                type="button"
+                onClick={() => { setSub(""); setOffset(0); }}
+                className="text-emerald-400 hover:text-emerald-300 cursor-pointer"
+              >
+                Back to the repository
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="text-zinc-500">Submodules:</span>
+              {subs.map((m) => (
+                <button
+                  key={m.path}
+                  type="button"
+                  onClick={() => { setSub(m.path); setOffset(0); }}
+                  title={`Browse this submodule's history — ${m.summary}`}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-zinc-700/60 bg-zinc-800/40 hover:border-emerald-500/50 hover:text-zinc-100 cursor-pointer font-mono"
+                >
+                  {subLabel(m)}
+                </button>
+              ))}
+            </>
+          )}
+        </div>
       )}
 
       {error && (
