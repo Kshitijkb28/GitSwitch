@@ -340,7 +340,7 @@ pub(crate) mod tests {
             // PROBE_ARGS: "<path>[,<path>…]" — a path holding a comma has to go
             // through `PROBE_OP=invoke` instead, which takes real JSON.
             "lfs_pull_paths" => show(git_ops::lfs_pull_paths(&repo(), a.clone()).await),
-            "lfs_progress" => match crate::lfs::read_progress(&repo()).await {
+            "lfs_progress" => match crate::lfs::read_progress(&repo()) {
                 Some(p) => emit(&p),
                 None => emit(&serde_json::Value::Null),
             },

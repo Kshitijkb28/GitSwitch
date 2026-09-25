@@ -487,23 +487,35 @@ pub fn progress_file_in(git_dir: &Path) -> PathBuf {
     git_dir.join("gitswitch-lfs.progress")
 }
 
-pub async fn progress_path(repo_path: &str) -> PathBuf {
-    let git_dir = GitCmd::at(repo_path)
-        .args(["rev-parse", "--absolute-git-dir"])
-        .ok_text()
-        .await
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        // A folder that is not a repository has no run to report on; the path
-        // is still needed so the caller can look and find nothing.
-        .unwrap_or_else(|| PathBuf::from(repo_path).join(".git"));
-    progress_file_in(&git_dir)
+/// The repository's git directory, found without starting a process.
+///
+/// The progress file is read once a second while a download runs, and spawning
+/// `git rev-parse` for each of those polls is exactly the kind of cost this
+/// feature exists to remove. `.git` is a directory in an ordinary clone and a
+/// file holding `gitdir: <path>` in a submodule or a linked worktree.
+pub fn git_dir_of(repo_path: &str) -> PathBuf {
+    let repo = PathBuf::from(repo_path);
+    let dot_git = repo.join(".git");
+    if dot_git.is_dir() {
+        return dot_git;
+    }
+    if let Ok(text) = std::fs::read_to_string(&dot_git) {
+        if let Some(rest) = text.trim().strip_prefix("gitdir:") {
+            let target = PathBuf::from(rest.trim());
+            return if target.is_absolute() { target } else { repo.join(target) };
+        }
+    }
+    dot_git
+}
+
+pub fn progress_path(repo_path: &str) -> PathBuf {
+    progress_file_in(&git_dir_of(repo_path))
 }
 
 /// How far the download running in this repository has got, or `None` when
 /// nothing has been reported yet.
-pub async fn read_progress(repo_path: &str) -> Option<LfsProgress> {
-    let raw = std::fs::read_to_string(progress_path(repo_path).await).ok()?;
+pub fn read_progress(repo_path: &str) -> Option<LfsProgress> {
+    let raw = std::fs::read_to_string(progress_path(repo_path)).ok()?;
     latest_progress(&raw)
 }
 
@@ -840,6 +852,25 @@ mod tests {
         assert_eq!(q.file, "assets/big files/tex ture.bin");
         assert!(latest_progress("").is_none());
         assert!(latest_progress("nonsense\n").is_none());
+    }
+
+    #[test]
+    fn a_submodules_git_directory_is_found_without_starting_a_process() {
+        // `.git` is a file holding `gitdir: …` in a submodule and in a linked
+        // worktree; the progress file has to land in the real directory.
+        let root = std::env::temp_dir().join(format!("gitswitch-gitdir-{}", std::process::id()));
+        let repo = root.join("sub");
+        let real = root.join("modules/sub");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(&real).expect("real");
+        std::fs::write(repo.join(".git"), format!("gitdir: {}\n", real.display())).expect("pointer");
+        assert_eq!(git_dir_of(repo.to_str().unwrap()), real);
+
+        // An ordinary clone: `.git` is the directory itself.
+        let plain = root.join("plain");
+        std::fs::create_dir_all(plain.join(".git")).expect("plain");
+        assert_eq!(git_dir_of(plain.to_str().unwrap()), plain.join(".git"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -703,7 +703,7 @@ pub async fn changes_lfs_pull_paths(repo_path: String, paths: Vec<String>) -> Re
 /// has reported anything yet, which is the normal state between operations.
 #[tauri::command]
 pub async fn changes_lfs_progress(repo_path: String) -> Option<LfsProgress> {
-    lfs::read_progress(&repo_path).await
+    lfs::read_progress(&repo_path)
 }
 
 /// `git lfs pull`: download the content for every pointer stub. Reports how

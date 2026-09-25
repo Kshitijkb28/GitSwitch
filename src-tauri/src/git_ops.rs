@@ -1414,7 +1414,7 @@ pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppEr
         configured_now = true;
     }
 
-    let progress = crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path).await);
+    let progress = crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path));
     let out = GitCmd::at(repo_path)
         .args(["lfs", "pull"])
         // Gigabytes of large files are normal; a transfer that is still moving
@@ -1618,7 +1618,7 @@ pub async fn lfs_pull_paths(repo_path: &str, paths: Vec<String>) -> Result<OpRes
 
     // Chunked, so an enormous selection is still exactly what was asked for
     // rather than a fallback that fetches and writes out the whole repository.
-    let progress = crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path).await);
+    let progress = crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path));
     let mut failure: Option<String> = None;
     for chunk in crate::lfs::chunk_selection(&selected) {
         let include = crate::lfs::include_patterns(&chunk);
