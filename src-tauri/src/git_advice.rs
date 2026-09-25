@@ -441,6 +441,67 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
                     s,
                 );
             }
+            // The objects arrived but git-lfs could not put them in place.
+            // git-lfs writes content by linking or copying out of .git/lfs,
+            // so a read-only file, a full disk or a different filesystem
+            // surfaces here — and reads like a download failure although the
+            // download worked.
+            if has("Could not checkout")
+                || has("error copying")
+                || has("cross-device link")
+                || has("link failed")
+                || has("hard link")
+                || has("read-only file system")
+                || has("no space left")
+            {
+                return advice(
+                    "The files downloaded, but couldn't be written into the folder.",
+                    "git-lfs fetched the content and then failed to put it in place. That is a local problem, not a server one: check that the files aren't open or read-only, that the disk isn't full, and that the folder isn't on a drive that forbids linking. The objects are already in .git/lfs, so retrying only has to write them out.",
+                    Some("retry"),
+                    s,
+                );
+            }
+            if has("content not local") {
+                return advice(
+                    "Some files weren't downloaded before being written out.",
+                    "git-lfs skipped those files because their content isn't in this clone yet. Download them (Pull LFS files, or pick them in the browser) and they will be written out.",
+                    None,
+                    s,
+                );
+            }
+            if has("Authentication required")
+                || has("401")
+                || has("403")
+                || has("Access denied")
+                || has("credentials")
+            {
+                return advice(
+                    "The LFS server wouldn't accept these credentials.",
+                    "Git itself could reach the repository, but its Git LFS endpoint refused the sign-in. Check that the account signed in here has access to the repository's large files, and that any token it uses hasn't expired.",
+                    None,
+                    s,
+                );
+            }
+            // Timeouts first, and a bare "exceeded" is not enough to call it a
+            // quota: Go's own timeout text is "context deadline exceeded", and
+            // reading that as a billing problem sends a person to the wrong
+            // place entirely.
+            if has("timed out") || has("timeout") || has("deadline exceeded") || has("connection reset") {
+                return advice(
+                    "The download stopped part way.",
+                    "The connection to the LFS server dropped. What already arrived is kept, so running it again continues rather than starting over.",
+                    Some("retry"),
+                    s,
+                );
+            }
+            if has("quota") || has("bandwidth") || has("exceeded its data") {
+                return advice(
+                    "This repository is over its Git LFS quota.",
+                    "GitHub meters Git LFS storage and bandwidth per account. Until the quota resets or is raised, the large files can't be downloaded. Nothing is wrong with this clone.",
+                    None,
+                    s,
+                );
+            }
             if has("smudge filter lfs failed") || has("batch response") {
                 return advice(
                     "The LFS server refused the download.",
@@ -726,5 +787,34 @@ mod tests {
         assert!(e.guidance.contains("a.txt"));
         let f = explain(GitOp::Stash, "error: conflicts in index. Try without --index.", &AdviceCtx::default());
         assert_eq!(f.action.as_deref(), Some("retry-without-index"));
+    }
+
+    #[test]
+    fn a_download_that_worked_but_could_not_be_written_out_is_not_blamed_on_the_server() {
+        let a = explain(
+            GitOp::Lfs,
+            "Could not checkout \"model.bin\": link failed: operation not permitted",
+            &AdviceCtx::default(),
+        );
+        assert!(a.headline.contains("couldn't be written into the folder"), "{}", a.headline);
+        assert!(a.guidance.contains("already in .git/lfs"), "{}", a.guidance);
+        assert_eq!(a.action.as_deref(), Some("retry"));
+        // The server-side gap keeps its own, different explanation.
+        let b = explain(GitOp::Lfs, "remote missing object abc123", &AdviceCtx::default());
+        assert!(b.headline.contains("aren't on the server"), "{}", b.headline);
+    }
+
+    #[test]
+    fn an_lfs_sign_in_failure_and_a_quota_are_told_apart() {
+        let a = explain(GitOp::Lfs, "batch response: Authentication required: 401", &AdviceCtx::default());
+        assert!(a.headline.contains("credentials"), "{}", a.headline);
+        let b = explain(GitOp::Lfs, "batch response: This repository is over its data quota", &AdviceCtx::default());
+        assert!(b.headline.contains("quota"), "{}", b.headline);
+        // Go's timeout text also contains "exceeded"; it is not a billing problem.
+        let t = explain(GitOp::Lfs, "batch response: context deadline exceeded", &AdviceCtx::default());
+        assert!(t.headline.contains("stopped part way"), "{}", t.headline);
+        assert_eq!(t.action.as_deref(), Some("retry"));
+        let c = explain(GitOp::Lfs, "Skipped checkout for \"a.bin\", content not local.", &AdviceCtx::default());
+        assert!(c.headline.contains("weren't downloaded"), "{}", c.headline);
     }
 }

@@ -10,6 +10,7 @@ import {
   SUBMODULES,
   SUB_INNER,
   LFS_POINTERS,
+  LFS_LISTING,
   LFS_PRESENT,
   LFS_NOT_INSTALLED,
   SYNC_PLAN,
@@ -48,6 +49,8 @@ async function openPage(browser, server, scenario, opts = {}) {
     submodules: opts.submodules ?? [],
     subInner: opts.subInner ?? null,
     lfs: opts.lfs ?? null,
+    lfsListing: opts.lfsListing ?? LFS_LISTING,
+    lfsProgress: opts.lfsProgress ?? null,
     lockOutcome: opts.lockOutcome ?? "applied",
     syncPlan: opts.syncPlan ?? SYNC_PLAN,
     syncPlanNoStash: opts.syncPlanNoStash ?? SYNC_PLAN_NOSTASH,
@@ -150,12 +153,17 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(cfg.submodules);
             case "changes_lfs_status":
               return Promise.resolve(cfg.lfs);
+            case "changes_lfs_files":
+              return Promise.resolve(cfg.lfsListing);
+            case "changes_lfs_progress":
+              return Promise.resolve(cfg.lfsProgress);
             case "changes_file_diff":
               return Promise.resolve(args.path === "logo.png" ? diffBinary : diffText);
             case "changes_pull":
             case "changes_push":
             case "changes_submodule_update":
             case "changes_lfs_pull":
+            case "changes_lfs_pull_paths":
               if (cfg.hang) return new Promise(() => {}); // never settles
               return done("Done.");
             case "changes_sync_plan":
@@ -1022,6 +1030,231 @@ try {
     ok("pulling runs as a background job with a banner", (await text(page)).includes("Downloading LFS files"));
     const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_lfs_pull"));
     ok("and calls the backend for the selected repo", call?.args?.repoPath === "/repos/gitswitch");
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Git LFS: browsing the files and downloading part of them");
+  {
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    await (await button(page, "Browse files…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Large files"), { timeout: 4000 });
+    const s = await text(page);
+    ok("the browser opens with the totals in words", s.includes("5 files · 3.0 GB in total"));
+    ok("  and says how much is still to come", s.includes("4 still to download (3.0 GB)"));
+    ok("  folders are listed with what they would cost", s.includes("3 of 3 to download"));
+    ok("  a file shows its own size", s.includes("1.0 MB"));
+    ok("  and whether it is already here", s.includes("to download"));
+    ok("  a downloaded-but-unwritten file is named as such", s.includes("downloaded, not written out"));
+    ok("  Download selected starts disabled", await (await button(page, "Download selected")).evaluate((b) => b.disabled));
+
+    // Pick one folder: the payload must be the folder, not its files.
+    await page.evaluate(() => {
+      const cb = document.querySelector('input[aria-label="Select folder media/video"]');
+      cb.click();
+    });
+    await sleep(150);
+    ok("selecting a folder counts its files and their weight",
+      (await text(page)).includes("2 selected · 2 to download (3.0 GB)"));
+    await (await button(page, "Download selected")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_lfs_pull_paths"), { timeout: 4000 });
+    const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_lfs_pull_paths"));
+    ok("  a fully chosen folder travels as the folder", JSON.stringify(call?.args?.paths) === JSON.stringify(["media/video"]));
+    ok("  for the repository on screen", call?.args?.repoPath === "/repos/gitswitch");
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    await (await button(page, "Browse files…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Large files"), { timeout: 4000 });
+    await page.evaluate(() => {
+      document.querySelector('input[aria-label="Select file media/video/clip.bin"]').click();
+    });
+    await sleep(150);
+    await (await button(page, "Download selected")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_lfs_pull_paths"), { timeout: 4000 });
+    const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_lfs_pull_paths"));
+    ok("one file out of a folder travels as that file", JSON.stringify(call?.args?.paths) === JSON.stringify(["media/video/clip.bin"]));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    await (await button(page, "Browse files…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Large files"), { timeout: 4000 });
+    ok("files already here are hidden by default", !(await text(page)).includes("model.bin"));
+    await page.evaluate(() => {
+      document.querySelector('input[aria-label="Only the ones still to download"]').click();
+    });
+    await sleep(200);
+    ok("  and shown when that is turned off", (await text(page)).includes("model.bin"));
+    await page.evaluate(() => {
+      const i = document.querySelector('input[aria-label="Search large files"]');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      setter.call(i, "tone");
+      i.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await sleep(250);
+    const s = await text(page);
+    ok("searching narrows the list to what matches", s.includes("tone.bin") && !s.includes("clip.bin"));
+    ok("  and the folder holding it is still shown", s.includes("audio"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS, hang: true });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    await (await button(page, "Browse files…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Large files"), { timeout: 4000 });
+    await (await button(page, "Download everything")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Downloading LFS files"), { timeout: 4000 });
+    ok("Download everything runs the whole-repository pull",
+      await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "changes_lfs_pull")));
+    ok("  and the browser closes behind it", !(await text(page)).includes("Only the ones still to download"));
+    await page.close();
+  }
+  {
+    // A long download must look like progress, not like a hung app.
+    const page = await open(SCENARIOS.lfsRepo, {
+      lfs: LFS_POINTERS,
+      hang: true,
+      lfsProgress: { file: "media/video/clip.bin", done: 2, total: 4, bytes: 1073741824, total_bytes: 3221225472 },
+    });
+    await page.waitForFunction(() => document.body.innerText.includes("Pull LFS files (5)"), { timeout: 4000 });
+    await (await button(page, "Pull LFS files")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("2 of 4 files"), { timeout: 5000 });
+    const s = await text(page);
+    ok("the banner says how far the download has got", s.includes("2 of 4 files"));
+    ok("  in bytes a person can read", s.includes("1.0 GB of 3.0 GB"));
+    ok("  and names the file being transferred", s.includes("media/video/clip.bin"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_NOT_INSTALLED });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    ok("without git-lfs there is nothing to browse",
+      await (await button(page, "Browse files…")).evaluate((b) => b.disabled));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    await (await button(page, "Browse files…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Large files"), { timeout: 4000 });
+    await page.evaluate(() => {
+      const i = document.querySelector('input[aria-label="Search large files"]');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      setter.call(i, "nothing-matches-this");
+      i.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await sleep(250);
+    const s = await text(page);
+    ok("a search with no match says so, naming what was searched for",
+      s.includes('Nothing here matches "nothing-matches-this"'));
+    ok("  and never claims everything is already downloaded",
+      !s.includes("Every large file here is already downloaded"));
+    await page.close();
+  }
+  {
+    // An older git-lfs has no --json, so no sizes. Printing "0 B" would be a
+    // measurement the app never made.
+    const noSizes = {
+      ...LFS_LISTING,
+      sizes_known: false,
+      total_bytes: 0,
+      missing_bytes: 0,
+      files: LFS_LISTING.files.map((f) => ({ ...f, size: 0 })),
+      folders: LFS_LISTING.folders.map((f) => ({ ...f, bytes: 0, missing_bytes: 0 })),
+    };
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS, lfsListing: noSizes });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    await (await button(page, "Browse files…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Large files"), { timeout: 4000 });
+    const s = await text(page);
+    ok("unknown sizes are said to be unknown", s.includes("size unknown"));
+    ok("  rather than printed as 0 B", !s.includes("0 B"));
+    await page.close();
+  }
+  {
+    // With the list capped, a folder still has to be downloadable whole —
+    // otherwise its unlisted files can never be asked for at all.
+    const capped = { ...LFS_LISTING, truncated: 3, total: 8 };
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS, lfsListing: capped });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    await (await button(page, "Browse files…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Large files"), { timeout: 4000 });
+    ok("the cap is stated", (await text(page)).includes("3 more files aren't listed here"));
+    await page.evaluate(() => document.querySelector('input[aria-label="Select folder media"]').click());
+    await sleep(150);
+    await (await button(page, "Download selected")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_lfs_pull_paths"), { timeout: 4000 });
+    const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_lfs_pull_paths"));
+    ok("  and choosing the folder sends the folder, not just the rows on screen",
+      JSON.stringify(call?.args?.paths) === JSON.stringify(["media"]));
+    await page.close();
+  }
+  {
+    // Progress belongs to downloads. During a push it would be the numbers a
+    // previous download left behind.
+    const page = await open(SCENARIOS.lfsRepo, {
+      lfs: LFS_POINTERS,
+      hang: true,
+      lfsProgress: { file: "media/video/clip.bin", done: 2, total: 4, bytes: 1073741824, total_bytes: 3221225472 },
+    });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    await (await button(page, "Push")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Pushing"), { timeout: 4000 });
+    await sleep(1400);
+    ok("a push shows no large-file progress", !(await text(page)).includes("2 of 4 files"));
+    await page.close();
+  }
+  {
+    // Thousands of un-virtualised rows is the lag this feature exists to
+    // avoid: the list is capped and says so.
+    const many = Array.from({ length: 400 }, (_, i) => ({
+      path: `bulk/file-${String(i).padStart(4, "0")}.bin`,
+      dir: "bulk",
+      size: 1024,
+      present: false,
+      downloaded: false,
+    }));
+    const big = {
+      ...LFS_LISTING,
+      files: many,
+      folders: [{ path: "bulk", depth: 0, files: 400, missing: 400, bytes: 409600, missing_bytes: 409600 }],
+      total: 400,
+      present: 0,
+      missing: 400,
+      total_bytes: 409600,
+      missing_bytes: 409600,
+    };
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS, lfsListing: big });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    await (await button(page, "Browse files…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Large files"), { timeout: 6000 });
+    const s = await text(page);
+    ok("a huge folder renders a capped list, and says so", s.includes("Showing the first 300 of 401 rows"));
+    ok("  and the folder can still be chosen whole without opening it",
+      s.includes("400 of 400 to download"));
+    await page.evaluate(() => document.querySelector('input[aria-label="Select folder bulk"]').click());
+    await sleep(200);
+    await (await button(page, "Download selected")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_lfs_pull_paths"), { timeout: 4000 });
+    const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_lfs_pull_paths"));
+    ok("  choosing it sends one folder, not four hundred paths",
+      JSON.stringify(call?.args?.paths) === JSON.stringify(["bulk"]));
+    await page.close();
+  }
+  {
+    // The browser is a wide table of paths and sizes: it has to survive a
+    // narrow window like every other surface.
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS, width: 700 });
+    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
+    await (await button(page, "Browse files…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Large files"), { timeout: 4000 });
+    const over = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
+    ok("the browser doesn't overflow a 700px window", !over);
     await page.close();
   }
 

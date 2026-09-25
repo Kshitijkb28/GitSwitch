@@ -143,12 +143,127 @@ ok "  installed is false" "$(printf '%s' "$OUT" | jqf lfs.installed)" "False"
 OUT=$(probe lfs_available "$SB")
 ok "the tool check answers without a repository" "$(printf '%s' "$OUT" | jqf installed)" "True"
 
+# --- browsing and downloading a part of the repository ----------------------
+# Read one field out of a JSON document on stdin with a python expression, for
+# the list-shaped answers `jqf` (dict paths only) can't reach.
+pysel() { "$PY" -c "
+import sys,json
+d=json.load(sys.stdin)
+print($1)
+"; }
+# The frontend's own IPC, for an argument a comma-separated PROBE_ARGS can't carry.
+invoke_json() {
+  PROBE_OP=invoke PROBE_CMD="$1" PROBE_JSON="$2" "$BIN" probe --ignored --nocapture 2>/dev/null \
+    | sed -n 's/^PROBE_OUT //p'
+}
+
+section "Browsing the large files folder by folder"
+cd "$SB/author"
+mkdir -p media/video media/audio
+head -c 3072 /dev/urandom > media/video/clip.bin
+head -c 1536 /dev/urandom > media/audio/tone.bin
+head -c 700  /dev/urandom > "media/odd,name.bin"
+git add -A >/dev/null; git commit -qm "more large files"; git push -q origin main 2>/dev/null
+cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" browse 2>/dev/null
+
+OUT=$(probe lfs_files "$SB/browse")
+ok "every tracked file is listed" "$(printf '%s' "$OUT" | jqf total)" "6"
+ok "  none of them is here yet" "$(printf '%s' "$OUT" | jqf missing)" "6"
+ok "  a stub still reports the real size it will take" \
+  "$(printf '%s' "$OUT" | pysel "[f['size'] for f in d['files'] if f['path']=='model.bin'][0]")" "4096"
+ok "  the total weight is the sum, not a guess" \
+  "$(printf '%s' "$OUT" | jqf total_bytes)" "$((4096+2048+6144+3072+1536+700))"
+ok "  a folder counts everything beneath it" \
+  "$(printf '%s' "$OUT" | pysel "[x['files'] for x in d['folders'] if x['path']=='media'][0]")" "3"
+ok "  a nested folder counts only its own" \
+  "$(printf '%s' "$OUT" | pysel "[x['files'] for x in d['folders'] if x['path']=='media/video'][0]")" "1"
+ok "  and carries what that folder would cost to download" \
+  "$(printf '%s' "$OUT" | pysel "[x['missing_bytes'] for x in d['folders'] if x['path']=='media'][0]")" "$((3072+1536+700))"
+ok "  a path with spaces survives whole" \
+  "$(printf '%s' "$OUT" | pysel "[f['path'] for f in d['files'] if ' ' in f['path']][0]")" "assets/big files/tex ture.bin"
+ok "  a file at the root belongs to no folder" \
+  "$(printf '%s' "$OUT" | pysel "repr([f['dir'] for f in d['files'] if f['path']=='model.bin'][0])")" "''"
+ok "  and the summary says it in words" "$(printf '%s' "$OUT" | jqf summary)" "6 of 6 LFS files are still a pointer stub"
+
+section "Downloading one folder and nothing else"
+OUT=$(probe lfs_pull_paths "$SB/browse" "media/video")
+ok "it succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  and names what arrived, with its weight" "$(printf '%s' "$OUT" | jqf headline)" "Downloaded 1 file (3.0 KB)."
+ok "  the chosen file holds real content" "$(wc -c < "$SB/browse/media/video/clip.bin" | tr -d ' ')" "3072"
+ok "  its neighbour in the next folder was left alone" \
+  "$([ "$(wc -c < "$SB/browse/media/audio/tone.bin" | tr -d ' ')" -lt 200 ] && echo stub || echo content)" "stub"
+ok "  and so was the rest of the repository" \
+  "$([ "$(wc -c < "$SB/browse/model.bin" | tr -d ' ')" -lt 200 ] && echo stub || echo content)" "stub"
+ok "  the counts that come back are measured, not assumed" "$(printf '%s' "$OUT" | jqf lfs.pointers)" "5"
+
+section "Downloading one file, including a path git-lfs can't filter on"
+# `--include` is comma-separated, so a comma in a path can only be fetched
+# approximately — the checkout step is given the exact path, which is what makes
+# the result precise. The UI sends real JSON, so the probe does too.
+OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/browse\",\"paths\":[\"media/odd,name.bin\"]}")
+ok "a path holding a comma still downloads" "$(printf '%s' "$OUT" | pysel "d['value']['ok']")" "True"
+ok "  and holds its content" "$(wc -c < "$SB/browse/media/odd,name.bin" | tr -d ' ')" "700"
+ok "  while its folder neighbour is still a stub" \
+  "$([ "$(wc -c < "$SB/browse/media/audio/tone.bin" | tr -d ' ')" -lt 200 ] && echo stub || echo content)" "stub"
+OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/browse\",\"paths\":[\"assets/big files/tex ture.bin\"]}")
+ok "a path holding spaces downloads too" "$(wc -c < "$SB/browse/assets/big files/tex ture.bin" | tr -d ' ')" "2048"
+
+section "Asking again for what is already here"
+OUT=$(probe lfs_pull_paths "$SB/browse" "media/video")
+ok "says so instead of downloading again" "$(printf '%s' "$OUT" | jqf headline)" "already here"
+ok "  and the file is untouched" "$(wc -c < "$SB/browse/media/video/clip.bin" | tr -d ' ')" "3072"
+
+section "A selection that can't be honoured is refused by name"
+OUT=$(probe lfs_pull_paths "$SB/browse" "no/such/folder")
+ok "an unknown path is named, not guessed at" "$(printf '%s' "$OUT" | jqf refusal.code)" "unknown-path"
+OUT=$(probe lfs_pull_paths "$SB/browse" "")
+ok "an empty selection is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-paths"
+OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/browse\",\"paths\":[\"../escape.bin\"]}")
+ok "a path leaving the repository never reaches git" "$(printf '%s' "$OUT" | pysel "d['value']['refusal']['code']")" "invalid-path"
+OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/browse\",\"paths\":[\"--upload\"]}")
+ok "and neither does one git would read as an option" "$(printf '%s' "$OUT" | pysel "d['value']['refusal']['code']")" "invalid-path"
+OUT=$(probe lfs_pull_paths "$SB/plain" "anything")
+ok "a repository without LFS is refused by name" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-lfs"
+
+section "A name holding a wildcard matches only itself"
+# Every path given to git-lfs is a pattern. Written literally, `st*r.bin` also
+# writes out `star.bin` — a file nobody selected — and `x[1].bin` fetches
+# `x1.bin` INSTEAD of itself, leaving the chosen file a stub while the app
+# blames the server.
+cd "$SB/author"
+head -c 111 /dev/urandom > "st*r.bin";  head -c 222 /dev/urandom > "star.bin"
+head -c 333 /dev/urandom > "x[1].bin";  head -c 444 /dev/urandom > "x1.bin"
+head -c 555 /dev/urandom > "q?r.bin";   head -c 666 /dev/urandom > "qZr.bin"
+git add -A >/dev/null; git commit -qm "wildcard names" >/dev/null; git push -q origin main 2>/dev/null
+cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" globs 2>/dev/null
+stub_or_content() { [ "$(wc -c < "$1" | tr -d ' ')" -lt 200 ] && echo stub || echo content; }
+
+OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"st*r.bin\"]}")
+ok "a name holding * downloads" "$(wc -c < "$SB/globs/st*r.bin" | tr -d ' ')" "111"
+ok "  and the file it would have globbed onto is untouched" "$(stub_or_content "$SB/globs/star.bin")" "stub"
+OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"x[1].bin\"]}")
+ok "a name holding [ ] downloads itself, not the file its class would match" \
+  "$(wc -c < "$SB/globs/x[1].bin" | tr -d ' ')" "333"
+ok "  and x1.bin is left alone" "$(stub_or_content "$SB/globs/x1.bin")" "stub"
+OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"q?r.bin\"]}")
+ok "a name holding ? downloads itself" "$(wc -c < "$SB/globs/q?r.bin" | tr -d ' ')" "555"
+ok "  and qZr.bin is left alone" "$(stub_or_content "$SB/globs/qZr.bin")" "stub"
+ok "  the progress file lives in the repository, not in shared temp" \
+  "$(ls "$SB/globs/.git/" | grep -c gitswitch-lfs || true)" "0"
+
+section "Downloading the rest"
+OUT=$(probe lfs_pull "$SB/browse")
+ok "everything else arrives" "$(printf '%s' "$OUT" | jqf lfs.pointers)" "0"
+ok "  including the file in the folder that was skipped before" "$(wc -c < "$SB/browse/media/audio/tone.bin" | tr -d ' ')" "1536"
+ok "  no progress file is left behind" "$(probe lfs_progress "$SB/browse")" "null"
+
 section "Objects missing from the server"
 cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" work2 2>/dev/null
 rm -rf "$SB/remote.git/lfs/objects"
 OUT=$(probe lfs_pull "$SB/work2")
 ok "the failure is explained as a server-side gap, not a local bug" "$(printf '%s' "$OUT" | tr -d '\n')" "server"
-# Three LFS files exist by now (model.bin, the spaced one, added.bin).
-ok "  and nothing pretends to have been downloaded" "$(printf '%s' "$OUT" | jqf lfs.pointers)" "3"
+# Twelve LFS files exist by now: model.bin, the spaced one, added.bin, the three
+# the browsing section added and the six wildcard-named ones.
+ok "  and nothing pretends to have been downloaded" "$(printf '%s' "$OUT" | jqf lfs.pointers)" "12"
 
 verify_result

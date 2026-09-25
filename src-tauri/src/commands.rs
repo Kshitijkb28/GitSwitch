@@ -18,7 +18,7 @@ use crate::profiles::{self, Profile};
 use crate::signing;
 use crate::sparse::{self, CertInfo, CloneResult, DestinationStatus, SparseInfo, SparseSetResult};
 use crate::submodules::{self, SubmoduleInfo};
-use crate::lfs::{self, LfsStatus, LfsTool};
+use crate::lfs::{self, LfsListing, LfsProgress, LfsStatus, LfsTool};
 use crate::ssh_keys;
 
 #[tauri::command]
@@ -686,6 +686,26 @@ pub async fn changes_lfs_status(repo_path: String) -> Result<LfsStatus, AppError
     lfs::lfs_status(&repo_path).await
 }
 
+/// Every large file in the checkout, with folder totals — what the browser
+/// needs to offer one file, one folder, or all of them.
+#[tauri::command]
+pub async fn changes_lfs_files(repo_path: String) -> Result<LfsListing, AppError> {
+    lfs::lfs_files(&repo_path).await
+}
+
+/// Download only the files and folders picked in the browser.
+#[tauri::command]
+pub async fn changes_lfs_pull_paths(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
+    git_ops::lfs_pull_paths(&repo_path, paths).await
+}
+
+/// How far the download running in this repository has got. `None` when no run
+/// has reported anything yet, which is the normal state between operations.
+#[tauri::command]
+pub async fn changes_lfs_progress(repo_path: String) -> Option<LfsProgress> {
+    lfs::read_progress(&repo_path).await
+}
+
 /// `git lfs pull`: download the content for every pointer stub. Reports how
 /// many actually arrived, measured by counting the stubs again afterwards.
 #[tauri::command]
@@ -880,6 +900,13 @@ pub async fn changes_stash_restore_file(repo_path: String, index: usize, path: S
 #[tauri::command]
 pub async fn history_commit_file_diff(repo_path: String, hash: String, path: String) -> Result<git_status::FileDiff, AppError> {
     git_status::commit_file_diff(&repo_path, &hash, &path).await
+}
+
+/// What is new on the remote branch, without downloading anything (ls-remote,
+/// plus GitHub's compare API for a count when an account is signed in).
+#[tauri::command]
+pub async fn history_peek(repo_path: String) -> Result<crate::peek::RemotePeek, AppError> {
+    crate::peek::peek_remote(&repo_path).await
 }
 
 /// A commit id, short id or ref typed by the user, with what a reset to it

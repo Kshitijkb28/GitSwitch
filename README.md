@@ -96,7 +96,14 @@ for folders that still use HTTPS.
     never says so. The Changes page counts the stubs and offers `git lfs pull`,
     setting the repository's LFS filters up first when they were never
     configured — the state in which `git lfs pull` exits 0 and downloads
-    nothing.
+    nothing. **Browse files…** opens the whole list folder by folder, with
+    each file's real size shown before anything is downloaded, and downloads
+    one file, one folder or any selection of them — `git lfs fetch --include`
+    brings the objects, `git lfs checkout` writes them out. Both read their
+    arguments as patterns, so each path is escaped to match only itself: a file
+    really called `shot*1.bin` downloads that file and not its neighbours. A
+    running download reports the file and the bytes it is on, and a failure
+    names what is still missing rather than reporting success next time round.
   - **Inside submodules.** Every populated submodule gets its own section on
     the page — its conflicts, staged, unstaged and new files, with the same
     stage / unstage / discard / diff actions and its own commit box committing
@@ -185,6 +192,14 @@ for folders that still use HTTPS.
     line diff of every file it touched. A reset that would drop commits already
     on the upstream is refused and the alternatives are offered instead.
     Anything that ends in a conflict hands you to the Changes page.
+  - **Fetch vs Check GitHub.** *Fetch* runs `git fetch` in the folder: it
+    updates your copy of the remote branches (`origin/*`) and nothing else —
+    your branch, your files and your unpushed commits stay put, nothing is
+    merged. *Check GitHub* asks the remote where the branch is without
+    downloading anything at all (no objects, no remote refs, not even
+    `FETCH_HEAD`), says how many commits are new since your last fetch when
+    that can be known (the objects are already here, or a signed-in GitHub
+    account can answer), and offers *Fetch now*.
   - **Submodules.** A repository's populated submodules are listed as chips
     with their own ahead/behind; pick one and the page browses that submodule
     (branches, commits, Fetch and every commit action belong to it) until you

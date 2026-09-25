@@ -18,6 +18,11 @@ pub const NET_TIMEOUT: Duration = Duration::from_secs(180);
 pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Reads: status, config, rev-parse, diff.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Git LFS transfers: a repository's large files can be many gigabytes, and a
+/// download that is still making progress must not be killed for taking longer
+/// than an ordinary fetch. Progress is reported separately, so a genuinely
+/// stalled transfer is visible rather than hidden behind this ceiling.
+pub const LFS_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub struct GitOutput {
     pub code: i32,
@@ -94,6 +99,7 @@ pub struct GitCmd {
     top: Vec<String>,
     args: Vec<String>,
     stdin: Option<Vec<u8>>,
+    env: Vec<(String, String)>,
     timeout: Duration,
 }
 
@@ -107,6 +113,7 @@ impl GitCmd {
             top: Vec::new(),
             args: Vec::new(),
             stdin: None,
+            env: Vec::new(),
             timeout: READ_TIMEOUT,
         }
     }
@@ -174,6 +181,14 @@ impl GitCmd {
     /// Feed bytes on stdin — for `commit --file=-` and
     /// `--pathspec-from-file=-`, so neither a message nor a filename is ever
     /// parsed as an option.
+    /// One extra environment variable for this command, applied after the
+    /// hardening below so a caller can add what only it needs — today that is
+    /// `GIT_LFS_PROGRESS`, which makes a long download observable.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
+    }
+
     pub fn stdin_bytes(mut self, data: Vec<u8>) -> Self {
         self.stdin = Some(data);
         self
@@ -222,6 +237,11 @@ impl GitCmd {
         for key in inherited_git_env_to_strip() {
             cmd.env_remove(key);
         }
+        // Caller-supplied variables come last: they are the only ones chosen
+        // for this single command, so nothing above may silently drop them.
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         match &self.stdin {
@@ -231,6 +251,13 @@ impl GitCmd {
         // If the timeout fires we drop the child future; without this the git
         // process would outlive it.
         cmd.kill_on_drop(true);
+        // `git lfs pull` is `git` running `git-lfs` as a CHILD process, so
+        // killing git alone leaves git-lfs downloading, re-parented to init.
+        // That is how a timed-out download used to report an error and then
+        // quietly finish anyway — the next look said everything was present.
+        // Its own process group makes the whole tree killable at once.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd
             .spawn()
@@ -248,13 +275,29 @@ impl GitCmd {
         }
 
         let secs = self.timeout.as_secs();
+        #[cfg(unix)]
+        let pid = child.id();
         let out = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
             Ok(result) => result.map_err(|e| AppError::Command(format!("git {} failed: {}", sub, e)))?,
             Err(_) => {
-                return Err(AppError::Command(format!(
-                    "git {} timed out after {}s — the remote may be unreachable, or another git process is holding a lock",
-                    sub, secs
-                )))
+                // Kill the group, not just git: see `process_group` above.
+                #[cfg(unix)]
+                if let Some(pid) = pid {
+                    unsafe {
+                        libc::kill(-(pid as i32), libc::SIGKILL);
+                    }
+                }
+                return Err(AppError::Command(if sub == "lfs" {
+                    format!(
+                        "The large-file download was stopped after {}s without finishing. Whatever already arrived is kept, so running it again continues rather than starting over.",
+                        secs
+                    )
+                } else {
+                    format!(
+                        "git {} timed out after {}s — the remote may be unreachable, or another git process is holding a lock",
+                        sub, secs
+                    )
+                }));
             }
         };
 
@@ -378,5 +421,45 @@ mod tests {
         ] {
             assert!(validate_branch_name(bad).is_err(), "{} should fail", bad);
         }
+    }
+
+    /// The failure this guards against, in the shape it really has: `git lfs
+    /// pull` is `git` running `git-lfs` as a child, so killing only the process
+    /// we spawned leaves the download running. It then finishes in the
+    /// background — after the app has already reported a timeout — and the next
+    /// look says everything is present. A `!shell` alias reproduces that tree
+    /// with no network and no git-lfs needed.
+    #[tokio::test]
+    async fn a_timed_out_command_takes_its_grandchildren_with_it() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-pgroup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let init = std::process::Command::new("git").arg("init").arg("-q").arg(&dir).output();
+        match init {
+            Ok(o) if o.status.success() => {}
+            // No usable git on this machine: there is nothing to prove here.
+            _ => return,
+        }
+        let marker = dir.join("the-grandchild-kept-working");
+        let alias = format!(
+            "!sh -c 'sh -c \"sleep 3; touch {}\" & wait'",
+            marker.display()
+        );
+
+        let out = GitCmd::at(&dir)
+            .cfg("alias.slowspawn", alias)
+            .args(["slowspawn"])
+            .timeout(Duration::from_millis(400))
+            .run()
+            .await;
+        assert!(out.is_err(), "the command should have timed out");
+
+        // Long enough for the grandchild's sleep to have finished, had it lived.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            !marker.exists(),
+            "a grandchild outlived the timeout and went on working"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

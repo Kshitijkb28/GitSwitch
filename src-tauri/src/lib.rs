@@ -16,6 +16,7 @@ mod git_remote;
 mod github;
 mod oauth;
 mod paths;
+mod peek;
 /// Test-only driver for scripts/verify — never part of the app binary.
 #[cfg(test)]
 mod probe;
@@ -105,6 +106,9 @@ pub fn run() {
             commands::changes_submodule_update,
             commands::changes_lfs_status,
             commands::changes_lfs_pull,
+            commands::changes_lfs_files,
+            commands::changes_lfs_pull_paths,
+            commands::changes_lfs_progress,
             commands::lfs_available,
             commands::changes_abort,
             commands::changes_continue,
@@ -134,6 +138,7 @@ pub fn run() {
             commands::changes_stash_restore_file,
             commands::history_commit_file_diff,
             commands::history_resolve,
+            commands::history_peek,
             commands::changes_file_diff,
             commands::changes_push_state,
             commands::changes_set_push_mode,

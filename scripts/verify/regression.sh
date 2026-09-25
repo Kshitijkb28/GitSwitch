@@ -89,6 +89,38 @@ ok "  with graph lanes assigned" "$(printf '%s' "$OUT" | python3 -c "import sys,
 OUT=$(probe sync "$R" "main")
 ok "sync reports ahead/behind against the upstream" "$(printf '%s' "$OUT" | jqf upstream)" "origin/main"
 
+section "Check GitHub (peek): what is new on the remote, without downloading"
+W="$SB/clones/plain"
+git -C "$W" fetch -q origin 2>/dev/null
+OBJ_BEFORE="$(git -C "$W" count-objects -v | tr '\n' ' ')"; REF_BEFORE="$(git -C "$W" rev-parse refs/remotes/origin/main)"
+mtime() { "$PY" -c 'import os,sys; print(os.path.getmtime(sys.argv[1]) if os.path.exists(sys.argv[1]) else "none")' "$1"; }
+FH_BEFORE="$(mtime "$W/.git/FETCH_HEAD")"
+OUT=$(probe peek "$W")
+ok "nothing new is reported as such" "$(printf '%s' "$OUT" | jqf changed)" "False"
+ok "  in words" "$(printf '%s' "$OUT" | jqf message)" "Nothing new on origin/main"
+cd "$SB/seed"; git pull -q --rebase origin main 2>/dev/null; echo more >> src/a.txt; git add -A >/dev/null; git commit -qm "seed: more"; git push -q origin main 2>/dev/null
+OUT=$(probe peek "$W")
+ok "a commit pushed elsewhere shows the branch moved" "$(printf '%s' "$OUT" | jqf changed)" "True"
+ok "  naming the new tip" "$(printf '%s' "$OUT" | jqf remote_tip)" "$(git -C "$SB/seed" rev-parse HEAD)"
+ok "  the objects are not here, so no count is invented" "$(printf '%s' "$OUT" | jqf new_commits)" "None"
+ok "  and it says nothing was downloaded" "$(printf '%s' "$OUT" | jqf message)" "Nothing was downloaded"
+ok "  origin/main did not move" "$(git -C "$W" rev-parse refs/remotes/origin/main)" "$REF_BEFORE"
+ok "  no object arrived" "$(git -C "$W" count-objects -v | tr '\n' ' ')" "$OBJ_BEFORE"
+ok "  FETCH_HEAD was not written" "$(mtime "$W/.git/FETCH_HEAD")" "$FH_BEFORE"
+git -C "$W" fetch -q origin 2>/dev/null
+OUT=$(probe peek "$W")
+ok "after a fetch the check is quiet again" "$(printf '%s' "$OUT" | jqf changed)" "False"
+git -C "$W" reset -q --hard origin/main~1
+git -C "$W" branch -q --set-upstream-to=origin/main
+git -C "$W" update-ref refs/remotes/origin/main origin/main~1
+OUT=$(probe peek "$W")
+ok "when the objects are already here the count is exact" "$(printf '%s' "$OUT" | jqf new_commits):$(printf '%s' "$OUT" | jqf counted_by)" "1:local"
+git -C "$W" fetch -q origin 2>/dev/null; git -C "$W" reset -q --hard origin/main
+git -C "$SB/seed" push -q origin :refs/heads/gone 2>/dev/null; git -C "$SB/seed" push -q origin main:gone 2>/dev/null; git -C "$W" fetch -q origin 2>/dev/null; git -C "$W" switch -q -c gone --track origin/gone; git -C "$SB/seed" push -q origin :refs/heads/gone 2>/dev/null
+OUT=$(probe peek "$W")
+ok "a branch deleted on the remote is reported, not guessed at" "$(printf '%s' "$OUT" | jqf branch_gone)" "True"
+git -C "$W" switch -q main
+
 section "The Changes page still reads these repos correctly"
 OUT=$(probe status "$SB/clones/withsub")
 ok "status sees the submodule repo" "$(printf '%s' "$OUT" | jqf has_submodules)" "True"

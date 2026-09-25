@@ -13,7 +13,7 @@
 
 use crate::error::AppError;
 use crate::git_advice::{self, Advice, AdviceCtx, GitOp};
-use crate::git_exec::{GitCmd, LOCAL_TIMEOUT, NET_TIMEOUT};
+use crate::git_exec::{GitCmd, LFS_TIMEOUT, LOCAL_TIMEOUT, NET_TIMEOUT};
 use crate::git_status::{self, RepoStatus};
 use crate::sparse::SubmoduleReport;
 use serde::{Deserialize, Serialize};
@@ -1414,11 +1414,17 @@ pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppEr
         configured_now = true;
     }
 
+    let progress = crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path).await);
     let out = GitCmd::at(repo_path)
         .args(["lfs", "pull"])
-        .timeout(NET_TIMEOUT)
+        // Gigabytes of large files are normal; a transfer that is still moving
+        // must not be killed on an ordinary fetch's clock. The progress file
+        // is what makes the wait visible instead of looking like a hang.
+        .timeout(LFS_TIMEOUT)
+        .env("GIT_LFS_PROGRESS", progress.0.to_string_lossy().to_string())
         .run()
         .await?;
+    drop(progress);
 
     // Measure, don't assume: count the stubs again.
     let after = crate::lfs::lfs_status(repo_path).await?;
@@ -1513,6 +1519,208 @@ pub async fn lfs_pull(repo_path: &str) -> Result<OpResult, AppError> {
         lfs: Some(lfs_after),
         ..OpResult::done(headline, detail, after)
     })
+}
+
+/// Download only the large files a person picked — one file, one folder, or
+/// any set of them.
+///
+/// Two git-lfs commands rather than one `pull`, because they answer different
+/// questions and only the pair is precise: `fetch --include` brings the objects
+/// for the selection into the local store, and `checkout` writes the *exact*
+/// paths into the working tree. `--include` is a comma-separated pattern list,
+/// so a path containing a comma can only be fetched approximately; checkout
+/// takes real arguments, which is why it, not the fetch, decides what lands.
+pub async fn lfs_pull_paths(repo_path: &str, paths: Vec<String>) -> Result<OpResult, AppError> {
+    let before = crate::lfs::lfs_files(repo_path).await?;
+    if !before.uses_lfs {
+        return Ok(OpResult::refused_alone(refuse(
+            "no-lfs",
+            "This repository doesn't use Git LFS — there is nothing to download.",
+        )));
+    }
+    if !before.installed {
+        return Ok(OpResult::refused_alone(refuse(
+            "lfs-not-installed",
+            "git-lfs isn't installed on this Mac, so the large files can't be downloaded. Install it (brew install git-lfs) and try again.",
+        )));
+    }
+    let selected: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim_end_matches('/').to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if selected.is_empty() {
+        return Ok(OpResult::refused_alone(refuse(
+            "no-paths",
+            "Nothing was selected, so there is nothing to download.",
+        )));
+    }
+    for p in &selected {
+        if let Err(msg) = crate::lfs::validate_lfs_path(p) {
+            return Ok(OpResult::refused_alone(refuse("invalid-path", msg)));
+        }
+        if !before.knows(p) {
+            return Ok(OpResult::refused_alone(refuse(
+                "unknown-path",
+                format!(
+                    "`{}` isn't a large file or folder in this repository any more — the list may be out of date. Close and reopen it.",
+                    p
+                ),
+            )));
+        }
+    }
+
+    let snap = snapshot(repo_path).await?;
+    if let Some(r) = check(&Intent::Submodule, &StatusFacts::from(&snap)) {
+        return Ok(OpResult::refused(
+            Refusal { code: r.code, message: r.message.replace("update submodules", "download LFS files") },
+            snap,
+        ));
+    }
+
+    let wanted: Vec<&crate::lfs::LfsFile> = before
+        .files
+        .iter()
+        .filter(|f| selected.iter().any(|s| crate::lfs::LfsListing::covers(s, &f.path)))
+        .collect();
+    let missing_before = wanted.iter().filter(|f| !f.present).count();
+    let bytes_wanted: u64 = wanted.iter().filter(|f| !f.present).map(|f| f.size).sum();
+    if missing_before == 0 && !wanted.is_empty() {
+        return Ok(OpResult {
+            lfs: Some(before.to_status()),
+            ..OpResult::done(
+                format!(
+                    "{} file{} already here.",
+                    wanted.len(),
+                    if wanted.len() == 1 { " is" } else { "s are" }
+                ),
+                "Nothing needed downloading.",
+                snap,
+            )
+        });
+    }
+
+    // Filters first: without them `git lfs checkout` writes nothing and still
+    // exits 0 — the silent failure this whole feature exists to avoid.
+    let mut configured_now = false;
+    if !before.filters_configured {
+        let setup = GitCmd::at(repo_path)
+            .args(["lfs", "install", "--local"])
+            .timeout(LOCAL_TIMEOUT)
+            .run()
+            .await?;
+        if !setup.ok() {
+            let advice = git_advice::explain(GitOp::Lfs, &setup.stderr, &AdviceCtx::default());
+            return Ok(OpResult { lfs: Some(before.to_status()), ..OpResult::failed(advice, snap) });
+        }
+        configured_now = true;
+    }
+
+    // Chunked, so an enormous selection is still exactly what was asked for
+    // rather than a fallback that fetches and writes out the whole repository.
+    let progress = crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path).await);
+    let mut failure: Option<String> = None;
+    for chunk in crate::lfs::chunk_selection(&selected) {
+        let include = crate::lfs::include_patterns(&chunk);
+        let fetched_out = GitCmd::at(repo_path)
+            .args(["lfs", "fetch"])
+            .arg(format!("--include={}", include))
+            .timeout(LFS_TIMEOUT)
+            .env("GIT_LFS_PROGRESS", progress.0.to_string_lossy().to_string())
+            .run()
+            .await?;
+        if !fetched_out.ok() {
+            failure = Some(if fetched_out.stderr.is_empty() { fetched_out.text() } else { fetched_out.stderr });
+            break;
+        }
+        // Write the selection into the working tree. Only content already in
+        // the local store is written, a file you have edited is never
+        // overwritten, and every pattern is escaped so a name holding a
+        // wildcard matches itself and nothing else.
+        let mut checkout = GitCmd::at(repo_path).args(["lfs", "checkout", "--"]);
+        for p in &chunk {
+            checkout = checkout.arg(crate::lfs::literal_pattern(p));
+        }
+        // Writing the files out is the slow half on a local disk, and it is
+        // the half git-lfs reports on there — so it gets the progress file too.
+        let checkout_out = checkout
+            .timeout(LFS_TIMEOUT)
+            .env("GIT_LFS_PROGRESS", progress.0.to_string_lossy().to_string())
+            .run()
+            .await?;
+        if !checkout_out.ok() {
+            failure = Some(if checkout_out.stderr.is_empty() { checkout_out.text() } else { checkout_out.stderr });
+            break;
+        }
+    }
+    drop(progress);
+
+    let after = crate::lfs::lfs_files(repo_path).await?;
+    let still_missing: Vec<&crate::lfs::LfsFile> = after
+        .files
+        .iter()
+        .filter(|f| !f.present && selected.iter().any(|s| crate::lfs::LfsListing::covers(s, &f.path)))
+        .collect();
+    let arrived = missing_before.saturating_sub(still_missing.len());
+    let status = snapshot(repo_path).await?;
+
+    if let Some(stderr) = failure {
+        let advice = git_advice::explain(GitOp::Lfs, &stderr, &AdviceCtx::default());
+        let names: Vec<String> = still_missing.iter().take(5).map(|f| f.path.clone()).collect();
+        // Name what is still a stub. Reporting only a count is how a failure
+        // ends up looking like a success the next time the list is read.
+        let detail = if still_missing.is_empty() {
+            format!(
+                "git-lfs reported an error, but all {} file{} asked for {} here now.",
+                missing_before,
+                if missing_before == 1 { "" } else { "s" },
+                if missing_before == 1 { "is" } else { "are" }
+            )
+        } else {
+            format!(
+                "{} of {} file{} arrived. Still missing: {}{}.",
+                arrived,
+                missing_before,
+                if missing_before == 1 { "" } else { "s" },
+                names.join(", "),
+                if still_missing.len() > names.len() {
+                    format!(" and {} more", still_missing.len() - names.len())
+                } else {
+                    String::new()
+                }
+            )
+        };
+        return Ok(OpResult { lfs: Some(after.to_status()), detail, ..OpResult::failed(advice, status) });
+    }
+
+    let headline = if still_missing.is_empty() {
+        // An older git-lfs reports no sizes at all; "(0 B)" would be a
+        // measurement that was never taken.
+        format!(
+            "Downloaded {} file{}{}.",
+            arrived,
+            if arrived == 1 { "" } else { "s" },
+            if before.sizes_known { format!(" ({})", crate::lfs::human_bytes(bytes_wanted)) } else { String::new() }
+        )
+    } else {
+        format!(
+            "Downloaded {} of {} files — {} still missing.",
+            arrived, missing_before, still_missing.len()
+        )
+    };
+    let mut detail = if still_missing.is_empty() {
+        format!(
+            "{} now hold{} real content.",
+            if selected.len() == 1 { selected[0].clone() } else { format!("The {} selected paths", selected.len()) },
+            if selected.len() == 1 { "s" } else { "" }
+        )
+    } else {
+        "git-lfs reported no error, but some files are still pointer stubs — their objects may not exist on the server.".to_string()
+    };
+    if configured_now {
+        detail.push_str(" (This repository's LFS filters weren't set up, so that was done first.)");
+    }
+    Ok(OpResult { lfs: Some(after.to_status()), ..OpResult::done(headline, detail, status) })
 }
 
 // --- Abort ---------------------------------------------------------------

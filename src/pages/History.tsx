@@ -13,6 +13,7 @@ import {
   Crosshair,
   X,
   Box,
+  Radar,
 } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
@@ -134,6 +135,9 @@ export function History() {
   const [gotoText, setGotoText] = useState("");
   const [gotoError, setGotoError] = useState<string | null>(null);
   const [gotoBusy, setGotoBusy] = useState(false);
+  /** "Check GitHub": what is new on the remote branch, read without downloading anything. */
+  const [peek, setPeek] = useState<api.RemotePeek | null>(null);
+  const [peeking, setPeeking] = useState(false);
   /** The outcome of the last action taken from the detail panel. */
   const [result, setResult] = useState<api.OpResult | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
@@ -180,10 +184,26 @@ export function History() {
     }
   }, []);
 
+  /** ls-remote — asks the remote where its branch is, writes nothing at all. */
+  async function doPeek() {
+    if (!repo) return;
+    setPeeking(true);
+    setError(null);
+    try {
+      setPeek(await api.historyPeek(repo));
+    } catch (e) {
+      setError(String(e));
+      setPeek(null);
+    } finally {
+      setPeeking(false);
+    }
+  }
+
   /** git fetch — updates remote refs only; the working tree is never touched. */
   async function doFetch(path = repo, silent = false) {
     if (!path) return;
     setFetching(true);
+    setPeek(null); // a fetch makes the check's answer stale
     if (!silent) setError(null);
     try {
       const res = await api.historyFetch(path);
@@ -366,6 +386,7 @@ export function History() {
       setResult(null);
       setDetail(null);
       setTarget(null);
+      setPeek(null);
     }
     loadBranches(repo);
   }, [repo, loadBranches]);
@@ -484,6 +505,16 @@ export function History() {
           </Button>
           <Button
             variant="secondary"
+            onClick={doPeek}
+            disabled={!repo || peeking}
+            className="min-w-[8.5rem]"
+            title="Asks the remote where the branch is now — downloads nothing, writes nothing in this folder"
+          >
+            <Radar size={16} className={peeking ? "animate-pulse" : ""} />
+            {peeking ? "Checking…" : "Check GitHub"}
+          </Button>
+          <Button
+            variant="secondary"
             onClick={() => { loadRepos(); loadBranches(repo); setOffset(0); setReloadKey((k) => k + 1); }}
             disabled={!repo || loadingBranches}
           >
@@ -511,6 +542,21 @@ export function History() {
 
       {gotoError && (
         <p className="text-sm text-red-400 break-words -mt-3">{gotoError}</p>
+      )}
+
+      {peek && (
+        <div className={`flex flex-wrap items-center gap-2 text-sm -mt-2 ${peek.changed ? "text-amber-200" : "text-zinc-400"}`}>
+          <Radar size={14} className={`shrink-0 ${peek.changed ? "text-amber-400" : "text-emerald-400"}`} />
+          <span className="break-words">{peek.message}</span>
+          {peek.changed && !peek.branch_gone && (
+            <Button size="sm" variant="secondary" onClick={() => doFetch()} disabled={fetching}>
+              Fetch now
+            </Button>
+          )}
+          <button type="button" onClick={() => setPeek(null)} className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer">
+            dismiss
+          </button>
+        </div>
       )}
 
       {subs.length > 0 && (
