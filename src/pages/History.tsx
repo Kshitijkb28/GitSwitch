@@ -1,0 +1,1026 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import { useNavigate } from "react-router-dom";
+import {
+  GitBranch,
+  GitMerge,
+  Loader2,
+  ChevronLeft,
+  ChevronRight,
+  Search,
+  RefreshCw,
+  CloudDownload,
+  CheckCircle2,
+  Crosshair,
+  X,
+  Box,
+  Radar,
+} from "lucide-react";
+import { GitHubIcon } from "../components/GitHubIcon";
+import { Button } from "../components/Button";
+import { Checkbox } from "../components/Checkbox";
+import { Card } from "../components/Card";
+import { Badge } from "../components/Badge";
+import { Input } from "../components/Input";
+import { Select } from "../components/Select";
+import { useToast } from "../components/Toast";
+import { ResultCard } from "../components/changes/ResultCard";
+import { CommitDetailPanel } from "../components/history/CommitDetailPanel";
+import { usePersistedState, writePersisted } from "../lib/persist";
+import { useRefreshOnFocus } from "../lib/focus";
+import { useGitJob } from "../lib/gitJobs";
+import * as api from "../lib/api";
+
+/** Refusals the detail panel answers inline (a note, a re-asked question) — it stays open for these. */
+const PANEL_HANDLES = new Set(["would-drop-pushed", "merge-commit-needs-mainline"]);
+
+const PAGE_SIZE = 50;
+const ROW_H = 46;
+const LANE_W = 16;
+const LANE_COLORS = [
+  "#34d399", "#60a5fa", "#f472b6", "#fbbf24",
+  "#a78bfa", "#22d3ee", "#fb7185", "#4ade80",
+];
+const laneColor = (l: number) => LANE_COLORS[l % LANE_COLORS.length];
+const laneX = (l: number) => l * LANE_W + 10;
+
+/** How stale the ahead/behind numbers are — they're only as good as the last fetch. */
+function fetchAgo(secs: number | null): string {
+  if (secs === null) return "never fetched — counts may be stale";
+  if (secs < 90) return "fetched just now";
+  if (secs < 3600) return `fetched ${Math.floor(secs / 60)}m ago`;
+  if (secs < 86400) return `fetched ${Math.floor(secs / 3600)}h ago`;
+  return `fetched ${Math.floor(secs / 86400)}d ago`;
+}
+
+/** One row of the commit graph: rails passing through, the dot, and the
+ *  connectors that fan out to a merge's parents. Mirrors `git log --graph`. */
+function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
+  const width = (maxLane + 1) * LANE_W + 10;
+  const mid = ROW_H / 2;
+  const continues = c.parent_lanes.includes(c.lane);
+
+  return (
+    <svg width={width} height={ROW_H} className="shrink-0 overflow-visible">
+      {c.active_lanes
+        .filter((l) => l !== c.lane)
+        .map((l) => (
+          <line
+            key={`rail-${l}`}
+            x1={laneX(l)} y1={0} x2={laneX(l)} y2={ROW_H}
+            stroke={laneColor(l)} strokeWidth={2} opacity={0.55}
+          />
+        ))}
+      {/* own lane: always comes from above; continues below only if a parent keeps it */}
+      <line
+        x1={laneX(c.lane)} y1={0} x2={laneX(c.lane)} y2={mid}
+        stroke={laneColor(c.lane)} strokeWidth={2} opacity={0.55}
+      />
+      {continues && (
+        <line
+          x1={laneX(c.lane)} y1={mid} x2={laneX(c.lane)} y2={ROW_H}
+          stroke={laneColor(c.lane)} strokeWidth={2} opacity={0.55}
+        />
+      )}
+      {/* fan-out to parents living in other lanes (this is what a merge looks like) */}
+      {c.parent_lanes
+        .filter((l) => l !== c.lane)
+        .map((l) => (
+          <path
+            key={`edge-${l}`}
+            d={`M ${laneX(c.lane)} ${mid} C ${laneX(c.lane)} ${mid + 14}, ${laneX(l)} ${mid + 8}, ${laneX(l)} ${ROW_H}`}
+            fill="none" stroke={laneColor(l)} strokeWidth={2} opacity={0.7}
+          />
+        ))}
+      <circle
+        cx={laneX(c.lane)} cy={mid} r={c.is_merge ? 5.5 : 4}
+        fill={c.is_merge ? "#18181b" : laneColor(c.lane)}
+        stroke={laneColor(c.lane)} strokeWidth={2}
+      />
+    </svg>
+  );
+}
+
+/** "staging ↑2 ↓1" — the submodule's own branch against its own upstream. */
+function subLabel(m: api.SubmoduleInfo): string {
+  const parts = [m.path];
+  if (m.own_ahead > 0) parts.push(`↑${m.own_ahead}`);
+  if (m.own_behind > 0) parts.push(`↓${m.own_behind}`);
+  return parts.join(" ");
+}
+
+export function History() {
+  const toast = useToast();
+  const navigate = useNavigate();
+  const [repos, setRepos] = useState<api.RepoRef[]>([]);
+  const [superRepo, setSuperRepo] = usePersistedState("history.repo", "");
+  /** A submodule path inside `superRepo` being browsed instead of the repository itself. */
+  const [sub, setSub] = usePersistedState("history.sub", "");
+  const [subs, setSubs] = useState<api.SubmoduleInfo[]>([]);
+  /** Everything below works on this path: the repository, or the chosen submodule inside it. */
+  const repo = sub && superRepo ? `${superRepo}/${sub}` : superRepo;
+  const [account, setAccount] = usePersistedState("history.account", ""); // profile id, "" = all
+  const [onlyMine, setOnlyMine] = usePersistedState("history.onlyMine", false);
+  const [branches, setBranches] = useState<api.BranchInfo[]>([]);
+  const [rev, setRev] = usePersistedState("history.rev", "--all");
+  const [page, setPage] = useState<api.HistoryPage | null>(null);
+  const [offset, setOffset] = useState(0);
+  const [search, setSearch] = useState("");
+  const [appliedSearch, setAppliedSearch] = useState("");
+  const [showRemote, setShowRemote] = usePersistedState("history.showRemote", false);
+  const [mergeInfo, setMergeInfo] = useState<api.MergeInfo | null>(null);
+  const [detail, setDetail] = useState<api.CommitDetail | null>(null);
+  /** What "Go to commit" resolved — carried into the panel so the chooser needn't ask again. */
+  const [target, setTarget] = useState<api.CommitTarget | null>(null);
+  const [repoStatus, setRepoStatus] = useState<api.RepoStatus | null>(null);
+  const [gotoText, setGotoText] = useState("");
+  const [gotoError, setGotoError] = useState<string | null>(null);
+  const [gotoBusy, setGotoBusy] = useState(false);
+  /** "Check GitHub": what is new on the remote branch, read without downloading anything. */
+  const [peek, setPeek] = useState<api.RemotePeek | null>(null);
+  const [peeking, setPeeking] = useState(false);
+  /** The outcome of the last action taken from the detail panel. */
+  const [result, setResult] = useState<api.OpResult | null>(null);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const job = useGitJob(repo);
+  const [loadingRepos, setLoadingRepos] = useState(true);
+  const [loadingBranches, setLoadingBranches] = useState(false);
+  const [loadingPage, setLoadingPage] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [sync, setSync] = useState<api.SyncStatus | null>(null);
+  const [fetching, setFetching] = useState(false);
+  const [autoFetch, setAutoFetch] = usePersistedState("history.autoFetch", false);
+  const [reloadKey, setReloadKey] = useState(0);
+  const pageSeq = useRef(0);
+
+  const accounts = Array.from(
+    new Map(
+      repos.map((r) => [r.profile_id, { id: r.profile_id, name: r.profile_name, email: r.profile_email }])
+    ).values()
+  );
+  const accountEmail = accounts.find((a) => a.id === account)?.email ?? "";
+  const visibleRepos = account ? repos.filter((r) => r.profile_id === account) : repos;
+
+  const isRange = rev.includes("..");
+
+  const loadSync = useCallback(async (path: string, r: string) => {
+    if (!path) return;
+    try {
+      setSync(await api.historySyncStatus(path, r.includes("..") ? "--all" : r));
+    } catch {
+      setSync(null);
+    }
+  }, []);
+
+  /** The Merge status card: which branches contain `r`. Only for a single branch, and re-read after anything that moved one. */
+  const loadMergeInfo = useCallback(async (path: string, r: string) => {
+    if (!path || r === "--all" || r.includes("..")) {
+      setMergeInfo(null);
+      return;
+    }
+    try {
+      setMergeInfo(await api.historyBranchMerges(path, r));
+    } catch {
+      setMergeInfo(null);
+    }
+  }, []);
+
+  /** ls-remote — asks the remote where its branch is, writes nothing at all. */
+  async function doPeek() {
+    if (!repo) return;
+    setPeeking(true);
+    setError(null);
+    try {
+      setPeek(await api.historyPeek(repo));
+    } catch (e) {
+      setError(String(e));
+      setPeek(null);
+    } finally {
+      setPeeking(false);
+    }
+  }
+
+  /** git fetch — updates remote refs only; the working tree is never touched. */
+  async function doFetch(path = repo, silent = false) {
+    if (!path) return;
+    setFetching(true);
+    setPeek(null); // a fetch makes the check's answer stale
+    if (!silent) setError(null);
+    try {
+      const res = await api.historyFetch(path);
+      await loadBranches(path);
+      await loadSync(path, rev);
+      await loadMergeInfo(path, rev);
+      setReloadKey((k) => k + 1); // re-read the commit page with fresh refs
+      if (!silent) toast.success(res.message);
+    } catch (e) {
+      if (!silent) setError(String(e));
+    } finally {
+      setFetching(false);
+    }
+  }
+
+  function showIncoming() {
+    if (!sync?.incoming_rev) return;
+    setRev(sync.incoming_rev);
+    setOffset(0);
+    setMergeInfo(null);
+  }
+
+
+
+  const loadRepos = useCallback(() => {
+    let cancelled = false;
+    api.historyListRepos()
+      .then((r) => {
+        if (cancelled) return;
+        setRepos(r);
+        // Keep the remembered repo only if it still exists.
+        setSuperRepo((prev) =>
+          prev && r.some((x) => x.path === prev) ? prev : r[0]?.path ?? ""
+        );
+      })
+      .catch((e) => !cancelled && setError(String(e)))
+      .finally(() => !cancelled && setLoadingRepos(false));
+    return () => { cancelled = true; };
+  }, [setSuperRepo]);
+  useEffect(loadRepos, [loadRepos]);
+
+  // The repository's populated, mapped submodules — each can be browsed as its
+  // own history. A remembered submodule that no longer exists falls back to the
+  // repository itself.
+  useEffect(() => {
+    if (!superRepo) {
+      setSubs([]);
+      return;
+    }
+    let cancelled = false;
+    api.changesSubmodules(superRepo)
+      .then((list) => {
+        if (cancelled) return;
+        const usable = list.filter((m) => m.initialised && m.listed && m.gitdir_valid);
+        setSubs(usable);
+        setSub((cur) => (cur && !usable.some((m) => m.path === cur) ? "" : cur));
+      })
+      .catch(() => !cancelled && setSubs([]));
+    return () => { cancelled = true; };
+  }, [superRepo, reloadKey, setSub]);
+  // Repos get cloned and deleted outside the app; re-scan on return.
+  useRefreshOnFocus(loadRepos);
+
+  const loadBranches = useCallback(async (path: string) => {
+    if (!path) return;
+    setLoadingBranches(true);
+    // The repo status says which branch HEAD is on (or that it is detached) —
+    // the branch list alone can't tell a detached HEAD from an unborn one.
+    api.changesRepoStatus(path).then(setRepoStatus).catch(() => setRepoStatus(null));
+    try {
+      setBranches(await api.historyBranches(path));
+    } catch (e) {
+      setError(String(e));
+      setBranches([]);
+    } finally {
+      setLoadingBranches(false);
+    }
+  }, []);
+
+  const currentBranch =
+    repoStatus?.branch ?? branches.find((b) => b.is_current && !b.is_remote)?.name ?? null;
+  const detached = repoStatus ? repoStatus.detached : branches.length > 0 && !currentBranch;
+
+  async function openCommit(hash: string, resolved: api.CommitTarget | null = null) {
+    try {
+      const d = await api.historyCommitDetail(repo, hash);
+      setTarget(resolved);
+      setDetail(d);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  function closePanel() {
+    setDetail(null);
+    setTarget(null);
+  }
+
+  /** "Go to commit": any id, short id or ref the user typed. */
+  async function gotoCommit(e: React.FormEvent) {
+    e.preventDefault();
+    const text = gotoText.trim();
+    if (!text || !repo) return;
+    setGotoBusy(true);
+    setGotoError(null);
+    try {
+      const t = await api.historyResolve(repo, text);
+      if (!t) {
+        setGotoError(`No commit matches "${text}" in this repository.`);
+        return;
+      }
+      await openCommit(t.oid, t);
+    } catch (err) {
+      setGotoError(String(err));
+    } finally {
+      setGotoBusy(false);
+    }
+  }
+
+  const resolveCommit = useCallback(
+    async (hash: string) => {
+      const t = await api.historyResolve(repo, hash);
+      setTarget(t);
+      return t;
+    },
+    [repo]
+  );
+
+  /**
+   * One git operation from the detail panel. The panel closes and the outcome
+   * shows as a card under the header — except for the refusals the panel
+   * answers itself, which keep it open. Everything is re-read afterwards: a
+   * reset moves a branch, a revert adds a commit, a detach changes HEAD.
+   */
+  async function onAction(key: string, fn: () => Promise<api.OpResult>): Promise<api.OpResult | undefined> {
+    if (busyKey) return undefined;
+    if (job?.running) {
+      toast.error("Wait for the running operation");
+      return undefined;
+    }
+    setBusyKey(key);
+    setError(null);
+    try {
+      const r = await fn();
+      setResult(r);
+      if (r.ok) toast.success(r.headline);
+      else toast.error(r.refusal?.message ?? r.advice?.headline ?? r.headline);
+      if (!(r.refusal && PANEL_HANDLES.has(r.refusal.code))) closePanel();
+      await loadBranches(repo);
+      await loadSync(repo, rev);
+      // A reset or a new branch changes which branches contain this one.
+      await loadMergeInfo(repo, rev);
+      setReloadKey((k) => k + 1);
+      return r;
+    } catch (e) {
+      setError(String(e));
+      toast.error(String(e));
+      return undefined;
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  // Switching repo resets the view (a branch from another repo would query the
+  // wrong thing) — but returning to the page must NOT reset, or the restored
+  // selection would be wiped on mount. So only react to a genuine change.
+  const prevRepo = useRef<string | null>(null);
+  useEffect(() => {
+    if (!repo) return;
+    const switched = prevRepo.current !== null && prevRepo.current !== repo;
+    prevRepo.current = repo;
+    if (switched) {
+      setRev("--all");
+      setOffset(0);
+      setMergeInfo(null);
+      setSearch("");
+      setAppliedSearch("");
+      setGotoText("");
+      setGotoError(null);
+      setResult(null);
+      setDetail(null);
+      setTarget(null);
+      setPeek(null);
+    }
+    loadBranches(repo);
+  }, [repo, loadBranches]);
+
+  // If the chosen account doesn't own the current repo, move to one it does —
+  // otherwise the picker would show a repo the filter says shouldn't be there.
+  useEffect(() => {
+    if (!account) return;
+    const owned = repos.filter((r) => r.profile_id === account);
+    if (owned.length > 0 && !owned.some((r) => r.path === superRepo)) {
+      setSuperRepo(owned[0].path);
+    }
+  }, [account, repos, superRepo]);
+
+  useEffect(() => {
+    if (!repo) return;
+    const seq = ++pageSeq.current;
+    setLoadingPage(true);
+    api.historyPage(
+      repo,
+      rev,
+      offset,
+      PAGE_SIZE,
+      appliedSearch || null,
+      onlyMine && accountEmail ? accountEmail : null
+    )
+      .then((p) => { if (pageSeq.current === seq) { setPage(p); setError(null); } })
+      .catch((e) => { if (pageSeq.current === seq) { setError(String(e)); setPage(null); } })
+      .finally(() => { if (pageSeq.current === seq) setLoadingPage(false); });
+  }, [repo, rev, offset, appliedSearch, reloadKey, onlyMine, accountEmail]);
+
+  useEffect(() => {
+    loadSync(repo, rev);
+  }, [repo, rev, loadSync]);
+
+  // Opt-in: refresh remote refs whenever a repo is opened, so the counts and
+  // "latest commit" are true without the user thinking about it.
+  useEffect(() => {
+    if (!repo || !autoFetch) return;
+    doFetch(repo, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repo, autoFetch]);
+
+  async function selectBranch(name: string) {
+    setRev(name);
+    setOffset(0);
+    setMergeInfo(null);
+    await loadMergeInfo(repo, name);
+  }
+
+  const visibleBranches = branches.filter((b) => b.is_remote === showRemote);
+  const totalPages = page ? Math.max(1, Math.ceil(page.total / PAGE_SIZE)) : 1;
+  const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-bold text-zinc-100">History</h1>
+          <p className="text-sm text-zinc-400 mt-1">
+            Browse branches, commits and how they merged — one repo at a time.
+          </p>
+        </div>
+        <div className="flex items-center gap-2 min-w-0 flex-wrap">
+          <div className="w-52 max-w-full">
+            <Select
+              value={account}
+              onChange={(v) => { setAccount(v); setOffset(0); if (!v) setOnlyMine(false); }}
+              placeholder="All accounts"
+              optionIcon={<GitHubIcon size={14} />}
+              options={[
+                { value: "", label: "All accounts" },
+                ...accounts.map((a) => ({ value: a.id, label: a.name })),
+              ]}
+            />
+          </div>
+          <div className="w-64 max-w-full">
+            <Select
+              value={superRepo}
+              onChange={(v) => { setSuperRepo(v); setSub(""); }}
+              placeholder={loadingRepos ? "Loading repos…" : "Pick a repository…"}
+              optionIcon={<GitBranch size={14} />}
+              options={visibleRepos.map((r) => ({
+                value: r.path,
+                label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
+              }))}
+            />
+          </div>
+          {subs.length > 0 && (
+            <div className="w-56 max-w-full">
+              <Select
+                value={sub}
+                onChange={(v) => { setSub(v); setOffset(0); }}
+                placeholder="This repository"
+                optionIcon={<Box size={14} />}
+                options={[
+                  { value: "", label: "This repository" },
+                  ...subs.map((m) => ({ value: m.path, label: subLabel(m) })),
+                ]}
+              />
+            </div>
+          )}
+          <Button
+            variant="secondary"
+            onClick={() => doFetch()}
+            disabled={!repo || fetching}
+            className="min-w-[8.25rem]" // fits "Fetching…" (≈125px), so the label swap never shifts Refresh
+            title={
+              sub
+                ? `git fetch inside ${sub} — updates that submodule's remote branches only`
+                : "git fetch — updates remote branches only, never your working tree; submodules are fetched on demand"
+            }
+          >
+            <CloudDownload size={16} className={fetching ? "animate-pulse" : ""} />
+            {fetching ? "Fetching…" : "Fetch"}
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={doPeek}
+            disabled={!repo || peeking}
+            className="min-w-[8.5rem]"
+            title="Asks the remote where the branch is now — downloads nothing, writes nothing in this folder"
+          >
+            <Radar size={16} className={peeking ? "animate-pulse" : ""} />
+            {peeking ? "Checking…" : "Check GitHub"}
+          </Button>
+          <Button
+            variant="secondary"
+            onClick={() => { loadRepos(); loadBranches(repo); setOffset(0); setReloadKey((k) => k + 1); }}
+            disabled={!repo || loadingBranches}
+          >
+            <RefreshCw size={16} className={loadingBranches ? "animate-spin" : ""} />
+            Refresh
+          </Button>
+          <form onSubmit={gotoCommit} className="flex items-center gap-2 min-w-0">
+            <Input
+              aria-label="Go to commit"
+              placeholder="commit id, short id or ref"
+              value={gotoText}
+              onChange={(e) => { setGotoText(e.target.value); if (gotoError) setGotoError(null); }}
+              disabled={!repo}
+              spellCheck={false}
+              containerClassName="w-56 max-w-full"
+              className="font-mono text-sm"
+            />
+            <Button type="submit" variant="secondary" disabled={!repo || gotoBusy || !gotoText.trim()} title="Open a commit by its id or a ref like main~3">
+              {gotoBusy ? <Loader2 size={16} className="animate-spin" /> : <Crosshair size={16} />}
+              Go
+            </Button>
+          </form>
+        </div>
+      </div>
+
+      {gotoError && (
+        <p className="text-sm text-red-400 break-words -mt-3">{gotoError}</p>
+      )}
+
+      {peek && (
+        <div className={`flex flex-wrap items-center gap-2 text-sm -mt-2 ${peek.changed ? "text-amber-200" : "text-zinc-400"}`}>
+          <Radar size={14} className={`shrink-0 ${peek.changed ? "text-amber-400" : "text-emerald-400"}`} />
+          <span className="break-words">{peek.message}</span>
+          {peek.changed && !peek.branch_gone && (
+            <Button size="sm" variant="secondary" onClick={() => doFetch()} disabled={fetching}>
+              Fetch now
+            </Button>
+          )}
+          <button type="button" onClick={() => setPeek(null)} className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer">
+            dismiss
+          </button>
+        </div>
+      )}
+
+      {subs.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400 -mt-2">
+          {sub ? (
+            <>
+              <Box size={13} className="text-emerald-400 shrink-0" />
+              <span>
+                Browsing inside <span className="font-mono text-zinc-200">{sub}</span> — branches, commits, Fetch and every action here belong to this submodule.
+              </span>
+              <button
+                type="button"
+                onClick={() => { setSub(""); setOffset(0); }}
+                className="text-emerald-400 hover:text-emerald-300 cursor-pointer"
+              >
+                Back to the repository
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="text-zinc-500">Submodules:</span>
+              {subs.map((m) => (
+                <button
+                  key={m.path}
+                  type="button"
+                  onClick={() => { setSub(m.path); setOffset(0); }}
+                  title={`Browse this submodule's history — ${m.summary}`}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-zinc-700/60 bg-zinc-800/40 hover:border-emerald-500/50 hover:text-zinc-100 cursor-pointer font-mono"
+                >
+                  {subLabel(m)}
+                </button>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+
+      {error && (
+        <div className="px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm break-words">
+          {error}
+        </div>
+      )}
+
+      {result && (
+        <ResultCard
+          result={result}
+          busy={busyKey !== null}
+          onDismiss={() => setResult(null)}
+          extraAction={{
+            label: "Open in Changes",
+            onClick: () => {
+              writePersisted("changes.repo", repo);
+              navigate("/changes");
+            },
+            primary: !result.ok || (result.status?.conflicted_count ?? 0) > 0,
+          }}
+        />
+      )}
+
+      {!loadingRepos && repos.length === 0 && (
+        <Card className="text-center py-10">
+          <GitBranch size={32} className="mx-auto text-zinc-600 mb-3" />
+          <h3 className="text-lg font-medium text-zinc-300">No repositories found</h3>
+          <p className="text-sm text-zinc-500 mt-1">
+            Assign folders to a profile and GitSwitch will list the repos inside them here.
+          </p>
+        </Card>
+      )}
+
+      {repo && sync && (
+        <div className="flex items-center gap-3 flex-wrap text-sm">
+          {sync.behind > 0 ? (
+            <div className="flex items-center gap-3 flex-wrap px-4 py-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 min-w-0">
+              <CloudDownload size={16} className="shrink-0" />
+              <span className="min-w-0">
+                <strong>{sync.behind}</strong> commit{sync.behind === 1 ? "" : "s"} on{" "}
+                <span className="font-mono">{sync.upstream}</span> you haven't pulled
+                {sync.ahead > 0 && <> · you're also <strong>{sync.ahead}</strong> ahead</>}
+              </span>
+              {!isRange && (
+                <Button size="sm" variant="secondary" onClick={showIncoming}>
+                  Show incoming
+                </Button>
+              )}
+            </div>
+          ) : sync.upstream ? (
+            <span className="inline-flex items-center gap-1.5 text-zinc-500">
+              <CheckCircle2 size={14} className="text-emerald-400" />
+              Up to date with <span className="font-mono">{sync.upstream}</span>
+              {sync.ahead > 0 && <> · {sync.ahead} to push</>}
+            </span>
+          ) : (
+            <span className="text-zinc-600">No upstream branch — nothing to compare against.</span>
+          )}
+
+          <span
+            className={`text-xs ${sync.last_fetch_secs === null ? "text-amber-400/80" : "text-zinc-600"}`}
+            title="Counts are only as fresh as the last fetch"
+          >
+            {fetchAgo(sync.last_fetch_secs)}
+          </span>
+
+          <label className="inline-flex items-center gap-2 text-xs text-zinc-500 cursor-pointer select-none ml-auto">
+            <Checkbox
+              checked={autoFetch}
+              onChange={setAutoFetch}
+            />
+            Auto-fetch on open
+          </label>
+        </div>
+      )}
+
+      {repo && sync && (sync.local_tip || sync.remote_tip) && (
+        <div className="grid sm:grid-cols-2 gap-3">
+          <TipCard
+            label="Your local branch"
+            name={sync.branch}
+            tip={sync.local_tip}
+            accent="zinc"
+            note={sync.ahead > 0 ? `${sync.ahead} commit${sync.ahead === 1 ? "" : "s"} not pushed` : undefined}
+          />
+          <TipCard
+            label="Remote branch"
+            name={sync.upstream ?? "no upstream"}
+            tip={sync.remote_tip}
+            accent={sync.behind > 0 ? "amber" : "emerald"}
+            note={
+              sync.behind > 0
+                ? `${sync.behind} commit${sync.behind === 1 ? "" : "s"} ahead of you — not pulled`
+                : "you have everything from here"
+            }
+          />
+        </div>
+      )}
+
+      {isRange && (
+        <div className="flex items-center gap-3 flex-wrap px-4 py-3 rounded-lg bg-zinc-800/60 border border-zinc-700/50 text-sm">
+          <span className="text-zinc-300">
+            Showing <strong>incoming</strong> commits — on the remote, not in your clone yet
+          </span>
+          <span className="font-mono text-xs text-zinc-500">{rev}</span>
+          <Button size="sm" variant="ghost" onClick={() => selectBranch("--all")}>
+            <X size={14} />
+            Back to history
+          </Button>
+        </div>
+      )}
+
+      {repo && (
+        <div className="flex flex-col lg:flex-row gap-6 min-w-0">
+          {/* ---------------- branches ---------------- */}
+          <div className="w-full lg:w-72 shrink-0 space-y-3">
+            <Card>
+              <div className="flex items-center gap-1 mb-3">
+                {(["local", "remote"] as const).map((k) => {
+                  const active = (k === "remote") === showRemote;
+                  return (
+                    <button
+                      key={k}
+                      onClick={() => setShowRemote(k === "remote")}
+                      className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                        active ? "bg-zinc-800 text-emerald-400" : "text-zinc-500 hover:text-zinc-300"
+                      }`}
+                    >
+                      {k === "local" ? "Local" : "Remote"}
+                    </button>
+                  );
+                })}
+                <span className="ml-auto text-xs text-zinc-600">
+                  {visibleBranches.length}
+                </span>
+              </div>
+
+              <button
+                onClick={() => selectBranch("--all")}
+                className={`w-full text-left px-3 py-2 rounded-lg mb-1.5 transition-colors cursor-pointer ${
+                  rev === "--all"
+                    ? "bg-emerald-500/10 border border-emerald-500/40"
+                    : "bg-zinc-800/50 border border-zinc-700/40 hover:border-zinc-600"
+                }`}
+              >
+                <span className="text-sm text-zinc-200">All branches</span>
+              </button>
+
+              {loadingBranches ? (
+                <div className="flex items-center gap-2 py-4 text-xs text-zinc-500">
+                  <Loader2 size={14} className="animate-spin text-emerald-400" />
+                  Reading branches…
+                </div>
+              ) : (
+                <div className="space-y-1.5 max-h-[26rem] overflow-y-auto pr-1">
+                  {visibleBranches.map((b) => (
+                    <button
+                      key={b.name}
+                      onClick={() => selectBranch(b.name)}
+                      title={b.name}
+                      className={`w-full text-left px-3 py-2 rounded-lg transition-colors cursor-pointer min-w-0 ${
+                        rev === b.name
+                          ? "bg-emerald-500/10 border border-emerald-500/40"
+                          : "bg-zinc-800/50 border border-zinc-700/40 hover:border-zinc-600"
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <span className="text-sm text-zinc-200 font-mono truncate min-w-0 flex-1">
+                          {b.name}
+                        </span>
+                        {b.is_current && <Badge variant="success">HEAD</Badge>}
+                      </div>
+                      <div className="flex items-center gap-2 mt-1 text-[11px] text-zinc-500">
+                        {b.ahead > 0 && <span className="text-emerald-400">↑{b.ahead}</span>}
+                        {b.behind > 0 && <span className="text-amber-400">↓{b.behind}</span>}
+                        <span className="truncate min-w-0">{b.last_subject}</span>
+                      </div>
+                    </button>
+                  ))}
+                  {visibleBranches.length === 0 && (
+                    <p className="text-xs text-zinc-600 py-2">
+                      No {showRemote ? "remote" : "local"} branches.
+                    </p>
+                  )}
+                </div>
+              )}
+            </Card>
+
+            {mergeInfo && (
+              <Card>
+                <div className="flex items-center gap-2 mb-2">
+                  <GitMerge size={15} className="text-emerald-400" />
+                  <h3 className="text-sm font-semibold text-zinc-200">Merge status</h3>
+                </div>
+                {mergeInfo.merged_into.length > 0 ? (
+                  <>
+                    <p className="text-xs text-zinc-500 mb-2">
+                      This branch is already contained in:
+                    </p>
+                    <div className="flex flex-wrap gap-1.5">
+                      {mergeInfo.merged_into.map((b) => (
+                        <Badge key={b} variant="success">{b}</Badge>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-xs text-zinc-500">
+                    Not merged into any other branch yet.
+                  </p>
+                )}
+                {mergeInfo.merges.length > 0 && (
+                  <>
+                    <p className="text-xs text-zinc-500 mt-3 mb-1.5">
+                      Merge commits on this branch ({mergeInfo.merges.length}):
+                    </p>
+                    <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
+                      {mergeInfo.merges.map((m) => (
+                        <p key={m.hash} className="text-[11px] text-zinc-400 truncate" title={m.subject}>
+                          <span className="font-mono text-zinc-600">{m.short}</span> {m.subject}
+                        </p>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </Card>
+            )}
+          </div>
+
+          {/* ---------------- commits ---------------- */}
+          <div className="flex-1 min-w-0 space-y-3">
+            <Card>
+              <form
+                onSubmit={(e) => { e.preventDefault(); setOffset(0); setAppliedSearch(search); }}
+                className="flex gap-2 mb-4"
+              >
+                <Input
+                  placeholder="Search commit messages…"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  containerClassName="flex-1 min-w-0"
+                />
+                <Button type="submit" variant="secondary">
+                  <Search size={16} />
+                  Search
+                </Button>
+                {appliedSearch && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    onClick={() => { setSearch(""); setAppliedSearch(""); setOffset(0); }}
+                  >
+                    <X size={16} />
+                  </Button>
+                )}
+              </form>
+
+              {account && (
+                <label className="flex items-start gap-2.5 mb-3 cursor-pointer select-none">
+                  <Checkbox
+                    checked={onlyMine}
+                    onChange={(v) => { setOnlyMine(v); setOffset(0); }}
+                    className="mt-0.5"
+                  />
+                  <span className="min-w-0">
+                    <span className="text-xs text-zinc-300">
+                      Only commits authored by this account
+                    </span>
+                    <span className="block text-[11px] text-zinc-600 font-mono truncate">
+                      {accountEmail}
+                    </span>
+                  </span>
+                </label>
+              )}
+
+              <div className="flex items-center justify-between gap-3 flex-wrap mb-2">
+                <p className="text-xs text-zinc-500">
+                  {rev === "--all" ? "All branches" : rev}
+                  {onlyMine && accountEmail && " · this account only"}
+                  {page && (
+                    <>
+                      {" · "}
+                      {page.total.toLocaleString()} commit{page.total === 1 ? "" : "s"}
+                      {page.total > 0 && (
+                        <>
+                          {" · showing "}
+                          {(offset + 1).toLocaleString()}–
+                          {(offset + page.commits.length).toLocaleString()}
+                        </>
+                      )}
+                    </>
+                  )}
+                </p>
+                {loadingPage && (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-zinc-500">
+                    <Loader2 size={12} className="animate-spin text-emerald-400" />
+                    Loading…
+                  </span>
+                )}
+              </div>
+
+              {page && page.commits.length === 0 && !loadingPage && (
+                <p className="text-sm text-zinc-500 py-6 text-center">
+                  No commits{appliedSearch ? ` matching “${appliedSearch}”` : ""}
+                  {onlyMine ? " authored by this account" : ""}.
+                </p>
+              )}
+
+              <div className="divide-y divide-zinc-800/70">
+                {page?.commits.map((c) => (
+                  <button
+                    key={c.hash}
+                    onClick={() => openCommit(c.hash)}
+                    className="w-full flex items-center gap-3 text-left hover:bg-zinc-800/40 transition-colors cursor-pointer min-w-0 px-1"
+                    style={{ height: ROW_H }}
+                  >
+                    <GraphCell c={c} maxLane={page.max_lane} />
+                    <span className="font-mono text-xs text-zinc-500 shrink-0">{c.short}</span>
+                    {c.is_merge && (
+                      <GitMerge size={13} className="text-emerald-400 shrink-0" />
+                    )}
+                    <span className="text-sm text-zinc-200 truncate min-w-0 flex-1">
+                      {c.subject}
+                    </span>
+                    <span className="hidden xl:flex items-center gap-1 shrink-0 max-w-[26%] overflow-hidden">
+                      {c.refs.slice(0, 2).map((r) => (
+                        <Badge key={r} variant="default">{r}</Badge>
+                      ))}
+                    </span>
+                    <span className="hidden md:inline text-xs text-zinc-500 truncate min-w-0 max-w-[18%]">
+                      {c.author_name}
+                    </span>
+                    <span className="hidden sm:inline text-xs text-zinc-600 shrink-0 tabular-nums">
+                      {c.date.slice(0, 10)}
+                    </span>
+                  </button>
+                ))}
+              </div>
+
+              {page && page.total > PAGE_SIZE && (
+                <div className="flex items-center justify-between gap-3 flex-wrap pt-4 mt-2 border-t border-zinc-800">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+                    disabled={offset === 0 || loadingPage}
+                  >
+                    <ChevronLeft size={14} />
+                    Previous
+                  </Button>
+                  <span className="text-xs text-zinc-500">
+                    Page {currentPage.toLocaleString()} of {totalPages.toLocaleString()}
+                  </span>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setOffset(offset + PAGE_SIZE)}
+                    disabled={!page.has_more || loadingPage}
+                  >
+                    Next
+                    <ChevronRight size={14} />
+                  </Button>
+                </div>
+              )}
+            </Card>
+          </div>
+        </div>
+      )}
+
+      {detail && (
+        <CommitDetailPanel
+          key={detail.hash}
+          detail={detail}
+          target={target && target.oid === detail.hash ? target : null}
+          repoPath={repo}
+          currentBranch={currentBranch}
+          detached={detached}
+          busy={busyKey !== null}
+          onClose={closePanel}
+          onAction={onAction}
+          onResolve={resolveCommit}
+        />
+      )}
+    </div>
+  );
+}
+
+function TipCard({
+  label,
+  name,
+  tip,
+  note,
+  accent,
+}: {
+  label: string;
+  name: string;
+  tip: api.CommitRef | null;
+  note?: string;
+  accent: "zinc" | "amber" | "emerald";
+}) {
+  const ring =
+    accent === "amber"
+      ? "border-amber-500/30"
+      : accent === "emerald"
+      ? "border-emerald-500/25"
+      : "border-zinc-700/50";
+  const noteColor =
+    accent === "amber" ? "text-amber-400" : accent === "emerald" ? "text-emerald-400/80" : "text-zinc-500";
+  return (
+    <div className={`rounded-xl border ${ring} bg-zinc-900/50 px-4 py-3 min-w-0`}>
+      <div className="flex items-center gap-2 min-w-0">
+        <span className="text-[11px] uppercase tracking-wider text-zinc-500 shrink-0">{label}</span>
+        <span className="font-mono text-xs text-zinc-300 truncate min-w-0">{name}</span>
+      </div>
+      {tip ? (
+        <>
+          <p className="text-sm text-zinc-200 truncate mt-1.5" title={tip.subject}>
+            <span className="font-mono text-zinc-500 mr-2">{tip.short}</span>
+            {tip.subject}
+          </p>
+          <p className="text-[11px] text-zinc-600 truncate mt-0.5">
+            {tip.author} · {tip.date.replace("T", " ").slice(0, 16)}
+          </p>
+        </>
+      ) : (
+        <p className="text-sm text-zinc-600 mt-1.5">—</p>
+      )}
+      {note && <p className={`text-[11px] mt-1 ${noteColor}`}>{note}</p>}
+    </div>
+  );
+}
+

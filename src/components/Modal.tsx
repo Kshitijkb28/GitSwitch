@@ -6,9 +6,11 @@ interface ModalProps {
   onClose: () => void;
   title: string;
   children: ReactNode;
+  /** "lg" for content with rows (a branch list); "md" for a confirmation. */
+  size?: "md" | "lg";
 }
 
-export function Modal({ open, onClose, title, children }: ModalProps) {
+export function Modal({ open, onClose, title, children, size = "md" }: ModalProps) {
   if (!open) return null;
 
   return (
@@ -17,7 +19,9 @@ export function Modal({ open, onClose, title, children }: ModalProps) {
         className="absolute inset-0 bg-black/60 backdrop-blur-sm"
         onClick={onClose}
       />
-      <div className="relative w-full max-w-md rounded-xl border border-zinc-700/50 bg-zinc-900 p-6 shadow-2xl">
+      <div
+        className={`relative w-full ${size === "lg" ? "max-w-2xl" : "max-w-md"} rounded-xl border border-zinc-700/50 bg-zinc-900 p-6 shadow-2xl`}
+      >
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold text-zinc-100">{title}</h2>
           <button

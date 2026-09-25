@@ -1334,7 +1334,9 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dirs",
+ "gitswitch-lock-core",
  "keyring",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -1347,6 +1349,28 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "gitswitch-lock-core"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "minisign-verify",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "gitswitch-lock-helper"
+version = "0.1.0"
+dependencies = [
+ "gitswitch-lock-core",
+ "libc",
+ "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

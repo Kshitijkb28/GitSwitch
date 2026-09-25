@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react";
-import { RefreshCw, Info, Download, ExternalLink } from "lucide-react";
+import { RefreshCw, Info, Download, ExternalLink, Lock, Trash2, Wrench } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { Input } from "../components/Input";
 import { useToast } from "../components/Toast";
 import { getCustomClientId, setOAuthClientId } from "../lib/oauth";
+import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -18,11 +19,46 @@ export function Settings() {
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
   const [clientId, setClientId] = useState("");
+  const [locks, setLocks] = useState<api.HelperStatus | null>(null);
+  const [lockBusy, setLockBusy] = useState(false);
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  const [lockMessage, setLockMessage] = useState<string | null>(null);
 
   useEffect(() => {
     loadConfig();
+    loadLocks();
     setClientId(getCustomClientId() ?? "");
   }, []);
+
+  async function loadLocks() {
+    try {
+      setLocks(await api.pushLockHelperStatus());
+    } catch {
+      setLocks(null);
+    }
+  }
+
+  async function runLockJob(job: () => Promise<api.JobOutcome>) {
+    setLockBusy(true);
+    setLockMessage(null);
+    try {
+      const r = await job();
+      setLockMessage(
+        r.outcome === "applied"
+          ? r.message
+          : r.outcome === "manual-required" && r.command
+            ? `${r.message}\n${r.command}`
+            : `${r.outcome === "cancelled" ? "Cancelled. " : ""}${r.message}`
+      );
+      if (r.outcome === "applied") toast.success(r.message);
+      await loadLocks();
+    } catch (e) {
+      setLockMessage(String(e));
+    } finally {
+      setLockBusy(false);
+      setConfirmRemove(false);
+    }
+  }
 
   function saveClientId() {
     setOAuthClientId(clientId);
@@ -32,6 +68,12 @@ export function Settings() {
         : "OAuth Client ID cleared"
     );
   }
+
+  // ~/.gitconfig can be edited outside the app — and so can the lock's files.
+  useRefreshOnFocus(() => {
+    loadConfig();
+    loadLocks();
+  });
 
   async function loadConfig() {
     try {
@@ -133,7 +175,7 @@ export function Settings() {
       )}
 
       <Card>
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center justify-between mb-4 gap-3 flex-wrap">
           <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">
             Current Git Config (Managed Sections)
           </h2>
@@ -207,12 +249,118 @@ export function Settings() {
             placeholder="Ov23li…  (your OAuth App Client ID)"
             value={clientId}
             onChange={(e) => setClientId(e.target.value)}
-            className="flex-1 font-mono"
+            containerClassName="flex-1 min-w-0"
+            className="font-mono"
           />
           <Button variant="secondary" onClick={saveClientId}>
             Save
           </Button>
         </div>
+      </Card>
+
+      <Card>
+        <div className="flex items-center gap-2 mb-2">
+          <Lock size={16} className="text-zinc-300" />
+          <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">
+            Push locks
+          </h2>
+        </div>
+        {!locks ? (
+          <p className="text-xs text-zinc-500">Reading the lock helper's state…</p>
+        ) : !locks.supported ? (
+          <p className="text-xs text-zinc-500">Push locks are not available on this operating system yet.</p>
+        ) : (
+          <div className="space-y-3 text-xs text-zinc-400">
+            <p className="leading-relaxed">
+              A locked repository refuses <span className="font-mono">git push</span> from any tool that
+              uses this machine's system git, and turning the lock off needs the administrator password.
+              The rules live in <span className="font-mono">{locks.system_gitconfig}</span> and{" "}
+              <span className="font-mono">{locks.audit_log?.replace(/\/audit\.log$/, "")}</span>; the
+              program that applies them runs only behind the administrator prompt.
+            </p>
+            <div className="space-y-1">
+              <p>
+                <span className="text-zinc-500">Lock helper:</span>{" "}
+                <span className="text-zinc-300">
+                  {locks.helper === "ok"
+                    ? `installed (${locks.installed_version ?? "?"})`
+                    : locks.helper === "outdated"
+                      ? `installed (${locks.installed_version ?? "?"}), newer one bundled (${locks.bundled_version ?? "?"})`
+                      : locks.helper === "missing"
+                        ? "not installed — it is installed the first time you lock a repository"
+                        : "present but not vouched for by the registry"}
+                </span>
+              </p>
+              {locks.installed_sha256 && (
+                <p className="break-all">
+                  <span className="text-zinc-500">Checksum:</span>{" "}
+                  <span className="font-mono text-zinc-400">{locks.installed_sha256}</span>
+                </p>
+              )}
+              <p>
+                <span className="text-zinc-500">Locked repositories:</span>{" "}
+                <span className="text-zinc-300">{locks.locks.length}</span>
+              </p>
+              {locks.locks.length > 0 && (
+                <ul className="pl-4 space-y-0.5">
+                  {locks.locks.map((l) => (
+                    <li key={l.repo} className="list-disc break-all">
+                      <span className="text-zinc-300">{l.label}</span>{" "}
+                      <span className="text-zinc-600 font-mono">{l.repo}</span>
+                      {!l.exists && <span className="text-amber-400"> — no longer exists</span>}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {locks.audit_log && (
+                <p className="break-all">
+                  <span className="text-zinc-500">Administrator-only record:</span>{" "}
+                  <span className="font-mono text-zinc-400">{locks.audit_log}</span>
+                </p>
+              )}
+            </div>
+            {(locks.installed || locks.locks.length > 0) && (
+              <div className="flex items-center gap-2 flex-wrap">
+                {locks.helper === "outdated" && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={lockBusy}
+                    onClick={() => runLockJob(() => api.pushLockFix("lock-upgrade-helper"))}
+                  >
+                    <Wrench size={14} />
+                    Upgrade helper (administrator)
+                  </Button>
+                )}
+                {!confirmRemove ? (
+                  <Button variant="ghost" size="sm" disabled={lockBusy} onClick={() => setConfirmRemove(true)}>
+                    <Trash2 size={14} />
+                    Remove push locks and helper…
+                  </Button>
+                ) : (
+                  <>
+                    <span className="text-amber-300/90">
+                      This unlocks {locks.locks.length} repositor{locks.locks.length === 1 ? "y" : "ies"} and removes the
+                      helper. The administrator prompt will appear.
+                    </span>
+                    <Button variant="danger" size="sm" disabled={lockBusy} onClick={() => runLockJob(api.pushLockUninstall)}>
+                      <Trash2 size={14} />
+                      Remove (administrator prompt)
+                    </Button>
+                    <Button variant="ghost" size="sm" disabled={lockBusy} onClick={() => setConfirmRemove(false)}>
+                      Keep
+                    </Button>
+                  </>
+                )}
+              </div>
+            )}
+            {lockMessage && (
+              <p className="whitespace-pre-wrap break-all text-zinc-300 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2">
+                {lockMessage}
+              </p>
+            )}
+          </div>
+        )}
       </Card>
 
       <Card>

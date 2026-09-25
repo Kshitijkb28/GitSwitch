@@ -14,6 +14,20 @@ dist-ssr
 
 # Tauri/Rust
 src-tauri/target
+# The lock-helper sidecar, built by scripts/build-lock-helper.sh
+src-tauri/binaries
+
+# VS Code extension build output
+vscode-extension/out
+*.vsix
+
+# Built installers — CI produces these, they don't belong in git
+dist-linux
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+*.msi
 
 # Editor directories and files
 .vscode/*

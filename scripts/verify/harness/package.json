@@ -1,0 +1,9 @@
+{
+  "name": "gitswitch-verify-harness",
+  "private": true,
+  "description": "Headless browser checks for the built GitSwitch frontend. Kept separate so the app's own dependencies stay untouched.",
+  "type": "module",
+  "devDependencies": {
+    "puppeteer-core": "^23.11.1"
+  }
+}
