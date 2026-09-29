@@ -679,6 +679,31 @@ try {
     await page.close();
   }
 
+  section("Picking a repository from a long list");
+  {
+    const page = await open();
+    await page.waitForFunction(() => document.body.innerText.includes("History"), { timeout: 4000 });
+    // The page labels neither picker; the repository one is the .w-64 in the header.
+    await page.evaluate(() => {
+      document.querySelector("div.w-64 button").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('input[aria-label="Search repositories"]'), { timeout: 4000 });
+    ok("History's repository picker has the same search box", true);
+    await page.evaluate(() => {
+      const i = document.querySelector('input[aria-label="Search repositories"]');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      setter.call(i, "argos");
+      i.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await sleep(200);
+    const rows = await page.evaluate(() => ({
+      argos: [...document.querySelectorAll("button")].some((b) => b.innerText.includes("argos")),
+      gitswitch: [...document.querySelectorAll('[role], button')].filter((b) => b.innerText.trim().startsWith("gitswitch")).length,
+    }));
+    ok("  and it narrows to the match", rows.argos);
+    await page.close();
+  }
+
   section("Layout");
   // Measure <main>, not documentElement: main has overflow-y-auto, so it
   // scrolls horizontally on its own and the document never reports overflow.

@@ -372,6 +372,8 @@ export function Changes() {
             <Select
               value={repoPath}
               onChange={setRepoPath}
+              searchable
+              searchLabel="Search repositories"
               placeholder={visibleRepos.length ? "Pick a repository" : "No repositories found"}
               options={[
                 ...visibleRepos.map((r) => ({

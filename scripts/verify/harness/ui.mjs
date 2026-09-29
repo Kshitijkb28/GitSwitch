@@ -49,6 +49,7 @@ async function openPage(browser, server, scenario, opts = {}) {
     submodules: opts.submodules ?? [],
     subInner: opts.subInner ?? null,
     lfs: opts.lfs ?? null,
+    repos: opts.repos ?? null,
     lfsListing: opts.lfsListing ?? LFS_LISTING,
     lfsProgress: opts.lfsProgress ?? null,
     lockOutcome: opts.lockOutcome ?? "applied",
@@ -103,7 +104,7 @@ async function openPage(browser, server, scenario, opts = {}) {
           }
           switch (cmd) {
             case "history_list_repos":
-              return Promise.resolve(repos);
+              return Promise.resolve(cfg.repos ?? repos);
             case "changes_repo_status": {
               const sub = args.repoPath && cfg.submoduleStatuses.find((s) => s.status.path === args.repoPath);
               if (sub) return Promise.resolve(sub.status);
@@ -987,6 +988,182 @@ try {
     await sleep(500);
     const picked = await page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:changes.repo") ?? '""'));
     ok("Open switches the page to that submodule", picked.endsWith("/staging"), picked);
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Picking a repository from a long list");
+  {
+    const many = Array.from({ length: 30 }, (_, i) => ({
+      path: `/repos/bulk-${i}`,
+      name: i === 7 ? "argos-staging" : `project-${i}`,
+      profile_id: "p1",
+      profile_name: "Kirmada",
+      profile_email: "me@personal.test",
+    }));
+    const page = await open(SCENARIOS.clean, { repos: [...REPOS, ...many] });
+    await page.waitForFunction(() => document.body.innerText.includes("Repository"), { timeout: 4000 });
+    // Open the Repository picker: the second combobox in the header.
+    await page.evaluate(() => {
+      const labels = [...document.querySelectorAll("label")];
+      const repoLabel = labels.find((l) => l.innerText.trim() === "Repository");
+      repoLabel.parentElement.querySelector("button").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('input[aria-label="Search repositories"]'), { timeout: 4000 });
+    ok("the repository picker has a search box", true);
+    const before = await page.evaluate(() =>
+      [...document.querySelectorAll("button")].filter((b) => b.innerText.includes("project-")).length
+    );
+    ok("  and every repository is listed before typing", before > 20);
+
+    await page.evaluate(() => {
+      const i = document.querySelector('input[aria-label="Search repositories"]');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      setter.call(i, "staging");
+      i.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await sleep(200);
+    const after = await page.evaluate(() => ({
+      staging: [...document.querySelectorAll("button")].some((b) => b.innerText.includes("argos-staging")),
+      others: [...document.querySelectorAll("button")].filter((b) => b.innerText.includes("project-")).length,
+      typed: document.querySelector('input[aria-label="Search repositories"]').value,
+    }));
+    ok("  typing keeps what it typed", after.typed === "staging");
+    ok("  narrows the list to the match", after.staging && after.others === 0);
+
+    // Enter picks the highlighted row, so the list works without the mouse.
+    await page.evaluate(() => {
+      const i = document.querySelector('input[aria-label="Search repositories"]');
+      i.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await sleep(250);
+    const chosen = await page.evaluate(() => document.body.innerText.includes("argos-staging"));
+    ok("  and Enter chooses it", chosen);
+    ok("  the list closes behind it", !(await page.evaluate(() => !!document.querySelector('input[aria-label="Search repositories"]'))));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.waitForFunction(() => document.body.innerText.includes("Repository"), { timeout: 4000 });
+    await page.evaluate(() => {
+      const labels = [...document.querySelectorAll("label")];
+      labels.find((l) => l.innerText.trim() === "Repository").parentElement.querySelector("button").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('input[aria-label="Search repositories"]'), { timeout: 4000 });
+    await page.evaluate(() => {
+      const i = document.querySelector('input[aria-label="Search repositories"]');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      setter.call(i, "zzz-nothing");
+      i.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await sleep(200);
+    ok("a search with no match says so rather than looking empty",
+      (await text(page)).includes("Nothing matches"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.waitForFunction(() => document.body.innerText.includes("Account"), { timeout: 4000 });
+    await page.evaluate(() => {
+      const labels = [...document.querySelectorAll("label")];
+      labels.find((l) => l.innerText.trim() === "Account").parentElement.querySelector("button").click();
+    });
+    await sleep(200);
+    // Any search box at all, not just the repositories one: a short list
+    // should be read at a glance, never typed into.
+    ok("a short list like Account keeps no search box",
+      !(await page.evaluate(() =>
+        [...document.querySelectorAll("input")].some((i) =>
+          (i.getAttribute("aria-label") || "").startsWith("Search")
+        )
+      )));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Every long dropdown searches and loads as it scrolls");
+  {
+    // The Account picker never asks for a search box: it gets one once the
+    // list is long enough to need one. The page derives accounts from the
+    // repositories, so distinct profiles are what make that list long.
+    const manyAccountRepos = Array.from({ length: 20 }, (_, i) => ({
+      path: `/repos/team-${i}`,
+      name: `team-repo-${i}`,
+      profile_id: `acct-${i}`,
+      profile_name: i === 12 ? "Ethara" : `Team ${i}`,
+      profile_email: `me${i}@x.test`,
+    }));
+    const page = await open(SCENARIOS.clean, { repos: [...REPOS, ...manyAccountRepos] });
+    await page.waitForFunction(() => document.body.innerText.includes("Account"), { timeout: 4000 });
+    await page.evaluate(() => {
+      const labels = [...document.querySelectorAll("label")];
+      labels.find((l) => l.innerText.trim() === "Account").parentElement.querySelector("button").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('input[aria-label="Search"]'), { timeout: 4000 });
+    ok("a long Account list gets a search box without being asked", true);
+    await page.evaluate(() => {
+      const i = document.querySelector('input[aria-label="Search"]');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      setter.call(i, "ethara");
+      i.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await sleep(200);
+    const narrowed = await page.evaluate(() => ({
+      ethara: [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Ethara"),
+      teams: [...document.querySelectorAll("button")].filter((b) => b.innerText.trim().startsWith("Team ")).length,
+    }));
+    ok("  and searching it works, ignoring case", narrowed.ethara && narrowed.teams === 0);
+    await page.close();
+  }
+  {
+    const many = Array.from({ length: 300 }, (_, i) => ({
+      path: `/repos/bulk-${i}`,
+      name: `project-${String(i).padStart(3, "0")}`,
+      profile_id: "p1",
+      profile_name: "Kirmada",
+      profile_email: "me@personal.test",
+    }));
+    const page = await open(SCENARIOS.clean, { repos: [...REPOS, ...many] });
+    await page.waitForFunction(() => document.body.innerText.includes("Repository"), { timeout: 4000 });
+    await page.evaluate(() => {
+      const labels = [...document.querySelectorAll("label")];
+      labels.find((l) => l.innerText.trim() === "Repository").parentElement.querySelector("button").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('input[aria-label="Search repositories"]'), { timeout: 4000 });
+    const first = await page.evaluate(() => ({
+      rows: [...document.querySelectorAll("button")].filter((b) => b.innerText.includes("project-")).length,
+      note: document.body.innerText.includes("Showing 50 of 302"),
+    }));
+    ok("302 repositories render as a first page, not all at once", first.rows < 60);
+    ok("  and it says how many are still below", first.note);
+
+    // Scrolling to the bottom brings the next page in.
+    await page.evaluate(() => {
+      const list = [...document.querySelectorAll("div.max-h-64")].pop();
+      list.scrollTop = list.scrollHeight;
+      list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    await sleep(250);
+    const second = await page.evaluate(() =>
+      [...document.querySelectorAll("button")].filter((b) => b.innerText.includes("project-")).length
+    );
+    ok("  scrolling to the end loads more", second > first.rows);
+
+    // Searching still reaches a repository far past the rendered window.
+    await page.evaluate(() => {
+      const i = document.querySelector('input[aria-label="Search repositories"]');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+      setter.call(i, "project-287");
+      i.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await sleep(250);
+    const found = await page.evaluate(() => ({
+      hit: [...document.querySelectorAll("button")].some((b) => b.innerText.includes("project-287")),
+      rows: [...document.querySelectorAll("button")].filter((b) => b.innerText.includes("project-")).length,
+      note: document.body.innerText.includes("Showing 50 of"),
+    }));
+    ok("  searching finds one far beyond what was rendered", found.hit && found.rows === 1);
+    ok("  and the list stops saying there is more below", !found.note);
     await page.close();
   }
 
