@@ -29,6 +29,7 @@ run "Sync"                bash "$HERE/sync.sh"
 run "Tree (branches, undo, reset, revert, conflicts)" bash "$HERE/tree.sh"
 run "Stashes"             bash "$HERE/stash.sh"
 run "Push lock"           bash "$HERE/lock.sh"
+run "Terminal"            bash "$HERE/console.sh"
 if [ -d "$HERE/harness/node_modules/puppeteer-core" ] && [ -n "$JS" ]; then
   # One run each: the log's tail is the summary, its exit code the verdict
   # (running twice for the two doubled the time and the exposure to a flaky Chrome start).

@@ -38,6 +38,10 @@ tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
 gitswitch-lock-core = { path = "lock-core" }
 
+# A real terminal needs a real pty: wezterm's crate wraps unix ptys and
+# Windows ConPTY behind one API.
+portable-pty = "0.9"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

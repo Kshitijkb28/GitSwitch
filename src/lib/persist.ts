@@ -2,6 +2,12 @@ import { useCallback, useState } from "react";
 
 const PREFIX = "gitswitch:";
 
+/** Read a persisted value from outside a component — for module-scope stores
+ *  like the console drawer, which exist before any page mounts. */
+export function readPersisted<T>(key: string, fallback: T): T {
+  return read(key, fallback);
+}
+
 function read<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(PREFIX + key);

@@ -26,6 +26,16 @@ for folders that still use HTTPS.
 
 ## Features
 
+- **A terminal, in a drawer, on every page.** `Ctrl`/`Cmd` + `` ` `` opens a
+  real shell in the repository you have selected, and it stays open while you
+  move between pages. It is the same shell you would open yourself, with the
+  same account, SSH key and push block, because those live in your git config
+  rather than in this app — so a blocked repository refuses a push here exactly
+  as it does in Terminal. On top of that, `git` inside this drawer refuses a
+  force push, `--no-verify`, and a push that would skip the system config where
+  a push lock lives. Those three are guard-rails against a slip, not a barrier:
+  an absolute path to git or a changed `PATH` steps around them, and the drawer
+  says so rather than pretending otherwise.
 - **Every dropdown searches.** A list longer than eight entries gets a filter
   box of its own: type to narrow it, arrow keys to move, Enter to choose. It
   matches the hidden value as well as the label, so two clones with the same
