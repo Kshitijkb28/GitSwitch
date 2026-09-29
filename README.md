@@ -26,6 +26,11 @@ for folders that still use HTTPS.
 
 ## Features
 
+- **Every dropdown searches.** A list longer than eight entries gets a filter
+  box of its own: type to narrow it, arrow keys to move, Enter to choose. It
+  matches the hidden value as well as the label, so two clones with the same
+  name are told apart by their path. Long lists are rendered fifty rows at a
+  time and grow as you scroll, so a few hundred repositories open instantly.
 - **Doctor** — one click finds the things that silently send commits to the
   wrong account: an `~/.ssh/config` block pinning one key for github.com, SSH
   keys not registered on any account, hand-written `includeIf` rules fighting

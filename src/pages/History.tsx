@@ -467,6 +467,8 @@ export function History() {
             <Select
               value={superRepo}
               onChange={(v) => { setSuperRepo(v); setSub(""); }}
+              searchable
+              searchLabel="Search repositories"
               placeholder={loadingRepos ? "Loading repos…" : "Pick a repository…"}
               optionIcon={<GitBranch size={14} />}
               options={visibleRepos.map((r) => ({
