@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { X, SquareTerminal, Info } from "lucide-react";
 import { Select } from "../Select";
 // xterm is ~250 KB and only a person who opens the drawer needs it, so it is
@@ -9,6 +9,7 @@ const TerminalView = lazy(() =>
 import * as api from "../../lib/api";
 import {
   closeConsole,
+  setConsoleAccount,
   setConsoleHeight,
   setConsoleRepo,
   useConsole,
@@ -27,7 +28,7 @@ import { baseName } from "../../lib/paths";
  * kill a shell that might be halfway through something.
  */
 export function ConsoleDrawer() {
-  const { open, repo, height } = useConsole();
+  const { open, account, repo, height } = useConsole();
   const [repos, setRepos] = useState<api.RepoRef[]>([]);
   const [started, setStarted] = useState(false);
   const [sizeKey, setSizeKey] = useState(0);
@@ -46,9 +47,7 @@ export function ConsoleDrawer() {
     api
       .historyListRepos()
       .then((list) => {
-        if (cancelled) return;
-        setRepos(list);
-        if (!repo && list.length) setConsoleRepo(list[0].path);
+        if (!cancelled) setRepos(list);
       })
       .catch(() => {
         /* the picker stays empty; the drawer still shows why */
@@ -56,7 +55,28 @@ export function ConsoleDrawer() {
     return () => {
       cancelled = true;
     };
-  }, [started, repo]);
+  }, [started]);
+
+  // The accounts are whichever profiles own the repositories on this machine —
+  // the same derivation the Changes page uses, so the two agree.
+  const accounts = useMemo(
+    () =>
+      Array.from(
+        new Map(repos.map((r) => [r.profile_id, { id: r.profile_id, name: r.profile_name }])).values()
+      ),
+    [repos]
+  );
+  const visible = useMemo(
+    () => (account ? repos.filter((r) => r.profile_id === account) : repos),
+    [repos, account]
+  );
+
+  // Never leave the picker naming a repository the filter just hid, or the
+  // shell and the label would disagree about where you are.
+  useEffect(() => {
+    if (!visible.length) return;
+    if (!repo || !visible.some((r) => r.path === repo)) setConsoleRepo(visible[0].path);
+  }, [visible, repo]);
 
   const onDrag = useCallback((e: MouseEvent) => {
     if (!dragging.current) return;
@@ -114,14 +134,29 @@ export function ConsoleDrawer() {
       <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-zinc-800 px-3 py-1.5">
         <SquareTerminal size={14} className="shrink-0 text-emerald-400" />
         <span className="text-xs font-medium text-zinc-300">Terminal</span>
+        <div className="w-40 max-w-full">
+          <Select
+            value={account}
+            onChange={setConsoleAccount}
+            searchLabel="Search accounts"
+            placeholder="All accounts"
+            options={[
+              { value: "", label: "All accounts" },
+              ...accounts.map((a) => ({ value: a.id, label: a.name })),
+            ]}
+          />
+        </div>
         <div className="w-64 max-w-full">
           <Select
             value={repo}
             onChange={setConsoleRepo}
             searchable
             searchLabel="Search repositories"
-            placeholder={repos.length ? "Pick a repository" : "No repositories found"}
-            options={repos.map((r) => ({ value: r.path, label: r.name }))}
+            placeholder={visible.length ? "Pick a repository" : "No repositories found"}
+            options={visible.map((r) => ({
+              value: r.path,
+              label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
+            }))}
           />
         </div>
         <span className="min-w-0 truncate text-[11px] text-zinc-500" title={repo}>
