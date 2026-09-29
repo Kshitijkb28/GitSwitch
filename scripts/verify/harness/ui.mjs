@@ -88,6 +88,13 @@ async function openPage(browser, server, scenario, opts = {}) {
       const done = (headline, p) =>
         Promise.resolve({ ok: true, headline, detail: "", status: statusFor(p) });
       window.__TAURI_INTERNALS__ = {
+        // A Channel (the terminal's output stream) is built on this. Without
+        // it, constructing one throws and the drawer never starts a shell.
+        transformCallback: (callback) => {
+          const id = (window.__NEXT_CB__ = (window.__NEXT_CB__ || 0) + 1);
+          (window.__CHANNELS__ = window.__CHANNELS__ || {})[id] = callback;
+          return id;
+        },
         invoke: (cmd, args) => {
           window.__CALLS__.push({ cmd, args });
           // Forcing a delete is the answer to its own refusal, so it goes through.
@@ -158,6 +165,12 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(cfg.lfsListing);
             case "changes_lfs_progress":
               return Promise.resolve(cfg.lfsProgress);
+            case "terminal_open":
+              return Promise.resolve("test-session");
+            case "terminal_write":
+            case "terminal_resize":
+            case "terminal_close":
+              return Promise.resolve(null);
             case "changes_file_diff":
               return Promise.resolve(args.path === "logo.png" ? diffBinary : diffText);
             case "changes_pull":
@@ -1164,6 +1177,85 @@ try {
     }));
     ok("  searching finds one far beyond what was rendered", found.hit && found.rows === 1);
     ok("  and the list stops saying there is more below", !found.note);
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("The terminal drawer");
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    ok("the drawer is not in the page until it is asked for",
+      !(await page.evaluate(() => !!document.querySelector('[aria-label="Terminal"]'))));
+
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
+    ok("the sidebar button opens it", true);
+    // xterm is code-split, so the shell starts once that chunk has arrived.
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "terminal_open"), { timeout: 8000 });
+    ok("  it opens a shell for the selected repository",
+      await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "terminal_open" && c.args?.repoPath === "/repos/gitswitch")));
+    ok("  and asks for a size, so the shell wraps correctly",
+      await page.evaluate(() => {
+        const c = window.__CALLS__.find((x) => x.cmd === "terminal_open");
+        return c?.args?.cols > 0 && c?.args?.rows > 0;
+      }));
+    ok("  it carries its own repository picker", await page.evaluate(() =>
+      !!document.querySelector('[aria-label="Terminal"]')?.querySelector("button")));
+
+    // The honest note about what the guards do and do not cover.
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.includes("What it guards")).click();
+    });
+    await sleep(200);
+    const note = await text(page);
+    ok("it says the shell uses the same account as your own terminal", note.includes("same account"));
+    ok("  that git here refuses a force push and --no-verify", note.includes("force push") && note.includes("--no-verify"));
+    ok("  and is honest that the guards can be stepped around", note.includes("not a barrier"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.keyboard.down("Control");
+    await page.keyboard.press("`");
+    await page.keyboard.up("Control");
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
+    ok("Ctrl+` opens it, the way every editor does", true);
+    // Hidden, not unmounted: a shell must survive being closed.
+    await page.keyboard.down("Control");
+    await page.keyboard.press("`");
+    await page.keyboard.up("Control");
+    await sleep(250);
+    const state = await page.evaluate(() => {
+      const el = document.querySelector('[aria-label="Terminal"]');
+      return { present: !!el, hidden: el ? el.className.includes("hidden") : false };
+    });
+    ok("  closing it hides the drawer rather than killing the shell", state.present && state.hidden);
+    ok("  and the shell was not closed behind your back",
+      !(await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "terminal_close"))));
+    await page.close();
+  }
+  {
+    // A fixed drawer must not push the page sideways at a narrow window.
+    const page = await open(SCENARIOS.clean, { width: 700 });
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
+    await sleep(300);
+    const over = await page.evaluate(() => {
+      const m = document.querySelector("main");
+      return m.scrollWidth > m.clientWidth + 1;
+    });
+    ok("an open drawer does not overflow a 700px window", !over);
+    ok("  and the page can still be scrolled clear of it", await page.evaluate(() => {
+      const m = document.querySelector("main");
+      return parseInt(getComputedStyle(m).paddingBottom, 10) > 100;
+    }));
     await page.close();
   }
 

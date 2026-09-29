@@ -1,5 +1,6 @@
+import { useEffect } from "react";
 import { Routes, Route, NavLink, useLocation } from "react-router-dom";
-import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, GitGraph, BookMarked, GitPullRequestArrow } from "lucide-react";
+import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, GitGraph, BookMarked, GitPullRequestArrow, SquareTerminal } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
 import { ProfileForm } from "./pages/ProfileForm";
@@ -13,9 +14,24 @@ import { Doctor } from "./pages/Doctor";
 import { CommitAudit } from "./pages/CommitAudit";
 import { History } from "./pages/History";
 import { Changes } from "./pages/Changes";
+import { ConsoleDrawer } from "./components/console/ConsoleDrawer";
+import { toggleConsole, useConsole } from "./lib/console";
 
 function App() {
   const location = useLocation();
+  const { open: consoleOpen, height: consoleHeight } = useConsole();
+
+  // Ctrl/Cmd + ` is the shortcut every other editor uses for its terminal.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "`") {
+        e.preventDefault();
+        toggleConsole();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   return (
     <div className="flex h-screen bg-zinc-900 text-zinc-100">
@@ -63,13 +79,29 @@ function App() {
           <SidebarLink to="/settings" icon={<SettingsIcon size={18} />}>
             Settings
           </SidebarLink>
+          <button
+            type="button"
+            onClick={toggleConsole}
+            title="A shell in the selected repository (Ctrl/Cmd + `)"
+            className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer ${
+              consoleOpen
+                ? "bg-emerald-500/10 text-emerald-400"
+                : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+            }`}
+          >
+            <SquareTerminal size={18} />
+            Terminal
+          </button>
         </div>
         <div className="p-3 border-t border-zinc-800">
           <p className="text-xs text-zinc-600">v0.1.0</p>
         </div>
       </nav>
 
-      <main className="flex-1 min-w-0 overflow-y-auto p-6">
+      <main
+        className="flex-1 min-w-0 overflow-y-auto p-6"
+        style={consoleOpen ? { paddingBottom: consoleHeight + 24 } : undefined}
+      >
         <Routes>
           <Route path="/" element={<Dashboard />} />
           <Route path="/profile/new" element={<ProfileForm />} />
@@ -86,6 +118,7 @@ function App() {
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>
+      <ConsoleDrawer />
     </div>
   );
 }

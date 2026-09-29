@@ -12,6 +12,7 @@ mod git_history;
 mod git_ops;
 mod git_status;
 mod lfs;
+mod terminal;
 mod git_remote;
 mod github;
 mod oauth;
@@ -109,6 +110,10 @@ pub fn run() {
             commands::changes_lfs_files,
             commands::changes_lfs_pull_paths,
             commands::changes_lfs_progress,
+            commands::terminal_open,
+            commands::terminal_write,
+            commands::terminal_resize,
+            commands::terminal_close,
             commands::lfs_available,
             commands::changes_abort,
             commands::changes_continue,
@@ -194,6 +199,13 @@ pub fn run() {
             tray::setup_tray(app.handle())?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app, event| {
+            // A shell started in the terminal drawer must not outlive the
+            // window that opened it.
+            if let tauri::RunEvent::Exit = event {
+                terminal::close_all();
+            }
+        });
 }

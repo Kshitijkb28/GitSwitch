@@ -1,4 +1,4 @@
-import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke, Channel } from "@tauri-apps/api/core";
 import type { Profile } from "../types/profile";
 
 function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -1629,4 +1629,33 @@ export async function doctorCheckPushLocks(): Promise<Finding[]> {
 
 export async function changesRepairPushBlock(repoPath: string): Promise<PushState> {
   return invoke("changes_repair_push_block", { repoPath });
+}
+
+// --- Terminal ------------------------------------------------------------
+// The only streaming surface in the app: a shell's output arrives on a channel
+// rather than as a return value, because a terminal that answered once would
+// not be a terminal.
+
+/** Start a shell in this repository. `onOutput` receives everything it prints. */
+export async function terminalOpen(
+  repoPath: string,
+  cols: number,
+  rows: number,
+  onOutput: (chunk: string) => void
+): Promise<string> {
+  const channel = new Channel<string>();
+  channel.onmessage = onOutput;
+  return invoke("terminal_open", { repoPath, cols, rows, onOutput: channel });
+}
+
+export async function terminalWrite(id: string, data: string): Promise<void> {
+  return invoke("terminal_write", { id, data });
+}
+
+export async function terminalResize(id: string, cols: number, rows: number): Promise<void> {
+  return invoke("terminal_resize", { id, cols, rows });
+}
+
+export async function terminalClose(id: string): Promise<void> {
+  return invoke("terminal_close", { id });
 }

@@ -340,6 +340,23 @@ pub(crate) mod tests {
             // PROBE_ARGS: "<path>[,<path>…]" — a path holding a comma has to go
             // through `PROBE_OP=invoke` instead, which takes real JSON.
             "lfs_pull_paths" => show(git_ops::lfs_pull_paths(&repo(), a.clone()).await),
+            // PROBE_ARGS: the command line to run in a real shell, in a real
+            // pty, through the real shim. One process, so open/write/close all
+            // happen here rather than across probe invocations.
+            "term_run" => {
+                let line = a.join(",");
+                match crate::terminal::run_once(
+                    &repo(),
+                    &line,
+                    std::time::Duration::from_secs(20),
+                ) {
+                    Ok(out) => emit(&serde_json::json!({ "output": out })),
+                    Err(e) => emit_err(e),
+                }
+            }
+            "term_shim" => emit(&serde_json::json!({
+                "script": crate::terminal::shim_script("/usr/bin/git"),
+            })),
             "lfs_progress" => match crate::lfs::read_progress(&repo()) {
                 Some(p) => emit(&p),
                 None => emit(&serde_json::Value::Null),

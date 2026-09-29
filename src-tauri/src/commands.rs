@@ -706,6 +706,35 @@ pub async fn changes_lfs_progress(repo_path: String) -> Option<LfsProgress> {
     lfs::read_progress(&repo_path)
 }
 
+/// Start a shell in this repository. Output arrives on `on_output` rather than
+/// as a return value: a terminal is the one thing in this app that streams.
+#[tauri::command]
+pub async fn terminal_open(
+    repo_path: String,
+    cols: u16,
+    rows: u16,
+    on_output: tauri::ipc::Channel<String>,
+) -> Result<String, AppError> {
+    crate::terminal::open(&repo_path, cols, rows, on_output)
+}
+
+/// Keystrokes, straight through to the shell.
+#[tauri::command]
+pub async fn terminal_write(id: String, data: String) -> Result<(), AppError> {
+    crate::terminal::write(&id, &data)
+}
+
+/// Tell the shell the window changed shape, so wrapping stays right.
+#[tauri::command]
+pub async fn terminal_resize(id: String, cols: u16, rows: u16) -> Result<(), AppError> {
+    crate::terminal::resize(&id, cols, rows)
+}
+
+#[tauri::command]
+pub async fn terminal_close(id: String) {
+    crate::terminal::close(&id);
+}
+
 /// `git lfs pull`: download the content for every pointer stub. Reports how
 /// many actually arrived, measured by counting the stubs again afterwards.
 #[tauri::command]
