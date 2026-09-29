@@ -36,7 +36,7 @@ for folders that still use HTTPS.
   a push lock lives. Those three are guard-rails against a slip, not a barrier:
   an absolute path to git or a changed `PATH` steps around them, and the drawer
   says so rather than pretending otherwise.
-- **Every dropdown searches.** A list longer than eight entries gets a filter
+- **Every dropdown searches.** A list longer than three entries gets a filter
   box of its own: type to narrow it, arrow keys to move, Enter to choose. It
   matches the hidden value as well as the label, so two clones with the same
   name are told apart by their path. Long lists are rendered fifty rows at a

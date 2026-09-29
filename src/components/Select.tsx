@@ -16,8 +16,8 @@ interface SelectProps {
   optionIcon?: ReactNode;
   /**
    * Force the filter box on or off. Left unset, it appears on its own once a
-   * list is longer than `SEARCH_FROM` — a list you can take in at a glance is
-   * faster to read than to type into, and every longer one is worth searching.
+   * list is longer than `SEARCH_FROM`. Two or three entries are a glance, not
+   * a search; beyond that, typing beats reading.
    */
   searchable?: boolean;
   /** Names the filter box for screen readers, and fills its placeholder. */
@@ -25,8 +25,9 @@ interface SelectProps {
   className?: string;
 }
 
-/** Longer than this and the list gets a filter box without being asked. */
-const SEARCH_FROM = 8;
+/** Longer than this and the list gets a filter box without being asked.
+ *  Three or fewer is a glance; a fourth is already worth typing into. */
+const SEARCH_FROM = 3;
 /** Rows put in the DOM at once; more are added as the list is scrolled. */
 const PAGE = 50;
 

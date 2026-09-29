@@ -1239,6 +1239,60 @@ try {
     await page.close();
   }
   {
+    // The drawer filters by account, the same way the Changes page does.
+    const mixed = [
+      { path: "/repos/work-a", name: "work-a", profile_id: "p2", profile_name: "Ethara", profile_email: "me@work.test" },
+      { path: "/repos/work-b", name: "work-b", profile_id: "p2", profile_name: "Ethara", profile_email: "me@work.test" },
+      { path: "/repos/mine-a", name: "mine-a", profile_id: "p1", profile_name: "Kirmada", profile_email: "me@personal.test" },
+    ];
+    const page = await open(SCENARIOS.clean, { repos: mixed });
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
+    await sleep(400);
+    const drawerText = () => page.evaluate(() => document.querySelector('[aria-label="Terminal"]').innerText);
+    ok("the drawer offers an account filter", (await drawerText()).includes("All accounts"));
+
+    // Open the account picker (the first Select inside the drawer) and choose one.
+    await page.evaluate(() => {
+      const drawer = document.querySelector('[aria-label="Terminal"]');
+      [...drawer.querySelectorAll("button")].find((b) => b.innerText.includes("All accounts")).click();
+    });
+    await sleep(200);
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Ethara").click();
+    });
+    await sleep(400);
+    ok("  choosing an account narrows the repositories to it", (await drawerText()).includes("work-"));
+    ok("  and the shell follows the filter rather than staying somewhere hidden",
+      await page.evaluate(() =>
+        window.__CALLS__.filter((c) => c.cmd === "terminal_open").slice(-1)[0]?.args?.repoPath?.includes("/repos/work-")
+      ));
+    await page.close();
+  }
+  {
+    // Two or three entries are a glance; a fourth is worth typing into.
+    const four = [
+      ...REPOS,
+      { path: "/repos/c", name: "c", profile_id: "p3", profile_name: "Third", profile_email: "c@x.test" },
+    ];
+    const page = await open(SCENARIOS.clean, { repos: four });
+    await page.waitForFunction(() => document.body.innerText.includes("Account"), { timeout: 4000 });
+    await page.evaluate(() => {
+      const labels = [...document.querySelectorAll("label")];
+      labels.find((l) => l.innerText.trim() === "Account").parentElement.querySelector("button").click();
+    });
+    await sleep(250);
+    ok("a four-entry Account list gets a search box",
+      await page.evaluate(() =>
+        [...document.querySelectorAll("input")].some((i) => (i.getAttribute("aria-label") || "").startsWith("Search"))
+      ));
+    await page.close();
+  }
+
+  {
     // A fixed drawer must not push the page sideways at a narrow window.
     const page = await open(SCENARIOS.clean, { width: 700 });
     await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });

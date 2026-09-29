@@ -13,6 +13,8 @@ import { readPersisted, writePersisted } from "./persist";
  */
 export type ConsoleState = {
   open: boolean;
+  /** Profile id the repository list is filtered by; "" means every account. */
+  account: string;
   /** Absolute path of the repository the shell runs in. */
   repo: string;
   /** Drawer height in pixels. */
@@ -24,6 +26,7 @@ const MAX_HEIGHT = 900;
 
 let state: ConsoleState = {
   open: false, // never restored open: a shell should start when asked for
+  account: readPersisted<string>("console.account", "") || readPersisted<string>("changes.account", ""),
   repo: readPersisted<string>("console.repo", "") || readPersisted<string>("changes.repo", ""),
   height: clampHeight(readPersisted<number>("console.height", 300)),
 };
@@ -77,6 +80,11 @@ export function toggleConsole() {
 export function setConsoleRepo(repo: string) {
   writePersisted("console.repo", repo);
   set({ repo });
+}
+
+export function setConsoleAccount(account: string) {
+  writePersisted("console.account", account);
+  set({ account });
 }
 
 export function setConsoleHeight(px: number) {
