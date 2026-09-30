@@ -164,6 +164,8 @@ pub(crate) mod tests {
             "changes_lfs_pull" => forward!(c::changes_lfs_pull, args, repo_path),
             "changes_lfs_files" => forward!(c::changes_lfs_files, args, repo_path),
             "changes_lfs_pull_paths" => forward!(c::changes_lfs_pull_paths, args, repo_path, paths),
+            "console_entries" => forward_plain!(c::console_entries, args, since_id, repo_path),
+            "console_clear" => forward_plain!(c::console_clear, args),
             "changes_continue" => forward!(c::changes_continue, args, repo_path),
             "changes_abort" => forward!(c::changes_abort, args, repo_path),
             // sync
@@ -353,6 +355,12 @@ pub(crate) mod tests {
                     Ok(out) => emit(&serde_json::json!({ "output": out })),
                     Err(e) => emit_err(e),
                 }
+            }
+            // Run a real status read — ~18 commands through GitCmd — then dump
+            // what was recorded. One process, because the log is in memory.
+            "cmdlog" => {
+                let _ = crate::git_status::repo_status(&repo()).await;
+                emit(&crate::cmdlog::since(0, Some(&repo())))
             }
             "term_shim" => emit(&serde_json::json!({
                 "script": crate::terminal::shim_script("/usr/bin/git"),

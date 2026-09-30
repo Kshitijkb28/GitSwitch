@@ -212,7 +212,24 @@ impl GitCmd {
     /// or a timeout is an `Err`; a non-zero exit is for the caller to read.
     pub async fn run(self) -> Result<GitOutput, AppError> {
         let sub = self.subcommand();
-        let mut cmd = tokio::process::Command::new(self.program.clone().unwrap_or_else(|| PathBuf::from("git")));
+        let program = self.program.clone().unwrap_or_else(|| PathBuf::from("git"));
+        // The argv is assembled straight onto the child below and never exists
+        // as a list, so the Activity tab's copy is built here alongside it.
+        let mut argv: Vec<String> = vec![program.to_string_lossy().to_string()];
+        if let Some(dir) = &self.repo {
+            argv.push("-C".into());
+            argv.push(dir.to_string_lossy().to_string());
+        }
+        argv.extend(self.top.iter().cloned());
+        for (k, v) in &self.cfg {
+            argv.push("-c".into());
+            argv.push(format!("{}={}", k, v));
+        }
+        argv.extend(self.args.iter().cloned());
+        let where_ = self.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+        let started = std::time::Instant::now();
+
+        let mut cmd = tokio::process::Command::new(program);
         if let Some(dir) = &self.repo {
             cmd.arg("-C").arg(dir);
         }
@@ -259,9 +276,15 @@ impl GitCmd {
         #[cfg(unix)]
         cmd.process_group(0);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| AppError::Command(format!("Failed to run git: {}", e)))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                // A command that never started is still something that was
+                // attempted, and its absence from the log would be a lie.
+                crate::cmdlog::record(&where_, argv, -1, started.elapsed(), "", &e.to_string());
+                return Err(AppError::Command(format!("Failed to run git: {}", e)));
+            }
+        };
 
         if let Some(data) = self.stdin {
             use tokio::io::AsyncWriteExt;
@@ -287,6 +310,12 @@ impl GitCmd {
                         libc::kill(-(pid as i32), libc::SIGKILL);
                     }
                 }
+                let why = if sub == "lfs" {
+                    format!("killed after {}s without finishing", secs)
+                } else {
+                    format!("timed out after {}s", secs)
+                };
+                crate::cmdlog::record(&where_, argv, -9, started.elapsed(), "", &why);
                 return Err(AppError::Command(if sub == "lfs" {
                     format!(
                         "The large-file download was stopped after {}s without finishing. Whatever already arrived is kept, so running it again continues rather than starting over.",
@@ -301,11 +330,17 @@ impl GitCmd {
             }
         };
 
-        Ok(GitOutput {
-            code: out.status.code().unwrap_or(-1),
-            stdout: out.stdout,
-            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        })
+        let code = out.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        crate::cmdlog::record(
+            &where_,
+            argv,
+            code,
+            started.elapsed(),
+            &String::from_utf8_lossy(&out.stdout),
+            &stderr,
+        );
+        Ok(GitOutput { code, stdout: out.stdout, stderr })
     }
 
     /// Run and fail on a non-zero exit, with the same error shape the rest of

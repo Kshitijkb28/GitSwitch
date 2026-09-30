@@ -1,6 +1,9 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { X, SquareTerminal, Info } from "lucide-react";
+import { X, SquareTerminal, Info, ShieldAlert, Lock } from "lucide-react";
 import { Select } from "../Select";
+import { Badge } from "../Badge";
+import { ActivityView } from "./ActivityView";
+import { currentMode } from "../changes/PushAccessCard";
 // xterm is ~250 KB and only a person who opens the drawer needs it, so it is
 // fetched on first open rather than shipped in the main bundle.
 const TerminalView = lazy(() =>
@@ -10,6 +13,7 @@ import * as api from "../../lib/api";
 import {
   closeConsole,
   setConsoleAccount,
+  setConsoleTab,
   setConsoleHeight,
   setConsoleRepo,
   useConsole,
@@ -28,12 +32,14 @@ import { baseName } from "../../lib/paths";
  * kill a shell that might be halfway through something.
  */
 export function ConsoleDrawer() {
-  const { open, account, repo, height } = useConsole();
+  const { open, tab, account, repo, height } = useConsole();
   const [repos, setRepos] = useState<api.RepoRef[]>([]);
   const [started, setStarted] = useState(false);
   const [sizeKey, setSizeKey] = useState(0);
   const [showNote, setShowNote] = useState(false);
+  const [push, setPush] = useState<api.PushState | null>(null);
   const dragging = useRef(false);
+  const pushSeq = useRef(0);
 
   useEffect(() => {
     if (open) setStarted(true);
@@ -77,6 +83,34 @@ export function ConsoleDrawer() {
     if (!visible.length) return;
     if (!repo || !visible.some((r) => r.path === repo)) setConsoleRepo(visible[0].path);
   }, [visible, repo]);
+
+  // What this repository's push state actually is, so it is known before a
+  // push is typed rather than discovered from a refusal.
+  //
+  // `changesPushState` rather than the full status: it is ~10 git config and
+  // remote reads that never touch the object database, so it costs the same on
+  // a monorepo. It is fetched on a repo change only and never polled, because
+  // under a lock it re-applies drifted mirrors as a side effect.
+  useEffect(() => {
+    if (!started || !open || !repo) {
+      setPush(null);
+      return;
+    }
+    // The account filter re-selects a repository when it hides the current
+    // one, so `repo` can change twice in a breath; the last request wins.
+    const mine = ++pushSeq.current;
+    const id = window.setTimeout(() => {
+      api
+        .changesPushState(repo)
+        .then((p) => {
+          if (mine === pushSeq.current) setPush(p);
+        })
+        .catch(() => {
+          if (mine === pushSeq.current) setPush(null);
+        });
+    }, 200);
+    return () => window.clearTimeout(id);
+  }, [started, open, repo]);
 
   const onDrag = useCallback((e: MouseEvent) => {
     if (!dragging.current) return;
@@ -162,6 +196,33 @@ export function ConsoleDrawer() {
         <span className="min-w-0 truncate text-[11px] text-zinc-500" title={repo}>
           {repo ? baseName(repo) : ""}
         </span>
+        {push && (push.blocked || push.lock.locked) && (
+          <span className="shrink-0" title={push.reason}>
+            <Badge variant="warning">
+              {currentMode(push) === "locked" ? (
+                <Lock size={11} className="mr-1" />
+              ) : (
+                <ShieldAlert size={11} className="mr-1" />
+              )}
+              {currentMode(push) === "locked" ? "Locked" : "Guard-rail"}
+            </Badge>
+          </span>
+        )}
+        <div className="flex shrink-0 items-center gap-0.5 rounded-md bg-zinc-800/70 p-0.5">
+          {(["terminal", "activity"] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              aria-label={t === "terminal" ? "Shell tab" : "Activity tab"}
+              onClick={() => setConsoleTab(t)}
+              className={`rounded px-2 py-0.5 text-[11px] transition-colors cursor-pointer ${
+                tab === t ? "bg-zinc-700 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              {t === "terminal" ? "Shell" : "Activity"}
+            </button>
+          ))}
+        </div>
         <button
           type="button"
           aria-label="What this terminal guards"
@@ -194,16 +255,21 @@ export function ConsoleDrawer() {
         </p>
       )}
 
-      <div className="min-h-0 flex-1 bg-zinc-900 px-2 py-1">
+      {/* Both panels stay mounted. Unmounting the terminal would close its pty,
+          so the inactive one is hidden exactly as the drawer hides itself. */}
+      <div className={`min-h-0 flex-1 bg-zinc-900 px-2 py-1 ${tab === "terminal" ? "" : "hidden"}`}>
         {repo ? (
           <Suspense fallback={<p className="p-3 text-sm text-zinc-500">Starting a shell…</p>}>
-            <TerminalView repoPath={repo} sizeKey={sizeKey} visible={open} />
+            <TerminalView repoPath={repo} sizeKey={sizeKey} visible={open && tab === "terminal"} />
           </Suspense>
         ) : (
           <p className="p-3 text-sm text-zinc-500">
             Pick a repository and a shell opens in that folder.
           </p>
         )}
+      </div>
+      <div className={`min-h-0 flex-1 bg-zinc-900 py-1 ${tab === "activity" ? "" : "hidden"}`}>
+        <ActivityView repoPath={repo} visible={open && tab === "activity"} />
       </div>
     </div>
   );

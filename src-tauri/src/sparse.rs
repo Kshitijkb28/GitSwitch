@@ -21,12 +21,23 @@ async fn run_git(repo: Option<&Path>, args: &[&str]) -> Result<String, AppError>
     }
     // No terminal exists for a GUI app, so an HTTPS credential prompt would
     // hang forever — make git fail fast with a readable error instead.
+    let started = std::time::Instant::now();
     let output = cmd
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(args)
         .output()
         .await
         .map_err(|e| AppError::Command(format!("Failed to run git: {}", e)))?;
+    // This runner takes its repository through `current_dir` rather than `-C`,
+    // so the log is told where it ran separately from the argv.
+    crate::cmdlog::record(
+        repo.unwrap_or(Path::new(".")),
+        std::iter::once("git".to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
+        output.status.code().unwrap_or(-1),
+        started.elapsed(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    );
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

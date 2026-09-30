@@ -1631,6 +1631,34 @@ export async function changesRepairPushBlock(repoPath: string): Promise<PushStat
   return invoke("changes_repair_push_block", { repoPath });
 }
 
+// --- The command log -----------------------------------------------------
+
+/** One git command this app ran, already redacted. */
+export interface ConsoleEntry {
+  id: number;
+  at: string;
+  repo: string;
+  /** Exactly what ran. `argv[0]` is the program. */
+  argv: string[];
+  /** -1 when git could not be started, -9 when it was killed on a timeout. */
+  exit_code: number;
+  duration_ms: number;
+  stdout: string;
+  stderr: string;
+  /** A read rather than a change; hidden by default because most are. */
+  is_read: boolean;
+  truncated: boolean;
+}
+
+/** Commands newer than `sinceId`. An empty `repoPath` means every repository. */
+export async function consoleEntries(sinceId: number, repoPath: string): Promise<ConsoleEntry[]> {
+  return invoke("console_entries", { sinceId, repoPath });
+}
+
+export async function consoleClear(): Promise<void> {
+  return invoke("console_clear", {});
+}
+
 // --- Terminal ------------------------------------------------------------
 // The only streaming surface in the app: a shell's output arrives on a channel
 // rather than as a return value, because a terminal that answered once would

@@ -791,12 +791,26 @@ async fn job_system_gitconfig(platform: Platform) -> String {
     }
     // Ask the system git where its system scope lives; the answer may be a
     // distribution-specific path.
+    let started = std::time::Instant::now();
     let out = tokio::process::Command::new(system_git())
         .args(["config", "--system", "--show-origin", "--list"])
         .env_remove("GIT_CONFIG_NOSYSTEM")
         .output()
         .await;
     let Ok(o) = out else { return default };
+    // This one prints whatever the user's system config holds, which is exactly
+    // where an `http.extraheader` credential would be — hence the redaction.
+    crate::cmdlog::record(
+        Path::new("."),
+        ["git", "config", "--system", "--show-origin", "--list"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect(),
+        o.status.code().unwrap_or(-1),
+        started.elapsed(),
+        &String::from_utf8_lossy(&o.stdout),
+        &String::from_utf8_lossy(&o.stderr),
+    );
     let stdout = String::from_utf8_lossy(&o.stdout);
     let stderr = String::from_utf8_lossy(&o.stderr);
     let found = stdout

@@ -21,6 +21,7 @@ import { useToast } from "../Toast";
 import { DiffView } from "../changes/DiffPanel";
 import { useGitJob } from "../../lib/gitJobs";
 import * as api from "../../lib/api";
+import { copyText } from "../../lib/clipboard";
 import type {
   CommitDetail,
   CommitTarget,
@@ -56,32 +57,6 @@ function isDirty(s: RepoStatus | null): boolean {
   return s.staged_count + s.unstaged_count > 0;
 }
 
-/** Clipboard write with a fallback for webviews that hide `navigator.clipboard`. */
-async function copyText(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // fall through to the textarea trick
-  }
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    ta.setAttribute("readonly", "");
-    ta.style.position = "fixed";
-    ta.style.opacity = "0";
-    ta.style.pointerEvents = "none";
-    document.body.appendChild(ta);
-    ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    return ok;
-  } catch {
-    return false;
-  }
-}
 
 /** A dark-theme radio, drawn the same way Checkbox is (the native one paints white). */
 function Radio({

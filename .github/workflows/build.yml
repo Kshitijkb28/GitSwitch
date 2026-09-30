@@ -73,6 +73,23 @@ jobs:
           bash scripts/verify/sync.sh
           bash scripts/verify/tree.sh
           bash scripts/verify/stash.sh
+      # A real shell in a real pty, through the real git shim. Kept separate so
+      # a failure here is attributed to the terminal rather than to git.
+      # The shell is pinned per platform: runners set SHELL=/bin/bash even on
+      # macOS, so without this zsh — what most Mac users actually get — would
+      # never be exercised.
+      - name: Terminal suite (Linux, bash)
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        env:
+          SHELL: /bin/bash
+        run: bash scripts/verify/console.sh
+      - name: Terminal suite (macOS, zsh)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        env:
+          SHELL: /bin/zsh
+        run: bash scripts/verify/console.sh
 
   build:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'

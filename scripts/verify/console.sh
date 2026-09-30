@@ -95,6 +95,38 @@ sleep 1
 AFTER=$(pgrep -f "$SB/work" 2>/dev/null | wc -l | tr -d ' ')
 ok "closing the terminal leaves no shell behind" "$([ "$AFTER" -le "$BEFORE" ] && echo clean || echo "leaked: $BEFORE -> $AFTER")" "clean"
 
+section "The command log records what the app itself ran"
+# The log lives in memory, so it cannot survive between probe invocations —
+# this op runs a real status read through GitCmd and dumps the log in the same
+# process, which is the only way to prove the recording actually happens.
+LOG=$(probe cmdlog "$SB/work")
+ok "a real status read is recorded" "$LOG" '"git"'
+ok "  with the repository it ran in" "$LOG" "$SB/work"
+ok "  and the porcelain status among the commands" "$LOG" "--porcelain=v2"
+ok "  every entry carries an exit code" "$LOG" '"exit_code"'
+ok "  and how long it took" "$LOG" '"duration_ms"'
+NONZERO=$(printf '%s' "$LOG" | "$PY" -c "
+import sys,json
+d=json.load(sys.stdin)
+print('yes' if any(e['duration_ms'] >= 0 for e in d) and len(d) > 3 else 'no')
+")
+ok "  a status read is many commands, not one" "$NONZERO" "yes"
+READS=$(printf '%s' "$LOG" | "$PY" -c "
+import sys,json
+d=json.load(sys.stdin)
+print('reads=%d writes=%d' % (sum(1 for e in d if e['is_read']), sum(1 for e in d if not e['is_read'])))
+")
+ok "  and they are classified as reads, so the list is not drowned" "$READS" "reads="
+
+section "A token never reaches the log"
+# A person pastes a credentialed URL into Clone and it lands in argv verbatim;
+# git also quotes it back in stderr. Both must come out redacted.
+git -C "$SB/work" remote add leaky "https://u:ghp_notarealtoken123@example.invalid/o/r.git"
+LOG=$(probe cmdlog "$SB/work")
+ok "the secret is not in the log" "$(printf '%s' "$LOG" | grep -c "ghp_notarealtoken123" || true)" "0"
+ok "  and what is left says a credential was there" "$LOG" "***@example.invalid"
+git -C "$SB/work" remote remove leaky
+
 section "The shim script itself"
 OUT=$(probe term_shim "$SB/work" | "$PY" -c "import sys,json;print(json.load(sys.stdin)['script'])")
 ok "it execs the real git at the end" "$OUT" 'exec "/usr/bin/git" "$@"'

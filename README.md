@@ -26,7 +26,7 @@ for folders that still use HTTPS.
 
 ## Features
 
-- **A terminal, in a drawer, on every page.** `Ctrl`/`Cmd` + `` ` `` opens a
+- **A terminal, and a record of what the app ran, in a drawer on every page.** `Ctrl`/`Cmd` + `` ` `` opens a
   real shell in the repository you have selected, and it stays open while you
   move between pages. It is the same shell you would open yourself, with the
   same account, SSH key and push block, because those live in your git config
@@ -35,7 +35,14 @@ for folders that still use HTTPS.
   force push, `--no-verify`, and a push that would skip the system config where
   a push lock lives. Those three are guard-rails against a slip, not a barrier:
   an absolute path to git or a changed `PATH` steps around them, and the drawer
-  says so rather than pretending otherwise.
+  says so rather than pretending otherwise. The header shows whether *this*
+  repository can be pushed at all, so a block is known before a push is typed.
+  Beside the shell is **Activity**: every git command GitSwitch itself ran, with
+  the exact command, its exit code, how long it took and what git said. Routine
+  reads are hidden by default because they are most of it. Anything that looks
+  like a credential — a token in a pasted clone URL, the same URL quoted back in
+  an error, an `Authorization` header — is replaced with `***` before it is
+  stored, not before it is shown.
 - **Every dropdown searches.** A list longer than three entries gets a filter
   box of its own: type to narrow it, arrow keys to move, Enter to choose. It
   matches the hidden value as well as the label, so two clones with the same

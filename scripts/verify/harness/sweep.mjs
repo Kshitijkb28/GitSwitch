@@ -44,6 +44,14 @@ try {
         { id: "p2", name: "Work", git_name: "Me At Work", git_email: "me@work.test", ssh_key_path: null, is_default: false, allow_push: false, signing_enabled: true, directories: ["/Users/me/Documents/Harbor"], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
       ];
       window.__TAURI_INTERNALS__ = {
+        // The terminal's output stream is a Channel, and its constructor calls
+        // this. Without it the drawer throws, renders an error instead of a
+        // shell, and any overflow check below would measure the wrong thing.
+        transformCallback: (callback) => {
+          const id = (window.__NEXT_CB__ = (window.__NEXT_CB__ || 0) + 1);
+          (window.__CHANNELS__ = window.__CHANNELS__ || {})[id] = callback;
+          return id;
+        },
         invoke: (cmd) => {
           switch (cmd) {
             case "get_profiles": return Promise.resolve(profiles);
@@ -53,6 +61,10 @@ try {
             case "changes_stash_list": return Promise.resolve(stashes);
             case "changes_file_diff": return Promise.resolve(d1);
             case "changes_lfs_progress": return Promise.resolve(null);
+            case "terminal_open": return Promise.resolve("sweep-session");
+            case "terminal_write": case "terminal_resize": case "terminal_close": return Promise.resolve(null);
+            case "console_entries": return Promise.resolve([]);
+            case "changes_push_state": return Promise.resolve({ ...st.push, blocked: false, repo_blocked: false, lock: { ...st.push.lock, locked: false }, reason: "Pushing is allowed from this folder." });
             case "changes_lfs_files": return Promise.resolve({ installed: true, version: "git-lfs/3.8.0", uses_lfs: false, filters_configured: true, files: [], folders: [], total: 0, present: 0, missing: 0, total_bytes: 0, missing_bytes: 0, sizes_known: true, truncated: 0, folders_truncated: 0, summary: "This repository doesn't use Git LFS." });
             case "get_current_git_config": return Promise.resolve("[user]\n\tname = Me\n\temail = me@personal.test");
             case "allowed_signers_path": return Promise.resolve("/Users/me/.ssh/allowed_signers");
@@ -93,6 +105,48 @@ try {
       if (over) bad++;
       console.log(`  ${over ? "\x1b[31mOVERFLOW\x1b[0m" : "\x1b[32mok      \x1b[0m"} ${name.padEnd(14)} needs ${String(r.need).padStart(4)} has ${r.have}`);
       for (const c of r.culprits) console.log(`             ${c}`);
+    }
+
+    // The terminal drawer is `fixed`, so it sits outside `main` and can never
+    // inflate main.scrollWidth — it has to be measured on its own. Its header
+    // carries a w-40 and a w-64 Select, which is the real risk at 700px.
+    const opened = await page.evaluate(() => {
+      const b = [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Terminal");
+      if (!b) return false;
+      b.click();
+      return true;
+    });
+    if (!opened) {
+      console.log("  Terminal: button not found");
+      bad++;
+    } else {
+      await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 5000 }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 700));
+      const d = await page.evaluate(() => {
+        const el = document.querySelector('[aria-label="Terminal"]');
+        const m = document.querySelector("main");
+        if (!el) return null;
+        return {
+          need: el.scrollWidth,
+          have: el.clientWidth,
+          mainNeed: m.scrollWidth,
+          mainHave: m.clientWidth,
+          clearance: parseInt(getComputedStyle(m).paddingBottom, 10) || 0,
+          errored: el.innerText.includes("Tauri runtime not available") || el.innerText.includes("transformCallback"),
+        };
+      });
+      if (!d) {
+        console.log("  Terminal: drawer never appeared");
+        bad++;
+      } else {
+        const over = d.need > d.have + 1 || d.mainNeed > d.mainHave + 1;
+        if (over || d.errored || d.clearance < 100) bad++;
+        console.log(
+          `  ${over || d.errored ? "\x1b[31mOVERFLOW\x1b[0m" : "\x1b[32mok      \x1b[0m"} ${"Terminal".padEnd(14)} needs ${String(d.need).padStart(4)} has ${d.have}` +
+            (d.errored ? "  (the drawer rendered an error, not a shell)" : "") +
+            (d.clearance < 100 ? `  (the page is not scrollable clear of it: ${d.clearance}px)` : "")
+        );
+      }
     }
     await page.close();
   }

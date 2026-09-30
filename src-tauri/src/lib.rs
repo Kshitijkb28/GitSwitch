@@ -11,6 +11,7 @@ mod git_exec;
 mod git_history;
 mod git_ops;
 mod git_status;
+mod cmdlog;
 mod lfs;
 mod terminal;
 mod git_remote;
@@ -110,6 +111,8 @@ pub fn run() {
             commands::changes_lfs_files,
             commands::changes_lfs_pull_paths,
             commands::changes_lfs_progress,
+            commands::console_entries,
+            commands::console_clear,
             commands::terminal_open,
             commands::terminal_write,
             commands::terminal_resize,

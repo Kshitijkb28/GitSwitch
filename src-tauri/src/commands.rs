@@ -706,6 +706,21 @@ pub async fn changes_lfs_progress(repo_path: String) -> Option<LfsProgress> {
     lfs::read_progress(&repo_path)
 }
 
+/// Every git command this app has run, newest last. `since_id` is the highest
+/// id already seen, so a poll asks only for what is new; an empty `repo_path`
+/// means every repository.
+#[tauri::command]
+pub async fn console_entries(since_id: u64, repo_path: String) -> Vec<crate::cmdlog::Entry> {
+    crate::cmdlog::since(since_id, Some(&repo_path))
+}
+
+/// Forget the recorded commands. The log is a convenience, not a record of
+/// account — the push lock keeps its own, which this cannot touch.
+#[tauri::command]
+pub async fn console_clear() {
+    crate::cmdlog::clear();
+}
+
 /// Start a shell in this repository. Output arrives on `on_output` rather than
 /// as a return value: a terminal is the one thing in this app that streams.
 #[tauri::command]

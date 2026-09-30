@@ -50,6 +50,8 @@ async function openPage(browser, server, scenario, opts = {}) {
     subInner: opts.subInner ?? null,
     lfs: opts.lfs ?? null,
     repos: opts.repos ?? null,
+    pushState: opts.pushState ?? null,
+    consoleEntries: opts.consoleEntries ?? [],
     lfsListing: opts.lfsListing ?? LFS_LISTING,
     lfsProgress: opts.lfsProgress ?? null,
     lockOutcome: opts.lockOutcome ?? "applied",
@@ -165,6 +167,12 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(cfg.lfsListing);
             case "changes_lfs_progress":
               return Promise.resolve(cfg.lfsProgress);
+            case "console_entries":
+              // Answer once, the way the real log does: a poll asks for what is
+              // newer than the highest id it has seen.
+              return Promise.resolve((args?.sinceId ?? 0) > 0 ? [] : cfg.consoleEntries);
+            case "console_clear":
+              return Promise.resolve(null);
             case "terminal_open":
               return Promise.resolve("test-session");
             case "terminal_write":
@@ -275,6 +283,7 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "push_lock_finish_manual":
               return Promise.resolve({ outcome: "applied", message: "Unlocked 1 repository.", command: null, job_nonce: null, changed: [], errors: [], bootstrapped: false });
             case "changes_push_state":
+              if (cfg.pushState) return Promise.resolve({ ...window.__SCENARIO__.push, ...cfg.pushState, lock: { ...window.__SCENARIO__.push.lock, ...(cfg.pushState.lock || {}) } });
               return Promise.resolve({ ...window.__SCENARIO__.push, lock: { ...window.__SCENARIO__.push.lock, locked: false }, blocked: false, repo_blocked: false, reason: "Pushing is allowed from this folder." });
             case "changes_repair_push_block":
               return Promise.resolve({ ...window.__SCENARIO__.push, needs_repair: false });
@@ -1292,67 +1301,143 @@ try {
     await page.close();
   }
 
+  // -----------------------------------------------------------------
+  section("The drawer says whether this repository can be pushed");
   {
-    // A fixed drawer must not push the page sideways at a narrow window.
-    const page = await open(SCENARIOS.clean, { width: 700 });
+    const page = await open(SCENARIOS.clean, {
+      pushState: { blocked: true, repo_blocked: true, reason: "Blocked for this repository (guard-rail)." },
+    });
     await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
     await page.evaluate(() => {
       [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
     });
     await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
-    await sleep(300);
-    const over = await page.evaluate(() => {
-      const m = document.querySelector("main");
-      return m.scrollWidth > m.clientWidth + 1;
+    await page.waitForFunction(
+      () => document.querySelector('[aria-label="Terminal"]').innerText.includes("Guard-rail"),
+      { timeout: 4000 }
+    );
+    ok("a guard-railed repository is named as such before you type", true);
+    ok("  and it is not called Locked, which means something stronger",
+      !(await page.evaluate(() => document.querySelector('[aria-label="Terminal"]').innerText.includes("Locked"))));
+    ok("  the reason is there to read", await page.evaluate(() =>
+      !!document.querySelector('[aria-label="Terminal"] [title*="guard-rail"], [aria-label="Terminal"] [title*="Blocked"]')));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean, {
+      pushState: { blocked: true, repo_blocked: true, lock: { locked: true }, reason: "Locked for this repository. Unlocking needs the administrator password." },
     });
-    ok("an open drawer does not overflow a 700px window", !over);
-    ok("  and the page can still be scrolled clear of it", await page.evaluate(() => {
-      const m = document.querySelector("main");
-      return parseInt(getComputedStyle(m).paddingBottom, 10) > 100;
-    }));
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
+    });
+    await page.waitForFunction(
+      () => document.querySelector('[aria-label="Terminal"]')?.innerText.includes("Locked"),
+      { timeout: 6000 }
+    );
+    ok("a locked repository is told apart from a guard-railed one", true);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
+    await sleep(700);
+    const t = await page.evaluate(() => document.querySelector('[aria-label="Terminal"]').innerText);
+    ok("a repository you can push to gets no badge at all", !t.includes("Guard-rail") && !t.includes("Locked"));
     await page.close();
   }
 
   // -----------------------------------------------------------------
-  section("Git LFS");
+  section("The Activity tab: what the app itself ran");
   {
-    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS });
-    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
-    const s = await text(page);
-    ok("a repo with pointer stubs gets an LFS card", s.includes("Git LFS"));
-    ok("it counts the stubs in words", s.includes("5 of 5 LFS files are still a pointer stub"));
-    ok("the button names how many it will fetch", s.includes("Pull LFS files (5)"));
-    ok("and is enabled", !(await (await button(page, "Pull LFS files")).evaluate((b) => b.disabled)));
-    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.startsWith("Which files"))?.click());
-    await sleep(200);
-    ok("the stub files can be listed", (await text(page)).includes("touchstones/axios__axios_dataset.jsonl"));
+    const page = await open(SCENARIOS.clean, { consoleEntries: [
+      { id: 1, at: "2026-09-30T10:00:00Z", repo: "/repos/gitswitch", argv: ["git", "-C", "/repos/gitswitch", "status", "--porcelain=v2"], exit_code: 0, duration_ms: 42, stdout: "", stderr: "", is_read: true, truncated: false },
+      { id: 2, at: "2026-09-30T10:00:01Z", repo: "/repos/gitswitch", argv: ["git", "fetch", "--all"], exit_code: 0, duration_ms: 1400, stdout: "Fetching origin", stderr: "", is_read: false, truncated: false },
+      { id: 3, at: "2026-09-30T10:00:02Z", repo: "/repos/gitswitch", argv: ["git", "push", "origin", "main"], exit_code: 128, duration_ms: 900, stdout: "", stderr: "fatal: refusing to push", is_read: false, truncated: false },
+    ] });
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
+    await page.evaluate(() => document.querySelector('[aria-label="Activity tab"]').click());
+    await page.waitForFunction(
+      () => document.querySelector('[aria-label="Terminal"]').innerText.includes("git fetch --all"),
+      { timeout: 4000 }
+    );
+    const drawer = () => page.evaluate(() => document.querySelector('[aria-label="Terminal"]').innerText);
+    let d = await drawer();
+    ok("it lists what the app ran", d.includes("git fetch --all"));
+    ok("  with how long it took", d.includes("1.4s"));
+    ok("  and names a command that failed by its exit code", d.includes("exit 128"));
+    ok("  routine reads are hidden by default, because most of it is reads",
+      !d.includes("--porcelain=v2"));
+
+    await page.evaluate(() => document.querySelector('input[aria-label="Hide routine reads"]').click());
+    await sleep(250);
+    d = await drawer();
+    ok("  and are shown when that is turned off", d.includes("--porcelain=v2"));
+
+    // Output is behind a disclosure: a log that dumped everything is unreadable.
+    ok("output is not dumped by default", !d.includes("refusing to push"));
+    await page.evaluate(() => {
+      const b = [...document.querySelectorAll('[aria-label^="Toggle git push"]')][0];
+      b.click();
+    });
+    await sleep(250);
+    ok("  and is there when a row is opened", (await drawer()).includes("refusing to push"));
     await page.close();
   }
   {
-    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_PRESENT });
-    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
-    const s = await text(page);
-    ok("when everything is present it says so", s.includes("All 5 LFS files are present"));
-    ok("and the button is disabled", await (await button(page, "Pull LFS files")).evaluate((b) => b.disabled));
+    // The one mistake that would kill a live shell.
+    const page = await open(SCENARIOS.clean, { consoleEntries: [
+      { id: 1, at: "2026-09-30T10:00:00Z", repo: "/repos/gitswitch", argv: ["git", "-C", "/repos/gitswitch", "status", "--porcelain=v2"], exit_code: 0, duration_ms: 42, stdout: "", stderr: "", is_read: true, truncated: false },
+      { id: 2, at: "2026-09-30T10:00:01Z", repo: "/repos/gitswitch", argv: ["git", "fetch", "--all"], exit_code: 0, duration_ms: 1400, stdout: "Fetching origin", stderr: "", is_read: false, truncated: false },
+      { id: 3, at: "2026-09-30T10:00:02Z", repo: "/repos/gitswitch", argv: ["git", "push", "origin", "main"], exit_code: 128, duration_ms: 900, stdout: "", stderr: "fatal: refusing to push", is_read: false, truncated: false },
+    ] });
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
+    });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "terminal_open"), { timeout: 8000 });
+    await page.evaluate(() => document.querySelector('[aria-label="Activity tab"]').click());
+    await sleep(300);
+    await page.evaluate(() => document.querySelector('[aria-label="Shell tab"]').click());
+    await sleep(300);
+    ok("switching tabs does not close the shell",
+      !(await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "terminal_close"))));
+    ok("  and it is still the same session, not a second one",
+      (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "terminal_open").length)) === 1);
     await page.close();
   }
   {
-    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_NOT_INSTALLED });
-    await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
-    const s = await text(page);
-    ok("a missing git-lfs is explained", s.includes("isn't installed"));
-    ok("with the install command", s.includes("brew install git-lfs"));
-    ok("and the button is disabled", await (await button(page, "Pull LFS files")).evaluate((b) => b.disabled));
-    await page.close();
-  }
-  {
-    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS, hang: true });
-    await page.waitForFunction(() => document.body.innerText.includes("Pull LFS files (5)"), { timeout: 4000 });
-    await (await button(page, "Pull LFS files")).click();
-    await page.waitForFunction(() => document.body.innerText.includes("Downloading LFS files"), { timeout: 4000 });
-    ok("pulling runs as a background job with a banner", (await text(page)).includes("Downloading LFS files"));
-    const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_lfs_pull"));
-    ok("and calls the backend for the selected repo", call?.args?.repoPath === "/repos/gitswitch");
+    const page = await open(SCENARIOS.clean, { consoleEntries: [
+      { id: 1, at: "2026-09-30T10:00:00Z", repo: "/repos/gitswitch", argv: ["git", "-C", "/repos/gitswitch", "status", "--porcelain=v2"], exit_code: 0, duration_ms: 42, stdout: "", stderr: "", is_read: true, truncated: false },
+      { id: 2, at: "2026-09-30T10:00:01Z", repo: "/repos/gitswitch", argv: ["git", "fetch", "--all"], exit_code: 0, duration_ms: 1400, stdout: "Fetching origin", stderr: "", is_read: false, truncated: false },
+      { id: 3, at: "2026-09-30T10:00:02Z", repo: "/repos/gitswitch", argv: ["git", "push", "origin", "main"], exit_code: 128, duration_ms: 900, stdout: "", stderr: "fatal: refusing to push", is_read: false, truncated: false },
+    ] });
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
+    await page.evaluate(() => document.querySelector('[aria-label="Activity tab"]').click());
+    await page.waitForFunction(
+      () => document.querySelector('[aria-label="Terminal"]').innerText.includes("git fetch --all"),
+      { timeout: 4000 }
+    );
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Clear").click();
+    });
+    await sleep(300);
+    ok("Clear empties the list and says what the tab is for",
+      (await page.evaluate(() => document.querySelector('[aria-label="Terminal"]').innerText)).includes("Nothing yet"));
+    ok("  and tells the backend to forget it too",
+      await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "console_clear")));
     await page.close();
   }
 

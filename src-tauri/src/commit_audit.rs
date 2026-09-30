@@ -38,12 +38,25 @@ pub struct RepoAudit {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let started = std::time::Instant::now();
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
         .output()
         .map_err(|e| format!("failed to run git: {}", e))?;
+    crate::cmdlog::record(
+        repo,
+        ["git", "-C", &repo.to_string_lossy()]
+            .iter()
+            .map(|a| a.to_string())
+            .chain(args.iter().map(|a| a.to_string()))
+            .collect(),
+        out.status.code().unwrap_or(-1),
+        started.elapsed(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    );
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
