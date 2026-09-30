@@ -40,6 +40,10 @@ RUN cargo install tauri-cli --version "^2" --locked
 RUN apt-get update && apt-get install -y --no-install-recommends xdg-utils \
  && rm -rf /var/lib/apt/lists/*
 
+# linuxdeploy is itself an AppImage and needs FUSE to run — containers have no
+# FUSE, so tell it to self-extract instead. Required for the AppImage bundle step.
+ENV APPIMAGE_EXTRACT_AND_RUN=1
+
 WORKDIR /app
 
 # Cache dependencies first
@@ -51,9 +55,12 @@ COPY src-tauri/Cargo.toml src-tauri/Cargo.lock ./src-tauri/
 # Now the full source
 COPY . .
 
-# Build the frontend + the Linux bundles
+# Build the frontend + the Linux bundles.
+# BUNDLES is comma-separated; exclude "appimage" on emulated cross-arch builds
+# (linuxdeploy cannot run under QEMU/Rosetta even with extract-and-run).
+ARG BUNDLES=deb,rpm,appimage
 RUN npm run build \
- && cargo tauri build
+ && cargo tauri build --bundles "$BUNDLES"
 
 # Default: copy the built installers to the mounted /out volume.
 CMD ["bash", "-c", "mkdir -p /out && cp -v src-tauri/target/release/bundle/deb/*.deb /out/ 2>/dev/null; cp -v src-tauri/target/release/bundle/appimage/*.AppImage /out/ 2>/dev/null; cp -rv src-tauri/target/release/bundle/rpm/*.rpm /out/ 2>/dev/null; echo 'Linux installers copied to ./dist-linux'"]

@@ -1,0 +1,74 @@
+{
+  "name": "gitswitch",
+  "displayName": "GitSwitch",
+  "description": "Shows which git identity applies to the folder you're working in \u2014 and warns before you commit as the wrong account.",
+  "version": "0.1.0",
+  "publisher": "kshitijkb28",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "keywords": [
+    "git",
+    "identity",
+    "multiple accounts",
+    "ssh",
+    "profile"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "gitswitch.showIdentity",
+        "title": "GitSwitch: Show identity for this folder"
+      },
+      {
+        "command": "gitswitch.refresh",
+        "title": "GitSwitch: Refresh identity"
+      },
+      {
+        "command": "gitswitch.fetchStatus",
+        "title": "GitSwitch: Check for incoming commits (fetch)"
+      }
+    ],
+    "configuration": {
+      "title": "GitSwitch",
+      "properties": {
+        "gitswitch.warnOnMismatch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Highlight the status bar when this repo's git identity doesn't match the GitSwitch profile for its folder."
+        },
+        "gitswitch.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the current git identity in the status bar."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "npx --yes @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "~5.8.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kshitijkb28/GitSwitch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Kshitijkb28/GitSwitch/issues"
+  }
+}

@@ -91,10 +91,18 @@ does **not** create long-running services or touch any other containers.
 
 > **Architecture note:** the Docker build produces installers for the *host's*
 > CPU architecture. On Apple Silicon / ARM machines you get **arm64** Linux
-> packages; on Intel/AMD machines you get **x86_64**. To force a specific arch,
-> add `platform: linux/amd64` (or `linux/arm64`) under the `builder` service in
-> `docker-compose.yml` — cross-arch builds run under emulation and are slower.
-> For clean native builds of both arches, prefer the GitHub Actions CI below.
+> packages; on Intel/AMD machines you get **x86_64**. To cross-build the other
+> arch under emulation (slower; AppImage must be skipped because linuxdeploy
+> can't run emulated):
+>
+> ```bash
+> docker build --platform linux/amd64 --build-arg BUNDLES=deb,rpm \
+>   -t gitswitch-builder:amd64 .
+> docker run --rm --platform linux/amd64 -v "$PWD/dist-linux:/out" gitswitch-builder:amd64
+> ```
+>
+> For clean native builds of both arches (including AppImage), prefer the
+> GitHub Actions CI below.
 
 ---
 
@@ -133,3 +141,41 @@ To ship signed updates from CI:
 2. Set `"createUpdaterArtifacts": true` under `bundle` in `tauri.conf.json`.
 3. Tag a release — the workflow uploads the updater artifacts + `latest.json`
    that the in-app "Check for Updates" consumes.
+
+## 6. Testing on Windows
+
+The `.exe` / `.msi` come from the CI workflow (Windows installers can only be
+built on Windows). Grab them from the draft Release, or from the run's
+artifacts if it was triggered manually.
+
+### Installing
+
+1. Run `GitSwitch_x.y.z_x64-setup.exe` (or the `.msi`).
+2. SmartScreen will say **"Windows protected your PC"** — the build is
+   unsigned, like the unnotarized macOS build. Click **More info → Run anyway**.
+
+### Runtime requirements
+
+| Tool | Needed for | Notes |
+|------|------------|-------|
+| `git` | everything | [git-scm.com](https://git-scm.com/download/win) — includes the `sh` that runs the commit guard hook |
+| `ssh`, `ssh-keygen` | keys, per-folder auth | ships with Windows 10/11 (OpenSSH Client) |
+| `gh` | account list, key registration, Auto Assign, autofill | optional — [cli.github.com](https://cli.github.com) |
+
+### What to check first
+
+Windows differs from macOS in ways that have bitten this app before, so verify
+these specifically:
+
+1. **`git config --global --list` still works** after creating a profile.
+   Paths written into git config MUST use forward slashes — a backslash is an
+   escape character there, and one bad line makes the whole `~/.gitconfig`
+   unreadable by *every* git command. There is a regression test for this
+   (`config_values_never_contain_backslashes`), but confirm on real hardware.
+2. **Per-folder identity** — create a profile, assign a folder, then inside a
+   repo in it run `git config user.email` and confirm it matches.
+3. **Commit Audit / Auto Assign list something.** If they come up empty, path
+   comparison is failing (`C:\Users\...` vs `/`).
+4. **Doctor** — it should find `%USERPROFILE%\.ssh\config` and report sensibly.
+5. **Commit guard** — enable it, then commit with a mismatched email; the hook
+   is `#!/bin/sh`, which Git for Windows runs through its bundled shell.

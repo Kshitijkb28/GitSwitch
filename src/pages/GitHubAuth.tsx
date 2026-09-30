@@ -221,7 +221,7 @@ export function GitHubAuth() {
         </Card>
 
         <Card>
-            <div className="flex items-center justify-between mb-1">
+            <div className="flex items-center justify-between mb-1 gap-3 flex-wrap">
               <div className="flex items-center gap-2">
                 <Terminal size={18} className="text-emerald-400" />
                 <h3 className="text-lg font-medium text-zinc-200">
@@ -260,7 +260,7 @@ export function GitHubAuth() {
                   key={acct}
                   className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-zinc-800/70 border border-zinc-700/50"
                 >
-                  <span className="text-sm text-zinc-200 font-mono truncate">
+                  <span className="text-sm text-zinc-200 font-mono truncate min-w-0">
                     {acct}
                   </span>
                   <div className="flex items-center gap-1 shrink-0">

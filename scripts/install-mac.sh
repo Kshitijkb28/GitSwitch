@@ -15,8 +15,20 @@ APP_DST="/Applications/GitSwitch.app"
 LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 if [[ "${1:-}" != "--skip-build" ]]; then
-  echo "▸ Building release bundle…"
-  npm run tauri build
+  # Only the .app is needed to install locally. Skipping the .dmg keeps this
+  # fast and sidesteps bundle_dmg.sh, whose AppleScript step fails whenever a
+  # stale disk image is mounted or Finder automation is unavailable.
+  # The shareable .dmg comes from CI (or `npm run tauri build` without --bundles).
+  echo "▸ Building release .app…"
+  # A Homebrew node with missing dylibs leaves npm unusable while bun still
+  # runs the same scripts; tauri.conf.json keeps npm for CI, so override the
+  # before-build command here when falling back.
+  if node --version >/dev/null 2>&1; then
+    npm run tauri build -- --bundles app
+  else
+    bun run tauri build --bundles app \
+      --config '{"build":{"beforeBuildCommand":"bun run build && bash scripts/build-lock-helper.sh release"}}'
+  fi
 fi
 
 [[ -d "$APP_SRC" ]] || { echo "✗ Build output not found at $APP_SRC"; exit 1; }
@@ -38,13 +50,15 @@ for v in /Volumes/dmg.*; do
 done
 
 echo "▸ Fixing Launch Services registrations…"
-"$LSREG" -dump 2>/dev/null \
+# `grep -v` exits 1 when there is nothing stale to remove, which under
+# `pipefail` would abort the script before the app is launched.
+{ "$LSREG" -dump 2>/dev/null \
   | grep -oE '/[^ ]*GitSwitch.app' | sort -u \
-  | grep -v "^${APP_DST}$" \
-  | while read -r p; do "$LSREG" -u "$p" 2>/dev/null || true; done
+  | grep -v "^${APP_DST}$" || true; } \
+  | while read -r p; do [ -n "$p" ] && "$LSREG" -u "$p" 2>/dev/null || true; done
 "$LSREG" -f "$APP_DST" 2>/dev/null || true
 
 echo "▸ Launching…"
 open "$APP_DST"
 echo "✓ Installed and launched $APP_DST"
-echo "  Shareable DMG: src-tauri/target/release/bundle/dmg/"
+echo "  For a shareable .dmg use CI, or: npm run tauri build   (bun run tauri build when node is broken)"

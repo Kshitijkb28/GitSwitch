@@ -17,6 +17,7 @@ import { Card } from "../components/Card";
 import { Badge } from "../components/Badge";
 import { Modal } from "../components/Modal";
 import { useProfiles } from "../hooks/useProfiles";
+import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
 
 export function Dashboard() {
@@ -25,6 +26,7 @@ export function Dashboard() {
   const [deleteTarget, setDeleteTarget] = useState<Profile | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  useRefreshOnFocus(() => refresh());
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -69,7 +71,7 @@ export function Dashboard() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold text-zinc-100">Profiles</h1>
           <p className="text-sm text-zinc-400 mt-1">
@@ -133,6 +135,12 @@ export function Dashboard() {
                     </h3>
                     {profile.is_default && (
                       <Badge variant="success">Default</Badge>
+                    )}
+                    {!profile.allow_push && (
+                      <Badge variant="error">push blocked</Badge>
+                    )}
+                    {profile.signing_enabled && (
+                      <Badge variant="success">signed</Badge>
                     )}
                   </div>
                   <p className="text-sm text-zinc-400 mt-0.5">
