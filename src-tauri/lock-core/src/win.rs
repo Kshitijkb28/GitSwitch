@@ -4,6 +4,10 @@
 //! with a DACL that grants no write right to Users, Everyone, Authenticated
 //! Users or INTERACTIVE.
 
+// Win32's security API is unsafe by nature; every block below states why it
+// is sound. The crate forbids unsafe code everywhere else (lib.rs).
+#![allow(unsafe_code)]
+
 use std::ffi::{c_void, OsStr};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;

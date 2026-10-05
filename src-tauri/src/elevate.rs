@@ -14,6 +14,7 @@ use std::time::Duration;
 
 /// The prompt can sit for as long as the person needs; a job never takes long.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+#[cfg(target_os = "macos")]
 pub const PROMPT_TEXT: &str = "GitSwitch needs an administrator to change a push lock.";
 
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -214,6 +215,7 @@ fn windows_blocking(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> El
 
 /// The AppleScript error number at the end of osascript's stderr, e.g.
 /// `execution error: User canceled. (-128)`.
+#[cfg(target_os = "macos")]
 pub fn applescript_error_code(stderr: &str) -> Option<i64> {
     let t = stderr.trim_end();
     let close = t.rfind(')')?;
@@ -222,6 +224,7 @@ pub fn applescript_error_code(stderr: &str) -> Option<i64> {
 }
 
 /// Everything before the trailing `(code)`, minus osascript's own prefix.
+#[cfg(target_os = "macos")]
 pub fn applescript_error_text(stderr: &str) -> String {
     let t = stderr.trim();
     let body = match t.rfind('(') {
@@ -365,6 +368,7 @@ fn askpass_program() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn applescript_errors_are_parsed_by_their_trailing_code() {
         let cancel = "42:200: execution error: User canceled. (-128)\n";
