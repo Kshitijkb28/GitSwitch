@@ -211,6 +211,9 @@ pub(crate) mod tests {
             "history_fetch" => forward!(c::history_fetch, args, repo_path),
             "history_sync_status" => forward!(c::history_sync_status, args, repo_path, branch),
             "history_head" => forward!(c::history_head, args, repo_path),
+            "history_authors" => forward!(c::history_authors, args, repo_path, rev),
+            "clone_progress" => forward_plain!(c::clone_progress, args, dest_path),
+            "clone_size_estimate" => forward_plain!(c::clone_size_estimate, args, url),
             // doctor
             "doctor_check_environment" => forward!(c::doctor_check_environment, args),
             "doctor_check_profiles" => forward!(c::doctor_check_profiles, args),

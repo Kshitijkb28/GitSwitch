@@ -509,6 +509,26 @@ pub async fn history_fetch(repo_path: String) -> Result<FetchResult, AppError> {
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
 }
 
+/// Who commits on the viewed revision, most frequent first.
+#[tauri::command]
+pub async fn history_authors(repo_path: String, rev: String) -> Result<Vec<git_history::AuthorCount>, AppError> {
+    tokio::task::spawn_blocking(move || git_history::authors(&repo_path, &rev))
+        .await
+        .map_err(|e| AppError::Command(format!("task failed: {}", e)))?
+}
+
+/// Live progress of a clone into `dest_path`, while it runs.
+#[tauri::command]
+pub async fn clone_progress(dest_path: String) -> Option<sparse::CloneProgress> {
+    sparse::clone_progress(&dest_path)
+}
+
+/// How big a GitHub repository is before cloning it, when GitHub will say.
+#[tauri::command]
+pub async fn clone_size_estimate(url: String) -> Option<sparse::CloneSizeEstimate> {
+    sparse::clone_size_estimate(&url).await
+}
+
 /// Which branch HEAD is on — or that it is detached or unborn. The one fact
 /// the branch list cannot give, read without the full repository status.
 #[tauri::command]

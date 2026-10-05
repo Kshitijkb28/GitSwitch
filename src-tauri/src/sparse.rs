@@ -14,6 +14,202 @@ pub struct SparseInfo {
     pub available_dirs: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Clone progress and size
+// ---------------------------------------------------------------------------
+
+/// One line of `git clone --progress`, as the page shows it.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct CloneProgress {
+    /// "Counting objects", "Receiving objects", "Resolving deltas", "Updating files", "Submodules", "Large files"…
+    pub phase: String,
+    pub percent: Option<u8>,
+    pub done: Option<u64>,
+    pub total: Option<u64>,
+    /// "10.00 MiB" — what has arrived so far, for the receiving phase.
+    pub bytes: Option<String>,
+    /// "2.00 MiB/s"
+    pub rate: Option<String>,
+}
+
+/// `Receiving objects:  45% (556/1234), 10.00 MiB | 2.00 MiB/s` and its
+/// siblings (`remote: Compressing objects: …`, `Resolving deltas: …, done.`).
+pub fn parse_clone_progress(line: &str) -> Option<CloneProgress> {
+    const PHASES: &[&str] = &["Enumerating objects", "Counting objects", "Compressing objects", "Receiving objects", "Resolving deltas", "Updating files", "Filtering content", "Checking out files"];
+    let line = line.trim().trim_start_matches("remote: ").trim();
+    let phase = PHASES.iter().find(|p| line.starts_with(*p))?;
+    let rest = line[phase.len()..].trim_start_matches(':').trim();
+    let mut p = CloneProgress { phase: phase.to_string(), percent: None, done: None, total: None, bytes: None, rate: None };
+    // "45% (556/1234), 10.00 MiB | 2.00 MiB/s, done." — pieces separated by commas.
+    for (i, piece) in rest.split(',').enumerate() {
+        let piece = piece.trim();
+        if i == 0 {
+            if let Some((pct, counts)) = piece.split_once('%') {
+                p.percent = pct.trim().parse().ok();
+                let counts = counts.trim().trim_start_matches('(').trim_end_matches(')');
+                if let Some((d, t)) = counts.split_once('/') {
+                    p.done = d.trim().parse().ok();
+                    p.total = t.trim().parse().ok();
+                }
+            } else if let Some(n) = piece.split_whitespace().next().and_then(|n| n.parse().ok()) {
+                // "Enumerating objects: 1234, done."
+                p.total = Some(n);
+            }
+        } else if piece.contains("iB") {
+            let (bytes, rate) = piece.split_once('|').unwrap_or((piece, ""));
+            p.bytes = Some(bytes.trim().to_string()).filter(|s| !s.is_empty());
+            p.rate = Some(rate.trim().to_string()).filter(|s| !s.is_empty());
+        }
+    }
+    Some(p)
+}
+
+type ProgressMap = std::collections::HashMap<String, CloneProgress>;
+fn progress_map() -> &'static std::sync::Mutex<ProgressMap> {
+    static M: std::sync::OnceLock<std::sync::Mutex<ProgressMap>> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn set_progress(dest: &str, p: CloneProgress) {
+    if let Ok(mut m) = progress_map().lock() {
+        m.insert(crate::paths::norm(dest), p);
+    }
+}
+
+/// Removes the entry when the clone is over, however it ended.
+struct ProgressGuard(String);
+impl Drop for ProgressGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = progress_map().lock() {
+            m.remove(&self.0);
+        }
+    }
+}
+
+pub fn clone_progress(dest: &str) -> Option<CloneProgress> {
+    progress_map().lock().ok().and_then(|m| m.get(&crate::paths::norm(dest)).cloned())
+}
+
+/// `git clone --progress …` with stderr read as it comes, so the page can show
+/// a bar instead of a spinner. git writes progress to stderr with `\r` between
+/// updates and only when asked (`--progress`), since there is no terminal.
+async fn run_git_with_progress(repo: Option<&Path>, args: &[&str], dest: &str) -> Result<String, AppError> {
+    use tokio::io::AsyncReadExt;
+    let mut cmd = crate::spawn::async_command("git");
+    if let Some(dir) = repo {
+        cmd.current_dir(dir);
+    }
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let started = std::time::Instant::now();
+    let mut child = cmd.spawn().map_err(|e| AppError::Command(format!("Failed to run git: {}", e)))?;
+    let key = crate::paths::norm(dest);
+    let stderr = child.stderr.take();
+    let stdout = child.stdout.take();
+    let err_task = tokio::spawn(async move {
+        let mut full = String::new();
+        let Some(mut pipe) = stderr else { return full };
+        let mut buf = [0u8; 4096];
+        let mut acc: Vec<u8> = Vec::new();
+        loop {
+            let n = match pipe.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            for &b in &buf[..n] {
+                if b == b'\r' || b == b'\n' {
+                    let line = String::from_utf8_lossy(&acc).to_string();
+                    acc.clear();
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Some(p) = parse_clone_progress(&line) {
+                        set_progress(&key, p);
+                    }
+                    // Keep one copy of each distinct line for the error message and the log.
+                    if !full.ends_with(&format!("{}\n", line)) {
+                        full.push_str(&line);
+                        full.push('\n');
+                    }
+                } else {
+                    acc.push(b);
+                }
+            }
+        }
+        if !acc.is_empty() {
+            full.push_str(&String::from_utf8_lossy(&acc));
+        }
+        full
+    });
+    let out_task = tokio::spawn(async move {
+        let mut s = String::new();
+        if let Some(mut pipe) = stdout {
+            let _ = pipe.read_to_string(&mut s).await;
+        }
+        s
+    });
+    let status = child.wait().await.map_err(|e| AppError::Command(format!("git {} failed: {}", args.first().unwrap_or(&"clone"), e)))?;
+    let stderr_text = err_task.await.unwrap_or_default();
+    let stdout_text = out_task.await.unwrap_or_default();
+    crate::cmdlog::record(
+        repo.unwrap_or(Path::new(".")),
+        std::iter::once("git".to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
+        status.code().unwrap_or(-1),
+        started.elapsed(),
+        &stdout_text,
+        &stderr_text,
+    );
+    if !status.success() {
+        let sub = args.iter().find(|a| !a.starts_with('-') && !a.contains('=')).copied().unwrap_or("clone");
+        return Err(AppError::Command(format!("git {} failed: {}", sub, stderr_text.trim())));
+    }
+    Ok(stdout_text.trim().to_string())
+}
+
+/// What GitHub reports as the repository's size, before a clone.
+#[derive(Debug, Serialize, Clone)]
+pub struct CloneSizeEstimate {
+    pub repo: String,
+    /// GitHub's `size` field: kilobytes of the repository's git data, which is
+    /// what a clone downloads. Large files kept in LFS are not included.
+    pub kb: u64,
+}
+
+/// Ask GitHub how big `url`'s repository is: with each signed-in account's
+/// token first (private repositories), then anonymously. None when the URL is
+/// not GitHub's, or GitHub will not say.
+pub async fn clone_size_estimate(url: &str) -> Option<CloneSizeEstimate> {
+    let (owner, repo) = crate::peek::github_slug(url)?;
+    let client = crate::github::http_client().ok()?;
+    let api = format!("{}/repos/{}/{}", crate::remote_repos::api_base(), owner, repo);
+    let mut tokens: Vec<Option<String>> = Vec::new();
+    for account in crate::remote_repos::accounts().await {
+        if let Ok(t) = crate::remote_repos::token_for(&account.key).await {
+            tokens.push(Some(t));
+        }
+    }
+    tokens.push(None);
+    for token in tokens {
+        let mut req = client.get(&api).header("User-Agent", "GitSwitch").header("Accept", "application/vnd.github+json");
+        if let Some(t) = &token {
+            req = req.header("Authorization", format!("Bearer {}", t));
+        }
+        let Ok(resp) = req.timeout(std::time::Duration::from_secs(6)).send().await else { continue };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
+        if let Some(kb) = v.get("size").and_then(|s| s.as_u64()) {
+            return Some(CloneSizeEstimate { repo: format!("{}/{}", owner, repo), kb });
+        }
+    }
+    None
+}
+
 async fn run_git(repo: Option<&Path>, args: &[&str]) -> Result<String, AppError> {
     let mut cmd = crate::spawn::async_command("git");
     if let Some(dir) = repo {
@@ -610,6 +806,8 @@ async fn clone_as_profile(
         args.push(cmd.clone());
     }
     args.push("clone".into());
+    // Progress is only written when asked: there is no terminal here.
+    args.push("--progress".into());
     args.extend(extra_args.iter().map(|a| a.to_string()));
     // `--` so a URL or folder name starting with "-" can never be read as an option.
     args.push("--".into());
@@ -617,7 +815,9 @@ async fn clone_as_profile(
     args.push(name);
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_git(Some(&parent), &arg_refs)
+    let _progress = ProgressGuard(crate::paths::norm(&dest_str));
+    set_progress(&dest_str, CloneProgress { phase: "Connecting".into(), percent: None, done: None, total: None, bytes: None, rate: None });
+    run_git_with_progress(Some(&parent), &arg_refs, &dest_str)
         .await
         .map_err(|e| match e {
             AppError::Command(msg) => AppError::Command(explain_clone_error(&msg, key.as_deref(), url)),
@@ -627,6 +827,7 @@ async fn clone_as_profile(
     // The main clone succeeded; submodule trouble is reported, not fatal —
     // the repo is usable and `git submodule update` can be retried.
     let submodules = if with_submodules {
+        set_progress(&dest_str, CloneProgress { phase: "Submodules".into(), percent: None, done: None, total: None, bytes: None, rate: None });
         Some(update_submodules(&dest, ssh_override.as_deref(), key.as_deref(), url).await)
     } else {
         None
@@ -636,6 +837,7 @@ async fn clone_as_profile(
     let lfs = if extra_args.contains(&"--no-checkout") {
         None
     } else {
+        set_progress(&dest_str, CloneProgress { phase: "Large files".into(), percent: None, done: None, total: None, bytes: None, rate: None });
         lfs_after_checkout(&dest, with_lfs).await
     };
 
@@ -771,6 +973,23 @@ pub async fn sparse_add(repo_path: &str, dirs: Vec<String>) -> Result<(), AppErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_progress_lines_are_read_in_every_shape_git_prints() {
+        let p = parse_clone_progress("Receiving objects:  45% (556/1234), 10.00 MiB | 2.00 MiB/s").unwrap();
+        assert_eq!(p.phase, "Receiving objects");
+        assert_eq!((p.percent, p.done, p.total), (Some(45), Some(556), Some(1234)));
+        assert_eq!(p.bytes.as_deref(), Some("10.00 MiB"));
+        assert_eq!(p.rate.as_deref(), Some("2.00 MiB/s"));
+        let p = parse_clone_progress("remote: Compressing objects:   7% (12/160)").unwrap();
+        assert_eq!((p.phase.as_str(), p.percent), ("Compressing objects", Some(7)));
+        let p = parse_clone_progress("Resolving deltas: 100% (900/900), done.").unwrap();
+        assert_eq!((p.percent, p.done, p.total, p.bytes), (Some(100), Some(900), Some(900), None));
+        let p = parse_clone_progress("remote: Enumerating objects: 1234, done.").unwrap();
+        assert_eq!((p.phase.as_str(), p.total), ("Enumerating objects", Some(1234)));
+        assert!(parse_clone_progress("Cloning into 'x'...").is_none());
+        assert!(parse_clone_progress("fatal: repository not found").is_none());
+    }
 
     fn prof(id: &str, dirs: &[&str], default: bool) -> Profile {
         Profile {

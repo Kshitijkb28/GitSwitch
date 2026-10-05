@@ -34,6 +34,12 @@ function commit(hash, subject, over = {}) {
   };
 }
 
+/** Who commits here, as `git shortlog -sne` orders them. */
+export const AUTHORS = [
+  { name: "Me", email: "me@example.test", commits: 2 },
+  { name: "Other Person", email: "other@example.test", commits: 1 },
+];
+
 export const HISTORY_PAGE = {
   commits: [
     commit(C1, "Tidy the settings page", { parents: [C2], refs: ["HEAD -> main", "origin/main"] }),

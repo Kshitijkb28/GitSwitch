@@ -406,6 +406,43 @@ fn parse_log(raw: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
         .collect()
 }
 
+/// One person who has committed to the viewed revision, with how often.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct AuthorCount {
+    pub name: String,
+    pub email: String,
+    pub commits: usize,
+}
+
+/// `git shortlog -sne`: `   12\tName <email>` per line, most frequent first.
+pub fn parse_shortlog(out: &str) -> Vec<AuthorCount> {
+    out.lines()
+        .filter_map(|line| {
+            let (count, who) = line.trim().split_once('\t')?;
+            let commits: usize = count.trim().parse().ok()?;
+            let (name, email) = match (who.rfind(" <"), who.ends_with('>')) {
+                (Some(i), true) => (who[..i].trim().to_string(), who[i + 2..who.len() - 1].trim().to_string()),
+                _ => (who.trim().to_string(), String::new()),
+            };
+            Some(AuthorCount { name, email, commits })
+        })
+        .collect()
+}
+
+/// Who commits on the viewed revision (or everywhere, for "--all"), most
+/// frequent first — the list behind the History page's people filter. Capped:
+/// a long-lived repository can have thousands of one-off authors.
+pub fn authors(repo_path: &str, rev: &str) -> Result<Vec<AuthorCount>, AppError> {
+    let repo = PathBuf::from(repo_path);
+    if rev != "--all" && rev.starts_with('-') {
+        return Err(AppError::Config(format!("Invalid revision: {}", rev)));
+    }
+    let raw = git(&repo, &["shortlog", "-sne", rev])?;
+    let mut list = parse_shortlog(&raw);
+    list.truncate(300);
+    Ok(list)
+}
+
 /// One page of history for a branch (or every branch when `rev` is "--all").
 pub fn history_page(
     repo_path: &str,
@@ -739,6 +776,16 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shortlog_becomes_people_with_counts_in_the_order_git_gave() {
+        let list = parse_shortlog("    12\tAnn Example <ann@example.test>\n     3\tBob <bob@x>\n     1\tNo Email\n");
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], AuthorCount { name: "Ann Example".into(), email: "ann@example.test".into(), commits: 12 });
+        assert_eq!(list[1].email, "bob@x");
+        assert_eq!(list[2], AuthorCount { name: "No Email".into(), email: String::new(), commits: 1 });
+        assert!(parse_shortlog("").is_empty());
+    }
 
     #[test]
     fn upstream_track_is_read_in_every_shape_git_prints() {

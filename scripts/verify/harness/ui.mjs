@@ -71,6 +71,9 @@ async function openPage(browser, server, scenario, opts = {}) {
     latency: Number(opts.latency ?? process.env.UI_LATENCY ?? 0) || 0,
     /** Who a push would authenticate as; null → the default fixture. */
     pushIdentity: opts.pushIdentity ?? null,
+    /** The clone page: what git is doing, and how big GitHub says the repo is. */
+    cloneProgress: opts.cloneProgress ?? null,
+    cloneSize: opts.cloneSize ?? null,
   };
   const page = await browser.newPage();
   await page.setViewport({ width: cfg.width, height: 900 });
@@ -140,6 +143,12 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(cfg.submoduleStatuses);
             case "changes_push_identity":
               return Promise.resolve(cfg.pushIdentity ?? { remote: "origin", url: "git@github.com:octo-work/gitswitch.git", via: "ssh-key", login: "octo-work", key_path: "/Users/me/.ssh/id_work", host: "github.com", account: null, expected_login: null, detail: "github.com accepted the key id_work." });
+            case "history_authors":
+              return Promise.resolve([{ name: "Me", email: "me@example.test", commits: 2 }]);
+            case "clone_progress":
+              return Promise.resolve(cfg.cloneProgress ?? null);
+            case "clone_size_estimate":
+              return Promise.resolve(cfg.cloneSize ?? { repo: "owner/repo", kb: 1258291 });
             case "history_head":
               return Promise.resolve({ branch: window.__SCENARIO__.branch, detached: window.__SCENARIO__.detached, unborn: window.__SCENARIO__.unborn });
             case "history_branches":
@@ -425,6 +434,10 @@ async function openClonePage(browser, server, opts = {}) {
     lfsTool: opts.lfsTool ?? { installed: true, version: "git-lfs/3.5.1 (GitHub; darwin arm64)", install_hint: "brew install git-lfs" },
     cloneResult: opts.cloneResult ?? null,
     mode: opts.mode ?? "full",
+    /** "hang" keeps the clone running so the progress banner can be looked at. */
+    cloneHang: opts.cloneHang ?? false,
+    cloneProgress: opts.cloneProgress ?? null,
+    cloneSize: opts.cloneSize ?? { repo: "me/big-data", kb: 1258291 },
   };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
@@ -448,7 +461,11 @@ async function openClonePage(browser, server, opts = {}) {
             return Promise.resolve(true);
           case "full_clone":
           case "sparse_clone":
-            return Promise.resolve(cfg.cloneResult);
+            return cfg.cloneHang ? new Promise(() => {}) : Promise.resolve(cfg.cloneResult);
+          case "clone_size_estimate":
+            return Promise.resolve(cfg.cloneSize);
+          case "clone_progress":
+            return Promise.resolve(cfg.cloneProgress);
           case "local_clone_index":
             return Promise.resolve({ by_path: {}, by_repo: {} });
           default:
@@ -1753,6 +1770,21 @@ try {
     ...CLONED_LFS,
     lfs: { installed: true, requested: false, tracked: 5, fetched: 0, pointers_left: 5, configured_now: false, error: null, note: "5 large files are pointer stubs — open the repository in Changes → Git LFS → Pull LFS files to download them." },
   };
+  {
+    const page = await openClonePage(browser, server, {
+      cloneHang: true,
+      cloneProgress: { phase: "Receiving objects", percent: 45, done: 556, total: 1234, bytes: "10.00 MiB", rate: "2.00 MiB/s" },
+    });
+    await page.waitForFunction(() => document.body.innerText.includes("About 1.2 GB on GitHub"), { timeout: 4000 });
+    ok("before cloning, the page says how big GitHub says the repository is", true);
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Clone").click());
+    await page.waitForFunction(() => document.body.innerText.includes("Receiving objects 45%"), { timeout: 4000 });
+    const s = await text(page);
+    ok("while it runs, the banner shows git's phase and percentage", s.includes("Receiving objects 45%"));
+    ok("  with how many objects, how much has arrived of the estimate, and the rate", s.includes("556 of 1,234") && s.includes("10.00 MiB of about 1.2 GB") && s.includes("2.00 MiB/s"));
+    ok("  as a bar", await page.evaluate(() => !!document.querySelector('[aria-label="Clone progress"]')));
+    await page.close();
+  }
   const lfsBox = (page) => page.$('input[aria-label="Also download Git LFS files"]');
   const clickClone = (page) =>
     page.evaluate(() => {

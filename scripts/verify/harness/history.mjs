@@ -25,6 +25,7 @@ import {
   STATUS_CLEAN,
   STATUS_DIRTY,
   STATUS_DETACHED,
+  AUTHORS,
 } from "./history-fixtures.mjs";
 
 if (!DIST_OK) {
@@ -92,6 +93,8 @@ async function openHistoryPage(browser, server, opts = {}) {
               return Promise.resolve(cfg.branches);
             case "history_page":
               return Promise.resolve(fx.historyPage);
+            case "history_authors":
+              return Promise.resolve(fx.authors);
             case "history_sync_status":
               return Promise.resolve(fx.syncStatus);
             case "history_commit_detail":
@@ -130,6 +133,7 @@ async function openHistoryPage(browser, server, opts = {}) {
       repo: REPO,
       repos: REPOS,
       historyPage: HISTORY_PAGE,
+  authors: AUTHORS,
       syncStatus: SYNC_STATUS,
       detail: COMMIT_DETAIL,
       detailMerge: COMMIT_DETAIL_MERGE,
@@ -219,6 +223,24 @@ const open = (opts) => openHistoryPage(browser, server, opts);
 
 try {
   // -----------------------------------------------------------------
+  section("People: who commits here, and when");
+  {
+    const page = await open();
+    await page.waitForFunction(() => document.body.innerText.includes("People"), { timeout: 4000 });
+    const s = await text(page);
+    ok("the people list was read for this repository and revision", (await calls(page, "history_authors")).length >= 1);
+    ok("every row shows the date AND the time", /\d{4}-\d\d-\d\d \d\d:\d\d/.test(s), s.slice(0, 300));
+    ok("  everyone is the default, with the total", s.includes("Everyone · 3"));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Everyone · 3")).click());
+    await page.waitForFunction(() => document.body.innerText.includes("Other Person · 1"), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Other Person · 1")).click());
+    await page.waitForFunction(() => document.body.innerText.includes("by Other Person"), { timeout: 4000 });
+    const last = await lastCall(page, "history_page");
+    ok("choosing a person re-reads the page filtered by their email, from the first page", last && last.args.author === "other@example.test" && last.args.offset === 0, JSON.stringify(last && last.args));
+    ok("  and says so in the summary line", (await text(page)).includes("by Other Person"));
+    await page.close();
+  }
+
   section("Go to commit");
   {
     const page = await open();

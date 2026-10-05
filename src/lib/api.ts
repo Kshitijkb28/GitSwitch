@@ -249,6 +249,17 @@ export async function changesPushIdentity(repoPath: string, refresh = false): Pr
   return invoke("changes_push_identity", { repoPath, refresh });
 }
 
+/** One person who committed on the viewed revision, with how often. */
+export interface AuthorCount {
+  name: string;
+  email: string;
+  commits: number;
+}
+
+export async function historyAuthors(repoPath: string, rev: string): Promise<AuthorCount[]> {
+  return invoke("history_authors", { repoPath, rev });
+}
+
 export interface HeadInfo {
   branch: string | null;
   detached: boolean;
@@ -473,6 +484,30 @@ export async function lfsAvailable(): Promise<LfsTool> {
 }
 
 /** `cloneAs` = profile id to authenticate as; null lets the folder decide. */
+/** One line of `git clone --progress`, while a clone runs. */
+export interface CloneProgress {
+  phase: string;
+  percent: number | null;
+  done: number | null;
+  total: number | null;
+  bytes: string | null;
+  rate: string | null;
+}
+
+export async function cloneProgress(destPath: string): Promise<CloneProgress | null> {
+  return invoke("clone_progress", { destPath });
+}
+
+/** GitHub's size for a repository (kilobytes of git data; LFS content is extra). */
+export interface CloneSizeEstimate {
+  repo: string;
+  kb: number;
+}
+
+export async function cloneSizeEstimate(url: string): Promise<CloneSizeEstimate | null> {
+  return invoke("clone_size_estimate", { url });
+}
+
 export async function sparseClone(
   url: string,
   parentDir: string,

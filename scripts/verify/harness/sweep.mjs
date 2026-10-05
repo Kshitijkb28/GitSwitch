@@ -58,6 +58,9 @@ try {
             case "history_list_repos": return Promise.resolve(repos);
             case "changes_repo_status": return Promise.resolve(st);
             case "history_head": return Promise.resolve({ branch: st.branch, detached: st.detached, unborn: st.unborn });
+            case "history_authors": return Promise.resolve([{ name: "Me", email: "me@example.test", commits: 2 }, { name: "Other", email: "o@example.test", commits: 1 }]);
+            case "clone_progress": return Promise.resolve(null);
+            case "clone_size_estimate": return Promise.resolve({ repo: "owner/repo", kb: 1258291 });
             case "changes_push_identity": return Promise.resolve({ remote: "origin", url: "git@github.com:octo-work/gitswitch.git", via: "ssh-key", login: "octo-work", key_path: "/Users/me/.ssh/id_work", host: "github.com", account: null, expected_login: null, detail: "github.com accepted the key id_work." });
             case "changes_submodule_statuses": return Promise.resolve(subs);
             case "changes_stash_list": return Promise.resolve(stashes);

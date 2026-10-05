@@ -14,6 +14,7 @@ import {
   X,
   Box,
   Radar,
+  UserRound,
 } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
@@ -122,6 +123,11 @@ export function History() {
   const repo = sub && superRepo ? `${superRepo}/${sub}` : superRepo;
   const [account, setAccount] = usePersistedState("history.account", ""); // profile id, "" = all
   const [onlyMine, setOnlyMine] = usePersistedState("history.onlyMine", false);
+  // The people filter: an author email, "" for everyone. It beats "only this
+  // account" when both are set, since it is the more specific choice.
+  const [author, setAuthor] = usePersistedState("history.author", "");
+  const [authors, setAuthors] = useState<api.AuthorCount[]>([]);
+  const authorsSeq = useRef(0);
   const [branches, setBranches] = useState<api.BranchInfo[]>([]);
   const [rev, setRev] = usePersistedState("history.rev", "--all");
   const [page, setPage] = useState<api.HistoryPage | null>(null);
@@ -406,22 +412,30 @@ export function History() {
     }
   }, [account, repos, superRepo]);
 
+  const effectiveAuthor = author || (onlyMine && accountEmail ? accountEmail : null);
   useEffect(() => {
     if (!repo) return;
     const seq = ++pageSeq.current;
     setLoadingPage(true);
-    api.historyPage(
-      repo,
-      rev,
-      offset,
-      PAGE_SIZE,
-      appliedSearch || null,
-      onlyMine && accountEmail ? accountEmail : null
-    )
+    api.historyPage(repo, rev, offset, PAGE_SIZE, appliedSearch || null, effectiveAuthor)
       .then((p) => { if (pageSeq.current === seq) { setPage(p); setError(null); } })
       .catch((e) => { if (pageSeq.current === seq) { setError(String(e)); setPage(null); } })
       .finally(() => { if (pageSeq.current === seq) setLoadingPage(false); });
-  }, [repo, rev, offset, appliedSearch, reloadKey, onlyMine, accountEmail]);
+  }, [repo, rev, offset, appliedSearch, reloadKey, effectiveAuthor]);
+
+  // Who commits here — read once per repository and revision, never polled.
+  useEffect(() => {
+    if (!repo) { setAuthors([]); return; }
+    const seq = ++authorsSeq.current;
+    api.historyAuthors(repo, rev)
+      .then((list) => { if (authorsSeq.current === seq) setAuthors(list); })
+      .catch(() => { if (authorsSeq.current === seq) setAuthors([]); });
+  }, [repo, rev, reloadKey]);
+  // A person who is not in this revision's list is no filter at all.
+  useEffect(() => {
+    if (author && authors.length && !authors.some((a) => a.email === author)) setAuthor("");
+  }, [authors, author, setAuthor]);
+  const authorName = authors.find((a) => a.email === author)?.name ?? author;
 
   useEffect(() => {
     loadSync(repo, rev);
@@ -879,6 +893,32 @@ export function History() {
                 )}
               </form>
 
+              {authors.length > 1 && (
+                <div className="flex items-center gap-2 mb-3 flex-wrap">
+                  <span className="text-xs text-zinc-500">People</span>
+                  <div className="w-72 max-w-full">
+                    <Select
+                      value={author}
+                      onChange={(v) => { setAuthor(v); setOffset(0); }}
+                      searchable
+                      searchLabel="Search people"
+                      placeholder="Everyone"
+                      optionIcon={<UserRound size={14} />}
+                      options={[
+                        { value: "", label: `Everyone · ${authors.reduce((n, a) => n + a.commits, 0).toLocaleString()}` },
+                        ...authors.map((a) => ({
+                          value: a.email,
+                          label: `${a.name} · ${a.commits.toLocaleString()}`,
+                        })),
+                      ]}
+                    />
+                  </div>
+                  {author && (
+                    <span className="text-[11px] text-zinc-600 font-mono truncate max-w-[16rem]">{author}</span>
+                  )}
+                </div>
+              )}
+
               {account && (
                 <label className="flex items-start gap-2.5 mb-3 cursor-pointer select-none">
                   <Checkbox
@@ -900,7 +940,7 @@ export function History() {
               <div className="flex items-center justify-between gap-3 flex-wrap mb-2">
                 <p className="text-xs text-zinc-500">
                   {rev === "--all" ? "All branches" : rev}
-                  {onlyMine && accountEmail && " · this account only"}
+                  {author ? ` · by ${authorName}` : onlyMine && accountEmail ? " · this account only" : ""}
                   {page && (
                     <>
                       {" · "}
@@ -926,7 +966,7 @@ export function History() {
               {page && page.commits.length === 0 && !loadingPage && (
                 <p className="text-sm text-zinc-500 py-6 text-center">
                   No commits{appliedSearch ? ` matching “${appliedSearch}”` : ""}
-                  {onlyMine ? " authored by this account" : ""}.
+                  {author ? ` by ${authorName}` : onlyMine ? " authored by this account" : ""}.
                 </p>
               )}
 
@@ -954,8 +994,8 @@ export function History() {
                     <span className="hidden md:inline text-xs text-zinc-500 truncate min-w-0 max-w-[18%]">
                       {c.author_name}
                     </span>
-                    <span className="hidden sm:inline text-xs text-zinc-600 shrink-0 tabular-nums">
-                      {c.date.slice(0, 10)}
+                    <span className="hidden sm:inline text-xs text-zinc-600 shrink-0 tabular-nums" title={c.date}>
+                      {c.date.replace("T", " ").slice(0, 16)}
                     </span>
                   </button>
                 ))}

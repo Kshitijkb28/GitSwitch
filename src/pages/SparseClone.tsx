@@ -45,6 +45,14 @@ function profileForFolder(dir: string, profiles: Profile[]): Profile | null {
 }
 
 /** Folder name git will create — mirrors the backend's repo_name_from_url. */
+/** "1.2 GB" from GitHub's kilobytes. */
+function formatKb(kb: number): string {
+  if (kb < 1024) return `${kb} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
+  return `${(mb / 1024).toFixed(mb / 1024 < 10 ? 1 : 0)} GB`;
+}
+
 function repoNameFromUrl(url: string): string {
   const t = url.trim().replace(/\/+$/, "").replace(/(\.git)+$/, "");
   const parts = t.split(/[/:]/);
@@ -96,6 +104,11 @@ export function SparseClone() {
   // but every large file is a pointer stub, and git status never says so.
   const [withLfs, setWithLfs] = usePersistedState("clone.lfs", true);
   const [lfsTool, setLfsTool] = useState<api.LfsTool | null>(null);
+  // How big the repository is, from GitHub, once the URL names one of theirs.
+  const [sizeEstimate, setSizeEstimate] = useState<api.CloneSizeEstimate | null>(null);
+  const sizeSeq = useRef(0);
+  // What git is doing right now, while a clone runs.
+  const [progress, setProgress] = useState<api.CloneProgress | null>(null);
   const [sparseLfs, setSparseLfs] = useState<api.LfsReport | null>(null);
   const navigate = useNavigate();
   const openInChanges = (path: string) => {
@@ -190,6 +203,31 @@ export function SparseClone() {
   }, []);
   const job = cloneJob;
   const cloning = !!job && !job.done;
+
+  // The size is asked for once per URL, a little after typing stops.
+  useEffect(() => {
+    const mine = ++sizeSeq.current;
+    setSizeEstimate(null);
+    if (!/github\.com[:/]/.test(url)) return;
+    const id = window.setTimeout(() => {
+      api
+        .cloneSizeEstimate(url)
+        .then((s) => { if (mine === sizeSeq.current) setSizeEstimate(s); })
+        .catch(() => { /* GitHub would not say; the clone works all the same */ });
+    }, 600);
+    return () => window.clearTimeout(id);
+  }, [url]);
+
+  // Poll the clone's progress while it runs — the same shape as the LFS poll.
+  useEffect(() => {
+    if (!cloning || !job) { setProgress(null); return; }
+    let stop = false;
+    const read = () =>
+      api.cloneProgress(job.key).then((p) => { if (!stop) setProgress(p); }).catch(() => {});
+    read();
+    const id = window.setInterval(read, 500);
+    return () => { stop = true; window.clearInterval(id); };
+  }, [cloning, job]);
   const elapsedSecs = job ? Math.max(0, Math.round((Date.now() - job.startedAt) / 1000)) : 0;
   const elapsedLabel =
     elapsedSecs < 60
@@ -408,6 +446,30 @@ export function SparseClone() {
               {job.mode === "sparse" && " (metadata only)"}…
             </span>
             <span className="block text-xs text-zinc-500 font-mono truncate">{job.key}</span>
+            {progress && (
+              <span className="block mt-1.5" aria-label="Clone progress">
+                <span className="flex items-center justify-between gap-3 text-xs text-zinc-300">
+                  <span>
+                    {progress.phase}
+                    {progress.percent !== null && ` ${progress.percent}%`}
+                    {progress.done !== null && progress.total !== null && (
+                      <span className="text-zinc-500"> · {progress.done.toLocaleString()} of {progress.total.toLocaleString()}</span>
+                    )}
+                  </span>
+                  <span className="text-zinc-500 tabular-nums">
+                    {progress.bytes}
+                    {progress.bytes && sizeEstimate && ` of about ${formatKb(sizeEstimate.kb)}`}
+                    {progress.rate && ` · ${progress.rate}`}
+                  </span>
+                </span>
+                <span className="block h-1.5 mt-1 rounded bg-zinc-700/70 overflow-hidden">
+                  <span
+                    className={`block h-full rounded bg-emerald-500 transition-[width] duration-300 ${progress.percent === null ? "w-1/4 animate-pulse" : ""}`}
+                    style={progress.percent !== null ? { width: `${progress.percent}%` } : undefined}
+                  />
+                </span>
+              </span>
+            )}
             <span className="block text-xs text-zinc-500 mt-0.5">
               Running for {elapsedLabel} — you can use other pages, it keeps going and the result
               appears here.
@@ -461,6 +523,12 @@ export function SparseClone() {
             value={url}
             onChange={(e) => setUrl(e.target.value)}
           />
+          {sizeEstimate && (
+            <p className="text-xs text-zinc-500" aria-label="Repository size">
+              About <span className="text-zinc-300">{formatKb(sizeEstimate.kb)}</span> on GitHub — large
+              files kept in LFS are extra.
+            </p>
+          )}
           {isHttps && (
             <div className="flex items-start gap-2.5 px-3 py-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-300">
               <AlertTriangle size={14} className="mt-0.5 shrink-0" />
