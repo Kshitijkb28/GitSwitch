@@ -61,6 +61,13 @@ cp -R "$SB/local" "$SB/local.pristine"
 
 section "Assess: the plan says exactly what will happen"
 OUT=$(probe sync_plan "$SB/local")
+ok "every commit of mine carries its author" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print(sorted(set(c['author_email'] for c in d['superproject']['own_commits'])))")" "['sync@example.test']"
+ok "  and a date" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print(all(c['date'][:4].isdigit() for c in d['superproject']['own_commits']+d['superproject']['incoming']))")" "True"
+ok "  upstream's bump of A says it moves A and is only a pointer" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);c=[c for c in d['superproject']['incoming'] if c['subject']=='super: bump A'][0];print(c['touches'],c['only_pointers'])")" "['A'] True"
+ok "  upstream's real work is not a pointer bump" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);c=[c for c in d['superproject']['incoming'] if c['subject']=='super: upstream work'][0];print(c['only_pointers'])")" "False"
+ok "  the base is where both agreed" "$(printf '%s' "$OUT" | jqf superproject.base_short)" "$(git -C "$SB/local" merge-base HEAD origin/main | cut -c1-7)"
+ok "  A's row lists its own commit and what comes in" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);a=[s for s in d['submodules'] if s['path']=='A'][0];print([c['subject'] for c in a['own_commits']],[c['subject'] for c in a['incoming_commits']])")" "['A: my commit'] ['A: upstream 2', 'A: upstream 1']"
+ok "  the uncommitted files are named" "$(printf '%s' "$OUT" | jqf superproject.dirty_paths)" "README.md"
 ok "the plan can run" "$(printf '%s' "$OUT" | jqf can_run)" "True"
 ok "  2 of mine on top of 3 incoming" "$(printf '%s' "$OUT" | jqf superproject.ahead):$(printf '%s' "$OUT" | jqf superproject.behind)" "2:3"
 ok "  the summary says so in words" "$(printf '%s' "$OUT" | jqf summary)" "Your 2 commits are replayed on top of 3 new commits from origin/main, rebasing the submodules"
@@ -140,11 +147,24 @@ OUT=$(probe sync_run "$SB/local")
 ok "paused on shared.txt" "$(printf '%s' "$OUT" | jqf sync.needs_user.paths)" "shared.txt"
 OUT=$(probe sync_continue "$SB/local")
 ok "continuing before resolving is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "unmerged-paths"
+ok "  the status counts what is still unmerged where the pause is" "$(probe status "$SB/local" | jqf sync.unresolved)" "1"
+ok "  and names the commit being replayed" "$(probe status "$SB/local" | jqf sync.needs_user.at_commit)" "$(cat "$(git -C "$SB/local" rev-parse --path-format=absolute --git-path rebase-merge/stopped-sha)")"
+printf 'shared line 1\n<<<<<<< HEAD\nshared line 2 (upstream)\n=======\nshared line 2 (mine)\n>>>>>>> my shared edit\nshared line 3\n' > "$SB/local/shared.txt"
+OUT=$(probe stage "$SB/local" "shared.txt")
+ok "marking it resolved with the markers still in it is refused by name" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "shared.txt still contains conflict markers (line 2)"
+OUT=$(probe stage_anyway "$SB/local" "shared.txt")
+ok "  'anyway' stages it as it is" "$(printf '%s' "$OUT" | jqf ok)" "True"
+OUT=$(probe sync_continue "$SB/local")
+ok "  and continuing then refuses the markers that would be committed" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
 printf 'shared line 1\nshared line 2 (both)\nshared line 3\n' > "$SB/local/shared.txt"
 OUT=$(probe stage "$SB/local" "shared.txt")
-ok "staging the resolution is allowed while paused" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "staging the real resolution is allowed while paused" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  nothing is left unmerged" "$(probe status "$SB/local" | jqf sync.unresolved)" "0"
 OUT=$(probe sync_continue "$SB/local")
 ok "continue finishes the sync" "$(printf '%s' "$OUT" | jqf headline)" "Updated: 3 commits of yours on top of 3 new commits"
+ok "  the resolved commit counts as on top" "$(printf '%s' "$OUT" | jqf sync.verified.own_on_top)" "True"
+ok "  so the result is the preview" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 3 commits of yours on top of 3 incoming."
 ok "  my resolved commit is on top" "$(git -C "$SB/local" log --format=%s -1)" "my shared edit"
 ok "  A and B are aligned" "$(git -C "$SB/local" submodule status 2>/dev/null | grep -c '^[+-]' || true)" "0"
 ok "  the README edit is back" "$(git -C "$SB/local" status --porcelain | grep -c 'README.md' || true)" "1"
@@ -152,10 +172,14 @@ ok "  the README edit is back" "$(git -C "$SB/local" status --porcelain | grep -
 section "A commit upstream already contains is dropped, and the result says so"
 restore
 printf 'shared line 1\nshared line 2 (upstream)\nshared line 3\n' > "$SB/local/shared.txt"; git -C "$SB/local" add shared.txt; git -C "$SB/local" commit -qm "same as upstream"
-probe sync_plan "$SB/local" >/dev/null
+OUT=$(probe sync_plan "$SB/local")
+ok "the plan foresees the drop" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([c['already_upstream'] for c in d['superproject']['own_commits'] if c['subject']=='same as upstream'])")" "[True]"
+ok "  and only that one" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for c in d['superproject']['own_commits'] if c['already_upstream']))")" "1"
 OUT=$(probe sync_run "$SB/local")
 ok "the sync succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
 ok "  and names the dropped commit" "$(printf '%s' "$OUT" | jqf detail)" "dropped because upstream already contained it: same as upstream"
+ok "  the on-top check is measured, and passes" "$(printf '%s' "$OUT" | jqf sync.verified.own_on_top)" "True"
+ok "  so the result is the preview" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 2 commits of yours on top of 3 incoming."
 ok "  the other two are on top" "$(subjects "$SB/local" origin/main..HEAD)" "local unrelated|seal work|"
 
 section "Blocked states are named, never guessed"
@@ -286,9 +310,17 @@ OUT=$(probe sync_run "$SB/local")
 ok "the sync pauses inside A" "$(printf '%s' "$OUT" | jqf headline)" "Update paused inside A."
 ok "  saying where to resolve" "$(printf '%s' "$OUT" | jqf sync.needs_user.hint)" "Open it as its own repository"
 ok "  A has the conflict" "$(git -C "$SB/local/A" status --porcelain | grep -c '^UU' || true)" "1"
+T=$(git -C "$SB/local" rev-parse origin/main:A)
+ok "  inside A, theirs is named after upstream's record" "$(probe status "$SB/local/A" | jqf operation.sides.theirs)" "origin/main's A ($(printf '%s' "$T" | cut -c1-7))"
+ok "  A's status knows the update, its path and its target" "$(probe status "$SB/local/A" | jqf sync.sub_path):$(probe status "$SB/local/A" | jqf sync.sub_target)" "A:$T"
+ok "  the superproject counts A's unresolved file" "$(probe status "$SB/local" | jqf sync.unresolved)" "1"
+OUT=$(probe sync_continue "$SB/local")
+ok "  continuing before resolving is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "unmerged-paths"
 printf 'A v1\nline2 (both)\nline3\n' > "$SB/local/A/A.txt"; git -C "$SB/local/A" add A.txt
+ok "  nothing is left unmerged" "$(probe status "$SB/local" | jqf sync.unresolved)" "0"
 OUT=$(probe sync_continue "$SB/local")
 ok "continue finishes the sync" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  the commit replayed with a rewritten pointer counts as on top" "$(printf '%s' "$OUT" | jqf sync.verified.own_on_top)" "True"
 ok "  A has my edits on top of upstream's" "$(git -C "$SB/local/A" log --format=%s -3 | tr '\n' '|')" "A: my edit of A.txt|A: my commit|A: upstream edits A.txt|"
 ok "  and the superproject records the rebased A" "$(git -C "$SB/local" rev-parse HEAD:A)" "$(head_of "$SB/local/A")"
 ok "  everything aligned" "$(git -C "$SB/local" submodule status 2>/dev/null | grep -c '^[+-]' || true)" "0"
@@ -301,5 +333,40 @@ OUT=$(probe pull "$SB/local3" "ff-only")
 ok "the pull fast-forwards" "$(printf '%s' "$OUT" | jqf ok)" "True"
 ok "  and counts the submodule pointer it moved (A), not the one it did not (B)" "$(printf '%s' "$OUT" | jqf pull.submodules_moved)" "1"
 ok "  the gitlink row says so too" "$(probe status "$SB/local3" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([e['sub_commit_changed'] for e in d['entries'] if e['path']=='A'])")" "[True]"
+
+section "A fast-forward over an edited file is a blocker, not a failure at align time"
+restore
+printf 'B v2\nline2\nline3\n' > "$SB/upstream/B/B.txt"; git -C "$SB/upstream/B" commit -qam "B: upstream edits B.txt"; git -C "$SB/upstream/B" push -q origin main 2>/dev/null
+git -C "$SB/upstream" add B >/dev/null; git -C "$SB/upstream" commit -qm "super: bump B again"; git -C "$SB/upstream" push -q origin main 2>/dev/null
+printf 'local edit\n' >> "$SB/local/B/B.txt"
+OUT=$(probe sync_plan "$SB/local")
+ok "B is blocked by name" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);b=[s for s in d['submodules'] if s['path']=='B'][0];print(b['action'],b['remedy'])")" "blocked stash-inside"
+ok "  the sentence names the file" "$(printf '%s' "$OUT" | jqf blockers)" "B: its uncommitted changes to B.txt collide with the commits it will be moved onto"
+ok "  running anyway is refused" "$(probe sync_run "$SB/local" | jqf refusal.code)" "sync-blocked"
+
+section "Identity: a rebase re-commits as whoever git is set to, so a mismatch blocks — a fast-forward does not"
+restore
+git -C "$SB/local/A" checkout -q -- A.txt   # upstream's A now edits A.txt too; that blocker is proven above
+profile_json() { "$PY" - "$@" <<'PY'
+import json, sys
+f, name, gname, email, key, *dirs = sys.argv[1:]
+p = {"name": name, "git_name": gname, "git_email": email, "directories": dirs}
+if key: p["ssh_key_path"] = key
+json.dump(p, open(f, "w"))
+PY
+}
+profile_json "$SB/psync.json" "Sync" "Sync Tester" "sync@example.test" "" "$SB"
+probe profile_apply "$SB" "$SB/psync.json" >/dev/null
+git -C "$SB/local" config user.email wrong@example.test
+OUT=$(probe sync_plan "$SB/local")
+ok "with commits of mine to replay, the wrong identity is a blocker" "$(printf '%s' "$OUT" | jqf blockers)" "This folder should commit as sync@example.test but git is set to wrong@example.test"
+ok "  with its code" "$(printf '%s' "$OUT" | jqf superproject.remedies)" "identity"
+ok "  running anyway is refused" "$(probe sync_run "$SB/local" | jqf refusal.code)" "sync-blocked"
+git -C "$SB/local" config --unset user.email
+ok "  and the fix lifts it" "$(probe sync_plan "$SB/local" | jqf can_run)" "True"
+git -C "$SB/local3" config user.email wrong@example.test
+OUT=$(probe sync_plan "$SB/local3")
+ok "with nothing of mine to replay and only fast-forwards, it is not" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | jqf superproject.ahead)" "True:0"
+git -C "$SB/local3" config --unset user.email
 
 verify_result

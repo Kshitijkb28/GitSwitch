@@ -816,6 +816,8 @@ export interface SyncSummary {
 }
 
 export interface SyncNeedsUser {
+  /** The commit of yours being replayed when the superproject's rebase stopped. */
+  at_commit?: string | null;
   /** superproject | submodule:<path> | submodule-autostash:<path> | autostash-conflict */
   where_: string;
   paths: string[];
@@ -1480,6 +1482,14 @@ export interface SyncCommitRef {
   subject: string;
   /** Submodule paths whose pointer this commit moves. */
   touches: string[];
+  author_name: string;
+  author_email: string;
+  /** The author date, ISO 8601 — stable across the rebases an update performs. */
+  date: string;
+  /** Changes nothing but submodule pointers (a CI bump). */
+  only_pointers: boolean;
+  /** Upstream already carries this change: the rebase drops it. */
+  already_upstream: boolean;
 }
 
 export interface SyncSubPlan {
@@ -1507,6 +1517,11 @@ export interface SyncSubPlan {
    * on the sentence.
    */
   remedy: string | null;
+  /** What the update brings into this submodule, and what is its own (capped). */
+  incoming_commits: SyncCommitRef[];
+  own_commits: SyncCommitRef[];
+  /** It has submodules of its own; the update does not go inside them. */
+  has_nested: boolean;
 }
 
 export interface SyncSuperPlan {
@@ -1524,8 +1539,15 @@ export interface SyncSuperPlan {
   untracked: number;
   will_stash: boolean;
   notes: string[];
-  /** turn-on-stash | stash-collides | untracked-in-the-way, in the blockers' order. */
+  /** turn-on-stash | stash-collides | untracked-in-the-way | identity, in the blockers' order. */
   remedies: string[];
+  /** Where you and upstream last agreed, shortened. */
+  base_short: string;
+  /** The first 30 files with uncommitted changes. */
+  dirty_paths: string[];
+  /** Commits beyond the 30 listed on each side. */
+  more_incoming: number;
+  more_own: number;
 }
 
 export interface SyncSkipped {
@@ -1609,8 +1631,8 @@ export async function changesSyncRun(
   return invoke("changes_sync_run", { repoPath, stash, bundles, fingerprint });
 }
 
-export async function changesSyncContinue(repoPath: string): Promise<OpResult> {
-  return invoke("changes_sync_continue", { repoPath });
+export async function changesSyncContinue(repoPath: string, allowMarkers = false): Promise<OpResult> {
+  return invoke("changes_sync_continue", { repoPath, allowMarkers });
 }
 
 export async function changesSyncAbort(repoPath: string): Promise<OpResult> {
@@ -1671,8 +1693,9 @@ export async function changesFileDiff(
   return invoke("changes_file_diff", { repoPath, path, staged, untracked });
 }
 
-export async function changesStage(repoPath: string, paths: string[]): Promise<OpResult> {
-  return invoke("changes_stage", { repoPath, paths });
+/** `allowMarkers`: stage a conflicted file even though conflict markers are still in it (the "anyway" button). */
+export async function changesStage(repoPath: string, paths: string[], allowMarkers = false): Promise<OpResult> {
+  return invoke("changes_stage", { repoPath, paths, allowMarkers });
 }
 
 export async function changesStageAll(repoPath: string): Promise<OpResult> {
@@ -1714,8 +1737,8 @@ export async function changesSubmoduleUpdate(repoPath: string, paths: string[] |
   return invoke("changes_submodule_update", { repoPath, paths });
 }
 
-export async function changesContinue(repoPath: string): Promise<OpResult> {
-  return invoke("changes_continue", { repoPath });
+export async function changesContinue(repoPath: string, allowMarkers = false): Promise<OpResult> {
+  return invoke("changes_continue", { repoPath, allowMarkers });
 }
 
 export async function changesAbort(repoPath: string): Promise<OpResult> {

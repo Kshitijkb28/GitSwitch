@@ -721,7 +721,10 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
 
 fn seconds_since_last_fetch(repo: &Path) -> Option<u64> {
     // git rewrites FETCH_HEAD on every fetch, so its mtime is the fetch time.
-    let meta = std::fs::metadata(repo.join(".git").join("FETCH_HEAD")).ok()?;
+    // Resolved through git: a submodule's `.git` is a file pointing elsewhere,
+    // and the banner used to call such a repository "never fetched".
+    let path = git(repo, &["rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"]).ok()?;
+    let meta = std::fs::metadata(path.trim()).ok()?;
     let modified = meta.modified().ok()?;
     std::time::SystemTime::now()
         .duration_since(modified)

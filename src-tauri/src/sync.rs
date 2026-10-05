@@ -39,6 +39,19 @@ pub struct CommitRef {
     /// Submodule paths whose pointer this commit moves.
     #[serde(default)]
     pub touches: Vec<String>,
+    #[serde(default)]
+    pub author_name: String,
+    #[serde(default)]
+    pub author_email: String,
+    /// The author date, ISO 8601 — stable across the rebases an update performs.
+    #[serde(default)]
+    pub date: String,
+    /// The commit changes nothing but submodule pointers (a CI bump).
+    #[serde(default)]
+    pub only_pointers: bool,
+    /// Upstream already carries this change (`git cherry`): the rebase drops it.
+    #[serde(default)]
+    pub already_upstream: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -60,6 +73,14 @@ pub struct SuperFacts {
     pub dirty_overlap: Vec<String>,
     pub untracked_overlap: Vec<String>,
     pub is_submodule_itself: bool,
+    /// git here is set to commit as someone other than the folder's profile.
+    /// Filled in by sync_plan / sync_run from the repository status.
+    #[serde(default)]
+    pub identity_mismatch: bool,
+    #[serde(default)]
+    pub identity_email: String,
+    #[serde(default)]
+    pub profile_email: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -93,6 +114,19 @@ pub struct SubFacts {
     pub operation: Option<String>,
     pub fetch_error: Option<String>,
     pub has_nested: bool,
+    /// Commits inside it that the update brings in (`head..target`) and that
+    /// are its own (`target..head`), each capped at MAX_LISTED.
+    #[serde(default)]
+    pub incoming_commits: Vec<CommitRef>,
+    #[serde(default)]
+    pub own_commits: Vec<CommitRef>,
+    /// Read only for a submodule that would be rebased: its commits are re-written.
+    #[serde(default)]
+    pub identity_mismatch: bool,
+    #[serde(default)]
+    pub identity_email: String,
+    #[serde(default)]
+    pub profile_email: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -140,6 +174,14 @@ pub struct SubPlan {
     /// its buttons on this, never on the sentence.
     #[serde(default)]
     pub remedy: Option<String>,
+    /// What the update brings into this submodule, and what is its own.
+    #[serde(default)]
+    pub incoming_commits: Vec<CommitRef>,
+    #[serde(default)]
+    pub own_commits: Vec<CommitRef>,
+    /// It has submodules of its own; the update does not go inside them.
+    #[serde(default)]
+    pub has_nested: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -161,6 +203,17 @@ pub struct SuperPlan {
     /// turn-on-stash | stash-collides | untracked-in-the-way.
     #[serde(default)]
     pub remedies: Vec<String>,
+    /// Where you and upstream last agreed, shortened.
+    #[serde(default)]
+    pub base_short: String,
+    /// The first MAX_LISTED files with uncommitted changes.
+    #[serde(default)]
+    pub dirty_paths: Vec<String>,
+    /// Commits beyond the MAX_LISTED shown on each side.
+    #[serde(default)]
+    pub more_incoming: usize,
+    #[serde(default)]
+    pub more_own: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -246,6 +299,9 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
             fetch_error: f.fetch_error.clone(),
             notes: Vec::new(),
             remedy: None,
+            incoming_commits: f.incoming_commits.clone(),
+            own_commits: f.own_commits.clone(),
+            has_nested: f.has_nested,
         };
         let block = |p: &mut SubPlan, code: &str, why: String| {
             p.action = "blocked".into();
@@ -289,8 +345,17 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
                 p.action = "none".into();
                 p.reason = "already at the commit upstream records".into();
             } else if f.head_is_ancestor_of_target {
-                p.action = "fast-forward".into();
-                p.reason = format!("moves forward to {} (no commits of yours)", short(&target));
+                if !f.dirty_overlap.is_empty() {
+                    // Said now, not at align time: a fast-forward over an
+                    // edited file would fail there and leave a half-done update.
+                    block(&mut p, "stash-inside", format!(
+                        "its uncommitted changes to {} collide with the commits it will be moved onto; commit or stash them inside it first",
+                        f.dirty_overlap.join(", ")
+                    ));
+                } else {
+                    p.action = "fast-forward".into();
+                    p.reason = format!("moves forward to {} (no commits of yours)", short(&target));
+                }
             } else if f.target_is_ancestor_of_head {
                 if f.my_commits_move_gitlink {
                     p.action = "none".into();
@@ -305,6 +370,12 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
                     block(&mut p, "stash-inside", format!(
                         "its uncommitted changes to {} collide with the commits it will be rebased onto; commit or stash them inside it first",
                         f.dirty_overlap.join(", ")
+                    ));
+                } else if f.identity_mismatch {
+                    block(&mut p, "identity", format!(
+                        "rebasing would re-write its commits as {} but this folder should commit as {}; fix it in Doctor first",
+                        f.identity_email,
+                        f.profile_email.clone().unwrap_or_default()
                     ));
                 } else {
                     p.action = "rebase".into();
@@ -334,6 +405,20 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
         subs.push(p);
     }
 
+    // Rebasing re-commits your work under whatever identity git has here —
+    // the same reason a commit or a rebase pull is refused on a mismatch. A
+    // pure fast-forward writes nothing and is allowed, as Pull allows it.
+    if s.identity_mismatch && (s.ahead > 0 || subs.iter().any(|p| p.action == "rebase")) {
+        blockers.insert(
+            remedies.len(),
+            format!(
+                "This folder should commit as {} but git is set to {}. The update would re-write your commits under that identity — fix it in Doctor first.",
+                s.profile_email.clone().unwrap_or_default(),
+                s.identity_email
+            ),
+        );
+        remedies.push("identity".into());
+    }
     let submodule_work = subs.iter().any(|p| matches!(p.action.as_str(), "fast-forward" | "rebase"));
     let nothing_to_do = s.behind == 0 && !submodule_work && blockers.is_empty();
     let can_run = blockers.is_empty() && !nothing_to_do;
@@ -378,6 +463,10 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
             will_stash: dirty && stash,
             notes,
             remedies,
+            base_short: if s.base_oid.is_empty() { String::new() } else { short(&s.base_oid) },
+            dirty_paths: s.dirty_tracked.iter().take(MAX_LISTED).cloned().collect(),
+            more_incoming: s.behind.saturating_sub(s.incoming.len()),
+            more_own: s.ahead.saturating_sub(s.own_commits.len()),
         },
         submodules: subs,
         skipped: facts.skipped.clone(),
@@ -423,6 +512,9 @@ pub struct NeedsUser {
     pub where_: String,
     pub paths: Vec<String>,
     pub hint: String,
+    /// The commit of yours being replayed when the superproject's rebase stopped.
+    #[serde(default)]
+    pub at_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -443,6 +535,11 @@ pub struct SyncState {
     pub needs_user: Option<NeedsUser>,
     pub plan: SyncPlan,
     pub bundles: Vec<String>,
+    /// Commits of yours replayed with help — a conflict you resolved, or a
+    /// submodule pointer the update rewrote — so their patch differs from the
+    /// original and `git cherry` cannot vouch for them afterwards.
+    #[serde(default)]
+    pub resolved: Vec<String>,
 }
 
 /// Where the state lives: per worktree, dies with the repo, invisible to git.
@@ -496,10 +593,10 @@ pub async fn summary_for(repo: &Path) -> Option<SyncSummary> {
         // has to resolve before the update can go on.
         let unresolved = match st.needs_user.as_ref().map(|n| n.where_.as_str()) {
             Some(w) if w.starts_with("submodule") => match w.split(':').nth(1).filter(|p| !p.is_empty()) {
-                Some(sub) => unmerged(&repo.join(sub)).await.len(),
+                Some(sub) => Box::pin(unmerged(&repo.join(sub))).await.len(),
                 None => 0,
             },
-            Some(_) => unmerged(repo).await.len(),
+            Some(_) => Box::pin(unmerged(repo)).await.len(),
             None => 0,
         };
         let upstream = st.plan.superproject.upstream.clone();
@@ -532,7 +629,7 @@ pub async fn summary_for(repo: &Path) -> Option<SyncSummary> {
         Some(s) => (Some(s.path.clone()), Some(s.target.clone())),
         None => (None, None),
     };
-    let unresolved = unmerged(repo).await.len();
+    let unresolved = Box::pin(unmerged(repo)).await.len();
     let upstream = st.plan.superproject.upstream.clone();
     Some(SyncSummary {
         phase: st.phase,
@@ -565,18 +662,47 @@ pub(crate) async fn is_ancestor(repo: &Path, a: &str, b: &str) -> bool {
 
 async fn commit_list(repo: &Path, range: &str) -> Vec<CommitRef> {
     g(repo)
-        .args(["log", &format!("-n{}", MAX_LISTED), "--format=%H%x1f%h%x1f%s", range])
+        .args(["log", &format!("-n{}", MAX_LISTED), "--format=%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%aI", range])
         .ok_text()
         .await
         .map(|out| {
             out.lines()
                 .filter_map(|l| {
                     let mut it = l.split('\x1f');
-                    Some(CommitRef { oid: it.next()?.to_string(), short: it.next()?.to_string(), subject: it.next().unwrap_or("").to_string(), touches: Vec::new() })
+                    Some(CommitRef {
+                        oid: it.next()?.to_string(),
+                        short: it.next()?.to_string(),
+                        subject: it.next().unwrap_or("").to_string(),
+                        touches: Vec::new(),
+                        author_name: it.next().unwrap_or("").to_string(),
+                        author_email: it.next().unwrap_or("").to_string(),
+                        date: it.next().unwrap_or("").to_string(),
+                        only_pointers: false,
+                        already_upstream: false,
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The files each commit in `range` touches — one git call for the whole
+/// range, so a commit can be told apart from a submodule-pointer bump.
+async fn files_per_commit(repo: &Path, range: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let mut out = BTreeMap::new();
+    let Some(text) = g(repo).args(["log", &format!("-n{}", MAX_LISTED), "--format=%x1e%H", "--name-only", range]).ok_text().await else { return out };
+    for chunk in text.split('\x1e') {
+        let mut lines = chunk.lines().map(str::trim).filter(|l| !l.is_empty());
+        let Some(oid) = lines.next() else { continue };
+        out.insert(oid.to_string(), lines.map(String::from).collect());
+    }
+    out
+}
+
+/// The commit the superproject's rebase stopped on (the merge backend writes it).
+async fn stopped_sha(repo: &Path) -> Option<String> {
+    let p = GitCmd::at(repo).args(["rev-parse", "--path-format=absolute", "--git-path", "rebase-merge/stopped-sha"]).ok_text().await?;
+    std::fs::read_to_string(p.trim()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 async fn name_only(repo: &Path, args: &[&str]) -> BTreeSet<String> {
@@ -670,7 +796,51 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
     let ahead: usize = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
     let behind: usize = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
     let mut own_commits = commit_list(&repo, &format!("{}..HEAD", upstream_ref)).await;
-    let incoming = commit_list(&repo, &format!("HEAD..{}", upstream_ref)).await;
+    let mut incoming = commit_list(&repo, &format!("HEAD..{}", upstream_ref)).await;
+    // Which of my commits upstream already carries, patch for patch: the
+    // rebase drops those, and the picture says so beforehand.
+    let cherry = g(&repo).args(["cherry", &upstream_ref, "HEAD"]).ok_text().await.unwrap_or_default();
+    let equivalent: BTreeSet<String> = cherry.lines().filter_map(|l| l.strip_prefix("- ")).map(|o| o.trim().to_string()).collect();
+    for c in own_commits.iter_mut() {
+        c.already_upstream = equivalent.contains(&c.oid);
+    }
+    let own_files = files_per_commit(&repo, &format!("{}..HEAD", upstream_ref)).await;
+    let in_files = files_per_commit(&repo, &format!("HEAD..{}", upstream_ref)).await;
+    // git also drops a commit whose change is already in place when it is
+    // replayed — the same lines arrived by another commit — even though its
+    // patch is not identical. Predicted when every file it touches already
+    // has its content in upstream, and no other commit of mine touches those
+    // files (a later one would replay onto them and not be empty).
+    for i in 0..own_commits.len() {
+        if own_commits[i].already_upstream {
+            continue;
+        }
+        let Some(files) = own_files.get(&own_commits[i].oid) else { continue };
+        if files.is_empty() {
+            continue;
+        }
+        let shared = own_commits.iter().enumerate().any(|(j, o)| j != i && own_files.get(&o.oid).is_some_and(|f| f.iter().any(|p| files.contains(p))));
+        if shared {
+            continue;
+        }
+        let mut args: Vec<String> = vec!["diff".into(), "--quiet".into(), own_commits[i].oid.clone(), upstream_ref.clone(), "--".into()];
+        args.extend(files.iter().cloned());
+        let same = g(&repo).args(args.iter().map(String::as_str)).run().await.map(|o| o.ok()).unwrap_or(false);
+        if same {
+            own_commits[i].already_upstream = true;
+        }
+    }
+    // A commit that changes nothing but submodule pointers is a bump, not work.
+    let gitlinks: BTreeSet<String> = subs_listed.iter().map(|s| s.path.clone()).collect();
+    if !gitlinks.is_empty() {
+        for (list, files) in [(&mut own_commits, &own_files), (&mut incoming, &in_files)] {
+            for c in list.iter_mut() {
+                if let Some(f) = files.get(&c.oid) {
+                    c.only_pointers = !f.is_empty() && f.iter().all(|p| gitlinks.contains(p));
+                }
+            }
+        }
+    }
     let upstream_changed = name_only(&repo, &["diff", "--name-only", "--ignore-submodules=none", &format!("HEAD...{}", upstream_ref)]).await;
     let upstream_added = name_only(&repo, &["diff", "--name-only", "--diff-filter=A", "--ignore-submodules=none", &format!("HEAD...{}", upstream_ref)]).await;
     let mine_changed = name_only(&repo, &["log", "--name-only", "--format=", "--ignore-submodules=none", &format!("{}..HEAD", upstream_ref)]).await;
@@ -706,6 +876,17 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
                 c.touches.push(s.path.clone());
             }
         }
+        let moving_in: Vec<String> = g(&repo)
+            .args(["log", "--format=%H", &format!("HEAD..{}", upstream_ref), "--", &s.path])
+            .ok_text()
+            .await
+            .map(|o| o.lines().map(|l| l.to_string()).collect())
+            .unwrap_or_default();
+        for c in incoming.iter_mut() {
+            if moving_in.iter().any(|m| m == &c.oid) {
+                c.touches.push(s.path.clone());
+            }
+        }
         let mut f = SubFacts {
             path: s.path.clone(),
             name: s.name.clone(),
@@ -738,6 +919,11 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
             operation: s.operation.clone(),
             fetch_error: fetch_errors.get(&s.path).cloned(),
             has_nested: sub.join(".gitmodules").exists(),
+            incoming_commits: Vec::new(),
+            own_commits: Vec::new(),
+            identity_mismatch: false,
+            identity_email: String::new(),
+            profile_email: None,
         };
         if !s.gitdir_valid {
             submodules.push(f);
@@ -760,6 +946,19 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
                     let (dirty, _) = dirty_sets(&sub).await;
                     let changed = name_only(&sub, &["diff", "--name-only", &format!("{}...{}", h, t)]).await;
                     f.dirty_overlap = dirty.into_iter().filter(|p| changed.contains(p)).collect();
+                    if !same_oid(h, t) {
+                        f.incoming_commits = commit_list(&sub, &format!("{}..{}", h, t)).await;
+                        f.own_commits = commit_list(&sub, &format!("{}..{}", t, h)).await;
+                    }
+                    // Diverged: its commits would be re-written, so the
+                    // identity git has there matters — as it does for a commit.
+                    if !f.head_is_ancestor_of_target && !f.target_is_ancestor_of_head {
+                        if let Ok(st) = Box::pin(git_status::repo_status(&sub.to_string_lossy())).await {
+                            f.identity_mismatch = !st.identity.matches_profile;
+                            f.identity_email = st.identity.email.clone();
+                            f.profile_email = st.identity.profile_email.clone();
+                        }
+                    }
                 }
                 let remote_head = g(&sub).args(["symbolic-ref", "-q", "--short", &format!("refs/remotes/{}/HEAD", rem)]).ok_text().await;
                 f.remote_head_branch = remote_head.as_deref().and_then(|r| r.split_once('/')).map(|(_, b)| b.to_string());
@@ -797,10 +996,21 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
             dirty_overlap,
             untracked_overlap,
             is_submodule_itself,
+            identity_mismatch: false,
+            identity_email: String::new(),
+            profile_email: None,
         },
         submodules,
         skipped,
     })
+}
+
+/// The identity git has in the superproject, from the status the caller
+/// already read: a rebase re-commits under it, so the planner must know.
+fn note_identity(facts: &mut SyncFacts, f: &StatusFacts) {
+    facts.superproject.identity_mismatch = !f.identity_matches;
+    facts.superproject.identity_email = f.identity_email.clone();
+    facts.superproject.profile_email = f.profile_email.clone();
 }
 
 // ---------------------------------------------------------------------------
@@ -808,7 +1018,7 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
 // ---------------------------------------------------------------------------
 
 async fn facts_for_check(repo_path: &str) -> Result<(RepoStatus, StatusFacts), AppError> {
-    let status = git_status::repo_status(repo_path).await?;
+    let status = Box::pin(git_status::repo_status(repo_path)).await?;
     let facts = StatusFacts::from(&status);
     Ok((status, facts))
 }
@@ -821,7 +1031,8 @@ pub async fn sync_plan(repo_path: &str, stash: bool, fetch: bool) -> Result<Sync
     if let Some(r) = check(&Intent::Sync, &f) {
         return Ok(SyncPlan { refusal: Some(r.clone()), summary: r.message, ..Default::default() });
     }
-    let facts = gather_facts(repo_path, fetch).await?;
+    let mut facts = gather_facts(repo_path, fetch).await?;
+    note_identity(&mut facts, &f);
     Ok(plan(&facts, stash))
 }
 
@@ -968,6 +1179,7 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
                 where_: "superproject".into(),
                 paths: Vec::new(),
                 hint: "The rebase stopped without a conflict to resolve. Read what git said on the Changes page, fix it, then Continue update — or Abort update.".into(),
+                at_commit: stopped_sha(repo).await,
             });
             st.phase = "rebasing".into();
             write_state_at(state_file, st)?;
@@ -979,6 +1191,7 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
                 where_: "superproject".into(),
                 paths: files.clone(),
                 hint: format!("Resolve {} on the Changes page (edit, then stage), then Continue update.", files.join(", ")),
+                at_commit: stopped_sha(repo).await,
             });
             st.phase = "rebasing".into();
             write_state_at(state_file, st)?;
@@ -990,6 +1203,9 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
                 return Ok(());
             }
         }
+        // This commit is replayed with a rewritten pointer: its patch will not
+        // match the original, so the check afterwards must not count it dropped.
+        remember_resolved(repo, st).await;
         let out = g(repo).args(["rebase", "--continue"]).timeout(NET_TIMEOUT).run().await?;
         if !out.ok() && !rebase_in_progress(repo).await {
             return Err(AppError::Command(format!("rebase --continue failed: {}", out.stderr.trim())));
@@ -1003,6 +1219,7 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
             where_: "autostash-conflict".into(),
             paths: leftovers.iter().map(|c| c.path.clone()).collect(),
             hint: "The rebase finished, but your stashed changes did not re-apply cleanly. Resolve and stage them, then Continue update — or run `git reset --hard` (your changes are still in stash@{0}) and `git stash pop` by hand.".into(),
+            at_commit: None,
         });
         st.phase = "aligning".into();
         write_state_at(state_file, st)?;
@@ -1013,13 +1230,24 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
     align_submodules(repo, st, state_file).await
 }
 
+/// Note the commit the superproject's rebase is replaying right now as one
+/// whose patch may differ afterwards (resolved by hand, or a rewritten pointer).
+async fn remember_resolved(repo: &Path, st: &mut SyncState) {
+    if let Some(sha) = stopped_sha(repo).await {
+        if !st.resolved.contains(&sha) {
+            st.resolved.push(sha);
+        }
+    }
+}
+
 /// A submodule-pointer stop: rebase that submodule's own commits onto the
 /// commit upstream recorded, then record the result. Neither `--ours` nor
 /// `--theirs` is ever right here.
 async fn resolve_gitlink_stop(repo: &Path, st: &mut SyncState, state_file: &Path, c: &git_status::ChangeEntry) -> Result<(), AppError> {
     let path = c.path.clone();
+    let at_commit = stopped_sha(repo).await;
     let hand_over = |st: &mut SyncState, hint: String| {
-        st.needs_user = Some(NeedsUser { where_: format!("submodule:{}", path), paths: vec![path.clone()], hint });
+        st.needs_user = Some(NeedsUser { where_: format!("submodule:{}", path), paths: vec![path.clone()], hint, at_commit: at_commit.clone() });
     };
     if c.stage_oids.len() != 3 || c.stage_oids.iter().any(|o| o.is_empty() || o == "0000000000000000000000000000000000000000") || c.stage_modes.get(1) != Some(&"160000".to_string()) || c.stage_modes.get(2) != Some(&"160000".to_string()) {
         hand_over(st, format!("The submodule {} was added or removed on one side; decide by hand, stage it, then Continue update.", path));
@@ -1102,6 +1330,11 @@ async fn reattach(sub: &Path, ss: &mut SubState) {
 /// superproject now records.
 async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(), AppError> {
     for i in 0..st.subs.len() {
+        // A continue after a pause comes back through here: what was already
+        // aligned keeps its note and is not touched again.
+        if st.subs[i].aligned {
+            continue;
+        }
         let path = st.subs[i].path.clone();
         let sub = repo.join(&path);
         let Some(recorded) = oid(repo, &format!("HEAD:{}", path)).await else { continue };
@@ -1144,6 +1377,7 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
                 where_: format!("submodule:{}", path),
                 paths: vec![path.clone()],
                 hint: format!("Rebasing {} onto {} stopped on a conflict inside it. Open it as its own repository, resolve and stage, then Continue update.", path, short(&recorded)),
+                at_commit: None,
             });
             return write_state_at(state_file, st);
         }
@@ -1152,6 +1386,7 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
                 where_: format!("submodule-autostash:{}", path),
                 paths: vec![path.clone()],
                 hint: format!("{} was rebased, but its uncommitted changes did not re-apply cleanly. Resolve and stage them inside it, then Continue update.", path),
+                at_commit: None,
             });
             return write_state_at(state_file, st);
         }
@@ -1192,10 +1427,10 @@ pub(crate) fn shell_quote(s: &str) -> String {
 async fn finish(repo_path: &str, st: &SyncState, state_file: &Path) -> Result<OpResult, AppError> {
     let repo = PathBuf::from(repo_path);
     let outcome = build_outcome(&repo, st).await;
-    let status = git_status::repo_status(repo_path).await?;
+    let status = Box::pin(git_status::repo_status(repo_path)).await?;
     let mut op = if st.phase == "done" {
         std::fs::remove_file(state_file).ok();
-        let status = git_status::repo_status(repo_path).await?;
+        let status = Box::pin(git_status::repo_status(repo_path)).await?;
         let verified = outcome.verified.behind_zero && outcome.verified.own_on_top && outcome.verified.no_conflicts_left;
         let headline = if !verified {
             "Update finished, but a check did not pass — read the details.".to_string()
@@ -1224,6 +1459,15 @@ async fn finish(repo_path: &str, st: &SyncState, state_file: &Path) -> Result<Op
                 outcome.own_dropped.iter().map(|c| c.subject.clone()).collect::<Vec<_>>().join("; ")
             ));
         }
+        // Every drop was foreseen (upstream already had the change) and every
+        // other commit of yours is on top: the result is the preview, nothing more.
+        if verified && outcome.own_dropped.iter().all(|c| c.already_upstream) {
+            detail.push_str(&format!(
+                " As previewed: {} of yours on top of {} incoming.",
+                plural(outcome.own_kept.len(), "commit", "commits"),
+                outcome.incoming
+            ));
+        }
         if !outcome.unrecorded_pointers.is_empty() {
             detail.push_str(&format!(" Submodule pointers not yet recorded by this branch: {}. Use \"Record submodule pointers\" when you want a commit for them.", outcome.unrecorded_pointers.join(", ")));
         }
@@ -1240,7 +1484,7 @@ async fn finish(repo_path: &str, st: &SyncState, state_file: &Path) -> Result<Op
         std::fs::remove_file(state_file).ok();
         OpResult::done("Update aborted.".to_string(), "Everything is back where it was, except what is named below.".to_string(), status)
     } else {
-        let nu = st.needs_user.clone().unwrap_or(NeedsUser { where_: "superproject".into(), paths: vec![], hint: String::new() });
+        let nu = st.needs_user.clone().unwrap_or(NeedsUser { where_: "superproject".into(), paths: vec![], hint: String::new(), at_commit: None });
         let mut r = OpResult::done(
             match nu.where_.as_str() {
                 "autostash-conflict" => "Update paused: your stashed changes did not re-apply cleanly.".to_string(),
@@ -1285,7 +1529,37 @@ async fn build_outcome(repo: &Path, st: &SyncState) -> SyncOutcome {
     let head_after = oid(repo, "HEAD").await.unwrap_or_default();
     let own_after = commit_list(repo, &format!("{}..HEAD", st.upstream_ref)).await;
     let kept_subjects: BTreeSet<String> = own_after.iter().map(|c| c.subject.clone()).collect();
-    let own_dropped: Vec<CommitRef> = st.plan.superproject.own_commits.iter().filter(|c| !kept_subjects.contains(&c.subject)).cloned().collect();
+    // Measured, not assumed: every commit the backup holds and HEAD does not
+    // contain must have a patch-identical twin in HEAD (`git cherry` says "-"),
+    // or be one replayed with help (resolved by hand, a rewritten pointer), or
+    // be one upstream already had — the drop the preview foresaw.
+    let (own_on_top, own_dropped) = match st.backup.as_deref() {
+        Some(backup) if st.phase == "done" => {
+            let cherry = g(repo).args(["cherry", "HEAD", backup]).ok_text().await.unwrap_or_default();
+            let missing: Vec<String> = cherry.lines().filter_map(|l| l.strip_prefix("+ ")).map(|o| o.trim().to_string()).collect();
+            let mut on_top = true;
+            let mut dropped = Vec::new();
+            for oid in missing {
+                if st.resolved.contains(&oid) {
+                    continue;
+                }
+                match st.plan.superproject.own_commits.iter().find(|c| c.oid == oid) {
+                    Some(c) if c.already_upstream => dropped.push(c.clone()),
+                    // Replayed with a different patch (a binary, a resolution
+                    // outside the app): its subject is still on top.
+                    Some(c) if kept_subjects.contains(&c.subject) => {}
+                    Some(c) => {
+                        dropped.push(c.clone());
+                        on_top = false;
+                    }
+                    // Beyond the listed commits: nothing to compare against.
+                    None => {}
+                }
+            }
+            (on_top, dropped)
+        }
+        _ => (true, st.plan.superproject.own_commits.iter().filter(|c| !kept_subjects.contains(&c.subject)).cloned().collect()),
+    };
     let counts = g(repo).args(["rev-list", "--left-right", "--count", &format!("HEAD...{}", st.upstream_ref)]).ok_text().await.unwrap_or_default();
     let behind: usize = counts.split_whitespace().nth(1).and_then(|n| n.parse().ok()).unwrap_or(0);
     let (dirty_now, untracked_now) = dirty_sets(repo).await;
@@ -1348,7 +1622,7 @@ async fn build_outcome(repo: &Path, st: &SyncState) -> SyncOutcome {
         submodules: subs,
         verified: Verified {
             behind_zero: behind == 0,
-            own_on_top: true,
+            own_on_top,
             dirty_paths_unchanged: dirty_set_now == dirty_set_before,
             untracked_unchanged: untracked_now.len() == untracked_before,
             submodules_aligned: aligned_all,
@@ -1379,7 +1653,8 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
     }
     let repo = PathBuf::from(repo_path);
     // No silent re-fetch: measure again and compare with what was approved.
-    let facts = gather_facts(repo_path, false).await?;
+    let mut facts = gather_facts(repo_path, false).await?;
+    note_identity(&mut facts, &f);
     if !opts.fingerprint.is_empty() {
         let mut now = vec![(String::new(), facts.superproject.upstream_oid.clone())];
         for s in &facts.submodules {
@@ -1439,6 +1714,7 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         needs_user: None,
         plan: plan.clone(),
         bundles: Vec::new(),
+        resolved: Vec::new(),
     };
     write_state_at(&state_file, &st)?;
 
@@ -1488,20 +1764,20 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         // Refused before starting (a hook, an untracked file): nothing to undo but the backup branches.
         st.phase = "aborted".into();
         write_state_at(&state_file, &st)?;
-        let after = git_status::repo_status(repo_path).await?;
+        let after = Box::pin(git_status::repo_status(repo_path)).await?;
         let a = crate::git_advice::explain(crate::git_advice::GitOp::Rebase, &format!("{}\n{}", out.text(), out.stderr), &crate::git_ops::advice_ctx(&after));
         let _ = std::fs::remove_file(&state_file);
         let mut r = OpResult::failed(a, after);
         r.sync = Some(build_outcome(&repo, &st).await);
         return Ok(r);
     }
-    drive(&repo, &mut st, &state_file).await?;
-    finish(repo_path, &st, &state_file).await
+    Box::pin(drive(&repo, &mut st, &state_file)).await?;
+    Box::pin(finish(repo_path, &st, &state_file)).await
 }
 
 /// After the user resolved and staged: continue the innermost rebase, then
 /// resume the state machine.
-pub async fn sync_continue(repo_path: &str) -> Result<OpResult, AppError> {
+pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpResult, AppError> {
     let (status, f) = facts_for_check(repo_path).await?;
     if let Some(r) = check(&Intent::SyncContinue, &f) {
         return Ok(OpResult::refused(r, status));
@@ -1511,16 +1787,39 @@ pub async fn sync_continue(repo_path: &str) -> Result<OpResult, AppError> {
     let Some(mut st) = read_state(&repo).await else {
         return Ok(OpResult::refused(Refusal { code: "no-sync".into(), message: "No update is paused here.".into() }, status));
     };
+    // A file staged with its conflict markers still in it would be committed
+    // that way by `rebase --continue`; refuse by name unless told otherwise.
     if let Some(path) = sub_rebase_in_progress(&repo, &st).await {
         let sub = repo.join(&path);
         if !unmerged(&sub).await.is_empty() {
-            let status = git_status::repo_status(repo_path).await?;
+            let status = Box::pin(git_status::repo_status(repo_path)).await?;
             return Ok(OpResult::refused(Refusal { code: "unmerged-paths".into(), message: format!("{} still has conflicted files. Resolve and stage them inside it first.", path) }, status));
+        }
+        if !allow_markers {
+            if let Some((file, lines)) = crate::git_ops::staged_marker_offence(&sub).await {
+                let status = Box::pin(git_status::repo_status(repo_path)).await?;
+                return Ok(OpResult::refused(crate::git_ops::markers_refusal(&format!("{}/{}", path, file), &lines), status));
+            }
         }
         let out = g(&sub).args(["rebase", "--continue"]).timeout(NET_TIMEOUT).run().await?;
         if !out.ok() && rebase_in_progress(&sub).await {
-            let status = git_status::repo_status(repo_path).await?;
+            let status = Box::pin(git_status::repo_status(repo_path)).await?;
             return Ok(OpResult::refused(Refusal { code: "sub-rebase-stopped".into(), message: format!("Rebasing {} stopped again: {}", path, out.stderr.trim()) }, status));
+        }
+        // Its rebase finished, but its own stashed changes may not have come
+        // back cleanly: that is another pause, not something to add silently.
+        if !unmerged(&sub).await.is_empty() || has_autostash_entry(&sub).await {
+            if let Some(ss) = st.subs.iter_mut().find(|s| s.path == path) {
+                ss.rebased = true;
+            }
+            st.needs_user = Some(NeedsUser {
+                where_: format!("submodule-autostash:{}", path),
+                paths: vec![path.clone()],
+                hint: format!("{} was rebased, but its uncommitted changes did not re-apply cleanly. Resolve and stage them inside it, then Continue update.", path),
+                at_commit: None,
+            });
+            write_state_at(&state_file, &st)?;
+            return finish(repo_path, &st, &state_file).await;
         }
         if let Some(ss) = st.subs.iter_mut().find(|s| s.path == path) {
             let new_head = oid(&sub, "HEAD").await.unwrap_or_default();
@@ -1532,25 +1831,30 @@ pub async fn sync_continue(repo_path: &str) -> Result<OpResult, AppError> {
             }
         }
         st.needs_user = None;
-        if rebase_in_progress(&repo).await {
-            // Back in the superproject's stop: record the submodule and carry on.
-            let out = g(&repo).args(["add", "--", &path]).run().await?;
-            if !out.ok() {
-                return Err(AppError::Command(format!("Could not record {}: {}", path, out.stderr.trim())));
-            }
-            let out = g(&repo).args(["rebase", "--continue"]).timeout(NET_TIMEOUT).run().await?;
-            if !out.ok() && !rebase_in_progress(&repo).await {
-                return Err(AppError::Command(format!("rebase --continue failed: {}", out.stderr.trim())));
-            }
-            drive(&repo, &mut st, &state_file).await?;
-        } else {
-            align_submodules(&repo, &mut st, &state_file).await?;
+        return Box::pin(resume_after_submodule(repo_path, &repo, &mut st, &state_file, &path)).await;
+    }
+    if let Some(path) = st.needs_user.as_ref().and_then(|n| n.where_.strip_prefix("submodule-autostash:")).map(|p| p.to_string()) {
+        let sub = repo.join(&path);
+        if !unmerged(&sub).await.is_empty() {
+            let status = Box::pin(git_status::repo_status(repo_path)).await?;
+            return Ok(OpResult::refused(Refusal { code: "unmerged-paths".into(), message: format!("{} still has conflicted files. Resolve and stage them inside it first.", path) }, status));
         }
-        return finish(repo_path, &st, &state_file).await;
+        // The stash entry it left is theirs to drop; the rebase itself is done.
+        if let Some(ss) = st.subs.iter_mut().find(|s| s.path == path) {
+            let new_head = oid(&sub, "HEAD").await.unwrap_or_default();
+            reattach(&sub, ss).await;
+            ss.head_after = Some(new_head);
+            ss.rebased = true;
+            if ss.note.is_empty() {
+                ss.note = "rebased (its stashed changes re-applied by you)".into();
+            }
+        }
+        st.needs_user = None;
+        return Box::pin(resume_after_submodule(repo_path, &repo, &mut st, &state_file, &path)).await;
     }
     if st.needs_user.as_ref().map(|n| n.where_.as_str()) == Some("autostash-conflict") {
         if !unmerged(&repo).await.is_empty() {
-            let status = git_status::repo_status(repo_path).await?;
+            let status = Box::pin(git_status::repo_status(repo_path)).await?;
             return Ok(OpResult::refused(Refusal { code: "unmerged-paths".into(), message: "Resolve and stage the conflicted files first.".into() }, status));
         }
         // The user staged the resolution of the stash. The leftover stash entry is theirs to drop; carry on.
@@ -1560,6 +1864,15 @@ pub async fn sync_continue(repo_path: &str) -> Result<OpResult, AppError> {
     }
     if rebase_in_progress(&repo).await {
         if !unmerged(&repo).await.iter().any(|c| !c.is_submodule) {
+            if !allow_markers {
+                if let Some((file, lines)) = crate::git_ops::staged_marker_offence(&repo).await {
+                    let status = Box::pin(git_status::repo_status(repo_path)).await?;
+                    return Ok(OpResult::refused(crate::git_ops::markers_refusal(&file, &lines), status));
+                }
+            }
+            // Resolved by hand: its patch is now its own, and the check
+            // afterwards must not call it dropped.
+            remember_resolved(&repo, &mut st).await;
             let out = g(&repo).args(["rebase", "--continue"]).timeout(NET_TIMEOUT).run().await?;
             if !out.ok() && !rebase_in_progress(&repo).await {
                 return Err(AppError::Command(format!("rebase --continue failed: {}", out.stderr.trim())));
@@ -1568,7 +1881,7 @@ pub async fn sync_continue(repo_path: &str) -> Result<OpResult, AppError> {
             drive(&repo, &mut st, &state_file).await?;
             return finish(repo_path, &st, &state_file).await;
         }
-        let status = git_status::repo_status(repo_path).await?;
+        let status = Box::pin(git_status::repo_status(repo_path)).await?;
         return Ok(OpResult::refused(Refusal { code: "unmerged-paths".into(), message: "Resolve and stage every conflicted file first.".into() }, status));
     }
     // Finished or aborted outside the app.
@@ -1579,6 +1892,28 @@ pub async fn sync_continue(repo_path: &str) -> Result<OpResult, AppError> {
     }
     align_submodules(&repo, &mut st, &state_file).await?;
     finish(repo_path, &st, &state_file).await
+}
+
+/// A submodule's pause is over: record it in the superproject's stop and carry
+/// on there, or — when the superproject's rebase had already finished —
+/// align whatever is left.
+async fn resume_after_submodule(repo_path: &str, repo: &Path, st: &mut SyncState, state_file: &Path, path: &str) -> Result<OpResult, AppError> {
+    if rebase_in_progress(repo).await {
+        let out = g(repo).args(["add", "--", path]).run().await?;
+        if !out.ok() {
+            return Err(AppError::Command(format!("Could not record {}: {}", path, out.stderr.trim())));
+        }
+        // The commit being replayed now records a rewritten pointer.
+        remember_resolved(repo, st).await;
+        let out = g(repo).args(["rebase", "--continue"]).timeout(NET_TIMEOUT).run().await?;
+        if !out.ok() && !rebase_in_progress(repo).await {
+            return Err(AppError::Command(format!("rebase --continue failed: {}", out.stderr.trim())));
+        }
+        drive(repo, st, state_file).await?;
+    } else {
+        align_submodules(repo, st, state_file).await?;
+    }
+    finish(repo_path, st, state_file).await
 }
 
 /// Undo: inner rebase first, then the superproject's (git restores the
@@ -1668,7 +2003,7 @@ pub async fn record_pointers(repo_path: &str) -> Result<OpResult, AppError> {
     g(&repo).args(args).timeout(LOCAL_TIMEOUT).text().await?;
     let msg = format!("Record submodule pointers: {}", paths.join(", "));
     g(&repo).args(["commit", "--quiet", "--only", "-m", &msg, "--"]).args(paths.iter().map(String::as_str)).timeout(LOCAL_TIMEOUT).text().await?;
-    let after = git_status::repo_status(repo_path).await?;
+    let after = Box::pin(git_status::repo_status(repo_path)).await?;
     Ok(OpResult::done(format!("Recorded {} submodule pointer(s).", paths.len()), msg, after))
 }
 
@@ -1687,7 +2022,7 @@ mod tests {
             base_oid: "b".repeat(40),
             ahead: 2,
             behind: 3,
-            own_commits: vec![CommitRef { oid: "1".repeat(40), short: "1111111".into(), subject: "seal work".into(), touches: vec!["A".into()] }],
+            own_commits: vec![CommitRef { oid: "1".repeat(40), short: "1111111".into(), subject: "seal work".into(), touches: vec!["A".into()], ..Default::default() }],
             incoming: vec![],
             ..Default::default()
         }
@@ -1763,6 +2098,67 @@ mod tests {
         let mut a = sub("A");
         a.gitdir_valid = false;
         assert!(plan(&facts(vec![a]), true).blockers[0].contains("no longer exists"));
+    }
+
+    #[test]
+    fn a_fast_forward_over_an_edited_file_is_a_blocker_not_a_late_failure() {
+        let mut b = sub("B");
+        b.my_commits_move_gitlink = false;
+        b.own_commits_moving_gitlink = 0;
+        b.head_is_ancestor_of_target = true;
+        b.dirty_overlap = vec!["B.txt".into()];
+        let p = plan(&facts(vec![b]), true);
+        assert!(!p.can_run);
+        assert_eq!(p.submodules[0].remedy.as_deref(), Some("stash-inside"));
+        assert!(p.blockers[0].contains("collide with the commits it will be moved onto"));
+    }
+
+    #[test]
+    fn identity_blocks_only_what_would_be_recommitted() {
+        // The superproject re-commits your work: a mismatch blocks.
+        let mut s = sup();
+        s.identity_mismatch = true;
+        s.identity_email = "wrong@example.test".into();
+        s.profile_email = Some("right@example.test".into());
+        let p = plan(&SyncFacts { superproject: s.clone(), submodules: vec![], skipped: vec![] }, true);
+        assert!(!p.can_run);
+        assert_eq!(p.superproject.remedies, vec!["identity".to_string()]);
+        assert!(p.blockers[0].contains("should commit as right@example.test but git is set to wrong@example.test"));
+        // Nothing of yours to replay and only a fast-forward: nothing is re-committed.
+        s.ahead = 0;
+        s.own_commits = vec![];
+        let mut b = sub("B");
+        b.my_commits_move_gitlink = false;
+        b.own_commits_moving_gitlink = 0;
+        b.head_is_ancestor_of_target = true;
+        let p = plan(&SyncFacts { superproject: s.clone(), submodules: vec![b], skipped: vec![] }, true);
+        assert!(p.can_run, "{:?}", p.blockers);
+        // A submodule rebase re-commits inside it: its own identity matters.
+        let mut a = sub("A");
+        a.identity_mismatch = true;
+        a.identity_email = "wrong@example.test".into();
+        a.profile_email = Some("right@example.test".into());
+        let p = plan(&facts(vec![a]), true);
+        assert_eq!(p.submodules[0].remedy.as_deref(), Some("identity"));
+        assert!(p.blockers[0].contains("re-write its commits as wrong@example.test"));
+    }
+
+    #[test]
+    fn the_plan_carries_what_the_picture_needs() {
+        let mut s = sup();
+        s.base_oid = "b".repeat(40);
+        s.dirty_tracked = vec!["README.md".into()];
+        s.behind = 40;
+        s.ahead = 2;
+        let mut a = sub("A");
+        a.has_nested = true;
+        a.own_commits = vec![CommitRef { oid: "1".repeat(40), short: "1111111".into(), subject: "A: my commit".into(), ..Default::default() }];
+        let p = plan(&SyncFacts { superproject: s, submodules: vec![a], skipped: vec![] }, true);
+        assert_eq!(p.superproject.base_short, "bbbbbbb");
+        assert_eq!(p.superproject.dirty_paths, vec!["README.md".to_string()]);
+        assert_eq!(p.superproject.more_incoming, 40);
+        assert!(p.submodules[0].has_nested);
+        assert_eq!(p.submodules[0].own_commits[0].subject, "A: my commit");
     }
 
     #[test]
@@ -1908,8 +2304,9 @@ mod tests {
             backup: Some("gitswitch-before-sync-1".into()),
             captures: BTreeMap::new(),
             subs: vec![],
-            needs_user: Some(NeedsUser { where_: "submodule:A".into(), paths: vec!["A".into()], hint: "x".into() }),
+            needs_user: Some(NeedsUser { where_: "submodule:A".into(), paths: vec!["A".into()], hint: "x".into(), at_commit: None }),
             plan: SyncPlan::default(),
+            resolved: vec![],
             bundles: vec![],
         };
         let json = serde_json::to_string(&st).unwrap();

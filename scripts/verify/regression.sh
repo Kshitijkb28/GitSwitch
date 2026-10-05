@@ -88,6 +88,9 @@ ok "returns a page of commits" "$(printf '%s' "$OUT" | jqf total)" "5"
 ok "  with graph lanes assigned" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print('lane' if 'lane' in d['commits'][0] else 'missing')")" "lane"
 OUT=$(probe sync "$R" "main")
 ok "sync reports ahead/behind against the upstream" "$(printf '%s' "$OUT" | jqf upstream)" "origin/main"
+git -C "$SB/clones/withsub/vendor/sub" fetch -q origin 2>/dev/null
+OUT=$(probe sync "$SB/clones/withsub/vendor/sub" "")
+ok "  a submodule's fetch age is read through its gitfile, not a missing .git folder" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);v=d.get('last_fetch_secs');print('known' if isinstance(v,int) else v)")" "known"
 
 section "Check GitHub (peek): what is new on the remote, without downloading"
 W="$SB/clones/plain"

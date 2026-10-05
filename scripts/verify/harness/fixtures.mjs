@@ -177,21 +177,29 @@ const SYNC_SUPER = {
   ahead: 2,
   behind: 3,
   own_commits: [
-    { oid: "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "1111111", subject: "local unrelated", touches: [] },
-    { oid: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "2222222", subject: "seal work", touches: ["A"] },
+    { oid: "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "1111111", subject: "local unrelated", touches: [], author_name: "Other", author_email: "o@example.test", date: "2026-09-23T10:30:00+02:00", only_pointers: false, already_upstream: false },
+    { oid: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "2222222", subject: "seal work", touches: ["A"], author_name: "Other", author_email: "o@example.test", date: "2026-09-23T10:30:00+02:00", only_pointers: false, already_upstream: false },
   ],
   incoming: [
-    { oid: "3333333aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "3333333", subject: "super: bump B", touches: ["B"] },
-    { oid: "4444444aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "4444444", subject: "super: upstream work", touches: [] },
-    { oid: "5555555aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "5555555", subject: "super: bump A", touches: ["A"] },
+    { oid: "3333333aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "3333333", subject: "super: bump B", touches: ["B"], author_name: "Other", author_email: "o@example.test", date: "2026-09-23T10:30:00+02:00", only_pointers: true, already_upstream: false },
+    { oid: "4444444aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "4444444", subject: "super: upstream work", touches: [], author_name: "Other", author_email: "o@example.test", date: "2026-09-23T10:30:00+02:00", only_pointers: false, already_upstream: false },
+    { oid: "5555555aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "5555555", subject: "super: bump A", touches: ["A"], author_name: "Other", author_email: "o@example.test", date: "2026-09-23T10:30:00+02:00", only_pointers: true, already_upstream: false },
   ],
   file_overlap: ["shared.txt"],
   dirty_count: 1,
   untracked: 1,
   will_stash: true,
   remedies: [],
+  base_short: "e81d1c5",
+  dirty_paths: ["README.md"],
+  more_incoming: 0,
+  more_own: 0,
   notes: [],
 };
+/** A commit as the sync engine lists it: who, what, when. */
+function commit(short, subject, author_name = "Other", author_email = "o@example.test", date = "2026-09-23T10:00:00+02:00", over = {}) {
+  return { oid: short.padEnd(40, "a"), short, subject, touches: [], author_name, author_email, date, only_pointers: false, already_upstream: false, ...over };
+}
 const SYNC_SUB_A = {
   path: "A", name: "A", action: "rebase",
   reason: "your 1 commit is rebased onto 7a9d38a when the superproject rebase stops on its pointer",
@@ -201,6 +209,9 @@ const SYNC_SUB_A = {
   dirty_tracked: 1, untracked: 1, fetch_error: null,
   notes: ["its 1 uncommitted change is stashed and re-applied around the rebase"],
   remedy: null,
+  incoming_commits: [commit("a2a2a2a", "A: upstream 2"), commit("a1a1a1a", "A: upstream 1")],
+  own_commits: [commit("a535d05", "A: my commit", "Me", "me@personal.test", "2026-09-22T18:00:00+02:00")],
+  has_nested: false,
 };
 const SYNC_SUB_B = {
   path: "B", name: "B", action: "fast-forward", reason: "moves forward to 3c3c3c3 (no commits of yours)",
@@ -208,6 +219,9 @@ const SYNC_SUB_B = {
   target: "3c3c3c3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", rebase_onto: null,
   predicted_gitlink_conflict: false, branch: "main", detached: false, reattach_to: null,
   dirty_tracked: 0, untracked: 0, fetch_error: null, notes: [], remedy: null,
+  incoming_commits: [commit("3c3c3c3", "B: upstream 1")],
+  own_commits: [],
+  has_nested: false,
 };
 export const SYNC_PLAN = {
   can_run: true,
@@ -272,7 +286,7 @@ export const SYNC_OUTCOME_UNRECORDED = {
 export const SYNC_PAUSED = {
   phase: "rebasing",
   started_at: "2026-09-23T12:00:00Z",
-  needs_user: { where_: "superproject", paths: ["shared.txt"], hint: "Resolve the conflicts listed on this page, stage them, then Continue update." },
+  needs_user: { where_: "superproject", paths: ["shared.txt"], hint: "Resolve the conflicts listed on this page, stage them, then Continue update.", at_commit: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
   root: "/repos/gitswitch",
   is_root: true,
   unresolved: 1,
@@ -282,7 +296,7 @@ export const SYNC_PAUSED = {
 };
 export const SYNC_PAUSED_IN_SUB = {
   ...SYNC_PAUSED,
-  needs_user: { where_: "submodule:A", paths: ["A.txt"], hint: "Rebasing A onto 7a9d38a stopped on a conflict inside it. Open it as its own repository, resolve and stage, then Continue update." },
+  needs_user: { where_: "submodule:A", paths: ["A.txt"], hint: "Rebasing A onto 7a9d38a stopped on a conflict inside it. Open it as its own repository, resolve and stage, then Continue update.", at_commit: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
   unresolved: 1,
 };
 

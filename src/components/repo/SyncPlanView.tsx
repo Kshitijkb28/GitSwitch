@@ -1,7 +1,8 @@
 import { AlertTriangle, XCircle } from "lucide-react";
 import { Button } from "../Button";
 import { Checkbox } from "../Checkbox";
-import type { SyncPlan, SyncSubPlan } from "../../lib/api";
+import type { SyncCommitRef, SyncPlan, SyncSubPlan } from "../../lib/api";
+import { formatWhen } from "../../lib/time";
 
 const short = (oid: string | null | undefined) => (oid ? oid.slice(0, 7) : "—");
 
@@ -21,6 +22,27 @@ export function actionLabel(s: SyncSubPlan): string {
     default:
       return s.action;
   }
+}
+
+/** One commit of the picture: who, what, when — and what it means for the update. */
+function CommitLine({ c }: { c: SyncCommitRef }) {
+  const when = c.date ? formatWhen(c.date) : null;
+  return (
+    <li className="flex flex-wrap items-baseline gap-x-2 min-w-0">
+      <span className="font-mono text-zinc-500 shrink-0">{c.short}</span>
+      <span className={`truncate min-w-0 ${c.already_upstream ? "text-zinc-500 line-through" : "text-zinc-300"}`}>{c.subject}</span>
+      {c.touches.length > 0 && <span className="text-zinc-500 shrink-0">moves {c.touches.join(", ")}</span>}
+      {c.only_pointers && <span className="text-[10px] px-1 rounded bg-zinc-800 text-zinc-500 shrink-0">pointer bump</span>}
+      {c.already_upstream && <span className="text-[10px] px-1 rounded bg-amber-500/15 text-amber-300 shrink-0">already upstream — dropped</span>}
+      {(c.author_name || when) && (
+        <span className="text-zinc-600 shrink-0" title={when?.title}>
+          {c.author_name}
+          {c.author_name && when ? " · " : ""}
+          {when?.text}
+        </span>
+      )}
+    </li>
+  );
 }
 
 /** The button a remedy code gets, if any. Keyed on the code, never on the sentence. */
@@ -148,18 +170,45 @@ export function SyncPlanView({ plan, stash, onStash, bundles, onBundles, busy, o
               {n}
             </p>
           ))}
-          {sup.own_commits.length > 0 && (
+          {(sup.dirty_paths?.length ?? 0) > 0 && (
             <details>
-              <summary className="cursor-pointer select-none hover:text-zinc-300">
-                Your {sup.own_commits.length} commit{sup.own_commits.length === 1 ? "" : "s"} that stay on top
-              </summary>
+              <summary className="cursor-pointer select-none hover:text-zinc-300">Which files are uncommitted</summary>
               <ul className="mt-1 space-y-0.5 font-mono">
-                {sup.own_commits.map((c) => (
-                  <li key={c.oid} className="truncate">
-                    {c.short} {c.subject}
-                    {c.touches.length > 0 && <span className="text-zinc-500"> · moves {c.touches.join(", ")}</span>}
+                {sup.dirty_paths.map((p) => (
+                  <li key={p} className="truncate">
+                    {p}
                   </li>
                 ))}
+              </ul>
+            </details>
+          )}
+          {sup.incoming.length > 0 && (
+            <details open>
+              <summary className="cursor-pointer select-none hover:text-zinc-300">
+                Coming in: {sup.incoming.length}
+                {(sup.more_incoming ?? 0) > 0 ? `+${sup.more_incoming}` : ""} commit{sup.incoming.length === 1 && !sup.more_incoming ? "" : "s"} from{" "}
+                {sup.upstream}
+              </summary>
+              <ul className="mt-1 space-y-0.5">
+                {sup.incoming.map((c) => (
+                  <CommitLine key={c.oid} c={c} />
+                ))}
+                {(sup.more_incoming ?? 0) > 0 && <li className="text-zinc-600">+{sup.more_incoming} more</li>}
+              </ul>
+            </details>
+          )}
+          {sup.own_commits.length > 0 && (
+            <details open>
+              <summary className="cursor-pointer select-none hover:text-zinc-300">
+                Your {sup.own_commits.length}
+                {(sup.more_own ?? 0) > 0 ? `+${sup.more_own}` : ""} commit{sup.own_commits.length === 1 && !sup.more_own ? "" : "s"} that stay on top
+                {sup.own_commits.some((c) => c.already_upstream) && <span className="text-zinc-500"> — except what upstream already has</span>}
+              </summary>
+              <ul className="mt-1 space-y-0.5">
+                {sup.own_commits.map((c) => (
+                  <CommitLine key={c.oid} c={c} />
+                ))}
+                {(sup.more_own ?? 0) > 0 && <li className="text-zinc-600">+{sup.more_own} more</li>}
               </ul>
             </details>
           )}
@@ -189,6 +238,29 @@ export function SyncPlanView({ plan, stash, onStash, bundles, onBundles, busy, o
                         {n}
                       </p>
                     ))}
+                    {(s.incoming_commits?.length ?? 0) > 0 && (
+                      <details className="mt-1">
+                        <summary className="cursor-pointer select-none text-zinc-500 hover:text-zinc-400">coming in: {s.incoming_commits.length}</summary>
+                        <ul className="mt-0.5 space-y-0.5">
+                          {s.incoming_commits.map((c) => (
+                            <CommitLine key={c.oid} c={c} />
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+                    {(s.own_commits?.length ?? 0) > 0 && (
+                      <details className="mt-1">
+                        <summary className="cursor-pointer select-none text-zinc-500 hover:text-zinc-400">yours: {s.own_commits.length}</summary>
+                        <ul className="mt-0.5 space-y-0.5">
+                          {s.own_commits.map((c) => (
+                            <CommitLine key={c.oid} c={c} />
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+                    {s.has_nested && (
+                      <p className="text-zinc-500">It has submodules of its own; Update does not go inside them — open it and Update there.</p>
+                    )}
                   </td>
                 </tr>
               ))}

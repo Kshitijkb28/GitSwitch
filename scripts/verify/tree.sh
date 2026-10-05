@@ -381,6 +381,10 @@ git -C "$W" switch -q main; printf 'MINE\n' > "$W/c.txt"; git -C "$W" commit -qa
 C_MINE="$(head_of "$W")"
 git -C "$W" merge -q cf >/dev/null 2>&1
 ok "the merge conflicts" "$(git -C "$W" status --porcelain -- c.txt)" "UU c.txt"
+OUT=$(probe stage "$W" "c.txt")
+ok "marking it resolved with the markers still in it is refused by name" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "c.txt still contains conflict markers (line 1)"
+ok "  and nothing was staged" "$(git -C "$W" ls-files -u c.txt | wc -l | tr -d ' ')" "3"
 OUT=$(probe tree_resolve_side "$W" "mine,c.txt")
 ok "Keep mine during a merge keeps my content" "$(cat "$W/c.txt")" "MINE"
 ok "  the result says what ran" "$(printf '%s' "$OUT" | jqf tree.mapping_note)" "Keep mine ran \`git checkout --ours\`"

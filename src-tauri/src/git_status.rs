@@ -219,7 +219,7 @@ pub fn parse_conflict_markers(text: &str) -> (Vec<ConflictHunk>, usize, bool) {
 pub async fn conflict_view(repo_path: &str, path: &str) -> Result<ConflictView, AppError> {
     let full = crate::git_ops::within_repo(repo_path, path)?;
     let bytes = std::fs::read(&full)?;
-    let sides = repo_status(repo_path)
+    let sides = Box::pin(repo_status(repo_path))
         .await?
         .operation
         .and_then(|o| o.sides)
@@ -1018,7 +1018,10 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
     // A rebase the superproject's update runs inside this submodule: "theirs"
     // is the commit upstream's superproject records for it, so it is named
     // that way — "origin/main's A (9f8e7d6)" — rather than by a bare id.
-    let sync = crate::sync::summary_for(&repo).await;
+    // Boxed: this future sits inside almost every operation's, and an inline
+    // copy of the summary's state machine pushed worker threads past their
+    // 2 MiB stacks.
+    let sync = Box::pin(crate::sync::summary_for(&repo)).await;
     if let (Some(op), Some(sy)) = (operation.as_mut(), sync.as_ref()) {
         if !sy.is_root && op.kind.starts_with("rebase") {
             if let (Some(sub), Some(target), Some(onto)) = (sy.sub_path.as_deref(), sy.sub_target.as_deref(), onto_oid.as_deref()) {

@@ -664,8 +664,8 @@ pub async fn changes_repair_push_block(repo_path: String) -> Result<PushState, A
 /// Stage the named files. Never "everything" by accident: an empty list is an
 /// error, and staging all is a separate command.
 #[tauri::command]
-pub async fn changes_stage(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
-    git_ops::stage(&repo_path, paths).await
+pub async fn changes_stage(repo_path: String, paths: Vec<String>, allow_markers: Option<bool>) -> Result<OpResult, AppError> {
+    git_ops::stage(&repo_path, paths, allow_markers.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -827,8 +827,8 @@ pub async fn changes_sync_run(
 
 /// Resume a paused sync after conflicts were resolved and staged.
 #[tauri::command]
-pub async fn changes_sync_continue(repo_path: String) -> Result<OpResult, AppError> {
-    crate::sync::sync_continue(&repo_path).await
+pub async fn changes_sync_continue(repo_path: String, allow_markers: Option<bool>) -> Result<OpResult, AppError> {
+    crate::sync::sync_continue(&repo_path, allow_markers.unwrap_or(false)).await
 }
 
 /// Undo a paused sync.
@@ -844,6 +844,10 @@ pub async fn changes_sync_abort(repo_path: String) -> Result<OpResult, AppError>
 #[tauri::command]
 pub async fn changes_open_path(repo_path: String, path: String, reveal: bool) -> Result<(), AppError> {
     let full = git_ops::within_repo(&repo_path, &path)?;
+    if !reveal && git_ops::opens_by_running(&full) {
+        // The system "open" would run it, not show it.
+        return Err(AppError::Command(format!("{} is a program, not a text file — Reveal it instead of opening it.", path)));
+    }
     let r = if reveal { tauri_plugin_opener::reveal_item_in_dir(&full) } else { tauri_plugin_opener::open_path(&full, None::<&str>) };
     r.map_err(|e| AppError::Command(format!("Could not open {}: {}", path, e)))
 }
@@ -862,8 +866,8 @@ pub async fn changes_record_pointers(repo_path: String) -> Result<OpResult, AppE
 
 /// Finish the operation in progress once its conflicts are staged.
 #[tauri::command]
-pub async fn changes_continue(repo_path: String) -> Result<OpResult, AppError> {
-    git_ops::continue_op(&repo_path).await
+pub async fn changes_continue(repo_path: String, allow_markers: Option<bool>) -> Result<OpResult, AppError> {
+    git_ops::continue_op(&repo_path, allow_markers.unwrap_or(false)).await
 }
 
 #[tauri::command]

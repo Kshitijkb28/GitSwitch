@@ -854,6 +854,35 @@ try {
     ok("  vendor/sub still was not touched", git(SUB, "rev-parse", "HEAD") === git(WORK, "rev-parse", "HEAD:vendor/sub"));
     ok("  and the card calls it clean again", await waitText(page, "up to date with what this repo records"));
   });
+
+  // -----------------------------------------------------------------------
+  await scenario("l. A conflict pauses the update; Keep mine resolves it; Continue update finishes with every check passed", async () => {
+    git(OTHER, "pull", "-q", "--ff-only");
+    write(`${OTHER}/c.txt`, "theirs again\n");
+    git(OTHER, "commit", "-qam", "theirs c again (live)");
+    git(OTHER, "push", "-q", "origin", "main");
+    write(`${WORK}/c.txt`, "mine again\n");
+    git(WORK, "commit", "-qam", "mine c again (live)");
+    const ownBefore = git(WORK, "rev-list", "--count", "origin/main..HEAD");
+    await openChanges();
+    ok("Preview update", await click(page, "Preview update"));
+    ok("  the plan warns that both sides changed c.txt", await waitText(page, "Both sides changed c.txt"));
+    ok("  and names who did what", (await text(page)).includes("theirs c again (live)") && (await text(page)).includes("Live"));
+    ok("Update now", await click(page, "Update now"));
+    ok("  the update pauses on the conflict", await waitText(page, "Update paused: conflicts to resolve."));
+    ok("  git: the rebase is stopped on c.txt", exists(`${WORK}/.git/rebase-merge`) && git(WORK, "diff", "--name-only", "--diff-filter=U") === "c.txt");
+    ok("  the conflict list names it with the sides", await waitText(page, "both modified"));
+    ok("  Continue update waits", (await buttonState(page, "Continue update"))?.disabled === true);
+    ok("Keep mine", await clickInRowWhen(page, "c.txt", { text: "Keep mine" }));
+    ok("  the page reports the file resolved", await waitText(page, "1 file(s) resolved."));
+    ok("  c.txt holds my content", fs.readFileSync(`${WORK}/c.txt`, "utf8") === "mine again\n");
+    ok("  Continue update is enabled once nothing is unmerged", await waitUntilAsync(async () => (await buttonState(page, "Continue update"))?.disabled === false));
+    ok("Continue update", await click(page, "Continue update"));
+    ok("  the page says Updated", await waitText(page, "Updated: "));
+    ok("  with every check passed — the resolved commit counts as on top", await waitText(page, "All 6 checks passed"));
+    ok("  git: my commits are on top of upstream's, nothing in progress, the state file gone", git(WORK, "rev-list", "--count", "origin/main..HEAD") === ownBefore && !exists(`${WORK}/.git/rebase-merge`) && !exists(`${WORK}/.git/gitswitch-sync.json`));
+    ok("  and c.txt is mine", git(WORK, "show", "HEAD:c.txt") === "mine again");
+  });
 } finally {
   await browser.close();
   server.close();

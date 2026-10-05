@@ -62,6 +62,8 @@ async function openPage(browser, server, scenario, opts = {}) {
     /** What Update now returns instead of the outcome (a refusal, say). */
     syncRunResult: opts.syncRunResult ?? null,
     conflictView: opts.conflictView ?? CONFLICT_VIEW,
+    /** What changes_stage answers unless markers are allowed. */
+    stageRefusal: opts.stageRefusal ?? null,
     submoduleStatuses: opts.submoduleStatuses ?? [],
     branches: opts.branches ?? BRANCHES,
     stashes: opts.stashes ?? [],
@@ -243,6 +245,9 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "changes_record_pointers":
               return done("Recorded 1 submodule pointer(s).");
             case "changes_stage":
+              if (cfg.stageRefusal && !args.allowMarkers)
+                return Promise.resolve({ ok: false, headline: cfg.stageRefusal.message, detail: "", refusal: cfg.stageRefusal, status: window.__SCENARIO__ });
+            // falls through
             case "changes_unstage":
             case "changes_discard":
             case "changes_abort":
@@ -823,6 +828,8 @@ try {
     ok("  file overlap is a warning, not a blocker", s1.includes("Both sides changed shared.txt") && (await button(page, "Update now")) !== null);
     ok("  Update now is enabled", !(await (await button(page, "Update now")).evaluate((b) => b.disabled)));
     ok("  what git will run is one click away", s1.includes("What git will run"));
+    ok("  the picture says who did what and when, and which commits are only pointer bumps", s1.includes("Coming in: 3") && s1.includes("Other") && s1.includes("2026-09-23") && s1.includes("pointer bump"));
+    ok("  and what the submodules bring in and own", s1.includes("coming in: 2") && s1.includes("yours: 1"));
     const c0 = await planCalls(page);
     ok("  opening the drawer assessed once, fetching, with stashing on", c0.length === 1 && c0[0].fetch === true && c0[0].stash === true);
     await stashBox(page);
@@ -1002,6 +1009,20 @@ try {
     ok("  and offers to go back to the parent", (await button(page, "Open gitswitch")) !== null);
     ok("  without a Continue update of its own", (await button(page, "Continue update")) === null);
     ok("  and names theirs as the parent's upstream's record for A", s.includes("origin/main's A (7a9d38a)"));
+    await page.close();
+  }
+  {
+    const refusal = { code: "conflict-markers", message: "shared.txt still contains conflict markers (lines 2, 6). Finish the edit, or Keep mine / Take theirs." };
+    const page = await open(SCENARIOS.syncPaused, { stageRefusal: refusal });
+    ok("Mark resolved on a file with its markers still in it", await clickInRow(page, "shared.txt", { title: "Mark resolved" }));
+    await page.waitForFunction(() => document.body.innerText.includes("still contains conflict markers"), { timeout: 4000 });
+    ok("  is refused by name, with the lines", (await text(page)).includes("shared.txt still contains conflict markers (lines 2, 6)"));
+    const anyway = await button(page, "Mark resolved anyway");
+    ok("  and offers to do it anyway", anyway !== null);
+    await anyway.click();
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_stage").length >= 2, { timeout: 4000 });
+    const calls = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_stage").map((c) => c.args));
+    ok("  which stages the same file with markers allowed", calls.length === 2 && calls[0].allowMarkers === false && calls[1].allowMarkers === true && calls[1].paths[0] === "shared.txt", JSON.stringify(calls));
     await page.close();
   }
 

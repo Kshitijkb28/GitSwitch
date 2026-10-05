@@ -100,6 +100,8 @@ export function ChangesTab({
   const [discardAllOpen, setDiscardAllOpen] = useState(false);
   const [tick, setTick] = useState(0);
   const [subRefresh, setSubRefresh] = useState(0);
+  /** The last operation a "conflict-markers" refusal can be retried from, markers allowed. */
+  const [lastOp, setLastOp] = useState<{ kind: "stage"; paths: string[] } | { kind: "continue" } | { kind: "update-continue" } | null>(null);
 
   const job = useGitJob(repoPath);
   const seq = useRef(0);
@@ -420,6 +422,20 @@ export function ChangesTab({
       }
     : null;
   const movedAction = result?.pull && (result.pull.submodules_moved ?? 0) > 0 ? { label: "Update…", onClick: onPreview, primary: true } : null;
+  // A file staged with its conflict markers still in it: the refusal names
+  // the lines, and whoever meant it (a marker-size setting, a file that really
+  // contains "<<<<<<<") says so once.
+  const markersAction =
+    result?.refusal?.code === "conflict-markers" && lastOp
+      ? {
+          label: lastOp.kind === "stage" ? "Mark resolved anyway" : lastOp.kind === "continue" ? "Continue anyway" : "Continue update anyway",
+          onClick: () => {
+            if (lastOp.kind === "stage") void apply("stage", () => api.changesStage(repoPath, lastOp.paths, true));
+            else if (lastOp.kind === "continue") void apply("continue", () => api.changesContinue(repoPath, true));
+            else void runLong("sync", "Continuing the update…", () => api.changesSyncContinue(repoPath, true));
+          },
+        }
+      : null;
 
   // The entries the discard confirmation describes: the parent's, or the submodule's.
   const confirmEntries = confirmDiscard?.target
@@ -512,7 +528,10 @@ export function ChangesTab({
               sync={status.sync}
               status={status}
               busy={anyBusy}
-              onContinue={() => runLong("sync", "Continuing the update…", () => api.changesSyncContinue(repoPath))}
+              onContinue={() => {
+                setLastOp({ kind: "update-continue" });
+                void runLong("sync", "Continuing the update…", () => api.changesSyncContinue(repoPath));
+              }}
               onAbort={() => runLong("sync", "Aborting the update…", () => api.changesSyncAbort(repoPath))}
               onOpenRoot={() => status.sync && openRepo(status.sync.root)}
               onHandOff={onGoToConflicts}
@@ -534,7 +553,10 @@ export function ChangesTab({
                     size="sm"
                     variant="primary"
                     disabled={anyBusy || status.conflicted_count > 0}
-                    onClick={() => apply("continue", () => api.changesContinue(repoPath))}
+                    onClick={() => {
+                      setLastOp({ kind: "continue" });
+                      void apply("continue", () => api.changesContinue(repoPath));
+                    }}
                     title={
                       status.conflicted_count > 0
                         ? "Resolve and stage every conflicted file first"
@@ -586,7 +608,7 @@ export function ChangesTab({
                 clearJob(repoPath);
               }}
               onRecordPointers={() => apply("record", () => api.changesRecordPointers(repoPath))}
-              extraAction={syncHandOff ?? movedAction ?? historyAction ?? publishAction}
+              extraAction={markersAction ?? syncHandOff ?? movedAction ?? historyAction ?? publishAction}
             />
           )}
 
@@ -599,7 +621,10 @@ export function ChangesTab({
                 status={status}
                 busy={anyBusy}
                 onOpen={setDiffFor}
-                onStage={(paths) => apply("stage", () => api.changesStage(repoPath, paths))}
+                onStage={(paths) => {
+                  setLastOp({ kind: "stage", paths });
+                  void apply("stage", () => api.changesStage(repoPath, paths));
+                }}
                 onUnstage={(paths) => apply("unstage", () => api.changesUnstage(repoPath, paths))}
                 onDiscard={(paths, variant) => setConfirmDiscard({ paths, variant })}
                 onResolveSide={(paths, side) =>

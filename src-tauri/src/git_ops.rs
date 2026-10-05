@@ -448,6 +448,35 @@ pub fn within_repo(repo_path: &str, path: &str) -> Result<PathBuf, AppError> {
     Ok(full)
 }
 
+/// Would the system's "open" run this path rather than show it? An
+/// executable bit, or a bundle / launcher type by extension. Such a path is
+/// revealed in the file manager, never opened.
+pub fn opens_by_running(path: &std::path::Path) -> bool {
+    const LAUNCHERS: &[&str] = &["app", "command", "tool", "pkg", "dmg", "scpt", "workflow", "exe", "bat", "cmd", "ps1", "msi", "jar", "sh", "bash", "zsh", "fish", "desktop", "run"];
+    let by_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| LAUNCHERS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    if by_ext {
+        return true;
+    }
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if meta.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
 pub fn validate_repo_path(p: &str) -> Result<(), AppError> {
     let bad = p.is_empty()
         || p.starts_with('/')
@@ -678,7 +707,63 @@ pub(crate) fn advice_ctx<'a>(status: &'a RepoStatus) -> AdviceCtx<'a> {
 
 // --- Staging -------------------------------------------------------------
 
-pub async fn stage(repo_path: &str, paths: Vec<String>) -> Result<OpResult, AppError> {
+/// Lines (1-based) that open a complete conflict group: seven `<` at the
+/// start, closed later by seven `>`. The marker size git writes by default;
+/// a repository with `conflict-marker-size` set is the "anyway" button's case.
+pub fn conflict_marker_lines(text: &str) -> Vec<usize> {
+    let is_marker = |line: &str, c: char| {
+        let m: String = std::iter::repeat_n(c, 7).collect();
+        line == m || line.starts_with(&(m + " "))
+    };
+    let mut lines = Vec::new();
+    let mut open: Option<usize> = None;
+    for (i, line) in text.lines().enumerate() {
+        if is_marker(line, '<') {
+            open = Some(i + 1);
+        } else if is_marker(line, '>') {
+            if let Some(o) = open.take() {
+                lines.push(o);
+            }
+        }
+    }
+    lines
+}
+
+/// The refusal for a file that still carries conflict markers.
+pub(crate) fn markers_refusal(path: &str, lines: &[usize]) -> Refusal {
+    refuse(
+        "conflict-markers",
+        format!(
+            "{} still contains conflict markers (line{} {}). Finish the edit, or Keep mine / Take theirs.",
+            path,
+            if lines.len() == 1 { "" } else { "s" },
+            lines.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+        ),
+    )
+}
+
+/// The first staged text file that still carries conflict markers, read from
+/// the index — what `rebase --continue` or a commit would record.
+pub(crate) async fn staged_marker_offence(repo: &std::path::Path) -> Option<(String, Vec<usize>)> {
+    let out = GitCmd::at(repo).args(["diff", "--cached", "--name-only", "-z", "--diff-filter=AM"]).run().await.ok()?;
+    if !out.ok() {
+        return None;
+    }
+    let names: Vec<String> = out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| String::from_utf8_lossy(p).to_string()).collect();
+    for name in names {
+        let Ok(blob) = GitCmd::at(repo).args(["show", &format!(":{}", name)]).run().await else { continue };
+        if !blob.ok() || blob.stdout.iter().take(8000).any(|b| *b == 0) {
+            continue;
+        }
+        let lines = conflict_marker_lines(&String::from_utf8_lossy(&blob.stdout));
+        if !lines.is_empty() {
+            return Some((name, lines));
+        }
+    }
+    None
+}
+
+pub async fn stage(repo_path: &str, paths: Vec<String>, allow_markers: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Stage, &StatusFacts::from(&before)) {
         return Ok(OpResult::refused(r, before));
@@ -689,6 +774,20 @@ pub async fn stage(repo_path: &str, paths: Vec<String>) -> Result<OpResult, AppE
         .filter(|e| e.kind == "conflicted" && paths.contains(&e.path))
         .map(|e| e.path.clone())
         .collect();
+    // "Mark resolved" on a file whose markers are still in it would stage the
+    // markers as the resolution. Refuse by name; the page offers "anyway".
+    if !allow_markers {
+        for p in &conflicted_before {
+            let Ok(bytes) = std::fs::read(std::path::Path::new(repo_path).join(p)) else { continue };
+            if bytes.iter().take(8000).any(|b| *b == 0) {
+                continue;
+            }
+            let lines = conflict_marker_lines(&String::from_utf8_lossy(&bytes));
+            if !lines.is_empty() {
+                return Ok(OpResult::refused(markers_refusal(p, &lines), before));
+            }
+        }
+    }
 
     let stdin = pathspec_stdin(&paths)?;
     let out = GitCmd::at(repo_path)
@@ -2019,10 +2118,17 @@ async fn staged_is_empty(repo_path: &str) -> bool {
 /// --continue`, `revert --continue`, `am --continue`, or the commit that
 /// concludes a merge. A pick that became empty after the resolution is
 /// skipped (git would refuse to continue it) and the result says so.
-pub async fn continue_op(repo_path: &str) -> Result<OpResult, AppError> {
+pub async fn continue_op(repo_path: &str, allow_markers: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Continue, &StatusFacts::from(&before)) {
         return Ok(OpResult::refused(r, before));
+    }
+    // What is staged is what the continue records: markers left in a staged
+    // file would be committed as the resolution.
+    if !allow_markers {
+        if let Some((file, lines)) = staged_marker_offence(std::path::Path::new(repo_path)).await {
+            return Ok(OpResult::refused(markers_refusal(&file, &lines), before));
+        }
     }
     let op = before.operation.clone().unwrap();
     let cmd = op.continue_command.clone().unwrap_or_default();
@@ -2612,6 +2718,38 @@ mod tests {
     #[test]
     fn continue_needs_an_operation_a_continue_command_and_no_conflicts() {
         assert_eq!(check(&Intent::Continue, &clean()).unwrap().code, "nothing-to-continue");
+    }
+
+    #[test]
+    fn programs_are_revealed_never_opened() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, "hello").unwrap();
+        assert!(!opens_by_running(&text));
+        assert!(opens_by_running(&dir.join("Installer.pkg")));
+        assert!(opens_by_running(&dir.join("run.command")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let exe = dir.join("tool");
+            std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(opens_by_running(&exe));
+        }
+        assert!(!opens_by_running(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conflict_markers_are_found_by_complete_group_only() {
+        let text = "a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> theirs\nb\n<<<<<<< ours\nunfinished\n";
+        assert_eq!(conflict_marker_lines(text), vec![2]);
+        assert!(conflict_marker_lines("=======\n<<<<<<<<\nnot markers\n").is_empty());
+        assert!(conflict_marker_lines("clean\n").is_empty());
+        let r = markers_refusal("shared.txt", &[3, 12]);
+        assert_eq!(r.code, "conflict-markers");
+        assert!(r.message.contains("shared.txt still contains conflict markers (lines 3, 12)"));
         let bisect = StatusFacts {
             operation: Some("bisect".into()),
             abort_command: Some("git bisect reset".into()),
