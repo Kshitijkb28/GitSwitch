@@ -40,7 +40,7 @@ fn https_to_ssh(url: &str) -> Option<String> {
 
 fn get_origin(dir: &Path) -> Option<String> {
     let started = std::time::Instant::now();
-    let out = std::process::Command::new("git")
+    let out = crate::spawn::command("git")
         .args(["-C", &dir.to_string_lossy(), "remote", "get-url", "origin"])
         .output()
         .ok()?;
@@ -69,7 +69,7 @@ fn convert_one(dir: &Path) -> Option<RemoteChange> {
     match https_to_ssh(&old_url) {
         Some(ssh) => {
             let started = std::time::Instant::now();
-            let set = std::process::Command::new("git")
+            let set = crate::spawn::command("git")
                 .args(["-C", &repo, "remote", "set-url", "origin", &ssh])
                 .output();
             if let Ok(o) = &set {

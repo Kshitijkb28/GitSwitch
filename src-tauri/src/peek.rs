@@ -54,7 +54,7 @@ pub fn github_slug(url: &str) -> Option<(String, String)> {
 
 async fn github_compare(owner: &str, repo: &str, base: &str, head: &str) -> Option<usize> {
     let client = crate::github::http_client().ok()?;
-    let api = std::env::var("GITSWITCH_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into());
+    let api = crate::remote_repos::api_base();
     for account in crate::remote_repos::accounts().await {
         let Ok(token) = crate::remote_repos::token_for(&account.key).await else { continue };
         let resp = client

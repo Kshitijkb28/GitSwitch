@@ -773,7 +773,10 @@ async fn read_identity(repo: &Path, hooks: &Path) -> RepoIdentity {
 
     let repo_str = crate::paths::norm(&repo.to_string_lossy());
     let store = profiles::load_profiles().unwrap_or_else(|_| profiles::ProfileStore::new());
-    let profile = crate::commit_audit::owning_profile(&repo_str, &store.profiles);
+    // By folder first; else by the include file git actually read the email
+    // from, which is how a remote rule's clone outside every folder is known.
+    let profile = crate::commit_audit::owning_profile(&repo_str, &store.profiles)
+        .or_else(|| email_origin.as_deref().and_then(|o| profiles::profile_for_include_origin(o, &store.profiles)));
 
     let matches_profile = match profile {
         Some(p) => p.git_email.trim().eq_ignore_ascii_case(email.trim()),
@@ -1005,12 +1008,29 @@ pub(crate) fn owning_profile_id(repo_path: &str) -> Option<String> {
     crate::commit_audit::owning_profile(&repo, &store.profiles).map(|p| p.id.clone())
 }
 
+/// The profile that applies to this repository: by folder, else the one whose
+/// include file git read `user.email` from (a remote rule's clone).
+pub(crate) async fn profile_for_repo(repo_path: &str) -> Option<profiles::Profile> {
+    let store = profiles::load_profiles().ok()?;
+    let repo = crate::paths::norm(repo_path);
+    if let Some(p) = crate::commit_audit::owning_profile(&repo, &store.profiles) {
+        return Some(p.clone());
+    }
+    let origin = GitCmd::at(repo_path)
+        .args(["config", "--show-origin", "--get", "user.email"])
+        .ok_text()
+        .await?;
+    let file = origin.split('\t').next()?.trim().trim_start_matches("file:");
+    profiles::profile_for_include_origin(file, &store.profiles).cloned()
+}
+
 /// Push state on its own, for the toggle — resolves the hooks directory the
 /// same way `repo_status` does.
 pub async fn push_state_for(repo_path: &str) -> Result<crate::push_guard::PushState, AppError> {
     let repo = PathBuf::from(repo_path);
     let paths = git_paths(&repo).await?;
-    Ok(crate::push_guard::push_state(&repo, &paths.hooks, owning_profile_id(repo_path).as_deref()).await)
+    let profile_id = profile_for_repo(repo_path).await.map(|p| p.id);
+    Ok(crate::push_guard::push_state(&repo, &paths.hooks, profile_id.as_deref()).await)
 }
 
 pub async fn repair_push_block_for(repo_path: &str) -> Result<crate::push_guard::PushState, AppError> {

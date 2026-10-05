@@ -127,11 +127,23 @@ function serialised(fn) {
 /** Everything the page asks for. Two shims (see the header); the rest is the real backend. */
 async function onInvoke(cmd, args) {
   if (cmd === "history_list_repos") return { ok: true, value: [REPO_REF] };
+  // Who would push depends on this machine's keys and on github.com answering;
+  // the sandbox remote is a local path anyway, which is what the real backend says.
+  if (cmd === "changes_push_identity") {
+    return { ok: true, value: { remote: "origin", url: WORK, via: "local", login: null, key_path: null, host: null, account: null, expected_login: null, detail: "The remote is a local path; no account is involved." } };
+  }
   if (cmd === "get_profiles") {
     const r = await serialised(() => probeInvoke(cmd, args));
     return r.ok ? r : { ok: true, value: [] };
   }
-  return serialised(() => probeInvoke(cmd, args));
+  const r = await serialised(() => probeInvoke(cmd, args));
+  // A command the probe does not forward comes back as an ordinary error and
+  // the page shows its fallback — which would pass every assertion about the
+  // fallback. Name it instead.
+  if (r && r.ok === false && /unknown command/.test(String(r.error))) {
+    ok(`the probe forwards ${cmd} (src-tauri/src/probe.rs)`, false, r.error);
+  }
+  return r;
 }
 
 // ---------------------------------------------------------------------------

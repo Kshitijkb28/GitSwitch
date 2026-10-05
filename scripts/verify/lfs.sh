@@ -60,6 +60,40 @@ ok "status says it doesn't use LFS" "$(printf '%s' "$OUT" | jqf uses_lfs)" "Fals
 OUT=$(probe lfs_pull "$SB/plain")
 ok "pull is refused by name, not by a git error" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-lfs"
 
+section "A switch in a complete repository brings its large files along"
+# Left to itself git downloads large files INSIDE the switch, through the
+# smudge filter, on a 180s clock with nothing moving on screen. The app makes
+# the switch write pointer stubs instantly and downloads afterwards on the
+# large-file clock — and when everything was present before, everything is
+# present after.
+git -C "$SB/author" switch -q -c lfs-branch
+head -c 3072 /dev/urandom > "$SB/author/branch-only.bin"
+git -C "$SB/author" add -A >/dev/null; git -C "$SB/author" commit -qm "a large file only this branch has"; git -C "$SB/author" push -q origin lfs-branch 2>/dev/null
+git -C "$SB/author" switch -q main
+cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" switcher 2>/dev/null
+probe lfs_pull "$SB/switcher" >/dev/null
+ok "the clone starts complete" "$(probe lfs_status "$SB/switcher" | jqf pointers)" "0"
+# A local branch to switch to (the app refuses to guess at a remote-only name).
+git -C "$SB/switcher" branch -q lfs-branch origin/lfs-branch
+OUT=$(probe tree_branch_switch "$SB/switcher" "lfs-branch")
+ok "the switch succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  and says it downloaded the branch's large file" "$(printf '%s' "$OUT" | jqf detail)" "Downloaded 1 LFS file."
+ok "  which really is content, not a stub" "$(wc -c < "$SB/switcher/branch-only.bin" | tr -d ' ')" "3072"
+ok "  the whole repository is still complete" "$(probe lfs_status "$SB/switcher" | jqf pointers)" "0"
+OUT=$(probe tree_branch_switch "$SB/switcher" "main")
+ok "switching back needs no download and says nothing about one" "$(printf '%s' "$OUT" | jqf detail | grep -c "LFS" || true)" "0"
+
+section "A switch in a deliberately partial repository stays partial, and says so"
+cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" partial 2>/dev/null
+git -C "$SB/partial" branch -q lfs-branch origin/lfs-branch
+probe lfs_pull_paths "$SB/partial" "model.bin" >/dev/null
+ok "one of two files was downloaded on purpose" "$(probe lfs_status "$SB/partial" | jqf pointers)" "1"
+OUT=$(probe tree_branch_switch "$SB/partial" "lfs-branch")
+ok "the switch succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  the new large file is a stub, like the one left out before" "$(printf '%s' "$OUT" | jqf detail)" "2 LFS files here are a pointer stub"
+ok "  no download was forced on a partial checkout" "$([ "$(wc -c < "$SB/partial/branch-only.bin" | tr -d ' ')" -lt 200 ] && echo stub || echo content)" "stub"
+ok "  and what was downloaded before is still here" "$(wc -c < "$SB/partial/model.bin" | tr -d ' ')" "4096"
+
 section "git-lfs missing from this machine"
 # git-lfs is a separate binary git finds via PATH. Every PATH directory that
 # holds one is replaced by a shadow directory linking to everything else in

@@ -18,6 +18,10 @@ pub const NET_TIMEOUT: Duration = Duration::from_secs(180);
 pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Reads: status, config, rev-parse, diff.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a timed-out command gets to leave on its own after SIGTERM —
+/// enough for git to remove its `index.lock` and for git-lfs to finish the
+/// object it is writing — before SIGKILL.
+pub const KILL_GRACE: Duration = Duration::from_secs(5);
 /// Git LFS transfers: a repository's large files can be many gigabytes, and a
 /// download that is still making progress must not be killed for taking longer
 /// than an ordinary fetch. Progress is reported separately, so a genuinely
@@ -101,6 +105,9 @@ pub struct GitCmd {
     stdin: Option<Vec<u8>>,
     env: Vec<(String, String)>,
     timeout: Duration,
+    /// False for a command whose output is a credential (`credential fill`):
+    /// the log keeps the command and its exit code, never what it printed.
+    log_output: bool,
 }
 
 impl GitCmd {
@@ -115,7 +122,14 @@ impl GitCmd {
             stdin: None,
             env: Vec::new(),
             timeout: READ_TIMEOUT,
+            log_output: true,
         }
+    }
+
+    /// Keep this command's output out of the command log altogether.
+    pub fn private_output(mut self) -> Self {
+        self.log_output = false;
+        self
     }
 
     /// Run a specific git binary instead of the first on PATH — the push lock
@@ -229,7 +243,7 @@ impl GitCmd {
         let where_ = self.repo.clone().unwrap_or_else(|| PathBuf::from("."));
         let started = std::time::Instant::now();
 
-        let mut cmd = tokio::process::Command::new(program);
+        let mut cmd = crate::spawn::async_command(program);
         if let Some(dir) = &self.repo {
             cmd.arg("-C").arg(dir);
         }
@@ -297,50 +311,73 @@ impl GitCmd {
             }
         }
 
+        // On Windows the child's descendants are reached through a Job Object;
+        // on unix through the process group set up above.
+        #[cfg(windows)]
+        let job = crate::spawn::JobObject::adopt(&child);
+
+        // Both pipes are drained while waiting — so a chatty command can never
+        // block on a full pipe, and so what it said before a timeout is kept
+        // for the log and the error instead of being thrown away.
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let drain = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut o = Vec::new();
+            let mut e = Vec::new();
+            let read_o = async {
+                if let Some(mut p) = stdout_pipe {
+                    let _ = p.read_to_end(&mut o).await;
+                }
+            };
+            let read_e = async {
+                if let Some(mut p) = stderr_pipe {
+                    let _ = p.read_to_end(&mut e).await;
+                }
+            };
+            tokio::join!(read_o, read_e);
+            (o, e)
+        });
+
         let secs = self.timeout.as_secs();
-        #[cfg(unix)]
-        let pid = child.id();
-        let out = match tokio::time::timeout(self.timeout, child.wait_with_output()).await {
+        let status = match tokio::time::timeout(self.timeout, child.wait()).await {
             Ok(result) => result.map_err(|e| AppError::Command(format!("git {} failed: {}", sub, e)))?,
             Err(_) => {
-                // Kill the group, not just git: see `process_group` above.
-                #[cfg(unix)]
-                if let Some(pid) = pid {
-                    unsafe {
-                        libc::kill(-(pid as i32), libc::SIGKILL);
-                    }
+                #[cfg(windows)]
+                if let Some(j) = &job {
+                    j.terminate();
                 }
+                terminate_tree(&mut child).await;
+                // The pipes close as the tree dies; a short cap in case a
+                // process outside both the group and the job holds one open.
+                let (o, e) = tokio::time::timeout(Duration::from_secs(2), drain)
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default();
+                let partial = String::from_utf8_lossy(&e).trim().to_string();
                 let why = if sub == "lfs" {
                     format!("killed after {}s without finishing", secs)
                 } else {
                     format!("timed out after {}s", secs)
                 };
-                crate::cmdlog::record(&where_, argv, -9, started.elapsed(), "", &why);
-                return Err(AppError::Command(if sub == "lfs" {
-                    format!(
-                        "The large-file download was stopped after {}s without finishing. Whatever already arrived is kept, so running it again continues rather than starting over.",
-                        secs
-                    )
-                } else {
-                    format!(
-                        "git {} timed out after {}s — the remote may be unreachable, or another git process is holding a lock",
-                        sub, secs
-                    )
-                }));
+                let logged = if partial.is_empty() { why.clone() } else { format!("{}\n{}", why, partial) };
+                crate::cmdlog::record(&where_, argv, -9, started.elapsed(), &String::from_utf8_lossy(&o), &logged);
+                return Err(AppError::Command(timeout_message(&sub, self.timeout, &partial)));
             }
         };
 
-        let code = out.status.code().unwrap_or(-1);
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        crate::cmdlog::record(
-            &where_,
-            argv,
-            code,
-            started.elapsed(),
-            &String::from_utf8_lossy(&out.stdout),
-            &stderr,
-        );
-        Ok(GitOutput { code, stdout: out.stdout, stderr })
+        let (stdout, stderr) = drain
+            .await
+            .map_err(|e| AppError::Command(format!("git {}: reading its output failed: {}", sub, e)))?;
+        let code = status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+        if self.log_output {
+            crate::cmdlog::record(&where_, argv, code, started.elapsed(), &String::from_utf8_lossy(&stdout), &stderr);
+        } else {
+            crate::cmdlog::record(&where_, argv, code, started.elapsed(), "(output not logged: it is a credential)", &stderr);
+        }
+        Ok(GitOutput { code, stdout, stderr })
     }
 
     /// Run and fail on a non-zero exit, with the same error shape the rest of
@@ -372,12 +409,70 @@ impl GitCmd {
     }
 }
 
+/// Stop a child and everything it started. A polite SIGTERM to the process
+/// group first, a short wait for it to clean up, then SIGKILL for whatever
+/// ignored it. SIGKILL straight away was how a stopped command left an
+/// `index.lock` behind — and the next command then reported "another git
+/// process is holding a lock" about a process the app itself had killed.
+/// On Windows `kill()` is `TerminateProcess` on git alone; the Job Object
+/// taken out at spawn has already ended its descendants.
+async fn terminate_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let group = -(pid as i32);
+        // SAFETY: a signal to a process group this process created.
+        unsafe {
+            libc::kill(group, libc::SIGTERM);
+        }
+        let left_on_its_own = tokio::time::timeout(KILL_GRACE, child.wait()).await.is_ok();
+        // The leader may have gone while a grandchild lingers: insist on the
+        // whole group either way. ESRCH (nobody left) is the good outcome.
+        unsafe {
+            libc::kill(group, libc::SIGKILL);
+        }
+        if left_on_its_own {
+            return;
+        }
+    }
+    let _ = child.kill().await;
+}
+
+/// Why a command was stopped, in the words of the class it belongs to: a
+/// command given a network timeout was most likely waiting on the remote; a
+/// local one on a lock or on the size of the repository. The old wording
+/// blamed the remote for a `git status` that never touched one.
+fn timeout_message(sub: &str, timeout: Duration, partial_stderr: &str) -> String {
+    let secs = timeout.as_secs();
+    if sub == "lfs" {
+        return format!(
+            "The large-file download was stopped after {}s without finishing. Whatever already arrived is kept, so running it again continues rather than starting over.",
+            secs
+        );
+    }
+    let likely = if timeout >= NET_TIMEOUT {
+        "the remote may be unreachable, or the connection very slow"
+    } else {
+        "another git process may be holding a lock, or the repository is very large"
+    };
+    let mut m = format!("git {} was stopped after {}s without finishing — {}.", sub, secs, likely);
+    if let Some(last) = partial_stderr.lines().rev().find(|l| !l.trim().is_empty()) {
+        m.push_str(&format!(" It had got as far as: {}", last.trim()));
+    }
+    m
+}
+
 /// A git remote name we are willing to pass to git. Rejects anything that could
 /// be read as an option or a path.
 pub fn validate_remote_name(name: &str) -> Result<(), AppError> {
+    // A slash inside the name is legal to git (`git remote add team/gh …`),
+    // and refusing it silently left such a remote out of the push guard's
+    // rewrite list. Leading, trailing or doubled slashes are still not names.
     let bad = name.is_empty()
         || name.starts_with('-')
-        || name.contains(['/', '\\', ' ', '\t', '\n', ':', '?', '*', '[', '~', '^'])
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.contains("//")
+        || name.contains(['\\', ' ', '\t', '\n', ':', '?', '*', '[', '~', '^'])
         || name.contains("..");
     if bad {
         return Err(AppError::Command(format!(
@@ -436,7 +531,8 @@ mod tests {
     fn remote_names_that_could_be_options_or_paths_are_rejected() {
         assert!(validate_remote_name("origin").is_ok());
         assert!(validate_remote_name("up-stream2").is_ok());
-        for bad in ["", "--upload-pack=x", "-o", "a/b", "a b", "a..b", "a:b"] {
+        assert!(validate_remote_name("team/gh").is_ok(), "git itself accepts a slash in a remote name");
+        for bad in ["", "--upload-pack=x", "-o", "/a", "a/", "a//b", "a b", "a..b", "a:b"] {
             assert!(
                 validate_remote_name(bad).is_err(),
                 "{} should be rejected",
@@ -469,7 +565,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gitswitch-pgroup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let init = std::process::Command::new("git").arg("init").arg("-q").arg(&dir).output();
+        let init = crate::spawn::command("git").arg("init").arg("-q").arg(&dir).output();
         match init {
             Ok(o) if o.status.success() => {}
             // No usable git on this machine: there is nothing to prove here.

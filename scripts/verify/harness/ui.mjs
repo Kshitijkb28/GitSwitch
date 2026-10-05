@@ -68,6 +68,9 @@ async function openPage(browser, server, scenario, opts = {}) {
     treeReset: TREE_RESET_OUTCOME,
     stashDrop: STASH_DROP_OUTCOME,
     branchDelete: BRANCH_DELETE_OUTCOME,
+    latency: Number(opts.latency ?? process.env.UI_LATENCY ?? 0) || 0,
+    /** Who a push would authenticate as; null → the default fixture. */
+    pushIdentity: opts.pushIdentity ?? null,
   };
   const page = await browser.newPage();
   await page.setViewport({ width: cfg.width, height: 900 });
@@ -97,7 +100,16 @@ async function openPage(browser, server, scenario, opts = {}) {
           (window.__CHANNELS__ = window.__CHANNELS__ || {})[id] = callback;
           return id;
         },
+        // UI_LATENCY=<ms> delays every answer: a mock that answers in the same
+        // tick hides exactly the races a real backend produces (a result for a
+        // repository the page has since left, a request cancelled by the state
+        // it set). The default is instant, as before.
         invoke: (cmd, args) => {
+          const answer = window.__TAURI_INTERNALS__.answer(cmd, args);
+          if (!cfg.latency) return answer;
+          return new Promise((res, rej) => setTimeout(() => Promise.resolve(answer).then(res, rej), cfg.latency));
+        },
+        answer: (cmd, args) => {
           window.__CALLS__.push({ cmd, args });
           // Forcing a delete is the answer to its own refusal, so it goes through.
           const refusal = cfg.refuse[cmd];
@@ -126,6 +138,10 @@ async function openPage(browser, server, scenario, opts = {}) {
             }
             case "changes_submodule_statuses":
               return Promise.resolve(cfg.submoduleStatuses);
+            case "changes_push_identity":
+              return Promise.resolve(cfg.pushIdentity ?? { remote: "origin", url: "git@github.com:octo-work/gitswitch.git", via: "ssh-key", login: "octo-work", key_path: "/Users/me/.ssh/id_work", host: "github.com", account: null, expected_login: null, detail: "github.com accepted the key id_work." });
+            case "history_head":
+              return Promise.resolve({ branch: window.__SCENARIO__.branch, detached: window.__SCENARIO__.detached, unborn: window.__SCENARIO__.unborn });
             case "history_branches":
               return Promise.resolve(cfg.branches);
             case "changes_stash_list":
@@ -1442,12 +1458,42 @@ try {
   }
 
   // -----------------------------------------------------------------
+  section("Who would push: the account is shown before anything is sent");
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.waitForFunction(() => document.body.innerText.includes("Pushes as"), { timeout: 4000 });
+    const s = await text(page);
+    ok("the card says which account a push would use", s.includes("Pushes as @octo-work"));
+    ok("  and through which key", s.includes("key id_work"));
+    ok("  with no warning when the profile does not say otherwise", !s.includes("would go as"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean, {
+      pushIdentity: { remote: "origin", url: "git@github.com:octo-home/x.git", via: "ssh-key", login: "octo-work", key_path: "/Users/me/.ssh/id_work", host: "github.com", account: null, expected_login: "octo-home", detail: "" },
+    });
+    await page.waitForFunction(() => document.body.innerText.includes("would go as"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a push that would go as another account than the profile's is called out", s.includes("profile is @octo-home") && s.includes("would go as @octo-work"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean, {
+      pushIdentity: { remote: "origin", url: "https://github.com/acme/x.git", via: "https-credential", login: null, key_path: null, host: "github.com", account: null, expected_login: null, detail: "No credential is stored for github.com." },
+    });
+    await page.waitForFunction(() => document.body.innerText.includes("Can't tell who would push"), { timeout: 4000 });
+    ok("when the account can't be told, the reason is shown", (await text(page)).includes("No credential is stored"));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
   section("Git LFS: browsing the files and downloading part of them");
   {
     const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS });
     await page.waitForFunction(() => document.body.innerText.includes("Git LFS"), { timeout: 4000 });
     await (await button(page, "Browse files…")).click();
-    await page.waitForFunction(() => document.body.innerText.includes("Large files"), { timeout: 4000 });
+    // The dialog opens before its listing arrives; wait for the listing.
+    await page.waitForFunction(() => document.body.innerText.includes("in total"), { timeout: 4000 });
     const s = await text(page);
     ok("the browser opens with the totals in words", s.includes("5 files · 3.0 GB in total"));
     ok("  and says how much is still to come", s.includes("4 still to download (3.0 GB)"));

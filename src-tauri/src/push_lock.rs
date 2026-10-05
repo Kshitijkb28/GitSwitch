@@ -216,10 +216,22 @@ pub fn layout() -> Option<Layout> {
 /// Homebrew put first on PATH is deliberately not it.
 pub fn system_git() -> PathBuf {
     if cfg!(target_os = "macos") {
-        let p = PathBuf::from("/usr/bin/git");
-        if p.exists() {
-            return p;
-        }
+        // /usr/bin/git is Apple's forwarding stub: every call asks xcrun where
+        // the real git lives (tens of milliseconds, and the "install the
+        // developer tools" dialog when there is none). Resolve it once.
+        static REAL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        return REAL
+            .get_or_init(|| {
+                let found = crate::spawn::command("/usr/bin/xcrun")
+                    .args(["--find", "git"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+                    .filter(|p| p.is_absolute() && p.is_file());
+                found.unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+            })
+            .clone();
     }
     if cfg!(windows) {
         if let Some(install) = windows_install_path() {
@@ -301,10 +313,15 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// Owned by the administrator and not group- or world-writable — or, under a
-/// test root, owned by the user running the suite.
-fn trusted_owner(m: &fs::Metadata) -> bool {
+/// test root, owned by the user running the suite. On Windows this is the
+/// helper's own check (lock-core's `win`): Administrators, SYSTEM or
+/// TrustedInstaller as owner, and no write right for a low-privilege group in
+/// the DACL. It used to answer `true` unconditionally there, which made every
+/// lock measurement on Windows a statement of faith.
+fn trusted_owner(path: &Path, m: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
+        let _ = path;
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no preconditions.
         let me = unsafe { libc::geteuid() };
@@ -314,9 +331,17 @@ fn trusted_owner(m: &fs::Metadata) -> bool {
         };
         owner_ok && m.mode() & 0o022 == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         let _ = m;
+        match test_root() {
+            Some(_) => true,
+            None => lc::win::admin_owned(path) && !lc::win::loosely_writable(path),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, m);
         true
     }
 }
@@ -360,7 +385,13 @@ fn sha256_of_file(p: &Path) -> Option<String> {
 /// The sidecar shipped next to the app executable (one level up for the test
 /// binaries, which live in `target/debug/deps`).
 pub fn bundled_helper_path() -> Option<PathBuf> {
-    let name = if cfg!(windows) { format!("{}.exe", lc::HELPER_BIN_NAME) } else { lc::HELPER_BIN_NAME.to_string() };
+    bundled_sidecar_path(lc::HELPER_BIN_NAME)
+}
+
+/// A sidecar Tauri placed beside the app's executable — or one level up, in a
+/// development tree.
+pub fn bundled_sidecar_path(name: &str) -> Option<PathBuf> {
+    let name = if cfg!(windows) { format!("{}.exe", name) } else { name.to_string() };
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let direct = dir.join(&name);
@@ -424,11 +455,11 @@ pub fn read_registry(layout: &Layout) -> RegistryRead {
     if meta.file_type().is_symlink() || !meta.is_file() {
         return RegistryRead::Untrusted(format!("{} is not a regular file", path.display()));
     }
-    if !trusted_owner(&meta) {
+    if !trusted_owner(path, &meta) {
         return RegistryRead::Untrusted(format!("{} is not owned by the administrator", path.display()));
     }
     if let Ok(dm) = fs::symlink_metadata(&layout.registry_dir) {
-        if dm.file_type().is_symlink() || !trusted_owner(&dm) {
+        if dm.file_type().is_symlink() || !trusted_owner(&layout.registry_dir, &dm) {
             return RegistryRead::Untrusted(format!("{} is not an administrator-only directory", layout.registry_dir.display()));
         }
     }
@@ -459,7 +490,7 @@ fn measure_helper(layout: &Layout, reg: Option<&Registry>) -> HelperMeasure {
         Ok(m) => m,
         Err(_) => return HelperMeasure { state: "missing".into(), installed_sha: None, bundled_sha },
     };
-    if m.file_type().is_symlink() || !m.is_file() || !trusted_owner(&m) {
+    if m.file_type().is_symlink() || !m.is_file() || !trusted_owner(&layout.helper_path, &m) {
         return HelperMeasure { state: "untrusted".into(), installed_sha: None, bundled_sha };
     }
     let installed_sha = sha256_of_file(&layout.helper_path);
@@ -485,8 +516,7 @@ fn measure_remote_helper(layout: &Layout, installed_sha: Option<&str>, vouched_s
     let link = &layout.remote_helper_path;
     let dir_ok = link
         .parent()
-        .and_then(|d| fs::symlink_metadata(d).ok())
-        .map(|m| trusted_owner(&m))
+        .and_then(|d| fs::symlink_metadata(d).ok().map(|m| trusted_owner(d, &m)))
         .unwrap_or(false);
     match fs::symlink_metadata(link) {
         Err(_) => "missing".into(),
@@ -792,7 +822,7 @@ async fn job_system_gitconfig(platform: Platform) -> String {
     // Ask the system git where its system scope lives; the answer may be a
     // distribution-specific path.
     let started = std::time::Instant::now();
-    let out = tokio::process::Command::new(system_git())
+    let out = crate::spawn::async_command(system_git())
         .args(["config", "--system", "--show-origin", "--list"])
         .env_remove("GIT_CONFIG_NOSYSTEM")
         .output()
@@ -1180,7 +1210,7 @@ fn upgrade_op() -> Option<Op> {
 }
 
 fn bundled_version() -> Option<String> {
-    let out = std::process::Command::new(bundled_helper_path()?).arg("--version").output().ok()?;
+    let out = crate::spawn::command(bundled_helper_path()?).arg("--version").output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     s.split_whitespace().nth(1).map(|v| v.to_string())
 }

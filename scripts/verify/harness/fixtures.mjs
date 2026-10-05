@@ -654,6 +654,7 @@ export const LFS_POINTERS = {
   version: "git-lfs/3.8.0",
   uses_lfs: true,
   filters_configured: false,
+  install_hint: "brew install git-lfs",
   tracked: 5,
   pointers: 5,
   pointer_paths: [
@@ -673,6 +674,7 @@ export const LFS_LISTING = {
   version: "git-lfs/3.8.0",
   uses_lfs: true,
   filters_configured: true,
+  install_hint: "brew install git-lfs",
   files: [
     { path: "model.bin", dir: "", size: 4096, present: true, downloaded: true },
     { path: "media/video/clip.bin", dir: "media/video", size: 3221225472, present: false, downloaded: false },
@@ -700,6 +702,7 @@ export const LFS_LISTING = {
 export const LFS_PRESENT = {
   ...LFS_POINTERS,
   filters_configured: true,
+  install_hint: "brew install git-lfs",
   pointers: 0,
   pointer_paths: [],
   summary: "All 5 LFS files are present.",

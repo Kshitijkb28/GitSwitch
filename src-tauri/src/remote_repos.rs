@@ -13,14 +13,16 @@ use std::collections::HashMap;
 /// 50 pages × 100 = 5,000 repos per account before we stop and say so.
 const MAX_PAGES: usize = 50;
 
-/// Overridable so the paging/SSO logic can be tested against a local fake API.
-fn api_base() -> String {
-    std::env::var("GITSWITCH_GITHUB_API")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "https://api.github.com".into())
-        .trim_end_matches('/')
-        .to_string()
+/// Overridable in a DEBUG build only, so the paging/SSO logic can be tested
+/// against a local fake API. A release build ignores the variable: every
+/// request here carries an account token, and an environment variable that
+/// redirects them is a way to steal it.
+pub(crate) fn api_base() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(s) = std::env::var("GITSWITCH_GITHUB_API").ok().filter(|s| !s.trim().is_empty()) {
+        return s.trim_end_matches('/').to_string();
+    }
+    "https://api.github.com".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +192,7 @@ fn majority(counts: &HashMap<String, usize>) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
+#[derive(Clone)]
 struct LocalIndex {
     /// "owner/name" (lowercase) -> local path
     clones: HashMap<String, String>,
@@ -199,7 +202,30 @@ struct LocalIndex {
     org_ssh_users: HashMap<String, String>,
 }
 
+/// The local index for these profiles — built at most once a minute. Every
+/// page of a listing needs it, and building it walks every profile folder
+/// and asks git for every clone's remote; page two used to pay that again.
 async fn local_index(profs: &[Profile]) -> LocalIndex {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static CACHE: OnceLock<Mutex<Option<(Instant, String, LocalIndex)>>> = OnceLock::new();
+    let key: String = profs.iter().flat_map(|p| std::iter::once(p.id.as_str()).chain(p.directories.iter().map(String::as_str))).collect::<Vec<_>>().join("\0");
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(slot) = cache.lock() {
+        if let Some((at, k, idx)) = slot.as_ref() {
+            if *k == key && at.elapsed() < Duration::from_secs(60) {
+                return idx.clone();
+            }
+        }
+    }
+    let idx = build_local_index(profs).await;
+    if let Ok(mut slot) = cache.lock() {
+        *slot = Some((Instant::now(), key, idx.clone()));
+    }
+    idx
+}
+
+async fn build_local_index(profs: &[Profile]) -> LocalIndex {
     let mut idx = LocalIndex::default();
     let mut seen = std::collections::HashSet::new();
     for p in profs {

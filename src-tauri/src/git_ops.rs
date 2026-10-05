@@ -316,6 +316,21 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
                     "You're not on a branch. Switch to one before pulling.",
                 ));
             }
+            // A merge writes a new commit, and a rebase re-commits yours, both
+            // under whatever identity git has here — the same reason a commit
+            // is refused on a mismatch. A fast-forward writes nothing.
+            if *mode != PullMode::FfOnly && !f.identity_matches {
+                let expected = f.profile_email.clone().unwrap_or_default();
+                return Some(refuse(
+                    "identity-mismatch",
+                    format!(
+                        "This folder should commit as {} but git is set to {}. A {} would record commits under that identity — fix it first, or pull fast-forward only.",
+                        expected,
+                        f.identity_email,
+                        if *mode == PullMode::Rebase { "rebase" } else { "merge" }
+                    ),
+                ));
+            }
             if f.upstream.is_none() {
                 return Some(refuse(
                     "no-upstream",
@@ -1000,6 +1015,115 @@ pub fn parse_shortstat(s: &str) -> (usize, usize, usize) {
 
 // --- Push ----------------------------------------------------------------
 
+/// What `push()` knows before choosing where the branch goes.
+#[derive(Debug, Default, Clone)]
+pub struct PushInputs {
+    pub branch: String,
+    /// The upstream as `git status` shows it (`origin/main`, or `dev` for a
+    /// branch that tracks a local one).
+    pub upstream: Option<String>,
+    pub branch_remote: Option<String>,
+    pub merge_ref: Option<String>,
+    pub push_remote: Option<String>,
+    pub push_default: Option<String>,
+    /// Every remote's name.
+    pub remotes: Vec<String>,
+    /// The caller asked for `--set-upstream`: the "Publish" button.
+    pub set_upstream: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PushTarget {
+    pub remote: String,
+    pub remote_ref: String,
+    pub set_upstream: bool,
+}
+
+/// Where a push goes, by the same rules as git's default (`push.default =
+/// simple`). An upstream of the SAME name is pushed to. One of a different
+/// name is refused: a branch started from `origin/main` with tracking would
+/// otherwise send its commits straight into main — git's own default refuses
+/// exactly this. A branch that tracks a local branch has no remote branch to
+/// go to. With no upstream the remote is the one git would choose
+/// (`pushRemote`, `pushDefault`, `branch.remote`, `origin`), or the only one
+/// there is; the branch is then published under its own name. "Publish"
+/// (`set_upstream`) always means: this name, on that remote, tracked from now
+/// on.
+pub fn resolve_push_target(i: &PushInputs) -> Result<PushTarget, Refusal> {
+    let own = format!("refs/heads/{}", i.branch);
+    let value = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let branch_remote = value(&i.branch_remote);
+    let tracks_local = branch_remote.as_deref() == Some(".");
+    let upstream_remote = branch_remote.clone().filter(|r| r != ".");
+
+    // 1. Which remote — git's own precedence: branch.<b>.pushRemote, then
+    //    remote.pushDefault (a fork, in a triangular workflow), then the
+    //    upstream's remote, then origin, then the only one there is.
+    let picked = value(&i.push_remote).or_else(|| value(&i.push_default)).or_else(|| upstream_remote.clone());
+    let remote = match picked {
+        Some(r) => r,
+        None if i.remotes.iter().any(|r| r == "origin") => "origin".to_string(),
+        None if i.remotes.len() == 1 => i.remotes[0].clone(),
+        None if i.remotes.is_empty() => {
+            return Err(refuse(
+                "no-remote",
+                "This repository has no remote to push to. Add one first — `git remote add origin <url>` in the terminal.",
+            ))
+        }
+        None => {
+            return Err(refuse(
+                "ambiguous-remote",
+                format!(
+                    "This branch has no upstream and there are {} remotes ({}), none called origin. Tell git which one to use — `git config remote.pushDefault <name>` — or push once from the terminal with `git push -u <remote> {}`.",
+                    i.remotes.len(),
+                    i.remotes.join(", "),
+                    i.branch
+                ),
+            ))
+        }
+    };
+
+    // 2. A branch tracking a LOCAL branch has no remote branch to go to.
+    if tracks_local && !i.set_upstream {
+        return Err(refuse(
+            "local-upstream",
+            format!(
+                "This branch tracks the local branch `{}`, not a remote one, so a push has nowhere to go. Publish it as `{}/{}` instead.",
+                i.upstream.as_deref().unwrap_or("?"),
+                remote,
+                i.branch
+            ),
+        ));
+    }
+
+    // 3. Pushing to the upstream's own remote: the branch there must have the
+    //    same name (`push.default = simple`), or a branch started from
+    //    `origin/main` with tracking would send its commits into main. A
+    //    DIFFERENT remote (pushRemote / pushDefault) is a triangular workflow:
+    //    git pushes the branch under its own name there and asks nothing.
+    if let (Some(_), Some(up_remote)) = (&i.upstream, &upstream_remote) {
+        if *up_remote == remote {
+            let merge = value(&i.merge_ref).unwrap_or_else(|| own.clone());
+            if merge != own && !i.set_upstream {
+                let there = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+                return Err(refuse(
+                    "upstream-name-differs",
+                    format!(
+                        "This branch tracks `{remote}/{there}`, which has a different name, so pushing would send your commits into `{there}`. Publish it as `{remote}/{branch}` instead.",
+                        branch = i.branch
+                    ),
+                ));
+            }
+            let re_pointed = merge != own;
+            return Ok(PushTarget { remote, remote_ref: own, set_upstream: i.set_upstream || re_pointed });
+        }
+        return Ok(PushTarget { remote, remote_ref: own, set_upstream: i.set_upstream });
+    }
+
+    // No remote upstream: publish under the branch's own name, tracked from now on.
+    Ok(PushTarget { remote, remote_ref: own, set_upstream: true })
+}
+
 pub async fn push(repo_path: &str, set_upstream: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Push, &StatusFacts::from(&before)) {
@@ -1012,32 +1136,28 @@ pub async fn push(repo_path: &str, set_upstream: bool) -> Result<OpResult, AppEr
         ));
     };
 
-    // Which remote, and which ref on it.
-    let (remote, remote_ref) = match &before.upstream {
-        Some(up) => {
-            let remote = up.split('/').next().unwrap_or("origin").to_string();
-            let merge_ref = GitCmd::at(repo_path)
-                .args(["config", "--get", &format!("branch.{}.merge", branch)])
-                .ok_text()
-                .await
-                .filter(|s| s.starts_with("refs/heads/"))
-                .unwrap_or_else(|| format!("refs/heads/{}", branch));
-            (remote, merge_ref)
-        }
-        None => (
-            before
-                .push
-                .remotes
-                .first()
-                .map(|r| r.name.clone())
-                .unwrap_or_else(|| "origin".into()),
-            format!("refs/heads/{}", branch),
-        ),
+    // Which remote, and which branch there — from git's own records
+    // (`branch.<b>.remote` / `.merge`), not parsed out of the upstream's
+    // display name, which a remote named with a slash or a branch tracking a
+    // LOCAL branch (`remote = .`) would both defeat.
+    let cfg = |key: String| GitCmd::at(repo_path).args(["config", "--get", key.as_str()]).ok_text();
+    let inputs = PushInputs {
+        branch: branch.clone(),
+        upstream: before.upstream.clone(),
+        branch_remote: cfg(format!("branch.{}.remote", branch)).await,
+        merge_ref: cfg(format!("branch.{}.merge", branch)).await,
+        push_remote: cfg(format!("branch.{}.pushRemote", branch)).await,
+        push_default: cfg("remote.pushDefault".to_string()).await,
+        remotes: before.push.remotes.iter().map(|r| r.name.clone()).collect(),
+        set_upstream,
     };
+    let target = match resolve_push_target(&inputs) {
+        Ok(t) => t,
+        Err(r) => return Ok(OpResult::refused(r, before)),
+    };
+    let PushTarget { remote, remote_ref, set_upstream: needs_upstream } = target;
     crate::git_exec::validate_remote_name(&remote)?;
     crate::git_exec::validate_branch_name(&branch)?;
-
-    let needs_upstream = before.upstream.is_none() || set_upstream;
     let args = build_push_args(&remote, &branch, &remote_ref, needs_upstream);
     let out = GitCmd::at(repo_path)
         .args(args)
@@ -1118,14 +1238,37 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
         return Ok(OpResult::refused(r, before));
     }
     let upstream = before.upstream.clone().unwrap_or_default();
-    let remote = upstream.split('/').next().unwrap_or("origin").to_string();
+    // The remote by git's own record, so a remote named with a slash is read
+    // whole and a branch tracking a LOCAL branch is told apart.
+    let branch = before.branch.clone().unwrap_or_default();
+    let branch_remote = GitCmd::at(repo_path)
+        .args(["config", "--get", &format!("branch.{}.remote", branch)])
+        .ok_text()
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if branch_remote.as_deref() == Some(".") {
+        return Ok(OpResult::refused(
+            refuse(
+                "local-upstream",
+                format!(
+                    "This branch tracks the local branch `{}`, not a remote one, so there is nothing to fetch. To bring its commits in, merge or rebase onto `{}` from the terminal.",
+                    upstream, upstream
+                ),
+            ),
+            before,
+        ));
+    }
+    let remote = branch_remote.unwrap_or_else(|| upstream.split('/').next().unwrap_or("origin").to_string());
     crate::git_exec::validate_remote_name(&remote)?;
     let head_before = before.head_oid.clone().unwrap_or_default();
 
     // Fetch only the remote's own refs: no refspec, no --prune, no --tags, so
-    // nothing local can move in this step.
+    // nothing local can move in this step. No submodule recursion either —
+    // `fetch.recurseSubmodules=on-demand` would fail the whole pull on one
+    // unreachable submodule remote.
     let fetched = GitCmd::at(repo_path)
-        .args(["fetch", "--quiet", "--", &remote])
+        .args(["fetch", "--quiet", "--no-recurse-submodules", "--", &remote])
         .timeout(NET_TIMEOUT)
         .run()
         .await?;
@@ -1137,7 +1280,11 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
 
     // Fully qualified, so a local branch of the same name can't win.
     let upstream_ref = format!("refs/remotes/{}", upstream);
-    let out = GitCmd::at(repo_path)
+    // Large files are downloaded after, by the step below, not inside the
+    // merge or rebase on its 180s clock (see LfsAround).
+    let lfs = lfs_before(repo_path, &before).await;
+    let out = lfs
+        .apply(GitCmd::at(repo_path))
         .args(build_integrate_args(mode, &upstream_ref, autostash))
         .timeout(NET_TIMEOUT)
         .run()
@@ -1381,6 +1528,77 @@ impl LfsFetch {
     }
 }
 
+/// Large files around a command that rewrites the worktree: a switch, a hard
+/// reset, a revert, a cherry-pick, the merge or rebase of a pull.
+///
+/// Left to itself, git downloads every large file such a command touches
+/// INSIDE the command, through the smudge filter: on a local timeout, with
+/// nothing on screen moving, and a kill at the deadline leaves the worktree
+/// half written. So the command runs with `GIT_LFS_SKIP_SMUDGE=1` — pointer
+/// stubs are written instantly — and the download is a separate step on the
+/// large-file clock, with its progress banner. When every large file was
+/// present before, the download runs so that stays true; a deliberately
+/// partial checkout (one folder downloaded) is left partial, and said.
+pub(crate) struct LfsAround {
+    skip: bool,
+    complete_before: bool,
+}
+
+impl LfsAround {
+    /// For a command that does not touch the worktree.
+    pub(crate) fn none() -> Self {
+        LfsAround { skip: false, complete_before: false }
+    }
+
+    pub(crate) fn apply(&self, cmd: GitCmd) -> GitCmd {
+        if self.skip {
+            cmd.env("GIT_LFS_SKIP_SMUDGE", "1")
+        } else {
+            cmd
+        }
+    }
+}
+
+pub(crate) async fn lfs_before(repo: &str, before: &RepoStatus) -> LfsAround {
+    if !before.uses_lfs {
+        return LfsAround::none();
+    }
+    match crate::lfs::lfs_status(repo).await {
+        Ok(s) if s.installed => LfsAround { skip: true, complete_before: s.pointers == 0 },
+        // Without git-lfs there is no smudge filter to wait on.
+        _ => LfsAround::none(),
+    }
+}
+
+/// After the command succeeded: what became of the large files, as a sentence
+/// (with its leading space) for the result's detail — or nothing to add.
+pub(crate) async fn lfs_after(repo: &str, plan: &LfsAround) -> String {
+    if !plan.skip {
+        return String::new();
+    }
+    if plan.complete_before {
+        return match fetch_lfs_content(repo).await {
+            Ok(done) => match done.error {
+                Some(a) => format!(" The large files didn't download: {} The LFS card can fetch them.", a.headline),
+                None if done.fetched > 0 => {
+                    format!(" Downloaded {} LFS file{}.", done.fetched, if done.fetched == 1 { "" } else { "s" })
+                }
+                None => String::new(),
+            },
+            Err(e) => format!(" The large files didn't download: {}", e),
+        };
+    }
+    match crate::lfs::lfs_status(repo).await {
+        Ok(s) if s.pointers > 0 => format!(
+            " {} LFS file{} here {} a pointer stub; the LFS card downloads them.",
+            s.pointers,
+            if s.pointers == 1 { "" } else { "s" },
+            if s.pointers == 1 { "is" } else { "are" }
+        ),
+        _ => String::new(),
+    }
+}
+
 /// Download the content behind every pointer stub. Safe to call on any repo:
 /// one that doesn't use LFS, has no stubs, or has no git-lfs installed simply
 /// reports that nothing was done.
@@ -1453,7 +1671,7 @@ pub async fn lfs_pull(repo_path: &str) -> Result<OpResult, AppError> {
     if !lfs_before.installed {
         return Ok(OpResult::refused_alone(refuse(
             "lfs-not-installed",
-            "git-lfs isn't installed on this Mac, so the large files can't be downloaded. Install it (brew install git-lfs) and try again.",
+            format!("git-lfs isn't installed on this computer, so the large files can't be downloaded. Install it with {} and try again.", crate::lfs::install_hint()),
         )));
     }
     let before = snapshot(repo_path).await?;
@@ -1541,7 +1759,7 @@ pub async fn lfs_pull_paths(repo_path: &str, paths: Vec<String>) -> Result<OpRes
     if !before.installed {
         return Ok(OpResult::refused_alone(refuse(
             "lfs-not-installed",
-            "git-lfs isn't installed on this Mac, so the large files can't be downloaded. Install it (brew install git-lfs) and try again.",
+            format!("git-lfs isn't installed on this computer, so the large files can't be downloaded. Install it with {} and try again.", crate::lfs::install_hint()),
         )));
     }
     let selected: Vec<String> = paths
@@ -1898,9 +2116,124 @@ mod tests {
     }
 
     #[test]
-    fn push_honours_a_differently_named_upstream_branch() {
+    fn the_refspec_builder_sends_the_branch_wherever_it_is_told() {
         let args = build_push_args("origin", "local-name", "refs/heads/remote-name", false);
         assert_eq!(args.last().unwrap(), "refs/heads/local-name:refs/heads/remote-name");
+    }
+
+    fn tracking(branch: &str, remote: &str, merge: &str) -> PushInputs {
+        PushInputs {
+            branch: branch.into(),
+            upstream: Some(format!("{}/{}", remote, merge)),
+            branch_remote: Some(remote.into()),
+            merge_ref: Some(format!("refs/heads/{}", merge)),
+            remotes: vec![remote.into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_push_goes_to_an_upstream_of_the_same_name() {
+        let t = resolve_push_target(&tracking("main", "origin", "main")).unwrap();
+        assert_eq!(t, PushTarget { remote: "origin".into(), remote_ref: "refs/heads/main".into(), set_upstream: false });
+    }
+
+    #[test]
+    fn a_branch_started_from_main_with_tracking_is_not_pushed_into_main() {
+        // `git switch -c feature origin/main` leaves feature tracking main.
+        // Pushing "to the upstream" would land the feature's commits in main.
+        let r = resolve_push_target(&tracking("feature", "origin", "main")).unwrap_err();
+        assert_eq!(r.code, "upstream-name-differs");
+        assert!(r.message.contains("origin/main") && r.message.contains("origin/feature"), "{}", r.message);
+        // Publishing it under its own name is the way out, and re-points the upstream.
+        let i = PushInputs { set_upstream: true, ..tracking("feature", "origin", "main") };
+        let t = resolve_push_target(&i).unwrap();
+        assert_eq!(t, PushTarget { remote: "origin".into(), remote_ref: "refs/heads/feature".into(), set_upstream: true });
+    }
+
+    #[test]
+    fn a_remote_named_with_a_slash_is_read_whole_from_the_config() {
+        let mut i = tracking("main", "team/gh", "main");
+        i.upstream = Some("team/gh/main".into());
+        let t = resolve_push_target(&i).unwrap();
+        assert_eq!(t.remote, "team/gh");
+    }
+
+    #[test]
+    fn a_branch_tracking_a_local_branch_is_refused_and_can_be_published() {
+        let i = PushInputs {
+            branch: "feature".into(),
+            upstream: Some("dev".into()),
+            branch_remote: Some(".".into()),
+            merge_ref: Some("refs/heads/dev".into()),
+            remotes: vec!["origin".into()],
+            ..Default::default()
+        };
+        let r = resolve_push_target(&i).unwrap_err();
+        assert_eq!(r.code, "local-upstream");
+        assert!(r.message.contains("`dev`") && r.message.contains("origin/feature"), "{}", r.message);
+        let t = resolve_push_target(&PushInputs { set_upstream: true, ..i }).unwrap();
+        assert_eq!(t, PushTarget { remote: "origin".into(), remote_ref: "refs/heads/feature".into(), set_upstream: true });
+    }
+
+    #[test]
+    fn without_an_upstream_the_remote_is_the_one_git_would_pick() {
+        let base = PushInputs { branch: "b".into(), remotes: vec!["fork".into(), "upstream".into()], ..Default::default() };
+        // pushRemote beats everything…
+        let i = PushInputs { push_remote: Some("fork".into()), push_default: Some("upstream".into()), ..base.clone() };
+        assert_eq!(resolve_push_target(&i).unwrap().remote, "fork");
+        // …then remote.pushDefault…
+        let i = PushInputs { push_default: Some("upstream".into()), ..base.clone() };
+        assert_eq!(resolve_push_target(&i).unwrap().remote, "upstream");
+        // …then branch.<b>.remote…
+        let i = PushInputs { branch_remote: Some("fork".into()), ..base.clone() };
+        assert_eq!(resolve_push_target(&i).unwrap().remote, "fork");
+        // …then origin, if there is one…
+        let i = PushInputs { remotes: vec!["zeta".into(), "origin".into()], ..base.clone() };
+        assert_eq!(resolve_push_target(&i).unwrap().remote, "origin");
+        // …then the only remote. Alphabetical order never decides.
+        let i = PushInputs { remotes: vec!["zeta".into()], ..base.clone() };
+        assert_eq!(resolve_push_target(&i).unwrap().remote, "zeta");
+        let r = resolve_push_target(&base).unwrap_err();
+        assert_eq!(r.code, "ambiguous-remote");
+        assert!(r.message.contains("fork, upstream"), "{}", r.message);
+        let r = resolve_push_target(&PushInputs { remotes: vec![], ..base }).unwrap_err();
+        assert_eq!(r.code, "no-remote");
+        // And publishing always sets the upstream.
+        let i = PushInputs { branch: "b".into(), remotes: vec!["origin".into()], ..Default::default() };
+        assert!(resolve_push_target(&i).unwrap().set_upstream);
+    }
+
+    #[test]
+    fn push_default_or_push_remote_wins_over_the_upstreams_remote_and_needs_no_same_name() {
+        // Triangular: track upstream's main, push to the fork. git pushes
+        // `main -> fork/main` and `feature -> fork/feature` with no complaint.
+        let mut i = tracking("main", "origin", "main");
+        i.remotes = vec!["origin".into(), "fork".into()];
+        i.push_default = Some("fork".into());
+        let t = resolve_push_target(&i).unwrap();
+        assert_eq!(t, PushTarget { remote: "fork".into(), remote_ref: "refs/heads/main".into(), set_upstream: false });
+        let mut f = tracking("feature", "origin", "main");
+        f.remotes = vec!["origin".into(), "fork".into()];
+        f.push_default = Some("fork".into());
+        let t = resolve_push_target(&f).unwrap();
+        assert_eq!(t.remote, "fork");
+        assert_eq!(t.remote_ref, "refs/heads/feature");
+        // branch.<b>.pushRemote beats remote.pushDefault.
+        f.push_remote = Some("origin".into());
+        let r = resolve_push_target(&f).unwrap_err();
+        assert_eq!(r.code, "upstream-name-differs", "back on the upstream's remote, the same-name rule applies again");
+    }
+
+    #[test]
+    fn a_merge_or_rebase_pull_with_the_wrong_identity_is_refused_but_a_fast_forward_is_not() {
+        let f = StatusFacts { identity_matches: false, identity_email: "me@home".into(), profile_email: Some("me@work".into()), ..clean() };
+        for mode in [PullMode::Merge, PullMode::Rebase] {
+            let r = check(&Intent::Pull { mode, autostash: false }, &f).unwrap();
+            assert_eq!(r.code, "identity-mismatch");
+            assert!(r.message.contains("me@work") && r.message.contains("me@home"), "{}", r.message);
+        }
+        assert!(check(&Intent::Pull { mode: PullMode::FfOnly, autostash: false }, &f).is_none());
     }
 
     #[test]

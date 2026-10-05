@@ -117,6 +117,38 @@ pub fn redact(s: &str) -> String {
     let mut out = redact_urls(s);
     out = redact_prefixed_tokens(&out);
     out = redact_headers(&out);
+    out = redact_credential_lines(&out);
+    out
+}
+
+/// `password=…` (what `git credential fill` prints) and `token=…` lines, the
+/// value gone whatever its shape — a stored password has no prefix to match.
+fn redact_credential_lines(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        // Everything the credential protocol carries besides protocol, host,
+        // path and username is a secret or describes one: password,
+        // oauth_refresh_token, credential, authtype… — judged by the key's
+        // shape, so a new key git adds later is masked too.
+        let key = lower.split('=').next().unwrap_or("");
+        let secret = lower.contains('=')
+            && !key.is_empty()
+            && !key.contains(' ')
+            && (matches!(key, "password" | "credential" | "authtype" | "password_expiry_utc") || key.contains("token") || key.contains("secret"));
+        if secret {
+            let (k, _) = trimmed.split_once('=').unwrap_or((trimmed, ""));
+            out.push_str(&line[..line.len() - trimmed.len()]);
+            out.push_str(k);
+            out.push_str("=***");
+        } else {
+            out.push_str(line);
+        }
+    }
     out
 }
 
@@ -148,21 +180,27 @@ fn redact_urls(s: &str) -> String {
 
 /// GitHub's own token shapes. These are recognisable on sight and never appear
 /// in ordinary prose.
-const TOKEN_PREFIXES: &[&str] = &["ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_"];
+pub(crate) const TOKEN_PREFIXES: &[&str] = &["ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_"];
 
 fn redact_prefixed_tokens(s: &str) -> String {
     let mut out = s.to_string();
     for prefix in TOKEN_PREFIXES {
-        while let Some(i) = out.find(prefix) {
+        // A cursor rather than a restart: a bare prefix in prose ("ghp_...")
+        // must be stepped past, or a real token later on the same line is
+        // never reached.
+        let mut from = 0;
+        while let Some(rel) = out[from..].find(prefix) {
+            let i = from + rel;
             let tail = &out[i + prefix.len()..];
             let len = tail
                 .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                 .unwrap_or(tail.len());
-            // A bare prefix with nothing after it is not a token.
             if len == 0 {
-                break;
+                from = i + prefix.len();
+                continue;
             }
             out.replace_range(i..i + prefix.len() + len, "***");
+            from = i + 3;
         }
     }
     out
@@ -172,7 +210,11 @@ fn redact_prefixed_tokens(s: &str) -> String {
 /// the `-c` form of the same.
 fn redact_headers(s: &str) -> String {
     let needles = ["authorization:", "extraheader="];
-    let lower = s.to_lowercase();
+    // ASCII-only lowering: both needles are ASCII, and `to_lowercase` on
+    // Unicode can change byte lengths ("İ" → 3 bytes), which would make the
+    // offsets below slice `s` off a character boundary — a panic reachable
+    // from any commit subject, since `log -1 --format=%s` runs every snapshot.
+    let lower = s.to_ascii_lowercase();
     let mut cuts: Vec<(usize, usize)> = Vec::new();
     for needle in needles {
         let mut from = 0;
@@ -204,15 +246,25 @@ fn redact_headers(s: &str) -> String {
     out
 }
 
-fn clip(s: &str) -> (String, bool) {
+/// Cut long output at a line boundary. A line is kept whole or dropped, so a
+/// credentialed URL can never be split with its secret half left on the kept
+/// side; and this runs BEFORE redaction, so a multi-megabyte `ls-files` is
+/// not scanned three times in full on every status refresh.
+fn clip(s: &str) -> (&str, bool) {
     if s.len() <= MAX_OUTPUT {
-        return (s.to_string(), false);
+        return (s, false);
     }
-    let mut end = MAX_OUTPUT;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    // A character boundary first: slicing at a byte inside a multi-byte
+    // character panics, and this runs on every command's output.
+    let mut cut = MAX_OUTPUT;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
     }
-    (s[..end].to_string(), true)
+    let end = match s[..cut].rfind('\n') {
+        Some(nl) if nl > 0 => nl,
+        _ => cut,
+    };
+    (&s[..end], true)
 }
 
 /// Record one command. Never fails, never blocks on anything but its own lock,
@@ -220,8 +272,10 @@ fn clip(s: &str) -> (String, bool) {
 pub fn record(repo: &Path, argv: Vec<String>, exit_code: i32, dur: Duration, stdout: &str, stderr: &str) {
     let argv: Vec<String> = argv.iter().map(|a| redact(a)).collect();
     let read = is_read(&argv);
-    let (stdout, cut_a) = clip(&redact(stdout));
-    let (stderr, cut_b) = clip(&redact(stderr));
+    let (stdout, cut_a) = clip(stdout);
+    let (stderr, cut_b) = clip(stderr);
+    let stdout = redact(stdout);
+    let stderr = redact(stderr);
     let entry = Entry {
         id: next_id(),
         at: chrono::Utc::now().to_rfc3339(),
@@ -318,6 +372,68 @@ mod tests {
         // `github_pat` without the trailing underscore is not the prefix, so an
         // ordinary filename that starts the same way is left alone.
         assert_eq!(redact("github_patch.diff"), "github_patch.diff");
+    }
+
+    #[test]
+    fn a_unicode_case_change_before_a_header_cannot_panic_or_under_redact() {
+        // "İ" lowercases to two code points; a byte offset taken from the
+        // lowered copy used to slice the original off a character boundary.
+        let out = redact("İ authorization: Bearer ghp_zzz\nnext");
+        assert!(out.contains("İ"), "{}", out);
+        assert!(!out.contains("ghp_zzz") && !out.contains("Bearer"), "{}", out);
+        assert!(out.ends_with("next"), "{}", out);
+        // The Kelvin sign is the other classic: its lowercase is ASCII 'k'.
+        let out = redact("\u{212A}elvin authorization: x");
+        assert!(out.contains("\u{212A}") && !out.ends_with("x"), "{}", out);
+    }
+
+    #[test]
+    fn a_bare_prefix_in_prose_does_not_hide_a_real_token_after_it() {
+        // Exactly the shape a hook's stderr takes: a rule, then a finding.
+        let out = redact("rule: GitHub PAT (ghp_...)  found: ghp_16C7e42F292c6912E7710c838347Ae178B4a");
+        assert!(!out.contains("ghp_16C7"), "{}", out);
+        assert!(out.contains("(ghp_...)"), "the bare prefix in prose is left as it was: {}", out);
+    }
+
+    #[test]
+    fn long_output_is_cut_on_a_line_so_a_secret_is_never_split_into_the_kept_half() {
+        let _lock = exclusive();
+        clear();
+        // A line of filler, then a credentialed line straddling the cap.
+        let filler = "x".repeat(MAX_OUTPUT - 20);
+        let out = format!("{}\nhttps://user:ghp_SECRETSECRET@host/r.git\n", filler);
+        record(Path::new("/split"), argv("git remote -v"), 0, Duration::from_millis(1), &out, "");
+        let e = &since(0, Some("/split"))[0];
+        assert!(e.truncated);
+        assert!(!e.stdout.contains("SECRET"), "{}", &e.stdout[e.stdout.len().saturating_sub(80)..]);
+        clear();
+    }
+
+    #[test]
+    fn a_credential_helpers_answer_keeps_its_user_name_and_loses_the_password() {
+        let out = redact("protocol=https\nhost=github.com\nusername=octocat\npassword=hunter2 with spaces\n");
+        assert!(out.contains("username=octocat"), "{out}");
+        assert!(out.contains("password=***") && !out.contains("hunter2"), "{out}");
+        // A word that merely contains "password=" mid-line is left alone.
+        assert_eq!(redact("the old password=field style"), "the old password=field style");
+        // Every other secret-bearing key of the credential protocol.
+        let out = redact("oauth_refresh_token=rt_abc\ncredential=xyz\nauthtype=bearer\nusername=u\nprotocol=https\n");
+        assert!(out.contains("oauth_refresh_token=***") && out.contains("credential=***") && out.contains("authtype=***"), "{out}");
+        assert!(out.contains("username=u") && out.contains("protocol=https"), "{out}");
+    }
+
+    #[test]
+    fn output_cut_inside_a_multi_byte_character_does_not_panic() {
+        let _lock = exclusive();
+        clear();
+        // 65535 ASCII bytes, then a 3-byte character straddling the cap.
+        let mut s = "x".repeat(MAX_OUTPUT - 1);
+        s.push('€');
+        s.push_str("tail");
+        record(Path::new("/utf8"), argv("git log"), 0, Duration::from_millis(1), &s, "");
+        let e = &since(0, Some("/utf8"))[0];
+        assert!(e.truncated && e.stdout.len() <= MAX_OUTPUT);
+        clear();
     }
 
     #[test]

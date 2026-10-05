@@ -43,6 +43,16 @@ export function ActivityView({ repoPath, visible }: Props) {
   const since = useRef(0);
   const scroller = useRef<HTMLDivElement>(null);
 
+  // Changing the filter means the ids already seen no longer apply. This
+  // runs BEFORE the poll below (effects run in order): the first read of the
+  // new filter must start from zero, not from the old filter's last id, or
+  // everything that repository ran before now is never shown.
+  useEffect(() => {
+    since.current = 0;
+    setEntries([]);
+    setOpen(new Set());
+  }, [repoPath, allRepos]);
+
   // Same shape as the LFS progress poll: an immediate first read, a flag so a
   // late promise cannot set state after the tab closed, and a silent catch
   // because a log is never allowed to raise an error of its own.
@@ -67,13 +77,6 @@ export function ActivityView({ repoPath, visible }: Props) {
       window.clearInterval(id);
     };
   }, [visible, repoPath, allRepos]);
-
-  // Changing the filter means the ids already seen no longer apply.
-  useEffect(() => {
-    since.current = 0;
-    setEntries([]);
-    setOpen(new Set());
-  }, [repoPath, allRepos]);
 
   const shown = useMemo(
     () => (hideReads ? entries.filter((e) => !e.is_read) : entries),

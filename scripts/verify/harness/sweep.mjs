@@ -57,6 +57,8 @@ try {
             case "get_profiles": return Promise.resolve(profiles);
             case "history_list_repos": return Promise.resolve(repos);
             case "changes_repo_status": return Promise.resolve(st);
+            case "history_head": return Promise.resolve({ branch: st.branch, detached: st.detached, unborn: st.unborn });
+            case "changes_push_identity": return Promise.resolve({ remote: "origin", url: "git@github.com:octo-work/gitswitch.git", via: "ssh-key", login: "octo-work", key_path: "/Users/me/.ssh/id_work", host: "github.com", account: null, expected_login: null, detail: "github.com accepted the key id_work." });
             case "changes_submodule_statuses": return Promise.resolve(subs);
             case "changes_stash_list": return Promise.resolve(stashes);
             case "changes_file_diff": return Promise.resolve(d1);

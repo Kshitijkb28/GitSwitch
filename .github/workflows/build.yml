@@ -50,9 +50,17 @@ jobs:
       - name: Install git-lfs (macOS)
         if: matrix.os == 'macos-latest'
         run: brew install git-lfs
-      - name: Build the lock helper sidecar
+      - name: Build the sidecars (lock helper, git guard)
         shell: bash
         run: bash scripts/build-lock-helper.sh debug
+      # Every crate, on every OS: the Windows-only code (Job Objects, the owner
+      # check, the git guard) is only ever compiled here.
+      - name: Rust unit tests (workspace)
+        shell: bash
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace --offline || cargo test --manifest-path src-tauri/Cargo.toml --workspace
+      - name: Clippy, zero warnings
+        shell: bash
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --workspace --all-targets -- -D warnings
       - name: Lock suite (test root, no privileges)
         if: matrix.os != 'windows-latest'
         shell: bash
@@ -68,11 +76,32 @@ jobs:
         run: |
           bash scripts/verify/sandbox.sh
           bash scripts/verify/regression.sh
+          bash scripts/verify/identity.sh
           bash scripts/verify/submodules.sh
           bash scripts/verify/lfs.sh
           bash scripts/verify/sync.sh
           bash scripts/verify/tree.sh
           bash scripts/verify/stash.sh
+      # The same suites under Git Bash. Informational until they have been seen
+      # green there: a failure is reported in the log and the step is marked,
+      # but does not fail the run.
+      - name: Git suites (Windows, Git Bash — informational)
+        if: matrix.os == 'windows-latest'
+        continue-on-error: true
+        shell: bash
+        run: |
+          bash scripts/verify/sandbox.sh
+          bash scripts/verify/regression.sh
+          bash scripts/verify/submodules.sh
+          bash scripts/verify/lfs.sh
+          bash scripts/verify/sync.sh
+          bash scripts/verify/tree.sh
+          bash scripts/verify/stash.sh
+      - name: Terminal suite (Windows, cmd.exe — informational)
+        if: matrix.os == 'windows-latest'
+        continue-on-error: true
+        shell: bash
+        run: bash scripts/verify/console.sh
       # A real shell in a real pty, through the real git shim. Kept separate so
       # a failure here is attributed to the terminal rather than to git.
       # The shell is pinned per platform: runners set SHELL=/bin/bash even on
@@ -90,6 +119,49 @@ jobs:
         env:
           SHELL: /bin/zsh
         run: bash scripts/verify/console.sh
+
+  # The frontend, on every push: the lockfile installs cleanly (`npm ci`
+  # refuses a package-lock.json that disagrees with package.json), the types
+  # check, the bundle builds, the IPC contract holds, and the built pages pass
+  # the headless browser suites — including the live one against the real
+  # backend in a sandbox.
+  verify-frontend:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install frontend deps (frozen lockfile)
+        run: npm ci
+      - name: TypeScript
+        run: npx tsc --noEmit
+      - name: Build the frontend
+        run: npm run build
+      - name: IPC contract (commands.rs ↔ lib.rs ↔ api.ts)
+        run: python3 scripts/verify/harness/ipc.py
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf git-lfs
+      - name: Build the sidecars (the live harness runs the real backend)
+        run: bash scripts/build-lock-helper.sh debug
+      - name: Headless browser suites
+        working-directory: scripts/verify/harness
+        run: |
+          npm install
+          node ui.mjs
+          node history.mjs
+          node sweep.mjs
+          node live.mjs
 
   build:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -142,7 +214,7 @@ jobs:
       # tauri-build refuses to compile the app without the lock-helper sidecar
       # file, so build it (host triple) before the tests. `tauri build` below
       # rebuilds it for the bundle target through beforeBuildCommand.
-      - name: Build the lock helper sidecar
+      - name: Build the sidecars (lock helper, git guard)
         run: bash scripts/build-lock-helper.sh release
 
       - name: Run Rust unit tests

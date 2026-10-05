@@ -1,0 +1,12 @@
+[package]
+name = "gitswitch-git-shim"
+version = "0.1.0"
+description = "The `git` first on PATH inside GitSwitch's terminal on Windows: refuses a force push, --no-verify and a push that would skip the system config, then hands everything else to the real git"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "gitswitch-git-shim"
+path = "src/main.rs"
+
+[dependencies]

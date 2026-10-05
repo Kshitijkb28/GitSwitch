@@ -15,7 +15,7 @@ pub struct SparseInfo {
 }
 
 async fn run_git(repo: Option<&Path>, args: &[&str]) -> Result<String, AppError> {
-    let mut cmd = tokio::process::Command::new("git");
+    let mut cmd = crate::spawn::async_command("git");
     if let Some(dir) = repo {
         cmd.current_dir(dir);
     }
@@ -449,7 +449,7 @@ pub(crate) fn resolve_profile<'a>(path: &str, profs: &'a [Profile]) -> Option<&'
 
 /// Same command GitSwitch writes into the per-profile gitconfig.
 fn ssh_command_for(key: &str) -> String {
-    format!("ssh -i {} -o IdentitiesOnly=yes", crate::paths::norm(key))
+    crate::git_config::ssh_command_for(key)
 }
 
 /// GitHub shows `org-<ID>@github.com:org/repo.git` instead of `git@…` when an
@@ -544,7 +544,7 @@ pub async fn certificate_info(key_path: &str) -> CertInfo {
 }
 
 async fn run_git_like(bin: &str, args: &[&str]) -> Result<String, AppError> {
-    let out = tokio::process::Command::new(bin)
+    let out = crate::spawn::async_command(bin)
         .args(args)
         .output()
         .await
@@ -645,7 +645,7 @@ async fn clone_as_profile(
         if !already {
             let mut dirs = p.directories.clone();
             dirs.push(dest_str.clone());
-            profiles::update_profile(p.id.clone(), None, None, None, None, Some(dirs), None, None)
+            profiles::update_profile(p.id.clone(), None, None, None, None, Some(dirs), None, None, None, None)
                 .and_then(|_| crate::git_config::apply_git_config())
                 .map_err(|e| {
                     AppError::Config(format!(
@@ -782,6 +782,8 @@ mod tests {
             is_default: default,
             allow_push: true,
             signing_enabled: false,
+            remote_patterns: Vec::new(),
+            github_login: None,
             directories: dirs.iter().map(|d| d.to_string()).collect(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

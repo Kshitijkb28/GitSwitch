@@ -259,6 +259,33 @@ ok "  the backup still holds the merge" "$(git -C "$W" rev-parse "$BK")" "$MERGE
 OUT=$(probe tree_reset "$W" "HEAD,soft")
 ok "a reset to HEAD is nothing to do" "$(printf '%s' "$OUT" | jqf refusal.code)" "nothing-to-do"
 
+section "A hard reset never overwrites an untracked file without saying so"
+# A commit adds gen/out.txt; step back below it and recreate the file by hand,
+# exactly what a build tool does. A forward `git reset --hard` would replace
+# it without a word: git protects only the files it tracks.
+mkdir -p "$W/gen"; printf 'committed\n' > "$W/gen/out.txt"; git -C "$W" add -A >/dev/null; git -C "$W" commit -qm "adds gen/out.txt"
+FWD="$(head_of "$W")"
+git -C "$W" reset -q --hard HEAD~1
+mkdir -p "$W/gen"; printf 'mine, unsaved\n' > "$W/gen/out.txt"
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "the reset is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "untracked-in-the-way"
+ok "  naming the file" "$(printf '%s' "$OUT" | jqf refusal.message)" "gen/out.txt"
+ok "  the file is untouched" "$(cat "$W/gen/out.txt")" "mine, unsaved"
+ok "  and HEAD did not move" "$(head_of "$W")" "$(git -C "$W" rev-parse "$FWD~1")"
+git -C "$W" add gen/out.txt
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "a STAGED file at that path is the person's stated choice: the reset runs" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  and the committed content is in place" "$(cat "$W/gen/out.txt")" "committed"
+git -C "$W" reset -q --hard HEAD~1
+mkdir -p "$W/gen"; printf 'gen/\n' >> "$W/.gitignore"; printf 'ignored, unsaved\n' > "$W/gen/out.txt"
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "an ignored file in the way is just as lost, so it is refused too" "$(printf '%s' "$OUT" | jqf refusal.code)" "untracked-in-the-way"
+ok "  and kept" "$(cat "$W/gen/out.txt")" "ignored, unsaved"
+git -C "$W" checkout -q -- .gitignore; rm -rf "$W/gen"
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "with nothing in the way the same reset runs" "$(printf '%s' "$OUT" | jqf ok)" "True"
+git -C "$W" reset -q --hard HEAD~1
+
 section "Pushed means on any remote branch — for reset and undo alike"
 printf 'elsewhere\n' > "$W/else.txt"; git -C "$W" add -A >/dev/null; git -C "$W" commit -qm "pushed elsewhere"
 git -C "$W" push -q origin main:refs/heads/backup 2>/dev/null

@@ -151,7 +151,7 @@ pub(crate) fn is_remote_head(full_ref: &str) -> bool {
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, AppError> {
     let started = std::time::Instant::now();
-    let out = std::process::Command::new("git")
+    let out = crate::spawn::command("git")
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -297,10 +297,48 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
     Ok(out)
 }
 
+/// Where HEAD is, in three facts. The History page only needs these; it used
+/// to ask for the Changes page's whole status (seventeen git commands, some
+/// proportional to the size of the repository) to learn them.
+#[derive(Debug, Serialize, Clone)]
+pub struct HeadInfo {
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub unborn: bool,
+}
+
+pub fn head_info(repo_path: &str) -> Result<HeadInfo, AppError> {
+    let repo = PathBuf::from(repo_path);
+    // Unborn: HEAD names a branch that has no commit yet, so symbolic-ref
+    // answers but rev-parse does not. Detached: the other way round.
+    let branch = git(&repo, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let has_commit = git(&repo, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).is_ok();
+    Ok(HeadInfo { detached: branch.is_none() && has_commit, unborn: !has_commit, branch })
+}
+
+/// `%(upstream:track,nobracket)`: "ahead 1, behind 2", "ahead 1", "behind 2",
+/// "" (level), or "gone" (the upstream no longer exists).
+pub fn parse_track(s: &str) -> (usize, usize) {
+    let mut ahead = 0;
+    let mut behind = 0;
+    for part in s.split(',') {
+        let mut it = part.split_whitespace();
+        match (it.next(), it.next().and_then(|n| n.parse::<usize>().ok())) {
+            (Some("ahead"), Some(n)) => ahead = n,
+            (Some("behind"), Some(n)) => behind = n,
+            _ => {}
+        }
+    }
+    (ahead, behind)
+}
+
 pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
     let repo = PathBuf::from(repo_path);
     let fmt = format!(
-        "%(refname){US}%(refname:short){US}%(upstream:short){US}%(objectname){US}%(objectname:short){US}%(authorname){US}%(committerdate:iso8601){US}%(HEAD){US}%(subject)",
+        "%(refname){US}%(refname:short){US}%(upstream:short){US}%(objectname){US}%(objectname:short){US}%(authorname){US}%(committerdate:iso8601){US}%(HEAD){US}%(upstream:track,nobracket){US}%(subject)",
         US = US
     );
     let raw = git(
@@ -311,8 +349,8 @@ pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
     let mut branches = Vec::new();
     for line in raw.lines() {
         // subject is last so any separator inside it can't shift the other fields
-        let f: Vec<&str> = line.splitn(9, US).collect();
-        if f.len() < 9 {
+        let f: Vec<&str> = line.splitn(10, US).collect();
+        if f.len() < 10 {
             continue;
         }
         let full_ref = f[0];
@@ -324,14 +362,11 @@ pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
         let is_remote = full_ref.starts_with("refs/remotes/");
 
         // ahead/behind only makes sense for a local branch with an upstream.
-        let (mut ahead, mut behind) = (0usize, 0usize);
-        if let (false, Some(up)) = (is_remote, upstream.as_ref()) {
-            if let Ok(counts) = git(&repo, &["rev-list", "--left-right", "--count", &format!("{}...{}", name, up)]) {
-                let mut it = counts.split_whitespace();
-                ahead = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                behind = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            }
-        }
+        // for-each-ref computes it in the same walk (`%(upstream:track)`);
+        // this used to be one `rev-list --count` process per branch, which on
+        // a repository with two hundred branches was two hundred processes
+        // every time the History page opened.
+        let (ahead, behind) = if is_remote || upstream.is_none() { (0, 0) } else { parse_track(f[8]) };
 
         branches.push(BranchInfo {
             is_current: f[7].trim() == "*",
@@ -344,7 +379,7 @@ pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
             short_tip: f[4].to_string(),
             last_author: f[5].to_string(),
             last_date: f[6].to_string(),
-            last_subject: f[8].to_string(),
+            last_subject: f[9].to_string(),
         });
     }
     Ok(branches)
@@ -704,6 +739,15 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_track_is_read_in_every_shape_git_prints() {
+        assert_eq!(parse_track("ahead 3, behind 2"), (3, 2));
+        assert_eq!(parse_track("ahead 1"), (1, 0));
+        assert_eq!(parse_track("behind 7"), (0, 7));
+        assert_eq!(parse_track(""), (0, 0));
+        assert_eq!(parse_track("gone"), (0, 0));
+    }
 
     fn c(h: &str, parents: &[&str]) -> (String, Vec<String>) {
         (h.into(), parents.iter().map(|s| s.to_string()).collect())

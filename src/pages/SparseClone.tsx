@@ -23,7 +23,7 @@ import { Badge } from "../components/Badge";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import { baseName, isWithin, normPath } from "../lib/paths";
-import { usePersistedState, writePersisted } from "../lib/persist";
+import { usePersistedState, handOff } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
@@ -99,7 +99,7 @@ export function SparseClone() {
   const [sparseLfs, setSparseLfs] = useState<api.LfsReport | null>(null);
   const navigate = useNavigate();
   const openInChanges = (path: string) => {
-    writePersisted("changes.repo", path);
+    handOff("changes", path);
     navigate("/changes");
   };
 

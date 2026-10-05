@@ -36,6 +36,9 @@ struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The shell's process id, for the test that proves none is left behind.
+    #[allow(dead_code)]
+    pid: Option<u32>,
 }
 
 impl Drop for Session {
@@ -62,6 +65,16 @@ fn shim_dir() -> Option<PathBuf> {
 /// The real git, found the way the shell would but ignoring our own shim, so a
 /// regenerated shim can never end up calling itself.
 fn real_git(skip: &Path) -> PathBuf {
+    // On macOS the push lock is written through the system git (/usr/bin/git),
+    // into that git's system config. A Homebrew git first on PATH reads a
+    // different system config and would walk straight past the lock — so the
+    // shim hands off to the same git the lock was written with.
+    if cfg!(target_os = "macos") {
+        let sys = crate::push_lock::system_git();
+        if sys.is_absolute() && sys.is_file() {
+            return sys;
+        }
+    }
     let exe = if cfg!(windows) { "git.exe" } else { "git" };
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -181,62 +194,49 @@ exec "{real_git}" "$@"
     )
 }
 
-/// Windows has no `/bin/sh` on PATH by default, so the same three guards are
-/// written as a batch file.
-pub fn shim_cmd(real_git: &str) -> String {
-    format!(
-        r##"@echo off
-setlocal
-set "VERB="
-for %%a in (%*) do if not defined VERB (
-  set "ARG=%%a"
-  setlocal enabledelayedexpansion
-  if not "!ARG:~0,1!"=="-" ( endlocal & set "VERB=%%a" ) else ( endlocal )
-)
-if /I "%VERB%"=="push" if defined GIT_CONFIG_NOSYSTEM (
-  echo GitSwitch: this push would skip the system git config, which is where a push lock lives. 1>&2
-  exit /b 1
-)
-if /I "%VERB%"=="push" if defined GIT_CONFIG_SYSTEM (
-  echo GitSwitch: this push would skip the system git config, which is where a push lock lives. 1>&2
-  exit /b 1
-)
-echo %* | findstr /C:"--no-verify" >nul && (
-  echo GitSwitch: --no-verify skips the identity guard that stops commits from the wrong account. 1>&2
-  exit /b 1
-)
-if /I "%VERB%"=="push" (
-  echo %* | findstr /C:"--force" >nul && (
-    echo GitSwitch never force-pushes. Use your own Terminal if you really mean to. 1>&2
-    exit /b 1
-  )
-)
-"{real_git}" %*
-"##,
-        real_git = real_git,
-    )
-}
+/// The guard binary (the `git-shim` crate), bundled beside the app like the
+/// lock helper. On Windows it is copied into the shim directory as `git.exe`.
+const SHIM_BIN_NAME: &str = "gitswitch-git-shim";
 
-/// Write the shim and return the directory to put first on PATH.
-fn install_shim() -> Result<PathBuf, AppError> {
+/// Write the shim; return the directory to put first on PATH and the real git
+/// the session should hand off to.
+fn install_shim() -> Result<(PathBuf, PathBuf), AppError> {
     let dir = shim_dir().ok_or_else(|| AppError::Command("No application data directory".into()))?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| AppError::Command(format!("Could not create {}: {}", dir.display(), e)))?;
     let git = real_git(&dir);
-    let (name, body) = if cfg!(windows) {
-        ("git.cmd", shim_cmd(&git.to_string_lossy()))
-    } else {
-        ("git", shim_script(&git.to_string_lossy()))
-    };
-    let path = dir.join(name);
-    std::fs::write(&path, body)
+    if cfg!(windows) {
+        // No /bin/sh here, and a batch file cannot parse arguments faithfully;
+        // the guard is a small console program instead, which reads the real
+        // git from GITSWITCH_REAL_GIT (set on the session below).
+        let src = crate::push_lock::bundled_sidecar_path(SHIM_BIN_NAME).ok_or_else(|| {
+            AppError::Command(format!("The terminal's git guard ({}.exe) is not beside the app", SHIM_BIN_NAME))
+        })?;
+        let dst = dir.join("git.exe");
+        let unchanged = match (std::fs::metadata(&src), std::fs::metadata(&dst)) {
+            (Ok(a), Ok(b)) => a.len() == b.len() && a.modified().ok() == b.modified().ok(),
+            _ => false,
+        };
+        if !unchanged {
+            // A shell that is still open may hold the old file; then the old
+            // guard keeps serving it and the next open gets the new one.
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                if !dst.is_file() {
+                    return Err(AppError::Command(format!("Could not place the git guard: {}", e)));
+                }
+            }
+        }
+        return Ok((dir, git));
+    }
+    let path = dir.join("git");
+    std::fs::write(&path, shim_script(&git.to_string_lossy()))
         .map_err(|e| AppError::Command(format!("Could not write the git shim: {}", e)))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
     }
-    Ok(dir)
+    Ok((dir, git))
 }
 
 fn default_shell() -> String {
@@ -277,7 +277,7 @@ where
             repo_path
         )));
     }
-    let shim = install_shim()?;
+    let (shim, real_git) = install_shim()?;
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -301,6 +301,9 @@ where
     cmd.env_remove("GIT_CONFIG_GLOBAL");
     cmd.env("TERM", "xterm-256color");
     cmd.env("GITSWITCH_TERMINAL", "1");
+    // The git the guard hands off to. The sh shim has it baked in; the
+    // Windows guard reads it from here.
+    cmd.env("GITSWITCH_REAL_GIT", real_git.as_os_str());
     let path = match std::env::var_os("PATH") {
         Some(existing) => {
             let mut dirs = vec![shim.clone()];
@@ -329,6 +332,7 @@ where
         .take_writer()
         .map_err(|e| AppError::Command(format!("Could not write to the terminal: {}", e)))?;
     let killer = child.clone_killer();
+    let pid = child.process_id();
 
     let id = uuid::Uuid::new_v4().to_string();
     let done_id = id.clone();
@@ -366,9 +370,29 @@ where
                 master: pair.master,
                 writer,
                 killer,
+                pid,
             },
         );
+
+    // Wait for the shell itself. On unix the reader's EOF already says it
+    // exited; on Windows ConPTY sends no EOF until the master is closed, so
+    // without this a shell that had exited stayed "open" forever. Waiting also
+    // reaps the process, so a closed terminal never leaves a zombie behind.
+    let wait_id = id.clone();
+    let mut child = child;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        if let Ok(mut map) = sessions().lock() {
+            map.remove(&wait_id);
+        }
+    });
     Ok(id)
+}
+
+/// The shell's process id, while the session is open.
+#[allow(dead_code)] // the leak test below
+fn session_pid(id: &str) -> Option<u32> {
+    sessions().lock().ok().and_then(|m| m.get(id).and_then(|s| s.pid))
 }
 
 pub fn write(id: &str, data: &str) -> Result<(), AppError> {
@@ -474,6 +498,33 @@ pub fn is_open(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Closing a terminal must end its shell — and reap it, or a zombie would
+    /// still answer `kill -0`. This used to be a `pgrep` count in console.sh,
+    /// which compared before and after and could not tell a leak from noise.
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_terminal_leaves_no_shell_behind() {
+        let dir = std::env::temp_dir();
+        let id = match open_with(&dir.to_string_lossy(), 80, 24, |_| true) {
+            Ok(id) => id,
+            Err(_) => return, // no shell on this machine (a bare container): nothing to prove
+        };
+        let pid = session_pid(&id).expect("the session knows its shell's pid") as i32;
+        // SAFETY: signal 0 only checks that the process exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the shell is running");
+        close(&id);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            // ESRCH once it is gone AND reaped; a zombie still answers 0.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                assert!(!is_open(&id));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the shell (pid {}) outlived its terminal", pid);
+    }
 
     #[test]
     fn a_character_split_across_two_reads_is_carried_not_mangled() {

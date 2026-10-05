@@ -9,6 +9,10 @@
 
 #![forbid(unsafe_code)]
 
+/// Windows file ownership, shared with the privileged helper.
+#[cfg(windows)]
+pub mod win;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};

@@ -103,6 +103,12 @@ export function Doctor() {
         toast.success(
           changed > 0 ? "Remote converted to SSH" : "Nothing needed converting"
         );
+      } else if (finding.fix.startsWith("unset-local:")) {
+        // unset-local:<key>:<repo path> — the key has no colon; the path may.
+        const rest = finding.fix.slice("unset-local:".length);
+        const cut = rest.indexOf(":");
+        const msg = await api.doctorUnsetLocal(rest.slice(cut + 1), rest.slice(0, cut));
+        toast.success(msg);
       } else if (finding.fix.startsWith("lock-")) {
         // Most of these open the administrator prompt; the outcome — cancelled
         // included — comes back as a sentence rather than an exception.

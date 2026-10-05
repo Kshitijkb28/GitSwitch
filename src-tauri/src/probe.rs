@@ -164,6 +164,7 @@ pub(crate) mod tests {
             "changes_lfs_pull" => forward!(c::changes_lfs_pull, args, repo_path),
             "changes_lfs_files" => forward!(c::changes_lfs_files, args, repo_path),
             "changes_lfs_pull_paths" => forward!(c::changes_lfs_pull_paths, args, repo_path, paths),
+            "changes_lfs_progress" => forward_plain!(c::changes_lfs_progress, args, repo_path),
             "console_entries" => forward_plain!(c::console_entries, args, since_id, repo_path),
             "console_clear" => forward_plain!(c::console_clear, args),
             "changes_continue" => forward!(c::changes_continue, args, repo_path),
@@ -176,6 +177,7 @@ pub(crate) mod tests {
             "changes_record_pointers" => forward!(c::changes_record_pointers, args, repo_path),
             // push access
             "changes_push_state" => forward!(c::changes_push_state, args, repo_path),
+            "changes_push_identity" => forward!(c::changes_push_identity, args, repo_path, refresh),
             "changes_set_push_mode" => forward!(c::changes_set_push_mode, args, repo_path, mode),
             "changes_repair_push_lock" => forward!(c::changes_repair_push_lock, args, repo_path),
             "changes_repair_push_block" => forward!(c::changes_repair_push_block, args, repo_path),
@@ -208,6 +210,14 @@ pub(crate) mod tests {
             "history_branch_merges" => forward!(c::history_branch_merges, args, repo_path, branch),
             "history_fetch" => forward!(c::history_fetch, args, repo_path),
             "history_sync_status" => forward!(c::history_sync_status, args, repo_path, branch),
+            "history_head" => forward!(c::history_head, args, repo_path),
+            // doctor
+            "doctor_check_environment" => forward!(c::doctor_check_environment, args),
+            "doctor_check_profiles" => forward!(c::doctor_check_profiles, args),
+            "doctor_check_keys" => forward!(c::doctor_check_keys, args),
+            "doctor_check_repos" => forward!(c::doctor_check_repos, args),
+            "doctor_unset_local" => forward!(c::doctor_unset_local, args, repo_path, key),
+            "history_peek" => forward!(c::history_peek, args, repo_path),
             "history_commit_file_diff" => forward!(c::history_commit_file_diff, args, repo_path, hash, path),
             "history_resolve" => forward!(c::history_resolve, args, repo_path, text),
             // These take a `tauri::AppHandle` (tray label updates) and cannot run outside the app.
@@ -229,6 +239,22 @@ pub(crate) mod tests {
         match op.as_str() {
             // --- the UI's IPC, forwarded (scripts/verify/harness/live.mjs) ---
             "invoke" => invoke().await,
+            // --- identity: a profile written into the sandbox HOME's gitconfig ---
+            // first = a JSON file {name, git_name, git_email, ssh_key_path?, directories[]}
+            "profile_apply" => {
+                let text = std::fs::read_to_string(first).expect("profile json file");
+                let v: serde_json::Value = serde_json::from_str(&text).expect("profile json");
+                let str_of = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+                let dirs: Vec<String> = v["directories"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default();
+                let remotes: Vec<String> = v["remote_patterns"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default();
+                match crate::profiles::create_profile(str_of("name"), str_of("git_name"), str_of("git_email"), v["ssh_key_path"].as_str().map(String::from), dirs, v["allow_push"].as_bool().unwrap_or(true), false, remotes, v["github_login"].as_str().map(String::from)) {
+                    Ok(p) => match crate::git_config::apply_git_config() {
+                        Ok(()) => emit(&p),
+                        Err(e) => emit_err(e),
+                    },
+                    Err(e) => emit_err(e),
+                }
+            }
             // --- Changes page ---
             "status" => match git_status::repo_status(&repo()).await {
                 Ok(s) => emit(&s),

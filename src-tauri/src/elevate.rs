@@ -99,11 +99,11 @@ fn test_mode() -> Option<String> {
 /// passwordless sudo, so the real root code path is exercised there.
 async fn run_direct(helper: &Path, job: &Path, sha: &str, bootstrap: bool, via_sudo: bool) -> Elevated {
     let mut cmd = if via_sudo {
-        let mut c = tokio::process::Command::new("sudo");
+        let mut c = crate::spawn::async_command("sudo");
         c.arg("-n").arg(helper);
         c
     } else {
-        tokio::process::Command::new(helper)
+        crate::spawn::async_command(helper)
     };
     cmd.args(helper_args(job, sha, bootstrap));
     let out = tokio::time::timeout(PROMPT_TIMEOUT, cmd.output()).await;
@@ -250,7 +250,7 @@ async fn macos(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> Elevate
     );
     let out = tokio::time::timeout(
         PROMPT_TIMEOUT,
-        tokio::process::Command::new("/usr/bin/osascript")
+        crate::spawn::async_command("/usr/bin/osascript")
             .arg("-e")
             .arg(&script)
             .arg(helper)
@@ -291,7 +291,7 @@ async fn linux(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> Elevate
     let manual = manual_command(helper, job, sha, bootstrap);
     let out = tokio::time::timeout(
         PROMPT_TIMEOUT,
-        tokio::process::Command::new("pkexec").arg(helper).args(helper_args(job, sha, bootstrap)).output(),
+        crate::spawn::async_command("pkexec").arg(helper).args(helper_args(job, sha, bootstrap)).output(),
     )
     .await;
     let no_agent = match out {
@@ -319,7 +319,7 @@ async fn linux(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> Elevate
         if let Some(askpass) = askpass_program() {
             let out = tokio::time::timeout(
                 PROMPT_TIMEOUT,
-                tokio::process::Command::new("sudo")
+                crate::spawn::async_command("sudo")
                     .env("SUDO_ASKPASS", &askpass)
                     .arg("-A")
                     .arg(helper)

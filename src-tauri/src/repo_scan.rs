@@ -88,7 +88,7 @@ pub(crate) fn mask_token(url: &str) -> String {
 
 fn get_origin(dir: &std::path::Path) -> Option<String> {
     let started = std::time::Instant::now();
-    let out = std::process::Command::new("git")
+    let out = crate::spawn::command("git")
         .args(["-C", &dir.to_string_lossy(), "remote", "get-url", "origin"])
         .output()
         .ok()?;

@@ -172,6 +172,10 @@ export function Repositories() {
     if (!key) return;
     const cached = listingCache.get(key);
     if (cached && !force) {
+      // Taking the cached answer is a load too: a slower fetch for another
+      // account that is still in flight must not paint over it when it lands.
+      ++loadSeq.current;
+      setLoading(false);
       listingKey.current = key;
       setListing(cached.listing);
       setFetchedAt(cached.fetchedAt);

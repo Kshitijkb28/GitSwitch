@@ -16,13 +16,16 @@ run() {
 }
 
 run "Lock helper sidecar" bash "$ROOT/scripts/build-lock-helper.sh" debug
-run "Rust unit tests"     bash -c "cd '$ROOT/src-tauri' && cargo test 2>&1 | grep -E '^test result' | head -2 && cargo test >/dev/null 2>&1"
-run "Clippy"              bash -c "cd '$ROOT/src-tauri' && n=\$(cargo clippy --all-targets 2>&1 | grep -cE '^warning: '); echo \"warnings: \$n\"; [ \"\$n\" -eq 0 ]"
+run "Rust unit tests"     bash -c "cd '$ROOT/src-tauri' && cargo test --workspace 2>&1 | grep -E '^test result' | head -6 && cargo test --workspace >/dev/null 2>&1"
+# Both the warning count AND clippy's own exit code: a crate that fails to
+# compile has zero warnings, which used to read as a pass.
+run "Clippy"              bash -c "cd '$ROOT/src-tauri' && out=\$(cargo clippy --workspace --all-targets 2>&1); rc=\$?; n=\$(printf '%s\n' \"\$out\" | grep -cE '^warning: '); echo \"warnings: \$n (clippy exit \$rc)\"; [ \$rc -eq 0 ] || printf '%s\n' \"\$out\" | tail -30; [ \$rc -eq 0 ] && [ \"\$n\" -eq 0 ]"
 run "TypeScript"          bash -c "cd '$ROOT' && $TSC --noEmit && echo clean"
 run "Frontend build"      bash -c "cd '$ROOT' && $BUILD 2>&1 | grep -E '✓ built'"
 run "IPC contract"        python3 "$HERE/harness/ipc.py"
 run "Changes sandbox"     bash "$HERE/sandbox.sh"
 run "Regression"          bash "$HERE/regression.sh"
+run "Identity (gitconfig round-trip)" bash "$HERE/identity.sh"
 run "Submodules"          bash "$HERE/submodules.sh"
 run "Git LFS"             bash "$HERE/lfs.sh"
 run "Sync"                bash "$HERE/sync.sh"
@@ -40,7 +43,10 @@ if [ -d "$HERE/harness/node_modules/puppeteer-core" ] && [ -n "$JS" ]; then
   # The two pages against the REAL backend (probe's `invoke` op) in a sandbox: needs git, cargo and Chrome.
   run "Live UI ↔ backend"     harness live.mjs
 else
-  echo; echo "(headless UI skipped — run: cd scripts/verify/harness && npm install   (or: bun install))"
+  printf '\n\033[1m════ Headless UI ════\033[0m\n'
+  echo "SKIPPED: puppeteer-core is not installed (cd scripts/verify/harness && bun install) or no JS runtime works."
+  echo "Four suites did not run, so this is not a full pass. Set GITSWITCH_ALLOW_SKIP=1 to accept that knowingly."
+  [ "${GITSWITCH_ALLOW_SKIP:-}" = 1 ] || status=1
 fi
 
 printf '\n\033[1m%s\033[0m\n' "$([ $status -eq 0 ] && echo 'ALL SUITES PASSED' || echo 'SOME SUITES FAILED')"

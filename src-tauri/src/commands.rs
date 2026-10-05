@@ -38,6 +38,8 @@ pub fn create_profile(
     directories: Vec<String>,
     allow_push: Option<bool>,
     signing_enabled: Option<bool>,
+    remote_patterns: Option<Vec<String>>,
+    github_login: Option<String>,
 ) -> Result<Profile, AppError> {
     let profile = profiles::create_profile(
         name,
@@ -47,6 +49,8 @@ pub fn create_profile(
         directories,
         allow_push.unwrap_or(true),
         signing_enabled.unwrap_or(false),
+        remote_patterns.unwrap_or_default(),
+        github_login,
     )?;
     git_config::apply_git_config()?;
     crate::tray::update_active_label(&app);
@@ -65,9 +69,11 @@ pub fn update_profile(
     directories: Option<Vec<String>>,
     allow_push: Option<bool>,
     signing_enabled: Option<bool>,
+    remote_patterns: Option<Vec<String>>,
+    github_login: Option<String>,
 ) -> Result<Profile, AppError> {
     let profile = profiles::update_profile(
-        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled,
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login,
     )?;
     git_config::apply_git_config()?;
     crate::tray::update_active_label(&app);
@@ -184,6 +190,19 @@ pub async fn doctor_check_keys() -> Result<Vec<Finding>, AppError> {
 #[tauri::command]
 pub async fn doctor_check_repos() -> Result<Vec<Finding>, AppError> {
     doctor::check_repos().await
+}
+
+/// Which account a push from this repository would authenticate as.
+/// `refresh` forgets the cached answers first (the Re-check button).
+#[tauri::command]
+pub async fn changes_push_identity(repo_path: String, refresh: bool) -> Result<crate::push_identity::PushIdentity, AppError> {
+    crate::push_identity::push_identity(&repo_path, refresh).await
+}
+
+/// Doctor's repair for a `local-override` finding.
+#[tauri::command]
+pub async fn doctor_unset_local(repo_path: String, key: String) -> Result<String, AppError> {
+    doctor::unset_local(&repo_path, &key).await
 }
 
 #[tauri::command]
@@ -488,6 +507,15 @@ pub async fn history_fetch(repo_path: String) -> Result<FetchResult, AppError> {
     tokio::task::spawn_blocking(move || git_history::fetch_repo(&repo_path))
         .await
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Which branch HEAD is on — or that it is detached or unborn. The one fact
+/// the branch list cannot give, read without the full repository status.
+#[tauri::command]
+pub async fn history_head(repo_path: String) -> Result<git_history::HeadInfo, AppError> {
+    tokio::task::spawn_blocking(move || git_history::head_info(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("task failed: {}", e)))?
 }
 
 /// Ahead/behind vs the remote, plus how stale that answer is.

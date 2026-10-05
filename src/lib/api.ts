@@ -20,6 +20,8 @@ export async function createProfile(params: {
   directories: string[];
   allowPush?: boolean | null;
   signingEnabled?: boolean | null;
+  remotePatterns?: string[] | null;
+  githubLogin?: string | null;
 }): Promise<Profile> {
   return invoke("create_profile", params);
 }
@@ -33,6 +35,8 @@ export async function updateProfile(params: {
   directories?: string[] | null;
   allowPush?: boolean | null;
   signingEnabled?: boolean | null;
+  remotePatterns?: string[] | null;
+  githubLogin?: string | null;
 }): Promise<Profile> {
   return invoke("update_profile", params);
 }
@@ -228,6 +232,35 @@ export async function historyFetch(repoPath: string): Promise<FetchResult> {
   return invoke("history_fetch", { repoPath });
 }
 
+/** Who a push from this repository would authenticate as. */
+export interface PushIdentity {
+  remote: string | null;
+  url: string | null;
+  via: "ssh-key" | "ssh-agent" | "https-credential" | "blocked" | "local" | "none" | "unknown";
+  login: string | null;
+  key_path: string | null;
+  host: string | null;
+  account: string | null;
+  expected_login: string | null;
+  detail: string;
+}
+
+export async function changesPushIdentity(repoPath: string, refresh = false): Promise<PushIdentity> {
+  return invoke("changes_push_identity", { repoPath, refresh });
+}
+
+export interface HeadInfo {
+  branch: string | null;
+  detached: boolean;
+  unborn: boolean;
+}
+
+/** Which branch HEAD is on, or that it is detached or unborn: three git reads
+ *  where the full repository status is seventeen. */
+export async function historyHead(repoPath: string): Promise<HeadInfo> {
+  return invoke("history_head", { repoPath });
+}
+
 export async function historySyncStatus(
   repoPath: string,
   branch: string
@@ -346,6 +379,11 @@ export async function doctorCheckKeys(): Promise<Finding[]> {
 
 export async function doctorCheckRepos(): Promise<Finding[]> {
   return invoke("doctor_check_repos");
+}
+
+/** Doctor's repair for a repository-local identity override. */
+export async function doctorUnsetLocal(repoPath: string, key: string): Promise<string> {
+  return invoke("doctor_unset_local", { repoPath, key });
 }
 
 export async function doctorFixSshConfig(): Promise<string> {
@@ -968,6 +1006,8 @@ export interface LfsStatus {
   pointer_paths: string[];
   more_pointers: number;
   summary: string;
+  /** How to install git-lfs on this platform, for when it is missing. */
+  install_hint: string;
 }
 
 export async function changesLfsStatus(repoPath: string): Promise<LfsStatus> {

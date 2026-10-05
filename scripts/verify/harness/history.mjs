@@ -108,6 +108,8 @@ async function openHistoryPage(browser, server, opts = {}) {
               return Promise.resolve({ message: "fetched", head_unchanged: true, worktree_unchanged: true, local_branches_unchanged: true, updated_remote_refs: 0 });
             case "changes_repo_status":
               return Promise.resolve(cfg.status);
+            case "history_head":
+              return Promise.resolve({ branch: cfg.status.branch, detached: cfg.status.detached, unborn: cfg.status.unborn });
             case "changes_submodules":
               return Promise.resolve(cfg.submodules);
             case "history_peek":
@@ -279,7 +281,9 @@ try {
     ok("  the detached-HEAD row explains nothing is lost", rows[0]?.includes("detached HEAD") && rows[0]?.includes("Nothing is lost"));
     ok("  the branch rows name the current branch", rows[1]?.includes("Move main here") && rows[3]?.includes("drop everything after it"));
     ok("opening it resolved the commit", (await calls(page, "history_resolve")).length >= 2);
-    ok("  and read the repo status", (await calls(page, "changes_repo_status")).length >= 1);
+    // The chooser itself reads the repo status (it needs the dirty-tree facts);
+    // the page's own HEAD question is the cheap one.
+    ok("  and read where HEAD is", (await calls(page, "history_head")).length >= 1);
     ok("no confirm dialog is stacked on the chooser", !(await text(page)).includes("Move main back to"));
 
     ok("Do it on Look at it", await clickInRow(page, "Look at it", { text: "Do it" }));
@@ -659,7 +663,7 @@ try {
     s = await text(page);
     ok("clicking a chip browses that submodule and says so", s.includes("Browsing inside") && s.includes("staging"));
     const subCalls = await page.evaluate(() => window.__CALLS__.filter((c) => c.args?.repoPath === "/repos/gitswitch/staging").map((c) => c.cmd));
-    ok("  branches, status, sync and the commit page are read from the submodule", ["history_branches", "changes_repo_status", "history_sync_status", "history_page"].every((c) => subCalls.includes(c)));
+    ok("  branches, status, sync and the commit page are read from the submodule", ["history_branches", "history_head", "history_sync_status", "history_page"].every((c) => subCalls.includes(c)));
     await (await button(page, "Fetch")).click();
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_fetch"), { timeout: 5000 });
     const fetched = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "history_fetch").map((c) => c.args.repoPath));

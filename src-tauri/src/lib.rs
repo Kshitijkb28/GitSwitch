@@ -28,6 +28,14 @@ mod push_lock;
 mod remote_repos;
 mod repo_scan;
 mod sparse;
+mod spawn;
+mod ssh_config;
+mod push_identity;
+
+/// sha256 hex of a secret, for cache keys that must not hold the secret itself.
+pub(crate) fn lfs_sha(secret: &str) -> String {
+    gitswitch_lock_core::sha256_hex(secret.as_bytes())
+}
 mod submodules;
 mod stash;
 mod sync;
@@ -159,6 +167,7 @@ pub fn run() {
             commands::doctor_check_push_locks,
             commands::history_fetch,
             commands::history_sync_status,
+            commands::history_head,
             commands::history_list_repos,
             commands::history_branches,
             commands::history_page,
@@ -173,6 +182,8 @@ pub fn run() {
             commands::doctor_check_keys,
             commands::doctor_check_repos,
             commands::doctor_fix_ssh_config,
+            commands::doctor_unset_local,
+            commands::changes_push_identity,
             commands::scan_repos,
             commands::check_repo_access,
             commands::sparse_clone,

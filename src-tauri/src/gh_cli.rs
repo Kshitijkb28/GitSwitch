@@ -1,17 +1,24 @@
 use crate::error::AppError;
 
+/// `gh` could not be started. "No such file" means it is not installed, which
+/// deserves the answer in words — the raw OS error reads like a bug.
+fn gh_error(e: std::io::Error) -> AppError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        AppError::Command(
+            "The GitHub CLI (gh) isn't installed on this computer. Install it from https://cli.github.com, sign in with `gh auth login`, then try again.".into(),
+        )
+    } else {
+        AppError::Command(format!("Failed to run gh: {}", e))
+    }
+}
+
 /// List the GitHub accounts the local `gh` CLI is authenticated with.
 pub async fn gh_list_accounts() -> Result<Vec<String>, AppError> {
-    let output = tokio::process::Command::new("gh")
+    let output = crate::spawn::async_command("gh")
         .args(["auth", "status"])
         .output()
         .await
-        .map_err(|e| {
-            AppError::Command(format!(
-                "Failed to run gh (is the GitHub CLI installed?): {}",
-                e
-            ))
-        })?;
+        .map_err(gh_error)?;
 
     let combined = format!(
         "{}{}",
@@ -42,11 +49,11 @@ pub async fn gh_list_accounts() -> Result<Vec<String>, AppError> {
 
 /// Log a specific account out of the local `gh` CLI (removes its stored token).
 pub async fn gh_logout(account: &str) -> Result<String, AppError> {
-    let output = tokio::process::Command::new("gh")
+    let output = crate::spawn::async_command("gh")
         .args(["auth", "logout", "--user", account])
         .output()
         .await
-        .map_err(|e| AppError::Command(format!("Failed to run gh: {}", e)))?;
+        .map_err(gh_error)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -60,11 +67,11 @@ pub async fn gh_logout(account: &str) -> Result<String, AppError> {
 
 /// Get an OAuth token for a specific gh account without switching the active one.
 pub async fn gh_get_token(account: &str) -> Result<String, AppError> {
-    let output = tokio::process::Command::new("gh")
+    let output = crate::spawn::async_command("gh")
         .args(["auth", "token", "--user", account])
         .output()
         .await
-        .map_err(|e| AppError::Command(format!("Failed to run gh: {}", e)))?;
+        .map_err(gh_error)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

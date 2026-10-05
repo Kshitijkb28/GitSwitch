@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useRef } from "react";
 import { Box, Download, Loader2, FolderOpen, GitCommitHorizontal, AlertTriangle, CornerDownRight } from "lucide-react";
 import { Button } from "../Button";
 import { ChangesList } from "./ChangesList";
@@ -88,9 +88,14 @@ function SubmoduleRow({
 
   // Read the submodule's own files only when asked: cheap per submodule
   // (~70 ms) but pointless for every one of them at once.
+  // `loading` is deliberately NOT a dependency: setting it re-ran this effect,
+  // whose cleanup cancelled the very request it had just started — and the
+  // cancelled request never cleared the flag, so the row span forever.
+  const inFlight = useRef(false);
   useEffect(() => {
-    if (hasSection || !open || !sub.initialised || !hasInnerChanges || inner || loading) return;
+    if (hasSection || !open || !sub.initialised || !hasInnerChanges || inner || inFlight.current) return;
     let cancelled = false;
+    inFlight.current = true;
     setLoading(true);
     api
       .changesRepoStatus(absolute)
@@ -101,12 +106,13 @@ function SubmoduleRow({
         if (!cancelled) setError(String(e));
       })
       .finally(() => {
+        inFlight.current = false;
         if (!cancelled) setLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [hasSection, open, sub.initialised, hasInnerChanges, inner, loading, absolute]);
+  }, [hasSection, open, sub.initialised, hasInnerChanges, inner, absolute]);
 
   const innerEntries = inner?.entries ?? [];
 

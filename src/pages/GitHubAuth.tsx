@@ -6,6 +6,8 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { Modal } from "../components/Modal";
 import { getEffectiveClientId } from "../lib/oauth";
+import { copyText } from "../lib/clipboard";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "../lib/api";
 
 type AuthStep = "idle" | "waiting" | "success" | "error";
@@ -181,14 +183,21 @@ export function GitHubAuth() {
 
   async function copyCode() {
     if (!deviceCode) return;
-    await navigator.clipboard.writeText(deviceCode.user_code);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    // The webview's clipboard API can be unavailable; copyText has the fallback.
+    if (await copyText(deviceCode.user_code)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
   }
 
   function openGitHub() {
     if (!deviceCode) return;
-    window.open(deviceCode.verification_uri, "_blank");
+    // window.open inside the webview opens nothing a person can use; the
+    // opener plugin hands the address to the system browser.
+    const uri = deviceCode.verification_uri;
+    openUrl(uri).catch(() => {
+      window.open(uri, "_blank");
+    });
   }
 
   function handleCreateProfile() {

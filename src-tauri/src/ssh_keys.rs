@@ -1,7 +1,6 @@
 use crate::error::AppError;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 fn get_ssh_dir() -> Result<PathBuf, AppError> {
     let home = dirs::home_dir().ok_or(AppError::Ssh("Cannot find home directory".into()))?;
@@ -23,7 +22,7 @@ pub fn generate_ssh_key(profile_name: &str, email: &str) -> Result<(String, Stri
         )));
     }
 
-    let output = Command::new("ssh-keygen")
+    let output = crate::spawn::command("ssh-keygen")
         .args([
             "-t", "ed25519",
             "-C", email,
@@ -62,7 +61,7 @@ pub fn get_public_key(private_key_path: &str) -> Result<String, AppError> {
 }
 
 pub async fn test_ssh_connection() -> Result<String, AppError> {
-    let output = tokio::process::Command::new("ssh")
+    let output = crate::spawn::async_command("ssh")
         .args(["-T", "git@github.com", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"])
         .output()
         .await
@@ -78,12 +77,19 @@ pub async fn test_ssh_connection() -> Result<String, AppError> {
     } else if combined.contains("Permission denied") {
         Err(AppError::Ssh("Permission denied - check your SSH key".into()))
     } else {
-        Ok(combined)
+        Err(unreachable(&combined))
     }
 }
 
+/// ssh neither authenticated nor was refused: the host was not reached. Its
+/// own last line (a DNS failure, a timeout, a proxy error) is the useful part.
+fn unreachable(output: &str) -> AppError {
+    let said = output.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("ssh printed nothing").trim();
+    AppError::Ssh(format!("Could not reach github.com over SSH: {}", said))
+}
+
 pub async fn test_ssh_connection_with_key(key_path: &str) -> Result<String, AppError> {
-    let output = tokio::process::Command::new("ssh")
+    let output = crate::spawn::async_command("ssh")
         .args([
             "-T", "git@github.com",
             "-i", key_path,
@@ -104,7 +110,7 @@ pub async fn test_ssh_connection_with_key(key_path: &str) -> Result<String, AppE
     } else if combined.contains("Permission denied") {
         Err(AppError::Ssh(format!("Permission denied for key {}", key_path)))
     } else {
-        Ok(combined)
+        Err(unreachable(&combined))
     }
 }
 
@@ -112,7 +118,7 @@ pub async fn test_ssh_connection_with_key(key_path: &str) -> Result<String, AppE
 /// Asking ssh-keygen for the public half with an empty passphrase succeeds only
 /// when the key is unencrypted. `-P ""` guarantees it can never prompt.
 pub fn key_has_passphrase(key_path: &str) -> bool {
-    std::process::Command::new("ssh-keygen")
+    crate::spawn::command("ssh-keygen")
         .args(["-y", "-P", "", "-f", key_path])
         .output()
         .map(|o| !o.status.success())
@@ -123,7 +129,7 @@ async fn probe_key_account(key_path: &str) -> Result<Option<String>, AppError> {
     // Bypass the user's ssh config with the platform's null device, so we test
     // the key itself rather than whatever identity the config forces.
     let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let output = tokio::process::Command::new("ssh")
+    let output = crate::spawn::async_command("ssh")
         .args([
             "-F", null_config,
             "-i", key_path,
@@ -159,7 +165,7 @@ async fn probe_key_account(key_path: &str) -> Result<Option<String>, AppError> {
 /// `Some(Some(login))` authenticated · `Some(None)` definitively rejected ·
 /// `None` indeterminate (timeout, throttling, DNS…) — must NOT be read as
 /// "not registered", or a transient blip condemns a working key.
-fn interpret_ssh_probe(combined: &str) -> Option<Option<String>> {
+pub(crate) fn interpret_ssh_probe(combined: &str) -> Option<Option<String>> {
     if let Some(idx) = combined.find("Hi ") {
         let rest = &combined[idx + 3..];
         if let Some(end) = rest.find('!') {

@@ -23,7 +23,8 @@ import { DiscardConfirmModal } from "../components/changes/DiscardConfirmModal";
 import { ResetConfirmModal } from "../components/changes/ResetConfirmModal";
 import { DiscardAllModal } from "../components/changes/DiscardAllModal";
 import { baseName } from "../lib/paths";
-import { usePersistedState, writePersisted } from "../lib/persist";
+import { usePersistedState, handOff } from "../lib/persist";
+import { open as pickFolder } from "@tauri-apps/plugin-dialog";
 import { useRefreshOnFocus } from "../lib/focus";
 import { elapsedLabel, runJob, useGitJob, clearJob, type GitJobKind } from "../lib/gitJobs";
 import * as api from "../lib/api";
@@ -206,14 +207,35 @@ export function Changes() {
     };
   }, [job?.running, job?.kind, job?.startedAt, repoPath]);
 
-  // A job that finished while we were on another page: show it and refresh.
-  const seenJob = useRef<number>(0);
+  // The repository on screen right now, for callbacks that outlive a render:
+  // a result that comes back after the person has moved to another
+  // repository must not be painted into that one's view.
+  const repoRef = useRef(repoPath);
   useEffect(() => {
-    if (!job || job.running || job.startedAt === seenJob.current) return;
-    seenJob.current = job.startedAt;
-    if (job.result) setResult(job.result);
-    if (job.error) setError(job.error);
-    loadStatus(repoPath);
+    repoRef.current = repoPath;
+  }, [repoPath]);
+
+  // A finished job is shown by this effect and nowhere else. `job` is the one
+  // for the repository on screen, so a job that finished while another
+  // repository was showing waits there until the person comes back. Seen
+  // jobs are remembered per repository, so returning to one does not replay
+  // a result that was already dismissed.
+  const seenJob = useRef<Record<string, number>>({});
+  useEffect(() => {
+    if (!job || job.running || seenJob.current[repoPath] === job.startedAt) return;
+    seenJob.current[repoPath] = job.startedAt;
+    if (job.result) {
+      setResult(job.result);
+      // The result carries the status git had after the operation, so a
+      // second full status read on top of it would be wasted work.
+      if (job.result.status) setStatus(job.result.status);
+      else loadStatus(repoPath);
+    }
+    if (job.error) {
+      setError(job.error);
+      loadStatus(repoPath);
+    }
+    setSubRefresh((n) => n + 1);
   }, [job, repoPath, loadStatus]);
 
   /** Work in another repo (a submodule) without waiting for the scan. */
@@ -239,22 +261,26 @@ export function Changes() {
    * confirm step), so it gets neither a toast nor a result card.
    */
   const apply = async (key: string, fn: () => Promise<OpResult>, target?: string, opts?: RunOptions) => {
+    const forRepo = repoPath;
     setBusy(key);
     setError(null);
     try {
       const r = await fn();
       const quiet = !r.ok && !!opts?.quietRefusal && r.refusal?.code === opts.quietRefusal;
-      if (!quiet) setResult(r);
-      if (r.status) {
+      // Still looking at the repository this ran in? Only then is the view
+      // updated; the toast below says what happened either way.
+      const stillHere = repoRef.current === forRepo;
+      if (!quiet && stillHere) setResult(r);
+      if (r.status && stillHere) {
         const s = r.status;
-        if (target && target !== repoPath) {
+        if (target && target !== forRepo) {
           setSubStatuses((list) => list.map((x) => (x.status.path === target ? { ...x, status: s } : x)));
-          loadStatus(repoPath);
+          loadStatus(forRepo);
         } else {
           setStatus(s);
         }
       }
-      setSubRefresh((n) => n + 1);
+      if (stillHere) setSubRefresh((n) => n + 1);
       if (r.ok) {
         toast.success(r.headline);
       } else if (quiet) {
@@ -273,18 +299,20 @@ export function Changes() {
     }
   };
 
-  /** Long operations survive leaving the page, so they run in the job slot. */
+  /**
+   * Long operations survive leaving the page, so they run in the job slot.
+   * Painting the result is left to the job effect above, which is keyed to
+   * the repository on screen — so a pull that finishes after the person has
+   * moved to another repository is shown when they come back, not over the
+   * one they are looking at.
+   */
   const runLong = (kind: GitJobKind, label: string, fn: () => Promise<OpResult>) => {
     setResult(null);
     setError(null);
     void runJob(repoPath, kind, label, fn).then((r) => {
       if (!r) return;
-      setResult(r);
-      if (r.status) setStatus(r.status);
       if (r.ok) toast.success(r.headline);
       else toast.error(r.refusal?.message ?? r.advice?.headline ?? "That didn't work");
-      loadStatus(repoPath);
-      setSubRefresh((n) => n + 1);
     });
   };
 
@@ -339,9 +367,19 @@ export function Changes() {
       ? {
           label: "Open in History",
           onClick: () => {
-            writePersisted("history.repo", repoPath);
+            handOff("history", repoPath);
             navigate("/history");
           },
+        }
+      : undefined;
+  // A branch whose upstream has another name (or is a local branch) is not
+  // pushed there; the way out is to publish it under its own name.
+  const publishAction =
+    (refusalCode === "upstream-name-differs" || refusalCode === "local-upstream") && status?.branch
+      ? {
+          label: `Publish as ${result?.refusal?.message.match(/`([^`]+\/[^`]+)` instead/)?.[1] ?? status.branch}`,
+          primary: true,
+          onClick: () => runLong("push", "Publishing…", () => api.changesPush(repoPath, true)),
         }
       : undefined;
 
@@ -436,8 +474,27 @@ export function Changes() {
       {!repoPath && (
         <Card>
           <p className="text-sm text-zinc-400">
-            Pick a repository to see what has changed in it.
+            {visibleRepos.length
+              ? "Pick a repository to see what has changed in it."
+              : "No repositories found. Assign folders to a profile and the repositories inside them are listed here — or open one folder now."}
           </p>
+          <div className="mt-3 flex items-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={async () => {
+                const dir = await pickFolder({ directory: true, multiple: false, title: "Open a repository" });
+                if (typeof dir === "string" && dir) openRepo(dir);
+              }}
+            >
+              Open a folder…
+            </Button>
+            {!visibleRepos.length && (
+              <Button variant="secondary" size="sm" onClick={() => navigate("/profile/new")}>
+                Set up a profile
+              </Button>
+            )}
+          </div>
         </Card>
       )}
 
@@ -568,7 +625,7 @@ export function Changes() {
                 clearJob(repoPath);
               }}
               onRecordPointers={() => apply("record", () => api.changesRecordPointers(repoPath))}
-              extraAction={historyAction}
+              extraAction={historyAction ?? publishAction}
             />
           )}
 
@@ -631,7 +688,12 @@ export function Changes() {
               <PushAccessCard
                 repoPath={repoPath}
                 push={status.push}
-                onChanged={(p) => setStatus({ ...status, push: p })}
+                onChanged={(p) => {
+                  // A mode change that lands after a switch to another
+                  // repository must not carry this status over to it.
+                  if (repoRef.current !== repoPath) return;
+                  setStatus((s) => (s ? { ...s, push: p } : s));
+                }}
               />
 
               {status.uses_lfs && (

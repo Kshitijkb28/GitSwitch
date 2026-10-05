@@ -25,7 +25,9 @@ import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import { ResultCard } from "../components/changes/ResultCard";
 import { CommitDetailPanel } from "../components/history/CommitDetailPanel";
-import { usePersistedState, writePersisted } from "../lib/persist";
+import { usePersistedState, handOff } from "../lib/persist";
+import { baseName } from "../lib/paths";
+import { open as pickFolder } from "@tauri-apps/plugin-dialog";
 import { useRefreshOnFocus } from "../lib/focus";
 import { useGitJob } from "../lib/gitJobs";
 import * as api from "../lib/api";
@@ -131,7 +133,9 @@ export function History() {
   const [detail, setDetail] = useState<api.CommitDetail | null>(null);
   /** What "Go to commit" resolved — carried into the panel so the chooser needn't ask again. */
   const [target, setTarget] = useState<api.CommitTarget | null>(null);
-  const [repoStatus, setRepoStatus] = useState<api.RepoStatus | null>(null);
+  const [head, setHead] = useState<api.HeadInfo | null>(null);
+  /** Folders opened by hand, outside every profile's folders. */
+  const [extraRepos, setExtraRepos] = useState<string[]>([]);
   const [gotoText, setGotoText] = useState("");
   const [gotoError, setGotoError] = useState<string | null>(null);
   const [gotoBusy, setGotoBusy] = useState(false);
@@ -270,9 +274,10 @@ export function History() {
   const loadBranches = useCallback(async (path: string) => {
     if (!path) return;
     setLoadingBranches(true);
-    // The repo status says which branch HEAD is on (or that it is detached) —
-    // the branch list alone can't tell a detached HEAD from an unborn one.
-    api.changesRepoStatus(path).then(setRepoStatus).catch(() => setRepoStatus(null));
+    // Which branch HEAD is on (or that it is detached): the branch list alone
+    // can't tell a detached HEAD from an unborn one. Three git reads, not the
+    // Changes page's whole status.
+    api.historyHead(path).then(setHead).catch(() => setHead(null));
     try {
       setBranches(await api.historyBranches(path));
     } catch (e) {
@@ -284,8 +289,8 @@ export function History() {
   }, []);
 
   const currentBranch =
-    repoStatus?.branch ?? branches.find((b) => b.is_current && !b.is_remote)?.name ?? null;
-  const detached = repoStatus ? repoStatus.detached : branches.length > 0 && !currentBranch;
+    head?.branch ?? branches.find((b) => b.is_current && !b.is_remote)?.name ?? null;
+  const detached = head ? head.detached : branches.length > 0 && !currentBranch;
 
   async function openCommit(hash: string, resolved: api.CommitTarget | null = null) {
     try {
@@ -471,10 +476,15 @@ export function History() {
               searchLabel="Search repositories"
               placeholder={loadingRepos ? "Loading repos…" : "Pick a repository…"}
               optionIcon={<GitBranch size={14} />}
-              options={visibleRepos.map((r) => ({
-                value: r.path,
-                label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
-              }))}
+              options={[
+                ...visibleRepos.map((r) => ({
+                  value: r.path,
+                  label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
+                })),
+                ...extraRepos
+                  .filter((p) => !visibleRepos.some((r) => r.path === p))
+                  .map((p) => ({ value: p, label: baseName(p) })),
+              ]}
             />
           </div>
           {subs.length > 0 && (
@@ -610,7 +620,7 @@ export function History() {
           extraAction={{
             label: "Open in Changes",
             onClick: () => {
-              writePersisted("changes.repo", repo);
+              handOff("changes", repo);
               navigate("/changes");
             },
             primary: !result.ok || (result.status?.conflicted_count ?? 0) > 0,
@@ -625,6 +635,24 @@ export function History() {
           <p className="text-sm text-zinc-500 mt-1">
             Assign folders to a profile and GitSwitch will list the repos inside them here.
           </p>
+          <div className="mt-4 flex items-center justify-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={async () => {
+                const dir = await pickFolder({ directory: true, multiple: false, title: "Open a repository" });
+                if (typeof dir !== "string" || !dir) return;
+                setExtraRepos((l) => (l.includes(dir) ? l : [...l, dir]));
+                setSuperRepo(dir);
+                setSub("");
+              }}
+            >
+              Open a folder…
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => navigate("/profile/new")}>
+              Set up a profile
+            </Button>
+          </div>
         </Card>
       )}
 

@@ -3,7 +3,6 @@ use crate::profiles;
 use crate::repo_scan;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const MARKER: &str = "GitSwitch identity guard";
 const MAX_COMMITS_PER_REPO: usize = 60;
@@ -39,7 +38,7 @@ pub struct RepoAudit {
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     let started = std::time::Instant::now();
-    let out = Command::new("git")
+    let out = crate::spawn::command("git")
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -84,7 +83,29 @@ pub(crate) fn owning_profile<'a>(
 }
 
 pub fn guard_state(repo: &Path) -> String {
-    guard_state_in(&repo.join(".git").join("hooks"))
+    match hooks_dir(repo) {
+        Ok(h) => guard_state_in(&h.dir),
+        Err(_) => guard_state_in(&repo.join(".git").join("hooks")),
+    }
+}
+
+/// Where this repository's hooks live, from git itself. `.git/hooks` is only
+/// right for a plain checkout: in a worktree or a submodule `.git` is a file
+/// pointing elsewhere, and `core.hooksPath` moves the directory anywhere —
+/// a guard written to `.git/hooks` there is never run.
+pub(crate) struct HooksDir {
+    pub dir: PathBuf,
+    /// `core.hooksPath` is set: the directory is shared or managed by another
+    /// tool (husky, lefthook), and not GitSwitch's to write into.
+    pub redirected: Option<String>,
+}
+
+pub(crate) fn hooks_dir(repo: &Path) -> Result<HooksDir, AppError> {
+    let said = git(repo, &["rev-parse", "--git-path", "hooks"]).map_err(AppError::Command)?;
+    let raw = PathBuf::from(said.trim());
+    let dir = if raw.is_absolute() { raw } else { repo.join(raw) };
+    let redirected = git(repo, &["config", "--get", "core.hooksPath"]).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    Ok(HooksDir { dir, redirected })
 }
 
 /// Same answer, but for a hooks directory already resolved with
@@ -310,7 +331,14 @@ __CHAIN__
 /// An existing foreign hook is preserved and chained, never discarded.
 pub fn install_guard(repo_path: &str, expected_email: &str) -> Result<String, AppError> {
     let repo = PathBuf::from(repo_path);
-    let hooks = repo.join(".git").join("hooks");
+    let resolved = hooks_dir(&repo)?;
+    if let Some(p) = resolved.redirected {
+        return Err(AppError::Config(format!(
+            "This repository routes its hooks through core.hooksPath = {} — a directory another tool manages, which GitSwitch won't write into. Add the identity check to that tool's pre-commit hook, or unset core.hooksPath here.",
+            p
+        )));
+    }
+    let hooks = resolved.dir;
     std::fs::create_dir_all(&hooks)?;
     let hook = hooks.join("pre-commit");
 
@@ -346,7 +374,8 @@ pub fn install_guard(repo_path: &str, expected_email: &str) -> Result<String, Ap
 }
 
 pub fn uninstall_guard(repo_path: &str) -> Result<String, AppError> {
-    let hooks = PathBuf::from(repo_path).join(".git").join("hooks");
+    let repo = PathBuf::from(repo_path);
+    let hooks = hooks_dir(&repo).map(|h| h.dir).unwrap_or_else(|_| repo.join(".git").join("hooks"));
     let hook = hooks.join("pre-commit");
     if !hook.exists() {
         return Ok("No guard installed.".into());
@@ -383,6 +412,8 @@ mod tests {
             is_default: false,
             allow_push: true,
             signing_enabled: false,
+            remote_patterns: Vec::new(),
+            github_login: None,
             directories: dirs.iter().map(|s| s.to_string()).collect(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
