@@ -125,7 +125,8 @@ pub fn loosely_writable(p: &Path) -> bool {
                 continue;
             }
             let hdr = &*(ace as *const ACE_HEADER);
-            if hdr.AceType as u32 != ACCESS_ALLOWED_ACE_TYPE as u32 {
+            // ACCESS_ALLOWED_ACE_TYPE is already a u32 in windows-sys; the AceType byte widens.
+            if u32::from(hdr.AceType) != ACCESS_ALLOWED_ACE_TYPE {
                 continue;
             }
             let a = &*(ace as *const ACCESS_ALLOWED_ACE);
