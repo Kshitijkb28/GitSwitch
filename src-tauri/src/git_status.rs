@@ -81,7 +81,7 @@ pub struct ParsedStatus {
 /// The two sides of a conflict, named the way the user thinks of them —
 /// during a rebase git's "ours" is the upstream and "theirs" is your commit,
 /// which is exactly the confusion these labels exist to remove.
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq, Default)]
 pub struct Sides {
     pub mine: String,
     pub theirs: String,
@@ -121,6 +121,117 @@ pub fn sides_for(kind: &str, branch: Option<&str>, upstream: Option<&str>, onto:
         "revert" => Sides { mine: mine_branch, theirs: "the revert".into() },
         _ => Sides { mine: mine_branch, theirs: "the branch being merged in".into() },
     }
+}
+
+/// One conflict in a file, split into what each side wants there.
+#[derive(Debug, Serialize, Clone, Default, PartialEq)]
+pub struct ConflictHunk {
+    /// 1-based line of the `<<<<<<<` marker.
+    pub line: usize,
+    pub mine: Vec<String>,
+    /// The common ancestor's lines, when the file carries diff3 markers.
+    pub base: Vec<String>,
+    pub theirs: Vec<String>,
+}
+
+/// A conflicted file read for resolution: its hunks side by side, and how
+/// many markers are still in it.
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct ConflictView {
+    pub path: String,
+    /// A binary file has no hunks to show: Keep mine or Take theirs decides it.
+    pub binary: bool,
+    /// How many `<<<<<<<` markers the file still has.
+    pub marker_count: usize,
+    pub hunks: Vec<ConflictHunk>,
+    /// Hunks or lines beyond the caps were left out.
+    pub truncated: bool,
+    pub sides: Sides,
+    pub total_lines: usize,
+}
+
+const MAX_CONFLICT_HUNKS: usize = 40;
+const MAX_CONFLICT_SIDE_LINES: usize = 200;
+
+/// A conflict marker line: seven identical `<`, `|`, `=` or `>` at the start,
+/// followed by the end of the line or a space (git's default marker size).
+fn marker_kind(line: &str) -> Option<char> {
+    for c in ['<', '|', '=', '>'] {
+        let m: String = std::iter::repeat_n(c, 7).collect();
+        if line == m || line.starts_with(&(m + " ")) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// Split a conflicted file into hunks. Text outside the markers is not kept:
+/// the point is what each side wants, not the whole file.
+pub fn parse_conflict_markers(text: &str) -> (Vec<ConflictHunk>, usize, bool) {
+    let mut hunks: Vec<ConflictHunk> = Vec::new();
+    let mut markers = 0;
+    let mut truncated = false;
+    let mut current: Option<(ConflictHunk, char)> = None;
+    for (i, line) in text.lines().enumerate() {
+        match (marker_kind(line), current.as_mut()) {
+            (Some('<'), _) => {
+                markers += 1;
+                if hunks.len() >= MAX_CONFLICT_HUNKS {
+                    truncated = true;
+                    current = None;
+                } else {
+                    current = Some((ConflictHunk { line: i + 1, ..Default::default() }, '<'));
+                }
+            }
+            (Some('|'), Some((_, side))) => *side = '|',
+            (Some('='), Some((_, side))) => *side = '=',
+            (Some('>'), Some(_)) => {
+                if let Some((h, _)) = current.take() {
+                    hunks.push(h);
+                }
+            }
+            (None, Some((h, side))) => {
+                let bucket = match side {
+                    '<' => &mut h.mine,
+                    '|' => &mut h.base,
+                    _ => &mut h.theirs,
+                };
+                if bucket.len() < MAX_CONFLICT_SIDE_LINES {
+                    bucket.push(line.to_string());
+                } else {
+                    truncated = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // A hunk never closed: the file is being edited, or the markers are
+    // damaged. Show what there is.
+    if let Some((h, _)) = current.take() {
+        hunks.push(h);
+    }
+    (hunks, markers, truncated)
+}
+
+/// The conflicted file at `path` (inside the repository), split for the
+/// resolution view. The sides are named as the operation in progress names
+/// them, so "mine" and "theirs" mean the same thing as on the file list.
+pub async fn conflict_view(repo_path: &str, path: &str) -> Result<ConflictView, AppError> {
+    let full = crate::git_ops::within_repo(repo_path, path)?;
+    let bytes = std::fs::read(&full)?;
+    let sides = repo_status(repo_path)
+        .await?
+        .operation
+        .and_then(|o| o.sides)
+        .unwrap_or(Sides { mine: "mine".into(), theirs: "theirs".into() });
+    let binary = bytes.iter().take(8000).any(|b| *b == 0);
+    if binary {
+        return Ok(ConflictView { path: path.to_string(), binary: true, sides, ..Default::default() });
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let total_lines = text.lines().count();
+    let (hunks, marker_count, truncated) = parse_conflict_markers(&text);
+    Ok(ConflictView { path: path.to_string(), binary: false, marker_count, hunks, truncated, sides, total_lines })
 }
 
 /// An interrupted merge/rebase/cherry-pick. Detected and shown; never acted on
@@ -893,6 +1004,7 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
 
     let paths = git_paths(&repo).await?;
     let mut presence = presence_from_disk(&paths);
+    let onto_oid = presence.onto.clone().filter(|o| is_full_oid(o));
     // git stores the rebase base as a full id; a person knows it by name.
     if let Some(onto) = presence.onto.clone().filter(|o| is_full_oid(o)) {
         if let Some(name) = onto_name(&repo, presence.head_name.as_deref(), &onto).await {
@@ -902,6 +1014,21 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
     let mut operation = parse_in_progress(&presence);
     if let Some(op) = operation.as_mut() {
         op.sides = Some(sides_for(&op.kind, parsed.branch.as_deref(), parsed.upstream.as_deref(), presence.onto.as_deref()));
+    }
+    // A rebase the superproject's update runs inside this submodule: "theirs"
+    // is the commit upstream's superproject records for it, so it is named
+    // that way — "origin/main's A (9f8e7d6)" — rather than by a bare id.
+    let sync = crate::sync::summary_for(&repo).await;
+    if let (Some(op), Some(sy)) = (operation.as_mut(), sync.as_ref()) {
+        if !sy.is_root && op.kind.starts_with("rebase") {
+            if let (Some(sub), Some(target), Some(onto)) = (sy.sub_path.as_deref(), sy.sub_target.as_deref(), onto_oid.as_deref()) {
+                if onto == target {
+                    if let Some(sides) = op.sides.as_mut() {
+                        sides.theirs = format!("{}'s {} ({})", sy.upstream, sub, short_oid(target));
+                    }
+                }
+            }
+        }
     }
     let merge_message = if paths.merge_head.exists() {
         std::fs::read_to_string(&paths.merge_msg)
@@ -997,7 +1124,7 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         merge_message,
         has_submodules,
         uses_lfs,
-        sync: crate::sync::summary_for(&repo).await,
+        sync,
         conflict_source,
     })
 }
@@ -1412,6 +1539,30 @@ mod tests {
         assert_eq!(st.branch.as_deref(), Some("main"));
         assert_eq!(st.entries.len(), 1);
         assert_eq!(st.entries[0].path, "real.txt");
+    }
+
+    #[test]
+    fn conflict_markers_are_split_into_sides_and_counted() {
+        let text = "a\n<<<<<<< HEAD\nmine 1\nmine 2\n||||||| base\nold\n=======\ntheirs 1\n>>>>>>> origin/main\nb\n<<<<<<< HEAD\nm\n=======\nt\n>>>>>>> theirs\n";
+        let (hunks, markers, truncated) = parse_conflict_markers(text);
+        assert_eq!(markers, 2);
+        assert!(!truncated);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].line, 2);
+        assert_eq!(hunks[0].mine, vec!["mine 1", "mine 2"]);
+        assert_eq!(hunks[0].base, vec!["old"]);
+        assert_eq!(hunks[0].theirs, vec!["theirs 1"]);
+        assert_eq!(hunks[1].mine, vec!["m"]);
+        assert!(hunks[1].base.is_empty());
+        assert_eq!(hunks[1].theirs, vec!["t"]);
+        // A separator inside normal text is not a marker: it needs exactly seven.
+        let (hunks, markers, _) = parse_conflict_markers("========\nplain\n<<<<<<<<\n");
+        assert_eq!(markers, 0);
+        assert!(hunks.is_empty());
+        // Half-edited: an unclosed hunk is still shown.
+        let (hunks, markers, _) = parse_conflict_markers("<<<<<<< HEAD\nx\n=======\ny\n");
+        assert_eq!(markers, 1);
+        assert_eq!(hunks[0].theirs, vec!["y"]);
     }
 
     #[test]

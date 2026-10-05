@@ -174,6 +174,8 @@ pub(crate) mod tests {
             "changes_sync_run" => forward!(c::changes_sync_run, args, repo_path, stash, bundles, fingerprint),
             "changes_sync_continue" => forward!(c::changes_sync_continue, args, repo_path),
             "changes_sync_abort" => forward!(c::changes_sync_abort, args, repo_path),
+            "changes_open_path" => forward!(c::changes_open_path, args, repo_path, path, reveal),
+            "changes_conflict_view" => forward!(c::changes_conflict_view, args, repo_path, path),
             "changes_record_pointers" => forward!(c::changes_record_pointers, args, repo_path),
             // push access
             "changes_push_state" => forward!(c::changes_push_state, args, repo_path),

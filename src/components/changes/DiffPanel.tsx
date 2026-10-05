@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
-import { X, Loader2, FileWarning } from "lucide-react";
+import { X, Loader2, FileWarning, ExternalLink, FolderOpen } from "lucide-react";
+import { Button } from "../Button";
+import { ConflictView } from "./ConflictView";
 import * as api from "../../lib/api";
 import type { ChangeEntry, FileDiff } from "../../lib/api";
 
@@ -7,6 +9,8 @@ interface Props {
   repoPath: string;
   entry: ChangeEntry;
   onClose: () => void;
+  /** Open the file in the system's default application, or reveal it. */
+  onOpenPath?: (path: string, reveal: boolean) => void;
 }
 
 /**
@@ -81,7 +85,9 @@ export function DiffView({
  * the index and a different set in the worktree — and collapsing the two would
  * misrepresent what a commit is about to contain.
  */
-export function DiffPanel({ repoPath, entry, onClose }: Props) {
+export function DiffPanel({ repoPath, entry, onClose, onOpenPath }: Props) {
+  // A conflicted file is shown by its sides, not as a diff against the index.
+  const conflicted = entry.kind === "conflicted";
   const hasStaged = entry.staged !== "." && entry.kind !== "untracked";
   const hasUnstaged = entry.unstaged !== "." || entry.kind === "untracked";
   const [side, setSide] = useState<"staged" | "unstaged">(
@@ -92,6 +98,10 @@ export function DiffPanel({ repoPath, entry, onClose }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (conflicted) {
+      setLoading(false);
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -109,7 +119,7 @@ export function DiffPanel({ repoPath, entry, onClose }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [repoPath, entry.path, entry.kind, side]);
+  }, [repoPath, entry.path, entry.kind, side, conflicted]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -157,16 +167,31 @@ export function DiffPanel({ repoPath, entry, onClose }: Props) {
               )}
             </div>
           </div>
-          <button
-            onClick={onClose}
-            className="p-1 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer shrink-0"
-          >
-            <X size={18} />
-          </button>
+          <div className="flex items-center gap-1 shrink-0">
+            {onOpenPath && (
+              <>
+                <Button size="sm" variant="ghost" onClick={() => onOpenPath(entry.path, false)} title="Open in your editor — the application your system opens this file with" className="px-1.5">
+                  <ExternalLink size={13} />
+                  Open in editor
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => onOpenPath(entry.path, true)} title="Reveal in the file manager" className="px-1.5">
+                  <FolderOpen size={13} />
+                  Reveal
+                </Button>
+              </>
+            )}
+            <button
+              onClick={onClose}
+              aria-label="Close"
+              className="p-1 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer shrink-0"
+            >
+              <X size={18} />
+            </button>
+          </div>
         </div>
 
         <div className="flex-1 overflow-auto">
-          <DiffView diff={diff} loading={loading} error={error} />
+          {conflicted ? <ConflictView repoPath={repoPath} path={entry.path} /> : <DiffView diff={diff} loading={loading} error={error} />}
         </div>
       </div>
     </div>

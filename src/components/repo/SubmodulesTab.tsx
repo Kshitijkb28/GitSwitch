@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Box, Download, FolderOpen, GitGraph, Loader2, AlertTriangle, GitCommitHorizontal } from "lucide-react";
+import { Box, Download, FolderOpen, GitGraph, Loader2, AlertTriangle, GitCommitHorizontal, ArrowDownUp } from "lucide-react";
 import { Button } from "../Button";
 import { Card } from "../Card";
 import * as api from "../../lib/api";
@@ -21,6 +21,8 @@ interface Props {
   onPullInside: (sub: SubmoduleInfo) => void;
   /** `git submodule update -- <path>`: check out the commit this repository records. */
   onUpdateOne: (path: string) => void;
+  /** Opens the Update drawer for the repository: the latest below, your work on top, every submodule aligned. */
+  onPreview: () => void;
 }
 
 function stateLabel(s: SubmoduleInfo): string {
@@ -61,7 +63,7 @@ function stateClass(s: SubmoduleInfo): string {
  * upstream is a stream of pointer bumps, this is where the person's work
  * actually lives.
  */
-export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInside, onOpenHistory, onInitialise, onRecordPointers, onPullInside, onUpdateOne }: Props) {
+export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInside, onOpenHistory, onInitialise, onRecordPointers, onPullInside, onUpdateOne, onPreview }: Props) {
   const [subs, setSubs] = useState<SubmoduleInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -115,6 +117,12 @@ export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInsid
               {unfetchable.length > 0 && <> · <span className="text-red-300">{unfetchable.length} unfetchable</span></>}
             </span>
             <span className="ml-auto flex items-center gap-2">
+              {moved.length > 0 && (
+                <Button size="sm" variant="primary" disabled={busy} onClick={onPreview} title="Fetches, then shows what an update would do to the repository and every submodule — nothing changes until you press Update now">
+                  <ArrowDownUp size={13} />
+                  Preview update
+                </Button>
+              )}
               {moved.length > 0 && (
                 <Button size="sm" variant="secondary" disabled={busy} onClick={onRecordPointers} title="Commit the superproject's record of where each submodule is checked out now">
                   <GitCommitHorizontal size={13} />

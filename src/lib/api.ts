@@ -806,6 +806,13 @@ export interface SyncSummary {
   root: string;
   /** False when this repository is a submodule of the one being synced. */
   is_root: boolean;
+  /** Conflicted files still unmerged where the pause is: 0 means Continue update can be pressed. */
+  unresolved: number;
+  /** The superproject's upstream, what "theirs" means in every rebase the update runs. */
+  upstream: string;
+  /** For a submodule's own status: its path in the superproject and the commit it is rebased onto. */
+  sub_path: string | null;
+  sub_target: string | null;
 }
 
 export interface SyncNeedsUser {
@@ -1191,6 +1198,8 @@ export interface PullOutcome {
   /** A rebase with autostash finished but the stash could not be re-applied cleanly. */
   autostash_conflict?: boolean;
   autostash_left?: string | null;
+  /** Submodule pointers the pull moved: the repository now records other commits than are checked out. */
+  submodules_moved?: number;
 }
 
 /** What every git operation returns: the outcome plus the re-read repo state. */
@@ -1491,6 +1500,13 @@ export interface SyncSubPlan {
   untracked: number;
   fetch_error: string | null;
   notes: string[];
+  /**
+   * When blocked, a stable code for the remedy: reinit | finish-operation |
+   * resolve-conflicts | removed-upstream | fetch-failed | unreachable |
+   * record-pointers | squash-own | stash-inside. Buttons key on this, never
+   * on the sentence.
+   */
+  remedy: string | null;
 }
 
 export interface SyncSuperPlan {
@@ -1508,6 +1524,8 @@ export interface SyncSuperPlan {
   untracked: number;
   will_stash: boolean;
   notes: string[];
+  /** turn-on-stash | stash-collides | untracked-in-the-way, in the blockers' order. */
+  remedies: string[];
 }
 
 export interface SyncSkipped {
@@ -1597,6 +1615,40 @@ export async function changesSyncContinue(repoPath: string): Promise<OpResult> {
 
 export async function changesSyncAbort(repoPath: string): Promise<OpResult> {
   return invoke("changes_sync_abort", { repoPath });
+}
+
+/**
+ * Opens a file of the repository in the system's default application, or
+ * reveals it in the file manager. The backend checks the path is inside the
+ * repository first.
+ */
+export async function changesOpenPath(repoPath: string, path: string, reveal: boolean): Promise<void> {
+  return invoke("changes_open_path", { repoPath, path, reveal });
+}
+
+export interface ConflictHunk {
+  /** 1-based line of the `<<<<<<<` marker. */
+  line: number;
+  mine: string[];
+  /** The common ancestor's lines, when the file carries diff3 markers. */
+  base: string[];
+  theirs: string[];
+}
+
+export interface ConflictView {
+  path: string;
+  /** No hunks to show: Keep mine or Take theirs decides it. */
+  binary: boolean;
+  marker_count: number;
+  hunks: ConflictHunk[];
+  truncated: boolean;
+  sides: Sides;
+  total_lines: number;
+}
+
+/** A conflicted file split into what each side wants, for the resolution view. */
+export async function changesConflictView(repoPath: string, path: string): Promise<ConflictView> {
+  return invoke("changes_conflict_view", { repoPath, path });
 }
 
 /** One commit recording every submodule checked out ahead of what the branch records. */

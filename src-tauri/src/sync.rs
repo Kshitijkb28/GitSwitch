@@ -134,6 +134,12 @@ pub struct SubPlan {
     pub untracked: usize,
     pub fetch_error: Option<String>,
     pub notes: Vec<String>,
+    /// A stable code for the blocker's remedy, when blocked: reinit |
+    /// finish-operation | resolve-conflicts | removed-upstream | fetch-failed |
+    /// unreachable | record-pointers | squash-own | stash-inside. The UI keys
+    /// its buttons on this, never on the sentence.
+    #[serde(default)]
+    pub remedy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -151,6 +157,10 @@ pub struct SuperPlan {
     pub untracked: usize,
     pub will_stash: bool,
     pub notes: Vec<String>,
+    /// Stable codes for the superproject's blockers, in their order:
+    /// turn-on-stash | stash-collides | untracked-in-the-way.
+    #[serde(default)]
+    pub remedies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -180,20 +190,23 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
     let s = &facts.superproject;
     let mut blockers: Vec<String> = Vec::new();
+    let mut remedies: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
     let dirty = !s.dirty_tracked.is_empty();
     if dirty && !stash {
         blockers.push(format!(
-            "You have {} with uncommitted changes. Turn on stashing for the sync, or commit or stash them yourself first.",
+            "You have {} with uncommitted changes. Turn on stashing for the update, or commit or stash them yourself first.",
             plural(s.dirty_tracked.len(), "file", "files")
         ));
+        remedies.push("turn-on-stash".into());
     }
     if dirty && stash && !s.dirty_overlap.is_empty() {
         blockers.push(format!(
             "Your uncommitted changes to {} collide with incoming commits; a stash could not be re-applied cleanly. Commit or stash them yourself first.",
             s.dirty_overlap.join(", ")
         ));
+        remedies.push("stash-collides".into());
     }
     if !s.untracked_overlap.is_empty() {
         blockers.push(format!(
@@ -201,6 +214,7 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
             if s.untracked_overlap.len() == 1 { "file" } else { "files" },
             s.untracked_overlap.join(", ")
         ));
+        remedies.push("untracked-in-the-way".into());
     }
     if !s.file_overlap.is_empty() {
         notes.push(format!(
@@ -231,34 +245,36 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
             untracked: f.untracked,
             fetch_error: f.fetch_error.clone(),
             notes: Vec::new(),
+            remedy: None,
         };
-        let block = |p: &mut SubPlan, why: String| {
+        let block = |p: &mut SubPlan, code: &str, why: String| {
             p.action = "blocked".into();
+            p.remedy = Some(code.into());
             p.reason = why;
         };
         let head = f.head.clone().unwrap_or_default();
         let pointer_moves = f.my_commits_move_gitlink || f.upstream_moves_gitlink;
         if !f.gitdir_valid {
-            block(&mut p, "its .git points at a directory that no longer exists; re-initialise it (git submodule update --init) first".into());
+            block(&mut p, "reinit", "its .git points at a directory that no longer exists; re-initialise it (git submodule update --init) first".into());
         } else if let Some(op) = &f.operation {
-            block(&mut p, format!("a {} is in progress inside it; finish or abort that first", op));
+            block(&mut p, "finish-operation", format!("a {} is in progress inside it; finish or abort that first", op));
         } else if f.conflicted > 0 {
-            block(&mut p, format!("{} inside it still {} conflicts", plural(f.conflicted, "file", "files"), if f.conflicted == 1 { "has" } else { "have" }));
+            block(&mut p, "resolve-conflicts", format!("{} inside it still {} conflicts", plural(f.conflicted, "file", "files"), if f.conflicted == 1 { "has" } else { "have" }));
         } else if f.target.is_none() {
-            block(&mut p, "upstream removed this submodule; decide by hand what to do with your copy".into());
+            block(&mut p, "removed-upstream", "upstream removed this submodule; decide by hand what to do with your copy".into());
         } else if !f.target_present {
-            block(&mut p, match &f.fetch_error {
+            block(&mut p, if f.fetch_error.is_some() { "fetch-failed" } else { "unreachable" }, match &f.fetch_error {
                 Some(e) => format!("the commit upstream records ({}) is not available here and fetching failed: {}", short(f.target.as_deref().unwrap_or("")), e),
                 None => format!("the commit upstream records ({}) is not reachable from its remote's branches", short(f.target.as_deref().unwrap_or(""))),
             });
         } else if !same_oid(&head, &f.recorded) && pointer_moves {
-            block(&mut p, format!(
-                "it is checked out at {} but this branch records {}; commit that pointer (Record submodule pointers) or move it back before syncing",
+            block(&mut p, "record-pointers", format!(
+                "it is checked out at {} but this branch records {}; commit that pointer (Record submodule pointers) or move it back before updating",
                 short(&head), short(&f.recorded)
             ));
         } else if f.own_commits_moving_gitlink > 1 {
-            block(&mut p, format!(
-                "{} of your commits move this submodule's pointer; the sync handles one — squash them, or do this one by hand",
+            block(&mut p, "squash-own", format!(
+                "{} of your commits move this submodule's pointer; the update handles one — squash them, or do this one by hand",
                 f.own_commits_moving_gitlink
             ));
         } else {
@@ -267,7 +283,7 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
                 p.notes.push(format!("its remote could not be fetched ({}); the recorded commit is available locally", e));
             }
             if f.tip_ahead_of_target {
-                p.notes.push("its remote has newer commits than upstream's superproject records; the sync targets what is recorded".into());
+                p.notes.push("its remote has newer commits than upstream's superproject records; the update targets what is recorded".into());
             }
             if same_oid(&head, &target) {
                 p.action = "none".into();
@@ -286,7 +302,7 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
             } else {
                 // Diverged: rebase this submodule's own commits onto the recorded target.
                 if !f.dirty_overlap.is_empty() {
-                    block(&mut p, format!(
+                    block(&mut p, "stash-inside", format!(
                         "its uncommitted changes to {} collide with the commits it will be rebased onto; commit or stash them inside it first",
                         f.dirty_overlap.join(", ")
                     ));
@@ -328,9 +344,9 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
         }
     }
     let summary = if nothing_to_do {
-        format!("Nothing to sync — you are level with {} and every submodule is where it should be.", s.upstream)
+        format!("Nothing to update — you are level with {} and every submodule is where it should be.", s.upstream)
     } else if !blockers.is_empty() {
-        format!("Cannot sync yet: {}.", plural(blockers.len(), "thing needs", "things need"))
+        format!("Cannot update yet: {}.", plural(blockers.len(), "thing needs", "things need"))
     } else if s.behind == 0 {
         "Only submodules need aligning.".into()
     } else {
@@ -361,6 +377,7 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
             untracked: s.untracked,
             will_stash: dirty && stash,
             notes,
+            remedies,
         },
         submodules: subs,
         skipped: facts.skipped.clone(),
@@ -461,11 +478,42 @@ pub struct SyncSummary {
     pub root: String,
     /// False when this repository is a submodule of the repository being synced.
     pub is_root: bool,
+    /// Conflicted files still unmerged in the repository the pause names —
+    /// 0 is when "Continue update" can be pressed.
+    pub unresolved: usize,
+    /// The superproject's upstream ("origin/main"): what "theirs" means in
+    /// every rebase the update runs.
+    pub upstream: String,
+    /// For a submodule's own status: its path inside the superproject, and the
+    /// commit the update rebases it onto (what upstream's superproject records).
+    pub sub_path: Option<String>,
+    pub sub_target: Option<String>,
 }
 
 pub async fn summary_for(repo: &Path) -> Option<SyncSummary> {
     if let Some(st) = read_state(repo).await {
-        return Some(SyncSummary { phase: st.phase, started_at: st.started_at, needs_user: st.needs_user, root: st.repo, is_root: true });
+        // One extra `git status`, only while paused: what the person still
+        // has to resolve before the update can go on.
+        let unresolved = match st.needs_user.as_ref().map(|n| n.where_.as_str()) {
+            Some(w) if w.starts_with("submodule") => match w.split(':').nth(1).filter(|p| !p.is_empty()) {
+                Some(sub) => unmerged(&repo.join(sub)).await.len(),
+                None => 0,
+            },
+            Some(_) => unmerged(repo).await.len(),
+            None => 0,
+        };
+        let upstream = st.plan.superproject.upstream.clone();
+        return Some(SyncSummary {
+            phase: st.phase,
+            started_at: st.started_at,
+            needs_user: st.needs_user,
+            root: st.repo,
+            is_root: true,
+            unresolved,
+            upstream,
+            sub_path: None,
+            sub_target: None,
+        });
     }
     let parent = GitCmd::at(repo)
         .args(["rev-parse", "--show-superproject-working-tree"])
@@ -473,7 +521,30 @@ pub async fn summary_for(repo: &Path) -> Option<SyncSummary> {
         .await
         .filter(|s| !s.is_empty())?;
     let st = read_state(Path::new(&parent)).await?;
-    Some(SyncSummary { phase: st.phase, started_at: st.started_at, needs_user: st.needs_user, root: st.repo, is_root: false })
+    // Which of the superproject's submodules this repository is: the one
+    // whose folder is this folder.
+    let here = std::fs::canonicalize(repo).ok();
+    let mine = st
+        .subs
+        .iter()
+        .find(|s| here.is_some() && std::fs::canonicalize(Path::new(&parent).join(&s.path)).ok() == here);
+    let (sub_path, sub_target) = match mine {
+        Some(s) => (Some(s.path.clone()), Some(s.target.clone())),
+        None => (None, None),
+    };
+    let unresolved = unmerged(repo).await.len();
+    let upstream = st.plan.superproject.upstream.clone();
+    Some(SyncSummary {
+        phase: st.phase,
+        started_at: st.started_at,
+        needs_user: st.needs_user,
+        root: st.repo,
+        is_root: false,
+        unresolved,
+        upstream,
+        sub_path,
+        sub_target,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -559,7 +630,7 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
         .ok_text()
         .await
         .filter(|s| s.starts_with("refs/remotes/"))
-        .ok_or_else(|| AppError::Command("This branch has no upstream to sync with.".into()))?;
+        .ok_or_else(|| AppError::Command("This branch has no upstream to update from.".into()))?;
     let upstream = upstream_ref.trim_start_matches("refs/remotes/").to_string();
     let remote = upstream.split('/').next().unwrap_or("origin").to_string();
     crate::git_exec::validate_remote_name(&remote)?;
@@ -896,7 +967,7 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
             st.needs_user = Some(NeedsUser {
                 where_: "superproject".into(),
                 paths: Vec::new(),
-                hint: "The rebase stopped without a conflict to resolve. Read what git said on the Changes page, fix it, then Continue sync — or Abort sync.".into(),
+                hint: "The rebase stopped without a conflict to resolve. Read what git said on the Changes page, fix it, then Continue update — or Abort update.".into(),
             });
             st.phase = "rebasing".into();
             write_state_at(state_file, st)?;
@@ -907,7 +978,7 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
             st.needs_user = Some(NeedsUser {
                 where_: "superproject".into(),
                 paths: files.clone(),
-                hint: format!("Resolve {} on the Changes page (edit, then stage), then Continue sync.", files.join(", ")),
+                hint: format!("Resolve {} on the Changes page (edit, then stage), then Continue update.", files.join(", ")),
             });
             st.phase = "rebasing".into();
             write_state_at(state_file, st)?;
@@ -931,7 +1002,7 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
         st.needs_user = Some(NeedsUser {
             where_: "autostash-conflict".into(),
             paths: leftovers.iter().map(|c| c.path.clone()).collect(),
-            hint: "The rebase finished, but your stashed changes did not re-apply cleanly. Resolve and stage them, then Continue sync — or run `git reset --hard` (your changes are still in stash@{0}) and `git stash pop` by hand.".into(),
+            hint: "The rebase finished, but your stashed changes did not re-apply cleanly. Resolve and stage them, then Continue update — or run `git reset --hard` (your changes are still in stash@{0}) and `git stash pop` by hand.".into(),
         });
         st.phase = "aligning".into();
         write_state_at(state_file, st)?;
@@ -951,7 +1022,7 @@ async fn resolve_gitlink_stop(repo: &Path, st: &mut SyncState, state_file: &Path
         st.needs_user = Some(NeedsUser { where_: format!("submodule:{}", path), paths: vec![path.clone()], hint });
     };
     if c.stage_oids.len() != 3 || c.stage_oids.iter().any(|o| o.is_empty() || o == "0000000000000000000000000000000000000000") || c.stage_modes.get(1) != Some(&"160000".to_string()) || c.stage_modes.get(2) != Some(&"160000".to_string()) {
-        hand_over(st, format!("The submodule {} was added or removed on one side; decide by hand, stage it, then Continue sync.", path));
+        hand_over(st, format!("The submodule {} was added or removed on one side; decide by hand, stage it, then Continue update.", path));
         return write_state_at(state_file, st);
     }
     let ours = c.stage_oids[1].clone(); // upstream's recorded commit (during a rebase, "ours" is the onto side)
@@ -960,13 +1031,13 @@ async fn resolve_gitlink_stop(repo: &Path, st: &mut SyncState, state_file: &Path
     let head = oid(&sub, "HEAD").await.unwrap_or_default();
     let ss = st.subs.iter_mut().find(|s| s.path == path);
     let Some(ss) = ss else {
-        hand_over(st, format!("The submodule {} was not part of the plan; stage it by hand, then Continue sync.", path));
+        hand_over(st, format!("The submodule {} was not part of the plan; stage it by hand, then Continue update.", path));
         return write_state_at(state_file, st);
     };
     let already_rebased = ss.rebased && ss.head_after.as_deref() == Some(head.as_str());
     if !same_oid(&head, &theirs) && !already_rebased {
         hand_over(st, format!(
-            "{} is checked out at {} but your commit records {}. Put it where you want it (with your commits on top of {}), stage it, then Continue sync.",
+            "{} is checked out at {} but your commit records {}. Put it where you want it (with your commits on top of {}), stage it, then Continue update.",
             path, short(&head), short(&theirs), short(&ours)
         ));
         return write_state_at(state_file, st);
@@ -978,7 +1049,7 @@ async fn resolve_gitlink_stop(repo: &Path, st: &mut SyncState, state_file: &Path
             ss.rebased = true;
             ss.note = "rebase stopped on a conflict inside it".into();
             hand_over(st, format!(
-                "Rebasing {} onto {} stopped on a conflict inside it. Open it as its own repository on the Changes page, resolve and stage, then Continue sync.",
+                "Rebasing {} onto {} stopped on a conflict inside it. Open it as its own repository on the Changes page, resolve and stage, then Continue update.",
                 path, short(&ours)
             ));
             return write_state_at(state_file, st);
@@ -986,7 +1057,7 @@ async fn resolve_gitlink_stop(repo: &Path, st: &mut SyncState, state_file: &Path
         if !unmerged(&sub).await.is_empty() || has_autostash_entry(&sub).await {
             ss.rebased = true;
             hand_over(st, format!(
-                "{} was rebased, but its uncommitted changes did not re-apply cleanly. Resolve and stage them inside it, then Continue sync.",
+                "{} was rebased, but its uncommitted changes did not re-apply cleanly. Resolve and stage them inside it, then Continue update.",
                 path
             ));
             st.needs_user.as_mut().unwrap().where_ = format!("submodule-autostash:{}", path);
@@ -1072,7 +1143,7 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
             st.needs_user = Some(NeedsUser {
                 where_: format!("submodule:{}", path),
                 paths: vec![path.clone()],
-                hint: format!("Rebasing {} onto {} stopped on a conflict inside it. Open it as its own repository, resolve and stage, then Continue sync.", path, short(&recorded)),
+                hint: format!("Rebasing {} onto {} stopped on a conflict inside it. Open it as its own repository, resolve and stage, then Continue update.", path, short(&recorded)),
             });
             return write_state_at(state_file, st);
         }
@@ -1080,7 +1151,7 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
             st.needs_user = Some(NeedsUser {
                 where_: format!("submodule-autostash:{}", path),
                 paths: vec![path.clone()],
-                hint: format!("{} was rebased, but its uncommitted changes did not re-apply cleanly. Resolve and stage them inside it, then Continue sync.", path),
+                hint: format!("{} was rebased, but its uncommitted changes did not re-apply cleanly. Resolve and stage them inside it, then Continue update.", path),
             });
             return write_state_at(state_file, st);
         }
@@ -1127,16 +1198,16 @@ async fn finish(repo_path: &str, st: &SyncState, state_file: &Path) -> Result<Op
         let status = git_status::repo_status(repo_path).await?;
         let verified = outcome.verified.behind_zero && outcome.verified.own_on_top && outcome.verified.no_conflicts_left;
         let headline = if !verified {
-            "Sync finished, but a check did not pass — read the details.".to_string()
+            "Update finished, but a check did not pass — read the details.".to_string()
         } else if outcome.own_kept.is_empty() {
             format!(
-                "Synced: fast-forwarded to {} from {}.",
+                "Updated: fast-forwarded to {} from {}.",
                 plural(outcome.incoming, "new commit", "new commits"),
                 st.plan.superproject.upstream
             )
         } else {
             format!(
-                "Synced: {} on top of {} from {}.",
+                "Updated: {} on top of {} from {}.",
                 plural(outcome.own_kept.len(), "commit of yours", "commits of yours"),
                 plural(outcome.incoming, "new commit", "new commits"),
                 st.plan.superproject.upstream
@@ -1160,21 +1231,21 @@ async fn finish(repo_path: &str, st: &SyncState, state_file: &Path) -> Result<Op
             detail.push_str(" Your uncommitted changes were stashed and re-applied (staged changes come back unstaged).");
         }
         if !outcome.verified.dirty_paths_unchanged {
-            detail.push_str(" The set of files with uncommitted changes differs from before the sync — check the file list.");
+            detail.push_str(" The set of files with uncommitted changes differs from before the update — check the file list.");
         }
         let mut r = OpResult::done(headline, detail.trim().to_string(), status);
         r.ok = verified;
         r
     } else if st.phase == "aborted" {
         std::fs::remove_file(state_file).ok();
-        OpResult::done("Sync aborted.".to_string(), "Everything is back where it was, except what is named below.".to_string(), status)
+        OpResult::done("Update aborted.".to_string(), "Everything is back where it was, except what is named below.".to_string(), status)
     } else {
         let nu = st.needs_user.clone().unwrap_or(NeedsUser { where_: "superproject".into(), paths: vec![], hint: String::new() });
         let mut r = OpResult::done(
             match nu.where_.as_str() {
-                "autostash-conflict" => "Sync paused: your stashed changes did not re-apply cleanly.".to_string(),
-                w if w.starts_with("submodule") => format!("Sync paused inside {}.", w.split(':').nth(1).unwrap_or("a submodule")),
-                _ => "Sync paused: conflicts to resolve.".to_string(),
+                "autostash-conflict" => "Update paused: your stashed changes did not re-apply cleanly.".to_string(),
+                w if w.starts_with("submodule") => format!("Update paused inside {}.", w.split(':').nth(1).unwrap_or("a submodule")),
+                _ => "Update paused: conflicts to resolve.".to_string(),
             },
             nu.hint.clone(),
             status,
@@ -1184,6 +1255,30 @@ async fn finish(repo_path: &str, st: &SyncState, state_file: &Path) -> Result<Op
     };
     op.sync = Some(outcome);
     Ok(op)
+}
+
+/// What the run actually did to a submodule — from its state, not from what
+/// the plan said would happen: fast-forwarded | rebased | left-ahead |
+/// unchanged | could-not-fast-forward | blocked.
+fn outcome_action(s: &SubState, planned: Option<&str>) -> String {
+    if s.rebased {
+        "rebased"
+    } else if s.note.starts_with("fast-forwarded") {
+        "fast-forwarded"
+    } else if s.note.starts_with("could not fast-forward") {
+        "could-not-fast-forward"
+    } else if s.note.starts_with("your commits sit on top") {
+        "left-ahead"
+    } else if s.note.starts_with("already at") {
+        "unchanged"
+    } else {
+        match planned {
+            Some("blocked") => "blocked",
+            Some("none") | None => "unchanged",
+            Some(other) => other,
+        }
+    }
+    .to_string()
 }
 
 async fn build_outcome(repo: &Path, st: &SyncState) -> SyncOutcome {
@@ -1226,7 +1321,7 @@ async fn build_outcome(repo: &Path, st: &SyncState) -> SyncOutcome {
         }
         subs.push(SubOutcome {
             path: s.path.clone(),
-            action: st.plan.submodules.iter().find(|p| p.path == s.path).map(|p| p.action.clone()).unwrap_or_default(),
+            action: outcome_action(s, st.plan.submodules.iter().find(|p| p.path == s.path).map(|p| p.action.as_str())),
             head_before: Some(s.head_before.clone()),
             head_after: head_now,
             recorded_after: recorded,
@@ -1294,7 +1389,7 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         }
         if now != opts.fingerprint {
             return Ok(OpResult::refused(
-                Refusal { code: "assess-again".into(), message: "Upstream moved since you assessed. Assess again, then sync.".into() },
+                Refusal { code: "assess-again".into(), message: "Upstream moved since you assessed. Assess again, then update.".into() },
                 status,
             ));
         }
@@ -1414,7 +1509,7 @@ pub async fn sync_continue(repo_path: &str) -> Result<OpResult, AppError> {
     let repo = PathBuf::from(repo_path);
     let state_file = state_path(&repo).await?;
     let Some(mut st) = read_state(&repo).await else {
-        return Ok(OpResult::refused(Refusal { code: "no-sync".into(), message: "No sync is paused here.".into() }, status));
+        return Ok(OpResult::refused(Refusal { code: "no-sync".into(), message: "No update is paused here.".into() }, status));
     };
     if let Some(path) = sub_rebase_in_progress(&repo, &st).await {
         let sub = repo.join(&path);
@@ -1497,7 +1592,7 @@ pub async fn sync_abort(repo_path: &str) -> Result<OpResult, AppError> {
     let repo = PathBuf::from(repo_path);
     let state_file = state_path(&repo).await?;
     let Some(mut st) = read_state(&repo).await else {
-        return Ok(OpResult::refused(Refusal { code: "no-sync".into(), message: "No sync is paused here.".into() }, status));
+        return Ok(OpResult::refused(Refusal { code: "no-sync".into(), message: "No update is paused here.".into() }, status));
     };
     let mut notes: Vec<String> = Vec::new();
     for s in st.subs.iter_mut() {
@@ -1513,9 +1608,9 @@ pub async fn sync_abort(repo_path: &str) -> Result<OpResult, AppError> {
                     Some(b) => g(&sub).args(["switch", "--quiet", "-C", b, &target]).run().await.map(|o| o.ok()).unwrap_or(false),
                     None => g(&sub).args(["checkout", "--quiet", "--detach", &target]).run().await.map(|o| o.ok()).unwrap_or(false),
                 };
-                s.note = if ok { format!("put back at {}", short(&target)) } else { format!("could not be put back; its pre-sync tip is branch {}", s.backup.clone().unwrap_or_default()) };
+                s.note = if ok { format!("put back at {}", short(&target)) } else { format!("could not be put back; its pre-update tip is branch {}", s.backup.clone().unwrap_or_default()) };
             } else {
-                s.note = format!("left as rebased because it has uncommitted changes; its pre-sync tip is branch {}", s.backup.clone().unwrap_or_default());
+                s.note = format!("left as rebased because it has uncommitted changes; its pre-update tip is branch {}", s.backup.clone().unwrap_or_default());
             }
             notes.push(format!("{}: {}", s.path, s.note));
         }
@@ -1531,7 +1626,7 @@ pub async fn sync_abort(repo_path: &str) -> Result<OpResult, AppError> {
             let _ = g(&repo).args(["reset", "--hard", &st.head_before]).timeout(LOCAL_TIMEOUT).run().await;
             notes.push(format!("the superproject was put back at {}", short(&st.head_before)));
         } else {
-            notes.push(format!("the superproject was left as rebased because it has uncommitted changes; its pre-sync tip is branch {}", st.backup.clone().unwrap_or_default()));
+            notes.push(format!("the superproject was left as rebased because it has uncommitted changes; its pre-update tip is branch {}", st.backup.clone().unwrap_or_default()));
         }
     }
     st.phase = "aborted".into();
@@ -1671,6 +1766,73 @@ mod tests {
     }
 
     #[test]
+    fn remedies_are_stable_codes_beside_the_sentences() {
+        let remedy = |a: SubFacts| plan(&facts(vec![a]), true).submodules[0].remedy.clone();
+        let mut a = sub("A");
+        a.head = Some("x".repeat(40));
+        assert_eq!(remedy(a).as_deref(), Some("record-pointers"));
+        let mut a = sub("A");
+        a.own_commits_moving_gitlink = 2;
+        assert_eq!(remedy(a).as_deref(), Some("squash-own"));
+        let mut a = sub("A");
+        a.target = None;
+        assert_eq!(remedy(a).as_deref(), Some("removed-upstream"));
+        let mut a = sub("A");
+        a.target_present = false;
+        a.fetch_error = Some("could not read".into());
+        assert_eq!(remedy(a).as_deref(), Some("fetch-failed"));
+        let mut a = sub("A");
+        a.target_present = false;
+        assert_eq!(remedy(a).as_deref(), Some("unreachable"));
+        let mut a = sub("A");
+        a.operation = Some("rebase".into());
+        assert_eq!(remedy(a).as_deref(), Some("finish-operation"));
+        let mut a = sub("A");
+        a.conflicted = 1;
+        assert_eq!(remedy(a).as_deref(), Some("resolve-conflicts"));
+        let mut a = sub("A");
+        a.dirty_overlap = vec!["A.txt".into()];
+        assert_eq!(remedy(a).as_deref(), Some("stash-inside"));
+        let mut a = sub("A");
+        a.gitdir_valid = false;
+        assert_eq!(remedy(a).as_deref(), Some("reinit"));
+        // Nothing blocked: no remedy.
+        assert_eq!(remedy(sub("A")), None);
+        // The superproject's own blockers carry their codes in order.
+        let mut s = sup();
+        s.dirty_tracked = vec!["README.md".into()];
+        let p = plan(&SyncFacts { superproject: s.clone(), submodules: vec![], skipped: vec![] }, false);
+        assert_eq!(p.superproject.remedies, vec!["turn-on-stash".to_string()]);
+        s.dirty_overlap = vec!["README.md".into()];
+        s.untracked_overlap = vec!["new.txt".into()];
+        let p = plan(&SyncFacts { superproject: s, submodules: vec![], skipped: vec![] }, true);
+        assert_eq!(p.superproject.remedies, vec!["stash-collides".to_string(), "untracked-in-the-way".to_string()]);
+        assert_eq!(p.blockers.len(), p.superproject.remedies.len());
+    }
+
+    #[test]
+    fn the_outcome_reports_what_align_did_not_what_was_planned() {
+        let st = |note: &str, rebased: bool| SubState {
+            path: "A".into(),
+            branch_before: None,
+            reattach_to: None,
+            head_before: String::new(),
+            backup: None,
+            target: String::new(),
+            rebased,
+            head_after: None,
+            aligned: true,
+            note: note.into(),
+        };
+        assert_eq!(outcome_action(&st("fast-forwarded to abc1234", false), Some("fast-forward")), "fast-forwarded");
+        assert_eq!(outcome_action(&st("rebased (conflicts resolved by you)", true), Some("rebase")), "rebased");
+        assert_eq!(outcome_action(&st("could not fast-forward: x", false), Some("fast-forward")), "could-not-fast-forward");
+        assert_eq!(outcome_action(&st("your commits sit on top of abc1234; the superproject does not record them yet", false), Some("ahead")), "left-ahead");
+        assert_eq!(outcome_action(&st("already at the recorded commit", false), Some("none")), "unchanged");
+        assert_eq!(outcome_action(&st("", false), Some("blocked")), "blocked");
+    }
+
+    #[test]
     fn stashing_is_the_users_choice_and_overlaps_block_it() {
         let mut s = sup();
         s.dirty_tracked = vec!["README.md".into()];
@@ -1726,7 +1888,7 @@ mod tests {
         let p = plan(&SyncFacts { superproject: s, submodules: vec![a], skipped: vec![Skipped { path: "forge/x".into(), why: "unmapped".into() }] }, true);
         assert!(p.nothing_to_do);
         assert!(!p.can_run);
-        assert!(p.summary.starts_with("Nothing to sync"));
+        assert!(p.summary.starts_with("Nothing to update"));
         assert!(p.submodules[0].notes.iter().any(|n| n.contains("newer commits than upstream's superproject records")));
         assert_eq!(p.skipped[0].why, "unmapped");
     }

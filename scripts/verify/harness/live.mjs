@@ -210,6 +210,19 @@ async function waitGone(page, needle, timeout = WAIT) {
     return false;
   }
 }
+/** Poll an asynchronous predicate until true or the timeout. */
+async function waitUntilAsync(fn, timeout = WAIT) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    try {
+      if (await fn()) return true;
+    } catch {
+      // keep polling
+    }
+    await sleep(150);
+  }
+  return false;
+}
 /** Poll a synchronous predicate (usually a git fact) until true or the timeout. */
 async function waitUntil(fn, timeout = WAIT) {
   const end = Date.now() + timeout;
@@ -705,7 +718,7 @@ try {
   });
 
   // -----------------------------------------------------------------------
-  await scenario("j. Sync card: Assess (fetches) then Sync now", async () => {
+  await scenario("j. Update drawer: Preview update (fetches) then Update now", async () => {
     git(OTHER, "pull", "-q", "--ff-only");
     write(`${OTHER}/more.txt`, "more\n");
     git(OTHER, "add", "-A");
@@ -713,24 +726,26 @@ try {
     git(OTHER, "push", "-q", "origin", "main");
     const incoming = git(OTHER, "rev-parse", "HEAD");
     await openChanges();
-    ok("Sync now is not offered before a plan exists", (await button(page, "Sync now")) === null);
-    ok("Assess (fetches)", await click(page, "Assess (fetches)"));
+    ok("Update now is not offered before a plan exists", (await button(page, "Update now")) === null);
+    ok("Preview update", await click(page, "Preview update"));
+    ok("  opens the Update drawer", await waitUntilAsync(async () => (await page.$('[role="dialog"][aria-label="Update"]')) !== null));
     ok("  the plan is a sentence", await waitText(page, "replayed on top of 1 new commit from origin/main"));
     let s = await text(page);
     ok("  main is 0 ahead and 1 behind", s.includes("main is 0 ahead and 1 behind origin/main"));
     ok("  the submodule table says vendor/sub has nothing to do", s.includes("vendor/sub") && s.includes("nothing to do"));
     ok("  Assess fetched: git sees the incoming commit", git(WORK, "rev-parse", "origin/main") === incoming);
     ok("  nothing moved yet", git(WORK, "rev-parse", "HEAD") !== incoming);
-    const st = await buttonState(page, "Sync now");
-    ok("  Sync now is enabled", st?.disabled === false, JSON.stringify(st));
-    ok("Sync now", await click(page, "Sync now"));
-    ok("  the page says Synced: fast-forwarded", await waitText(page, "Synced: fast-forwarded to 1 new commit from origin/main."));
+    const st = await buttonState(page, "Update now");
+    ok("  Update now is enabled", st?.disabled === false, JSON.stringify(st));
+    ok("Update now", await click(page, "Update now"));
+    ok("  the page says Updated: fast-forwarded", await waitText(page, "Updated: fast-forwarded to 1 new commit from origin/main."));
+    ok("  and the drawer closed", (await page.$('[role="dialog"][aria-label="Update"]')) === null);
     ok("  git: HEAD equals origin/main at other's commit", git(WORK, "rev-parse", "HEAD") === incoming && subjectOf(WORK, "HEAD") === "other 2 (live)");
     ok("  the tree is clean and no stash is left", git(WORK, "status", "--porcelain") === "" && git(WORK, "stash", "list") === "");
     s = await text(page);
     ok("  the result table shows the new HEAD", s.includes(`→ ${short(incoming)}`));
     ok("  every check passed", s.includes("All 6 checks passed"));
-    ok("  the page reflects the new HEAD: level with origin/main, plan cleared", s.includes("Nothing to pull — you're level with origin/main") && (await button(page, "Assess (fetches)")) !== null);
+    ok("  the page reflects the new HEAD: level with origin/main, the preview offered again", s.includes("Nothing to pull — you're level with origin/main") && (await button(page, "Preview update")) !== null);
   });
 
   // -----------------------------------------------------------------------

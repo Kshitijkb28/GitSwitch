@@ -49,6 +49,8 @@ type Props = {
   /** Gitlink rows with their own section on the page get a jump link. */
   jumpableSubmodules?: string[];
   onJumpToSubmodule?: (path: string) => void;
+  /** Conflicts: open the file in the system's default application, or reveal it. */
+  onOpenPath?: (path: string, reveal: boolean) => void;
 };
 
 /** Conflicts · Staged · Not staged · Untracked — one repository's working tree. */
@@ -62,6 +64,7 @@ export function TreeLists({
   onResolveSide,
   jumpableSubmodules,
   onJumpToSubmodule,
+  onOpenPath,
 }: Props) {
   const entries = status.entries;
   const conflicted = entries.filter((e) => e.kind === "conflicted");
@@ -80,6 +83,7 @@ export function TreeLists({
     <>
       {conflicted.length > 0 && (
         <ChangesList
+          id="conflicts"
           title="Conflicts"
           icon={<ShieldAlert size={14} />}
           accent="danger"
@@ -95,6 +99,7 @@ export function TreeLists({
           onDiscard={fromStash ? (paths) => onDiscard(paths, "changes") : undefined}
           jumpableSubmodules={jumpableSubmodules}
           onJumpToSubmodule={onJumpToSubmodule}
+          onOpenPath={onOpenPath}
         />
       )}
 

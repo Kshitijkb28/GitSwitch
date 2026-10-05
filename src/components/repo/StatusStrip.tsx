@@ -1,4 +1,5 @@
-import { RefreshCw, ArrowUp, ArrowDown, GitBranch, Upload, Download, Ban, Radar, Loader2, Box } from "lucide-react";
+import { RefreshCw, ArrowUp, ArrowDown, GitBranch, Upload, Download, Ban, Radar, Loader2, Box, ArrowDownUp } from "lucide-react";
+import { whyNoPreview } from "../../lib/updatePlan";
 import { Button } from "../Button";
 import { whyDisabled } from "../changes/PullControl";
 import { agoLabel } from "../changes/BranchCard";
@@ -26,6 +27,10 @@ export type RepoActions = StripActions & {
   updateOne: (repo: string, sub: string) => Promise<unknown>;
   pullInside: (repo: string, sub: SubmoduleInfo) => Promise<unknown>;
   recordPointers: (repo: string) => Promise<unknown>;
+  /** Runs an assessed plan (the Update drawer's "Update now"). */
+  update: (repo: string, stash: boolean, bundles: boolean, fingerprint: [string, string][]) => Promise<unknown>;
+  /** Stashes the uncommitted changes that collide with the update, so it can run. */
+  stashNow: (repo: string) => Promise<unknown>;
 };
 
 interface Props {
@@ -45,6 +50,8 @@ interface Props {
   peeking: boolean;
   onPeek: () => void;
   onPeekDismiss: () => void;
+  /** Opens the Update drawer: a fetch, then the plan — nothing runs until "Update now". */
+  onPreview: () => void;
 }
 
 /**
@@ -73,7 +80,7 @@ export function glance(status: RepoStatus, subs: SubmoduleInfo[], sub: string): 
   else if (status.operation) next = `Finish or abort the ${status.operation.kind}`;
   else if (status.unborn) next = "Make the first commit";
   else if (!status.upstream && !status.detached) next = "Publish the branch";
-  else if (status.behind > 0 || moved.length > 0) next = "Pull the latest";
+  else if (status.behind > 0 || moved.length > 0) next = "Preview update";
   else if (status.ahead > 0) next = status.push.blocked ? `Push blocked: ${status.push.reason}` : `Push (${status.ahead})`;
   else if (changed > 0 || status.untracked_count > 0) next = "Commit what you changed";
   else next = "Up to date";
@@ -96,8 +103,11 @@ export function StatusStrip({
   peeking,
   onPeek,
   onPeekDismiss,
+  onPreview,
 }: Props) {
   if (!repoPath) return null;
+  const noPreview = status ? whyNoPreview(status) : "Reading the repository…";
+  const wantsUpdate = !!status && (status.behind > 0 || (!sub && subs.some((m) => m.state === "moved" || m.state === "moved-and-dirty")));
   const pullBlocked = status
     ? whyDisabled(pullMode, status.ahead, status.behind, dirty, pullMode === "rebase" && pullAutostash)
     : "Reading the repository…";
@@ -182,7 +192,18 @@ export function StatusStrip({
           </Button>
           <Button
             size="sm"
-            variant={status && status.behind > 0 ? "primary" : "secondary"}
+            variant={wantsUpdate ? "primary" : "secondary"}
+            disabled={busy || !status || noPreview !== null}
+            title={noPreview ?? "Fetches, then shows what an update would do — nothing changes until you press Update now"}
+            onClick={onPreview}
+            className="min-w-[9rem]"
+          >
+            <ArrowDownUp size={13} />
+            Preview update
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
             disabled={busy || !status?.upstream || pullBlocked !== null || !actions}
             title={pullBlocked ?? undefined}
             onClick={() => actions?.pull()}

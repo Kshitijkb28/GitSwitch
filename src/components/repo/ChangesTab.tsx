@@ -16,7 +16,7 @@ import { LfsCard } from "../changes/LfsCard";
 import { LfsFilesModal, formatBytes } from "../changes/LfsFilesModal";
 import { StashesCard } from "../changes/StashesCard";
 import { StashModal } from "../changes/StashModal";
-import { SyncCard, SyncPausedCard } from "../changes/SyncCard";
+import { SyncPausedCard } from "../changes/SyncCard";
 import { ResultCard } from "../changes/ResultCard";
 import { DiscardConfirmModal } from "../changes/DiscardConfirmModal";
 import { ResetConfirmModal } from "../changes/ResetConfirmModal";
@@ -46,6 +46,12 @@ interface Props {
   /** The operations the strip's buttons run. Re-registered on every render. */
   onActions: (a: RepoActions) => void;
   onOpenHistory: () => void;
+  /** A run was refused because upstream moved: the drawer re-plans. */
+  onAssessAgain: () => void;
+  /** A paused update's hand-off: where the conflicts are (needs_user.where_). */
+  onGoToConflicts: (where: string) => void;
+  /** Opens the Update drawer. */
+  onPreview: () => void;
 }
 
 /**
@@ -67,6 +73,9 @@ export function ChangesTab({
   onStatus,
   onActions,
   onOpenHistory,
+  onAssessAgain,
+  onGoToConflicts,
+  onPreview,
 }: Props) {
   const toast = useToast();
   const [drafts, setDrafts] = usePersistedState<Record<string, string>>("changes.drafts", {});
@@ -221,6 +230,17 @@ export function ChangesTab({
   useEffect(() => {
     if (!job || job.running || seenJob.current[repoPath] === job.startedAt) return;
     seenJob.current[repoPath] = job.startedAt;
+    if (job.kind === "assess") {
+      // The plan lives in its own store; the fetch may have changed the counts.
+      loadStatus(repoPath);
+      setSubRefresh((n) => n + 1);
+      return;
+    }
+    if (job.result?.refusal?.code === "assess-again") {
+      // The drawer re-plans and says why; a result card would only repeat it.
+      loadStatus(repoPath);
+      return;
+    }
     if (job.result) {
       setResult(job.result);
       // The result carries the status git had after the operation, so a
@@ -306,9 +326,15 @@ export function ChangesTab({
     return runJob(repo, kind, label, fn).then((r) => {
       if (!r) return;
       if (r.ok) toast.success(r.headline);
+      else if (r.refusal?.code === "assess-again") onAssessAgain();
+      // A pause is a hand-off, not a failure.
+      else if (r.sync && r.sync.phase === "needs-user") toast.info(r.headline);
       else toast.error(r.refusal?.message ?? r.advice?.headline ?? "That didn't work");
     });
   };
+  /** Opens a file in the system's default application, or reveals it. */
+  const openPath = (path: string, reveal: boolean) =>
+    void api.changesOpenPath(repoPath, path, reveal).catch((e) => toast.error(String(e)));
   const runLong = (kind: GitJobKind, label: string, fn: () => Promise<OpResult>) => runLongIn(repoPath, kind, label, fn);
 
   /**
@@ -376,8 +402,24 @@ export function ChangesTab({
       updateOne: (repo, sub) => runLongIn(repo, "submodules", `Updating ${sub}…`, () => api.changesSubmoduleUpdate(repo, [sub])),
       pullInside,
       recordPointers: (repo) => apply("record", () => api.changesRecordPointers(repo)),
+      update: (repo, stash, bundles, fingerprint) =>
+        runLongIn(repo, "sync", "Updating — fetching, rebasing, aligning submodules…", () => api.changesSyncRun(repo, stash, bundles, fingerprint)),
+      stashNow: (repo) => apply("stash", () => api.changesStashPush(repo, "Before update", false)),
     });
   });
+
+  // What the result card offers next: a paused update hands over to its
+  // conflicts; a pull that moved submodule pointers offers the update.
+  const syncHandOff = result?.sync?.needs_user
+    ? {
+        label: result.sync.needs_user.where_.startsWith("submodule")
+          ? `Open ${result.sync.needs_user.where_.split(":")[1] || "the submodule"}`
+          : "Go to the conflicts",
+        onClick: () => onGoToConflicts(result.sync?.needs_user?.where_ ?? "superproject"),
+        primary: true,
+      }
+    : null;
+  const movedAction = result?.pull && (result.pull.submodules_moved ?? 0) > 0 ? { label: "Update…", onClick: onPreview, primary: true } : null;
 
   // The entries the discard confirmation describes: the parent's, or the submodule's.
   const confirmEntries = confirmDiscard?.target
@@ -470,11 +512,10 @@ export function ChangesTab({
               sync={status.sync}
               status={status}
               busy={anyBusy}
-              onContinue={() =>
-                runLong("sync", "Continuing the sync…", () => api.changesSyncContinue(repoPath))
-              }
-              onAbort={() => runLong("sync", "Aborting the sync…", () => api.changesSyncAbort(repoPath))}
+              onContinue={() => runLong("sync", "Continuing the update…", () => api.changesSyncContinue(repoPath))}
+              onAbort={() => runLong("sync", "Aborting the update…", () => api.changesSyncAbort(repoPath))}
               onOpenRoot={() => status.sync && openRepo(status.sync.root)}
+              onHandOff={onGoToConflicts}
             />
           )}
 
@@ -536,20 +577,6 @@ export function ChangesTab({
             onDiscardAll={() => setDiscardAllOpen(true)}
           />
 
-          {!status.unborn && !status.sync && (
-            <SyncCard
-              repoPath={repoPath}
-              status={status}
-              busy={anyBusy}
-              onSync={(stash, bundles, fingerprint) =>
-                runLong("sync", "Syncing — fetching, rebasing, aligning submodules…", () =>
-                  api.changesSyncRun(repoPath, stash, bundles, fingerprint)
-                )
-              }
-              onSwitchBranch={() => setBranchesFor(repoPath)}
-            />
-          )}
-
           {result && (
             <ResultCard
               result={result}
@@ -559,7 +586,7 @@ export function ChangesTab({
                 clearJob(repoPath);
               }}
               onRecordPointers={() => apply("record", () => api.changesRecordPointers(repoPath))}
-              extraAction={historyAction ?? publishAction}
+              extraAction={syncHandOff ?? movedAction ?? historyAction ?? publishAction}
             />
           )}
 
@@ -578,6 +605,7 @@ export function ChangesTab({
                 onResolveSide={(paths, side) =>
                   apply("resolve", () => api.changesResolveSide(repoPath, paths, side))
                 }
+                onOpenPath={openPath}
                 jumpableSubmodules={sectionPaths}
                 onJumpToSubmodule={jumpToSubmodule}
               />
@@ -671,7 +699,7 @@ export function ChangesTab({
       )}
 
       {diffFor && status && (
-        <DiffPanel repoPath={repoPath} entry={diffFor} onClose={() => setDiffFor(null)} />
+        <DiffPanel repoPath={repoPath} entry={diffFor} onClose={() => setDiffFor(null)} onOpenPath={openPath} />
       )}
 
       <DiscardConfirmModal

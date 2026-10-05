@@ -6,11 +6,13 @@ exactly the class of bug the unit tests and the mocked UI checks cannot see:
 a command that was never registered, a name typo, or an argument whose
 camelCase spelling doesn't match the Rust parameter.
 """
+import json
 import os
 import re
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+SRC_TS = f"{ROOT}/src"
 commands_rs = open(f"{ROOT}/src-tauri/src/commands.rs").read()
 # Strip line comments: a comment after an attribute would hide the fn that follows.
 commands_rs = re.sub(r"//[^\n]*", "", commands_rs)
@@ -112,6 +114,25 @@ print(f"commands registered      : {len(registered)}")
 print(f"commands called from UI  : {checked}")
 if unused:
     print(f"defined but never called : {', '.join(unused)}")
+
+# --- plugin JS imports ↔ granted capabilities -------------------------------
+# A page that imports `@tauri-apps/plugin-<name>` calls that plugin's commands
+# directly; the main window's capability must grant them, or the call fails at
+# runtime with a permission error nobody sees in tsc. (The app's own Rust
+# commands, like changes_open_path, need no grant: core:default covers them.)
+plugin_imports = set()
+for root, _dirs, files in os.walk(SRC_TS):
+    for f in files:
+        if f.endswith((".ts", ".tsx")):
+            text = open(os.path.join(root, f), encoding="utf-8").read()
+            plugin_imports.update(re.findall(r'from "@tauri-apps/plugin-([a-z-]+)"', text))
+cap_path = os.path.join(ROOT, "src-tauri", "capabilities", "default.json")
+with open(cap_path, encoding="utf-8") as fh:
+    granted = json.load(fh).get("permissions", [])
+for name in sorted(plugin_imports):
+    if not any(str(p).startswith(f"{name}:") or (isinstance(p, dict) and str(p.get("identifier", "")).startswith(f"{name}:")) for p in granted):
+        failures.append(f"@tauri-apps/plugin-{name} is imported but capabilities/default.json grants nothing for {name}:")
+print(f"plugin imports granted   : {', '.join(sorted(plugin_imports)) or 'none'}")
 
 if failures:
     print()

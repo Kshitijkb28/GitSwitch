@@ -55,6 +55,12 @@ export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAct
           {result.pull?.recovery && (
             <p className="text-xs text-zinc-500 font-mono break-all">undo: {result.pull.recovery}</p>
           )}
+          {(result.pull?.submodules_moved ?? 0) > 0 && (
+            <p className="text-xs text-sky-300/90 break-words">
+              {result.pull?.submodules_moved} submodule pointer{result.pull?.submodules_moved === 1 ? "" : "s"} moved — this repository now
+              records other commits than are checked out. Update aligns them.
+            </p>
+          )}
           {result.pull?.autostash_conflict && (
             <p className="text-xs text-amber-300/90 break-words">
               The rebase finished, but your stashed changes could not be re-applied cleanly. They are still in{" "}

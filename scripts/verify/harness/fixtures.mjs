@@ -189,6 +189,7 @@ const SYNC_SUPER = {
   dirty_count: 1,
   untracked: 1,
   will_stash: true,
+  remedies: [],
   notes: [],
 };
 const SYNC_SUB_A = {
@@ -199,13 +200,14 @@ const SYNC_SUB_A = {
   predicted_gitlink_conflict: true, branch: "main", detached: false, reattach_to: null,
   dirty_tracked: 1, untracked: 1, fetch_error: null,
   notes: ["its 1 uncommitted change is stashed and re-applied around the rebase"],
+  remedy: null,
 };
 const SYNC_SUB_B = {
   path: "B", name: "B", action: "fast-forward", reason: "moves forward to 3c3c3c3 (no commits of yours)",
   head: "84d0861aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", recorded: "84d0861aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   target: "3c3c3c3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", rebase_onto: null,
   predicted_gitlink_conflict: false, branch: "main", detached: false, reattach_to: null,
-  dirty_tracked: 0, untracked: 0, fetch_error: null, notes: [],
+  dirty_tracked: 0, untracked: 0, fetch_error: null, notes: [], remedy: null,
 };
 export const SYNC_PLAN = {
   can_run: true,
@@ -222,13 +224,13 @@ export const SYNC_PLAN_NOSTASH = {
   ...SYNC_PLAN,
   can_run: false,
   blockers: ["Turn on stashing, or commit or stash your 1 uncommitted change first"],
-  superproject: { ...SYNC_SUPER, will_stash: false },
+  superproject: { ...SYNC_SUPER, will_stash: false, remedies: ["turn-on-stash"] },
 };
 export const SYNC_PLAN_BLOCKED = {
   ...SYNC_PLAN,
   can_run: false,
-  blockers: ["B: it is checked out at 2404a33 but this branch records 84d0861; commit that pointer (Record submodule pointers) or move it back before syncing"],
-  submodules: [SYNC_SUB_A, { ...SYNC_SUB_B, action: "blocked", head: "2404a33aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", reason: "it is checked out at 2404a33 but this branch records 84d0861; commit that pointer (Record submodule pointers) or move it back before syncing" }],
+  blockers: ["B: it is checked out at 2404a33 but this branch records 84d0861; commit that pointer (Record submodule pointers) or move it back before updating"],
+  submodules: [SYNC_SUB_A, { ...SYNC_SUB_B, action: "blocked", head: "2404a33aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", reason: "it is checked out at 2404a33 but this branch records 84d0861; commit that pointer (Record submodule pointers) or move it back before updating", remedy: "record-pointers" }],
 };
 export const SYNC_PLAN_NOTHING = {
   ...SYNC_PLAN,
@@ -236,7 +238,7 @@ export const SYNC_PLAN_NOTHING = {
   nothing_to_do: true,
   superproject: { ...SYNC_SUPER, ahead: 2, behind: 0, incoming: [], file_overlap: [] },
   submodules: [{ ...SYNC_SUB_A, action: "none", reason: "already at the commit upstream records", notes: [] }, { ...SYNC_SUB_B, action: "none", reason: "already at the commit upstream records" }],
-  summary: "Nothing to sync: main already has everything from origin/main",
+  summary: "Nothing to update: main already has everything from origin/main",
 };
 export const SYNC_OUTCOME = {
   phase: "done",
@@ -254,8 +256,8 @@ export const SYNC_OUTCOME = {
   stashed: true,
   stash_left: false,
   submodules: [
-    { path: "A", action: "rebase", head_before: SYNC_SUB_A.head, head_after: "d1d1d1daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", recorded_after: "d1d1d1daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ok: true, note: "rebased onto 7a9d38a; 1 commit of yours on top" },
-    { path: "B", action: "fast-forward", head_before: SYNC_SUB_B.head, head_after: SYNC_SUB_B.target, recorded_after: SYNC_SUB_B.target, ok: true, note: "fast-forwarded to 3c3c3c3" },
+    { path: "A", action: "rebased", head_before: SYNC_SUB_A.head, head_after: "d1d1d1daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", recorded_after: "d1d1d1daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ok: true, note: "rebased onto 7a9d38a; 1 commit of yours on top" },
+    { path: "B", action: "fast-forwarded", head_before: SYNC_SUB_B.head, head_after: SYNC_SUB_B.target, recorded_after: SYNC_SUB_B.target, ok: true, note: "fast-forwarded to 3c3c3c3" },
   ],
   verified: { behind_zero: true, own_on_top: true, dirty_paths_unchanged: true, untracked_unchanged: true, submodules_aligned: true, no_conflicts_left: true },
   unrecorded_pointers: [],
@@ -264,19 +266,50 @@ export const SYNC_OUTCOME_UNRECORDED = {
   ...SYNC_OUTCOME,
   own_kept: [],
   incoming: 1,
-  submodules: [{ path: "B", action: "ahead", head_before: "9b9b9b9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", head_after: "9b9b9b9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", recorded_after: SYNC_SUB_B.target, ok: true, note: "left alone; your commits sit on top of the recorded commit" }],
+  submodules: [{ path: "B", action: "left-ahead", head_before: "9b9b9b9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", head_after: "9b9b9b9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", recorded_after: SYNC_SUB_B.target, ok: true, note: "left alone; your commits sit on top of the recorded commit" }],
   unrecorded_pointers: ["B"],
 };
 export const SYNC_PAUSED = {
   phase: "rebasing",
   started_at: "2026-09-23T12:00:00Z",
-  needs_user: { where_: "superproject", paths: ["shared.txt"], hint: "Resolve the conflicts listed on this page, stage them, then Continue sync." },
+  needs_user: { where_: "superproject", paths: ["shared.txt"], hint: "Resolve the conflicts listed on this page, stage them, then Continue update." },
   root: "/repos/gitswitch",
   is_root: true,
+  unresolved: 1,
+  upstream: "origin/main",
+  sub_path: null,
+  sub_target: null,
 };
 export const SYNC_PAUSED_IN_SUB = {
   ...SYNC_PAUSED,
-  needs_user: { where_: "submodule:A", paths: ["A.txt"], hint: "Rebasing A onto 7a9d38a stopped on a conflict inside it. Open it as its own repository, resolve and stage, then Continue sync." },
+  needs_user: { where_: "submodule:A", paths: ["A.txt"], hint: "Rebasing A onto 7a9d38a stopped on a conflict inside it. Open it as its own repository, resolve and stage, then Continue update." },
+  unresolved: 1,
+};
+
+/** A plain pull that moved two submodule pointers: the repository records commits that are not checked out. */
+export const PULL_MOVED_OUTCOME = {
+  mode: "fast-forward only",
+  head_before: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+  head_after: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+  fast_forward: true,
+  commits_pulled: 2,
+  files_changed: 3,
+  conflicts: [],
+  recovery: "git reset --hard aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+  autostash_conflict: false,
+  autostash_left: null,
+  submodules_moved: 2,
+};
+
+/** shared.txt mid-rebase, as the backend splits it: one conflict, both sides named. */
+export const CONFLICT_VIEW = {
+  path: "shared.txt",
+  binary: false,
+  marker_count: 1,
+  hunks: [{ line: 2, mine: ["shared line 2 (mine)"], base: [], theirs: ["shared line 2 (upstream)"] }],
+  truncated: false,
+  sides: { mine: "your commit being replayed", theirs: "origin/main" },
+  total_lines: 7,
 };
 
 
@@ -480,8 +513,9 @@ export const SCENARIOS = {
   syncPausedChild: status({
     path: "/repos/gitswitch/A",
     name: "A",
-    operation: REBASE_OP,
-    sync: { ...SYNC_PAUSED_IN_SUB, is_root: false },
+    // The backend names "theirs" as the parent's upstream's record for this submodule.
+    operation: { ...REBASE_OP, sides: { mine: "your commit being replayed", theirs: "origin/main's A (7a9d38a)" } },
+    sync: { ...SYNC_PAUSED_IN_SUB, is_root: false, sub_path: "A", sub_target: SYNC_SUB_A.rebase_onto },
     entries: [entry({ path: "A.txt", kind: "conflicted", staged: "U", unstaged: "U", conflict: "both modified" })],
     conflicted_count: 1,
     can_amend: false,

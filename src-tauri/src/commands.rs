@@ -837,6 +837,23 @@ pub async fn changes_sync_abort(repo_path: String) -> Result<OpResult, AppError>
     crate::sync::sync_abort(&repo_path).await
 }
 
+/// Open a file of the repository in the system's default application, or
+/// reveal it in the file manager. The path is checked to be inside the
+/// repository first (`within_repo`), so no "open any path" capability is
+/// granted to the JavaScript side.
+#[tauri::command]
+pub async fn changes_open_path(repo_path: String, path: String, reveal: bool) -> Result<(), AppError> {
+    let full = git_ops::within_repo(&repo_path, &path)?;
+    let r = if reveal { tauri_plugin_opener::reveal_item_in_dir(&full) } else { tauri_plugin_opener::open_path(&full, None::<&str>) };
+    r.map_err(|e| AppError::Command(format!("Could not open {}: {}", path, e)))
+}
+
+/// A conflicted file split into its sides, for the resolution view.
+#[tauri::command]
+pub async fn changes_conflict_view(repo_path: String, path: String) -> Result<git_status::ConflictView, AppError> {
+    git_status::conflict_view(&repo_path, &path).await
+}
+
 /// One commit recording submodule pointers that sit ahead of the branch.
 #[tauri::command]
 pub async fn changes_record_pointers(repo_path: String) -> Result<OpResult, AppError> {

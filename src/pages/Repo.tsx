@@ -9,6 +9,8 @@ import { StatusStrip, type RepoActions, type StripActions } from "../components/
 import { ChangesTab } from "../components/repo/ChangesTab";
 import { HistoryTab } from "../components/repo/HistoryTab";
 import { SubmodulesTab } from "../components/repo/SubmodulesTab";
+import { UpdateDrawer } from "../components/repo/UpdateDrawer";
+import { markMoved, reconcilePlan } from "../lib/updatePlan";
 import { useRepoSelection } from "../lib/repoSelection";
 import { usePersistedState } from "../lib/persist";
 import { baseName } from "../lib/paths";
@@ -59,6 +61,9 @@ export function Repo() {
   /** Bumped when the repository visibly moved, so the History tab re-reads. */
   const [reloadKey, setReloadKey] = useState(0);
   const lastMoveKey = useRef("");
+  /** The Update drawer: preview, blockers, Update now. */
+  const [drawer, setDrawer] = useState(false);
+  const pathRef = useRef("");
 
   const [pullMode, setPullMode] = usePersistedState<PullMode>("changes.pullMode", "ff-only");
   // On by default: with LFS filters configured git already downloads large
@@ -164,6 +169,8 @@ export function Repo() {
   const onStatus = useCallback((s: RepoStatus | null, loading: boolean) => {
     setStatus(s);
     setLoadingStatus(loading);
+    // A plan made for another HEAD or upstream is stale: drop it.
+    reconcilePlan(pathRef.current, s);
     if (s) {
       const key = `${s.path}|${s.head_oid ?? ""}|${s.ahead}|${s.behind}|${s.upstream ?? ""}|${s.stash_count}|${s.conflicted_count}|${s.last_fetch_secs !== null && s.last_fetch_secs < 10 ? "fresh" : ""}`;
       if (lastMoveKey.current && lastMoveKey.current !== key) setReloadKey((k) => k + 1);
@@ -221,6 +228,73 @@ export function Repo() {
   const movedCount = subs.filter((m) => m.state === "moved" || m.state === "moved-and-dirty").length;
 
   const go = (t: Tab) => navigate(`/repo/${t}`);
+  pathRef.current = sel.effectivePath;
+  // The drawer belongs to one repository.
+  useEffect(() => {
+    setDrawer(false);
+  }, [sel.effectivePath]);
+  /** The run was refused because upstream moved: the drawer re-plans and says why. */
+  const onAssessAgain = () => {
+    markMoved(sel.effectivePath);
+    setDrawer(true);
+  };
+  /**
+   * A paused update hands over: the superproject's conflicts are on the
+   * Changes tab; a submodule's are inside it, so it becomes the scope first.
+   */
+  const goToConflicts = (where: string) => {
+    if (where.startsWith("submodule")) {
+      const p = where.split(":")[1];
+      if (p) sel.setSub(p);
+    }
+    setDrawer(false);
+    go("changes");
+    setTimeout(() => document.getElementById("conflicts")?.scrollIntoView({ behavior: "smooth", block: "start" }), 200);
+  };
+  const runUpdate = (stash: boolean, bundles: boolean, fingerprint: [string, string][]) => {
+    const a = actionsRef.current;
+    if (!a) return;
+    setDrawer(false);
+    void a.update(sel.effectivePath, stash, bundles, fingerprint).finally(() => {
+      setReloadKey((k) => k + 1);
+      actionsRef.current?.refresh();
+    });
+  };
+  /** A remedy button in the drawer, keyed on the backend's code. */
+  const remedy = async (code: string, sub?: string) => {
+    const a = actionsRef.current;
+    const repo = sel.effectivePath;
+    if (!a || !repo) return;
+    switch (code) {
+      case "record-pointers":
+        await a.recordPointers(repo);
+        break;
+      case "reinit":
+        if (sub) await a.initialise(repo, [sub]);
+        break;
+      case "stash-collides":
+        await a.stashNow(repo);
+        break;
+      case "open":
+        if (sub) {
+          setDrawer(false);
+          workInside(sub);
+        }
+        return;
+      case "untracked-in-the-way":
+        setDrawer(false);
+        go("changes");
+        return;
+      case "choose-branch":
+        setDrawer(false);
+        a.branches();
+        return;
+      default:
+        return;
+    }
+    setReloadKey((k) => k + 1);
+    actionsRef.current?.refresh();
+  };
   /**
    * An operation the Submodules tab asked for. It runs in the Changes tab (the
    * job slot, the result card, the toasts) on the repository itself — so the
@@ -386,6 +460,7 @@ export function Repo() {
         peeking={peeking}
         onPeek={doPeek}
         onPeekDismiss={() => setPeek(null)}
+        onPreview={() => setDrawer(true)}
       />
 
       {sel.effectivePath && (
@@ -450,6 +525,9 @@ export function Repo() {
         onStatus={onStatus}
         onActions={onActions}
         onOpenHistory={() => go("history")}
+        onAssessAgain={onAssessAgain}
+        onGoToConflicts={goToConflicts}
+        onPreview={() => setDrawer(true)}
       />
       <HistoryTab
         repo={sel.effectivePath}
@@ -474,7 +552,22 @@ export function Repo() {
         onRecordPointers={() => runOnRepo((a) => a.recordPointers(sel.path))}
         onPullInside={(s) => runOnRepo((a) => a.pullInside(sel.path, s))}
         onUpdateOne={(p) => runOnRepo((a) => a.updateOne(sel.path, p))}
+        onPreview={() => {
+          sel.setSub("");
+          setDrawer(true);
+        }}
       />
+
+      {drawer && status && (
+        <UpdateDrawer
+          repoPath={sel.effectivePath}
+          status={status}
+          busy={busy}
+          onClose={() => setDrawer(false)}
+          onRun={runUpdate}
+          onRemedy={remedy}
+        />
+      )}
     </div>
   );
 }

@@ -172,7 +172,7 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
     if f.sync_in_progress && !allowed_during_sync {
         return Some(refuse(
             "sync-in-progress",
-            "A sync is paused here. Continue or abort it first (the Changes page shows both).",
+            "An update is paused here. Continue or abort it first (the Changes tab shows both).",
         ));
     }
 
@@ -365,13 +365,13 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
 
         Intent::Sync => {
             if f.unborn {
-                return Some(refuse("unborn-head", "There are no commits yet — nothing to sync."));
+                return Some(refuse("unborn-head", "There are no commits yet — nothing to update."));
             }
             if f.detached {
                 return Some(refuse("detached-head", "You're not on a branch. Check one out first."));
             }
             if f.upstream.is_none() {
-                return Some(refuse("no-upstream", "This branch isn't tracking a remote branch, so there is nothing to sync with."));
+                return Some(refuse("no-upstream", "This branch isn't tracking a remote branch, so there is nothing to update from."));
             }
             busy("sync")
         }
@@ -380,7 +380,7 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
             if f.sync_in_progress {
                 None
             } else {
-                Some(refuse("no-sync", "No sync is paused here."))
+                Some(refuse("no-sync", "No update is paused here."))
             }
         }
 
@@ -432,6 +432,22 @@ pub fn pathspec_stdin(paths: &[String]) -> Result<Vec<u8>, AppError> {
 
 /// A path must stay inside the worktree. Paths come from our own status output,
 /// so this is a guard against a malformed request, not a user typo.
+/// The absolute, canonical path of `path` inside `repo_path` — or an error
+/// when it is not inside the repository (a `..`, an absolute path, a symlink
+/// that leaves it) or does not exist. Every command that hands a path to the
+/// operating system goes through this, so the JavaScript side never holds a
+/// general "open any path" capability.
+pub fn within_repo(repo_path: &str, path: &str) -> Result<PathBuf, AppError> {
+    validate_repo_path(path)?;
+    let base = std::fs::canonicalize(repo_path).map_err(|e| AppError::NotFound(format!("{}: {}", repo_path, e)))?;
+    let full = std::fs::canonicalize(base.join(path))
+        .map_err(|e| AppError::NotFound(format!("{} does not exist in this repository ({})", path, e)))?;
+    if !full.starts_with(&base) {
+        return Err(AppError::Command(format!("'{}' isn't a path inside this repository", path)));
+    }
+    Ok(full)
+}
+
 pub fn validate_repo_path(p: &str) -> Result<(), AppError> {
     let bad = p.is_empty()
         || p.starts_with('/')
@@ -549,6 +565,9 @@ pub struct PullOutcome {
     /// the conflicted files are in the tree and the stash entry is kept.
     pub autostash_conflict: bool,
     pub autostash_left: Option<String>,
+    /// Submodule pointers the pull moved: the repository now records other
+    /// commits for them than are checked out. Update aligns them.
+    pub submodules_moved: usize,
 }
 
 /// What every operation returns: whether it worked, what to tell the user, and
@@ -1361,6 +1380,7 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
         },
         autostash_conflict,
         autostash_left: if autostash_conflict { Some("stash@{0}".to_string()) } else { None },
+        submodules_moved: after.entries.iter().filter(|e| e.is_submodule && e.sub_commit_changed).count(),
     };
 
     if autostash_conflict {

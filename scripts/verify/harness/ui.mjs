@@ -29,7 +29,7 @@ import {
   SUBMODULE_A,
   TREE_RESET_OUTCOME,
   STASH_DROP_OUTCOME,
-  BRANCH_DELETE_OUTCOME, sub } from "./fixtures.mjs";
+  BRANCH_DELETE_OUTCOME, sub, PULL_MOVED_OUTCOME, CONFLICT_VIEW } from "./fixtures.mjs";
 
 if (!DIST_OK) {
   console.error("dist/ is missing — run `npm run build` first");
@@ -57,6 +57,11 @@ async function openPage(browser, server, scenario, opts = {}) {
     syncPlan: opts.syncPlan ?? SYNC_PLAN,
     syncPlanNoStash: opts.syncPlanNoStash ?? SYNC_PLAN_NOSTASH,
     syncOutcome: opts.syncOutcome ?? SYNC_OUTCOME,
+    /** A pull's full result (with its `pull` outcome), when the test needs one. */
+    pullResult: opts.pullResult ?? null,
+    /** What Update now returns instead of the outcome (a refusal, say). */
+    syncRunResult: opts.syncRunResult ?? null,
+    conflictView: opts.conflictView ?? CONFLICT_VIEW,
     submoduleStatuses: opts.submoduleStatuses ?? [],
     branches: opts.branches ?? BRANCHES,
     stashes: opts.stashes ?? [],
@@ -206,6 +211,9 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "changes_file_diff":
               return Promise.resolve(args.path === "logo.png" ? diffBinary : diffText);
             case "changes_pull":
+              if (cfg.hang) return new Promise(() => {}); // never settles
+              if (cfg.pullResult) return Promise.resolve({ ...cfg.pullResult, status: window.__SCENARIO__ });
+              return done("Done.");
             case "changes_push":
             case "changes_submodule_update":
             case "changes_lfs_pull":
@@ -216,17 +224,22 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(args.stash === false ? cfg.syncPlanNoStash : cfg.syncPlan);
             case "changes_sync_run":
               if (cfg.hang) return new Promise(() => {}); // never settles
+              if (cfg.syncRunResult) return Promise.resolve({ ...cfg.syncRunResult, status: window.__SCENARIO__ });
               return Promise.resolve({
                 ok: true,
-                headline: "Synced: 2 commits of yours on top of 3 new commits from origin/main.",
+                headline: "Updated: 2 commits of yours on top of 3 new commits from origin/main.",
                 detail: "Your uncommitted changes were stashed and re-applied.",
                 status: window.__SCENARIO__,
                 sync: cfg.syncOutcome,
               });
             case "changes_sync_continue":
-              return done("Synced: 3 commits of yours on top of 3 new commits from origin/main.");
+              return done("Updated: 3 commits of yours on top of 3 new commits from origin/main.");
             case "changes_sync_abort":
-              return done("Sync aborted.");
+              return done("Update aborted.");
+            case "changes_open_path":
+              return Promise.resolve(null);
+            case "changes_conflict_view":
+              return Promise.resolve(cfg.conflictView);
             case "changes_record_pointers":
               return done("Recorded 1 submodule pointer(s).");
             case "changes_stage":
@@ -748,7 +761,7 @@ try {
     ok("  the header names the rebase, not a detached HEAD", s0.split("Rebase in progress").length >= 3 && !s0.includes("not on a branch"));
     ok("  nobody is told to switch branches", !s0.includes("Switch to a branch") && !s0.includes("Check out a branch first"));
     ok("  and no Choose a branch is offered", (await page.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Choose a branch").length)) === 0);
-    ok("  the sync card says to finish or abort the rebase", s0.includes("Finish or abort the rebase first"));
+    ok("  Preview update waits, saying to finish or abort the rebase first", await (await button(page, "Preview update")).evaluate((b) => b.disabled && b.title.includes("Finish or abort the rebase first")));
     // The backend allows a plain commit during a rebase (it is one way to finish a stopped step), so the box asks for a message, not for a branch.
     ok("  the commit box asks for a message, not for a branch", s0.includes("A commit needs a message.") && !s0.includes("Switch to a branch before committing"));
     await (await button(page, "Continue")).click();
@@ -783,42 +796,51 @@ try {
   }
 
   // -----------------------------------------------------------------
-  section("Sync: the latest from upstream, your commits on top");
+  section("Update: the latest from upstream, your work on top");
   const stashBox = (page) =>
     page.evaluate(() => document.querySelector('input[aria-label="Stash uncommitted changes during the sync"]')?.click() ?? false);
+  const drawer = (page) => page.$('[role="dialog"][aria-label="Update"]');
+  const drawerText = (page) => page.evaluate(() => document.querySelector('[role="dialog"][aria-label="Update"]')?.innerText ?? "");
+  const waitDrawer = (page) => page.waitForFunction(() => !!document.querySelector('[role="dialog"][aria-label="Update"]'), { timeout: 4000 });
+  const planCalls = (page) => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_sync_plan").map((c) => c.args));
   {
     const page = await open(SCENARIOS.diverged);
     const s0 = await text(page);
-    ok("the card explains itself before anything runs", s0.includes("your commits on top") && s0.includes("Nothing is pushed"));
-    const assess = await button(page, "Assess");
-    ok("Assess says it fetches", assess !== null && (await assess.evaluate((b) => b.innerText)).includes("fetches"));
-    ok("Sync now is not offered before a plan exists", (await button(page, "Sync now")) === null);
-    await assess.click();
+    ok("the strip names the preview as the next step on a branch that is behind", s0.includes("Next: Preview update"));
+    ok("Update now is not offered before a plan exists", (await button(page, "Update now")) === null);
+    const pv = await button(page, "Preview update");
+    ok("Preview update is offered and enabled", pv !== null && !(await pv.evaluate((b) => b.disabled)));
+    await pv.click();
+    await waitDrawer(page);
     await page.waitForFunction(() => document.body.innerText.includes("replayed on top"), { timeout: 4000 });
-    const s1 = await text(page);
+    const s1 = await drawerText(page);
+    ok("the drawer explains itself", s1.includes("your work on top") && s1.includes("Nothing is pushed"));
     ok("the plan is a sentence", s1.includes("Your 2 commits are replayed on top of 3 new commits from origin/main"));
     ok("  the submodule table names A's rebase and its base", s1.includes("rebase your commits onto 7a9d38a"));
     ok("  and B's fast-forward", s1.includes("fast-forward to 3c3c3c3"));
     ok("  a skipped gitlink is collapsed, not hidden", s1.includes("1 gitlink left alone"));
-    ok("  the stash choice shows the count", s1.includes("Stash my 1 uncommitted change during the sync"));
-    ok("  file overlap is a warning, not a blocker", s1.includes("Both sides changed shared.txt") && (await button(page, "Sync now")) !== null);
-    ok("  Sync now is enabled", !(await (await button(page, "Sync now")).evaluate((b) => b.disabled)));
-    const calls0 = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_sync_plan"));
-    ok("  Assess fetched, with stashing on", calls0.length === 1 && calls0[0].args.fetch === true && calls0[0].args.stash === true);
+    ok("  the stash choice shows the count", s1.includes("Stash my 1 uncommitted change during the update"));
+    ok("  file overlap is a warning, not a blocker", s1.includes("Both sides changed shared.txt") && (await button(page, "Update now")) !== null);
+    ok("  Update now is enabled", !(await (await button(page, "Update now")).evaluate((b) => b.disabled)));
+    ok("  what git will run is one click away", s1.includes("What git will run"));
+    const c0 = await planCalls(page);
+    ok("  opening the drawer assessed once, fetching, with stashing on", c0.length === 1 && c0[0].fetch === true && c0[0].stash === true);
     await stashBox(page);
     await page.waitForFunction(() => document.body.innerText.includes("Turn on stashing"), { timeout: 4000 });
-    const calls1 = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_sync_plan"));
-    ok("turning stashing off re-plans without a second fetch", calls1.length === 2 && calls1[1].args.fetch === false && calls1[1].args.stash === false);
-    ok("  and the dirty tree becomes a named blocker", (await text(page)).includes("Turn on stashing"));
-    ok("  that disables Sync now", await (await button(page, "Sync now")).evaluate((b) => b.disabled));
-    await stashBox(page);
+    const c1 = await planCalls(page);
+    ok("turning stashing off re-plans without a second fetch", c1.length === 2 && c1[1].fetch === false && c1[1].stash === false);
+    ok("  and the dirty tree becomes a named blocker with a remedy button", (await drawerText(page)).includes("Turn on stashing") && (await button(page, "Turn on stashing")) !== null);
+    ok("  that disables Update now", await (await button(page, "Update now")).evaluate((b) => b.disabled));
+    await (await button(page, "Turn on stashing")).click();
     await page.waitForFunction(() => !document.body.innerText.includes("Turn on stashing"), { timeout: 4000 });
-    await (await button(page, "Sync now")).click();
-    await page.waitForFunction(() => document.body.innerText.includes("Synced:"), { timeout: 4000 });
+    ok("  the remedy turns it back on and re-plans", (await planCalls(page)).length === 3);
+    await (await button(page, "Update now")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Updated:"), { timeout: 4000 });
+    ok("Update now closes the drawer", (await drawer(page)) === null);
     const s2 = await text(page);
     const run = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_sync_run"));
-    ok("Sync now sends the plan's fingerprint and the choices", run && run.args.stash === true && run.args.bundles === false && run.args.fingerprint.length === 3);
-    ok("the result is a table per repository", s2.includes("this repository") && s2.includes("aaaa111 → cccc333") && s2.includes("rebased onto 7a9d38a"));
+    ok("  and sends the plan's fingerprint and the choices", run && run.args.stash === true && run.args.bundles === false && run.args.fingerprint.length === 3);
+    ok("the result is a table per repository, in the outcome's own words", s2.includes("this repository") && s2.includes("aaaa111 → cccc333") && s2.includes("rebased onto 7a9d38a") && s2.includes("fast-forwarded"));
     ok("  every check passed, said so", s2.includes("All 6 checks passed"));
     ok("  the backups are one click away, with the undo commands", s2.includes("Backups: 2 branches"));
     await page.evaluate(() => [...document.querySelectorAll("summary")].find((x) => x.innerText.includes("Backups"))?.click());
@@ -828,45 +850,51 @@ try {
   }
   {
     const page = await open(SCENARIOS.diverged, { syncPlan: SYNC_PLAN_BLOCKED });
-    await (await button(page, "Assess")).click();
+    await (await button(page, "Preview update")).click();
     await page.waitForFunction(() => document.body.innerText.includes("checked out at"), { timeout: 4000 });
-    const s = await text(page);
+    const s = await drawerText(page);
     ok("a blocker is a sentence with the remedy", s.includes("commit that pointer (Record submodule pointers)"));
-    const b = await button(page, "Sync now");
-    ok("  and Sync now stays disabled", await b.evaluate((x) => x.disabled));
-    ok("  saying why", (await b.evaluate((x) => x.title)).includes("blockers"));
+    const rec = await button(page, "Record submodule pointers");
+    ok("  and a button keyed on the remedy code, not the sentence", rec !== null);
+    const b = await button(page, "Update now");
+    ok("  Update now stays disabled, saying why", (await b.evaluate((x) => x.disabled)) && (await b.evaluate((x) => x.title)).includes("blockers"));
+    await rec.click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_record_pointers"), { timeout: 4000 });
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_sync_plan").length >= 2, { timeout: 4000 });
+    const last = (await planCalls(page)).at(-1);
+    ok("  the remedy records the pointers, then plans again without a second fetch", last.fetch === false);
     await page.close();
   }
   {
     const page = await open(SCENARIOS.clean, { syncPlan: SYNC_PLAN_NOTHING });
-    await (await button(page, "Assess")).click();
-    await page.waitForFunction(() => document.body.innerText.includes("Nothing to sync"), { timeout: 4000 });
-    ok("nothing to do is said in words, with no Sync now", (await button(page, "Sync now")) === null);
+    await (await button(page, "Preview update")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Nothing to update"), { timeout: 4000 });
+    ok("nothing to do is said in words, with no Update now", (await button(page, "Update now")) === null);
     await page.close();
   }
   {
     const page = await open(SCENARIOS.unpublished);
-    const b = await button(page, "Assess");
-    ok("without an upstream Assess is disabled", await b.evaluate((x) => x.disabled));
-    ok("  and the card says what to do", (await text(page)).includes("no upstream to sync from"));
+    const b = await button(page, "Preview update");
+    ok("without an upstream Preview update is disabled", await b.evaluate((x) => x.disabled));
+    ok("  and says what to do", (await b.evaluate((x) => x.title)).includes("no upstream to update from"));
     await page.close();
   }
   {
     const page = await open(SCENARIOS.diverged, { hang: true });
-    await (await button(page, "Assess")).click();
+    await (await button(page, "Preview update")).click();
     await page.waitForFunction(() => document.body.innerText.includes("replayed on top"), { timeout: 4000 });
-    await (await button(page, "Sync now")).click();
-    await page.waitForFunction(() => document.body.innerText.includes("Syncing"), { timeout: 4000 });
+    await (await button(page, "Update now")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Updating"), { timeout: 4000 });
     const s = await text(page);
-    ok("a running sync is a job banner that survives leaving the page", s.includes("Syncing — fetching, rebasing") && s.includes("keeps running"));
+    ok("a running update is a job banner that survives leaving the page", s.includes("Updating — fetching, rebasing") && s.includes("keeps running"));
     await page.close();
   }
   {
     const page = await open(SCENARIOS.diverged, { syncOutcome: SYNC_OUTCOME_UNRECORDED });
-    await (await button(page, "Assess")).click();
+    await (await button(page, "Preview update")).click();
     await page.waitForFunction(() => document.body.innerText.includes("replayed on top"), { timeout: 4000 });
-    await (await button(page, "Sync now")).click();
-    await page.waitForFunction(() => document.body.innerText.includes("Synced:"), { timeout: 4000 });
+    await (await button(page, "Update now")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Updated:"), { timeout: 4000 });
     ok("a submodule ahead of the recorded pointer is named", (await text(page)).includes("B is checked out ahead of what this branch records"));
     const rec = await button(page, "Record submodule pointers");
     ok("  with a button to record it", rec !== null);
@@ -876,38 +904,104 @@ try {
     await page.close();
   }
   {
+    const refused = { ok: false, headline: "Upstream moved since you assessed. Assess again, then update.", detail: "", refusal: { code: "assess-again", message: "Upstream moved since you assessed. Assess again, then update." } };
+    const page = await open(SCENARIOS.diverged, { syncRunResult: refused });
+    await (await button(page, "Preview update")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("replayed on top"), { timeout: 4000 });
+    await (await button(page, "Update now")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("moved while you were reading"), { timeout: 4000 });
+    ok("a run refused because upstream moved re-opens the drawer and says so", (await drawer(page)) !== null);
+    const calls = await planCalls(page);
+    ok("  with a second plan that fetched again", calls.length === 2 && calls[1].fetch === true);
+    ok("  and no error card for it", !(await text(page)).includes("That didn't work"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.behindOnly, { pullResult: { ok: true, headline: "Pulled 2 commit(s) (fast-forward).", detail: "", pull: PULL_MOVED_OUTCOME } });
+    await (await button(page, "Pull")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Pulled 2 commit(s)"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a pull that moved submodule pointers says so", s.includes("2 submodule pointers moved"));
+    const up = await button(page, "Update…");
+    ok("  and offers the update", up !== null);
+    await up.click();
+    await waitDrawer(page);
+    ok("  which opens the drawer", (await drawer(page)) !== null);
+    await page.close();
+  }
+  {
     const page = await open(SCENARIOS.syncPaused);
     const s = await text(page);
-    ok("a paused sync replaces the plain rebase banner", s.includes("Sync paused") && !s.includes("Rebase in progress"));
+    ok("a paused update replaces the plain rebase banner", s.includes("Update paused") && !s.includes("Rebase in progress"));
     ok("  with the hint", s.includes("Resolve the conflicts listed on this page"));
     ok("  and the file", s.includes("shared.txt"));
-    ok("  the Sync card itself is gone", (await button(page, "Assess")) === null);
-    const c = await button(page, "Continue sync");
-    ok("  Continue sync is disabled while conflicts remain", await c.evaluate((b) => b.disabled));
-    ok("  saying why", (await c.evaluate((b) => b.title)).includes("Resolve and stage"));
+    ok("  Preview update waits for the rebase to finish", await (await button(page, "Preview update")).evaluate((b) => b.disabled));
+    const c = await button(page, "Continue update");
+    ok("  Continue update is disabled while conflicts remain", await c.evaluate((b) => b.disabled));
+    ok("  saying why, with the count", (await c.evaluate((b) => b.title)).includes("Resolve and stage") && (await c.evaluate((b) => b.title)).includes("1 left"));
     ok("  the conflict list is there to resolve them", s.includes("Conflicts") && s.includes("both modified"));
-    await (await button(page, "Abort sync")).click();
-    await page.waitForFunction(() => document.body.innerText.includes("Sync aborted."), { timeout: 4000 });
-    ok("  Abort sync reports itself", true);
+    await (await button(page, "Go to the conflicts")).click();
+    await sleep(400);
+    ok(
+      "  Go to the conflicts lands on the list",
+      await page.evaluate(() => {
+        const el = document.getElementById("conflicts");
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.top >= 0 && r.top < window.innerHeight;
+      })
+    );
+    const rowButtons = await page.evaluate(() => {
+      const row = [...document.querySelectorAll("li")].find((r) => r.innerText.includes("shared.txt"));
+      return row ? [...row.querySelectorAll("button")].map((b) => b.innerText.trim()) : null;
+    });
+    ok(
+      "  the conflicted row offers the editor and the file manager beside Keep mine / Take theirs",
+      rowButtons?.includes("Open in editor") && rowButtons?.includes("Reveal") && rowButtons?.includes("Keep mine") && rowButtons?.includes("Take theirs"),
+      JSON.stringify(rowButtons)
+    );
+    await clickInRow(page, "shared.txt", { text: "Open in editor" });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_open_path"), { timeout: 4000 });
+    const opened = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_open_path").args);
+    ok("  Open in editor asks the backend to open that path inside the repository", opened.repoPath === "/repos/gitswitch" && opened.path === "shared.txt" && opened.reveal === false, JSON.stringify(opened));
+    await page.evaluate(() => {
+      const row = [...document.querySelectorAll("li")].find((r) => r.innerText.includes("shared.txt"));
+      row.querySelector("button").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Conflict view"]'), { timeout: 4000 });
+    const cv = await page.evaluate(() => document.querySelector('[aria-label="Conflict view"]').innerText);
+    ok("  clicking the row shows the conflict by its sides, named as on the list", cv.includes("mine = your commit being replayed") && cv.includes("theirs = origin/main") && cv.includes("shared line 2 (mine)") && cv.includes("shared line 2 (upstream)"));
+    ok("  with the count of conflicts left in the file", cv.includes("1 conflict left in the file"));
+    await page.click('button[aria-label="Close"]');
+    await sleep(100);
+    await (await button(page, "Abort update")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Update aborted."), { timeout: 4000 });
+    ok("  Abort update reports itself", true);
     await page.close();
   }
   {
     const page = await open(SCENARIOS.syncPausedInSub);
     const s = await text(page);
-    ok("paused inside a submodule says so", s.includes("Sync paused inside A"));
-    const c = await button(page, "Continue sync");
-    ok("  Continue sync stays enabled (the gitlink conflict is the sync's to finish)", !(await c.evaluate((b) => b.disabled)));
-    await c.click();
-    await page.waitForFunction(() => document.body.innerText.includes("Synced: 3 commits"), { timeout: 4000 });
-    ok("  and continuing reports the outcome", true);
+    ok("paused inside a submodule says so", s.includes("Update paused inside A"));
+    const c = await button(page, "Continue update");
+    ok("  Continue update waits for A's own conflict", await c.evaluate((b) => b.disabled));
+    const o = await button(page, "Open A");
+    ok("  and Open A hands over", o !== null);
+    await o.click();
+    await sleep(400);
+    ok(
+      "  making A the scope on the Changes tab",
+      (await page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:repo.sub") ?? '""'))) === "A" && (await page.evaluate(() => location.pathname)) === "/repo/changes"
+    );
     await page.close();
   }
   {
     const page = await open(SCENARIOS.syncPausedChild);
     const s = await text(page);
-    ok("the submodule's own page knows the parent's sync is paused here", s.includes("A sync of gitswitch is paused inside this submodule"));
+    ok("the submodule's own page knows the parent's update is paused here", s.includes("An update of gitswitch is paused inside this submodule"));
     ok("  and offers to go back to the parent", (await button(page, "Open gitswitch")) !== null);
-    ok("  without a Continue sync of its own", (await button(page, "Continue sync")) === null);
+    ok("  without a Continue update of its own", (await button(page, "Continue update")) === null);
+    ok("  and names theirs as the parent's upstream's record for A", s.includes("origin/main's A (7a9d38a)"));
     await page.close();
   }
 
@@ -1971,7 +2065,8 @@ try {
     ok("a detached HEAD is said in words, with the commit", s.includes("detached HEAD at 1a2b3c4") && s.includes("not on a branch"));
     ok("  and publishing is disabled (nothing to push from)", (await buttonState(page, "Publish branch"))?.disabled === true);
     const offers = await page.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Choose a branch").length);
-    ok("  the sync card and the commit box both offer to choose a branch", offers === 2);
+    ok("  the commit box offers to choose a branch", offers === 1);
+    ok("  and Preview update says why it waits", await (await button(page, "Preview update")).evaluate((b) => b.disabled && b.title.includes("Check out a branch first")));
     await (await button(page, "Choose a branch")).click();
     await page.waitForFunction(() => document.body.innerText.includes("this commit (detached HEAD)"), { timeout: 4000 });
     ok("  which opens the dialog starting from this commit", true);
@@ -2431,7 +2526,7 @@ try {
     await page.waitForFunction(() => document.body.innerText.includes("Inside A"), { timeout: 4000 });
     const s = await text(page);
     ok("a rebase that belongs to the paused sync shows no Continue in A / Abort in A", s.includes("Rebase in progress inside A") && (await button(page, "Continue in A")) === null && (await button(page, "Abort in A")) === null);
-    ok("  and points at the sync card's own buttons", s.includes("Finish it with Continue sync / Abort sync above") && (await button(page, "Abort sync")) !== null);
+    ok("  and points at the paused update's own buttons", s.includes("Finish it with Continue update / Abort update above") && (await button(page, "Abort update")) !== null);
     await page.close();
   }
 

@@ -155,7 +155,7 @@ export function SubmoduleSection({
                     ? // The sync owns this rebase: the backend refuses a plain
                       // continue/abort here, the same way the parent's own
                       // banner yields to the sync card.
-                      "it belongs to the paused sync. Finish it with Continue sync / Abort sync above."
+                      "it belongs to the paused update. Finish it with Continue update / Abort update above."
                     : op.detail || "Finish it, or abort to go back."}
                 </span>
               </p>

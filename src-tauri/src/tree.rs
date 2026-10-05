@@ -195,7 +195,7 @@ pub fn check_tree(intent: &TreeIntent, f: &StatusFacts) -> Option<Refusal> {
         if *submodule_selected {
             return Some(refuse(
                 "submodule-conflict",
-                "Submodule pointer conflicts are resolved by bringing the submodule to the right commit — Sync does that, or do it inside the submodule.",
+                "Submodule pointer conflicts are resolved by bringing the submodule to the right commit — Update does that, or do it inside the submodule.",
             ));
         }
         if *not_conflicted_selected {

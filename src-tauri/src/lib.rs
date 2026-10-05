@@ -132,6 +132,8 @@ pub fn run() {
             commands::changes_sync_run,
             commands::changes_sync_continue,
             commands::changes_sync_abort,
+            commands::changes_open_path,
+            commands::changes_conflict_view,
             commands::changes_record_pointers,
             commands::changes_submodule_statuses,
             commands::changes_switch_branch,

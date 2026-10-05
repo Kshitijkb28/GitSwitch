@@ -76,13 +76,14 @@ ok "the orphan gitlink is skipped as unmapped" "$(printf '%s' "$OUT" | jqf skipp
 ok "my uncommitted change will be stashed" "$(printf '%s' "$OUT" | jqf superproject.will_stash):$(printf '%s' "$OUT" | jqf superproject.dirty_count)" "True:1"
 ok "the fingerprint pins upstream and every target" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;print(len(json.load(sys.stdin)['fingerprint']))")" "3"
 OUT=$(probe sync_plan "$SB/local" "nostash")
+ok "  the stash blocker carries its code" "$(printf '%s' "$OUT" | jqf superproject.remedies)" "turn-on-stash"
 ok "without stashing a dirty tree is a named blocker" "$(printf '%s' "$OUT" | jqf blockers)" "Turn on stashing"
 ok "  and the plan cannot run" "$(printf '%s' "$OUT" | jqf can_run)" "False"
 
 section "Run: my commits end up on top, in the superproject and in A"
 OUT=$(probe sync_run "$SB/local")
 ok "the sync succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
-ok "  and says what it did" "$(printf '%s' "$OUT" | jqf headline)" "Synced: 2 commits of yours on top of 3 new commits from origin/main."
+ok "  and says what it did" "$(printf '%s' "$OUT" | jqf headline)" "Updated: 2 commits of yours on top of 3 new commits from origin/main."
 ok "  it mentions the stash" "$(printf '%s' "$OUT" | jqf detail)" "stashed and re-applied"
 ok "  the state file is gone" "$([ -e "$SB/local/.git/gitswitch-sync.json" ] && echo present || echo gone)" "gone"
 ok "the superproject is 0 behind" "$(git -C "$SB/local" rev-list --left-right --count HEAD...origin/main)" "2	0"
@@ -101,9 +102,10 @@ ok "a backup branch holds the old superproject tip" "$(git -C "$SB/local" rev-pa
 ok "  and one in A holds its old tip" "$(git -C "$SB/local/A" rev-parse "$(git -C "$SB/local/A" branch --list 'gitswitch-before-sync-*' | tr -d ' *')")" "$A_HEAD0"
 ok "  the result lists them with recovery commands" "$(printf '%s' "$OUT" | jqf sync.backups)" "reset --hard gitswitch-before-sync-"
 ok "  every check passed" "$(printf '%s' "$OUT" | jqf sync.verified)" "\"dirty_paths_unchanged\": true"
+ok "  the outcome says what was done to each submodule, in its own words" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print(sorted((x['path'],x['action']) for x in d['sync']['submodules']))")" "[('A', 'rebased'), ('B', 'fast-forwarded')]"
 OUT=$(probe sync_plan "$SB/local")
 ok "assessing again finds nothing to do" "$(printf '%s' "$OUT" | jqf nothing_to_do)" "True"
-ok "  in words" "$(printf '%s' "$OUT" | jqf summary)" "Nothing to sync"
+ok "  in words" "$(printf '%s' "$OUT" | jqf summary)" "Nothing to update"
 
 section "A file conflict pauses the sync; abort puts everything back"
 restore
@@ -112,7 +114,7 @@ printf 'shared line 1\nshared line 2 (mine)\nshared line 3\n' > "$SB/local/share
 SUPER_HEAD1="$(head_of "$SB/local")"; A_HEAD1="$(head_of "$SB/local/A")"
 probe sync_plan "$SB/local" >/dev/null
 OUT=$(probe sync_run "$SB/local")
-ok "the sync pauses" "$(printf '%s' "$OUT" | jqf headline)" "Sync paused: conflicts to resolve."
+ok "the sync pauses" "$(printf '%s' "$OUT" | jqf headline)" "Update paused: conflicts to resolve."
 ok "  naming the file" "$(printf '%s' "$OUT" | jqf sync.needs_user.paths)" "shared.txt"
 ok "  in the superproject" "$(printf '%s' "$OUT" | jqf sync.needs_user.where_)" "superproject"
 ok "  A was already rebased at its stop" "$(git -C "$SB/local/A" log --format=%s -1)" "A: my commit"
@@ -120,7 +122,7 @@ ok "  the status carries the paused sync" "$(probe status "$SB/local" | jqf sync
 ok "  and a push is refused while it is paused" "$(probe push "$SB/local" "" | jqf refusal.code)" "sync-in-progress"
 ok "  so is a plain pull" "$(probe pull "$SB/local" "merge" | jqf refusal.code)" "sync-in-progress"
 OUT=$(probe sync_abort "$SB/local")
-ok "abort reports itself" "$(printf '%s' "$OUT" | jqf headline)" "Sync aborted."
+ok "abort reports itself" "$(printf '%s' "$OUT" | jqf headline)" "Update aborted."
 ok "  the superproject is back at its old tip" "$(head_of "$SB/local")" "$SUPER_HEAD1"
 ok "  A was put back too (git's own abort would not have)" "$(head_of "$SB/local/A")" "$A_HEAD1"
 ok "  A is still on main" "$(on_branch "$SB/local/A")" "main"
@@ -142,7 +144,7 @@ printf 'shared line 1\nshared line 2 (both)\nshared line 3\n' > "$SB/local/share
 OUT=$(probe stage "$SB/local" "shared.txt")
 ok "staging the resolution is allowed while paused" "$(printf '%s' "$OUT" | jqf ok)" "True"
 OUT=$(probe sync_continue "$SB/local")
-ok "continue finishes the sync" "$(printf '%s' "$OUT" | jqf headline)" "Synced: 3 commits of yours on top of 3 new commits"
+ok "continue finishes the sync" "$(printf '%s' "$OUT" | jqf headline)" "Updated: 3 commits of yours on top of 3 new commits"
 ok "  my resolved commit is on top" "$(git -C "$SB/local" log --format=%s -1)" "my shared edit"
 ok "  A and B are aligned" "$(git -C "$SB/local" submodule status 2>/dev/null | grep -c '^[+-]' || true)" "0"
 ok "  the README edit is back" "$(git -C "$SB/local" status --porcelain | grep -c 'README.md' || true)" "1"
@@ -161,6 +163,7 @@ restore
 git -C "$SB/local/A" commit -q --allow-empty -m "A: extra, unrecorded"
 OUT=$(probe sync_plan "$SB/local")
 ok "A checked out ahead of what my commit records is a blocker" "$(printf '%s' "$OUT" | jqf blockers)" "checked out at"
+ok "  with a stable remedy code the page can key a button on" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([x['remedy'] for x in d['submodules'] if x['path']=='A'][0])")" "record-pointers"
 ok "  running anyway is refused" "$(probe sync_run "$SB/local" | jqf refusal.code)" "sync-blocked"
 restore
 printf 'more\n' > "$SB/local/A/more.txt"; git -C "$SB/local/A" add -A >/dev/null; git -C "$SB/local/A" commit -qm "A: second"
@@ -201,7 +204,7 @@ cd "$SB/plain"; echo me > me.txt; git add -A >/dev/null; git commit -qm "my comm
 OUT=$(probe sync_plan "$SB/plain")
 ok "the plan has no submodule rows" "$(printf '%s' "$OUT" | jqf submodules)" "[]"
 OUT=$(probe sync_run "$SB/plain")
-ok "the sync succeeds" "$(printf '%s' "$OUT" | jqf headline)" "Synced: 1 commit of yours on top of 1 new commit"
+ok "the sync succeeds" "$(printf '%s' "$OUT" | jqf headline)" "Updated: 1 commit of yours on top of 1 new commit"
 ok "  my commit is on top" "$(git -C "$SB/plain" log --format=%s -2 | tr '\n' '|')" "my commit|their commit|"
 ok "  the dirty edit is back" "$(git -C "$SB/plain" status --porcelain)" " M a.txt"
 
@@ -233,7 +236,7 @@ B_PLAN=$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);p
 ok "B is ahead" "$(printf '%s' "$B_PLAN" | jqf action)" "ahead"
 ok "  with the reason in words" "$(printf '%s' "$B_PLAN" | jqf reason)" "does not record them yet"
 OUT=$(probe sync_run "$SB/local2")
-ok "the sync succeeds" "$(printf '%s' "$OUT" | jqf headline)" "Synced: fast-forwarded to 1 new commit from origin/main."
+ok "the sync succeeds" "$(printf '%s' "$OUT" | jqf headline)" "Updated: fast-forwarded to 1 new commit from origin/main."
 ok "  and names the pointer the branch does not record" "$(printf '%s' "$OUT" | jqf sync.unrecorded_pointers)" "B"
 ok "  B kept my commit" "$(git -C "$SB/local2/B" log --format=%s -1)" "B: my commit"
 OUT=$(probe record_pointers "$SB/local2")
@@ -280,7 +283,7 @@ printf 'A v1\nline2 (mine)\nline3\n' > "$SB/local/A/A.txt"; git -C "$SB/local/A"
 git -C "$SB/local" add A >/dev/null; git -C "$SB/local" commit -q --amend --no-edit
 probe sync_plan "$SB/local" >/dev/null
 OUT=$(probe sync_run "$SB/local")
-ok "the sync pauses inside A" "$(printf '%s' "$OUT" | jqf headline)" "Sync paused inside A."
+ok "the sync pauses inside A" "$(printf '%s' "$OUT" | jqf headline)" "Update paused inside A."
 ok "  saying where to resolve" "$(printf '%s' "$OUT" | jqf sync.needs_user.hint)" "Open it as its own repository"
 ok "  A has the conflict" "$(git -C "$SB/local/A" status --porcelain | grep -c '^UU' || true)" "1"
 printf 'A v1\nline2 (both)\nline3\n' > "$SB/local/A/A.txt"; git -C "$SB/local/A" add A.txt
@@ -289,5 +292,14 @@ ok "continue finishes the sync" "$(printf '%s' "$OUT" | jqf ok)" "True"
 ok "  A has my edits on top of upstream's" "$(git -C "$SB/local/A" log --format=%s -3 | tr '\n' '|')" "A: my edit of A.txt|A: my commit|A: upstream edits A.txt|"
 ok "  and the superproject records the rebased A" "$(git -C "$SB/local" rev-parse HEAD:A)" "$(head_of "$SB/local/A")"
 ok "  everything aligned" "$(git -C "$SB/local" submodule status 2>/dev/null | grep -c '^[+-]' || true)" "0"
+
+section "A plain pull says how many submodule pointers it moved"
+git clone -q --recurse-submodules "$SB/super.git" "$SB/local3" 2>/dev/null
+printf 'up3\n' > "$SB/upstream/A/up3.txt"; git -C "$SB/upstream/A" add -A >/dev/null; git -C "$SB/upstream/A" commit -qm "A: upstream 3"; git -C "$SB/upstream/A" push -q origin main 2>/dev/null
+git -C "$SB/upstream" add A >/dev/null; git -C "$SB/upstream" commit -qm "super: bump A again"; git -C "$SB/upstream" push -q origin main 2>/dev/null
+OUT=$(probe pull "$SB/local3" "ff-only")
+ok "the pull fast-forwards" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  and counts the submodule pointer it moved (A), not the one it did not (B)" "$(printf '%s' "$OUT" | jqf pull.submodules_moved)" "1"
+ok "  the gitlink row says so too" "$(probe status "$SB/local3" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([e['sub_commit_changed'] for e in d['entries'] if e['path']=='A'])")" "[True]"
 
 verify_result

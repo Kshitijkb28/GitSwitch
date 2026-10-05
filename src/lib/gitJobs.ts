@@ -12,7 +12,7 @@ import type { OpResult } from "./api";
  * One slot per repository, so two repos can be busy at once without either
  * hiding the other.
  */
-export type GitJobKind = "pull" | "push" | "fetch" | "submodules" | "lfs" | "sync";
+export type GitJobKind = "pull" | "push" | "fetch" | "submodules" | "lfs" | "sync" | "assess";
 
 export type GitJob = {
   repo: string;
