@@ -116,7 +116,9 @@ OUT=$(PATH="$STRIPPED" probe lfs_status "$SB/work")
 ok "the status says git-lfs is not installed" "$(printf '%s' "$OUT" | jqf installed)" "False"
 ok "  in words a person can act on" "$(printf '%s' "$OUT" | jqf summary)" "isn't installed"
 OUT=$(PATH="$STRIPPED" probe lfs_pull "$SB/work")
-ok "pull is refused with the install hint" "$(printf '%s' "$OUT" | jqf refusal.message)" "brew install git-lfs"
+# The hint names the platform's installer (lfs::install_hint).
+case "$(uname -s)" in Darwin) LFS_HINT="brew install git-lfs";; Linux) LFS_HINT="apt install git-lfs";; *) LFS_HINT="git-lfs.com";; esac
+ok "pull is refused with the install hint" "$(printf '%s' "$OUT" | jqf refusal.message)" "$LFS_HINT"
 # With filter.lfs.required set, git status itself fails in this state, and its
 # own words ("the remote end hung up unexpectedly") read like a network outage.
 # git only runs the filter for a file whose stat data changed, so touch one to

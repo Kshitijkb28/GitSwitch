@@ -44,6 +44,16 @@ pub fn async_command(program: impl AsRef<OsStr>) -> tokio::process::Command {
 #[cfg(windows)]
 pub struct JobObject(windows_sys::Win32::Foundation::HANDLE);
 
+// SAFETY: a job object handle is a process-wide kernel handle — Windows lets
+// any thread use or close it, and nothing here keeps thread-local state. The
+// raw pointer inside `HANDLE` is what makes the compiler say otherwise, and
+// without this every command future that holds a job across an `.await`
+// stops being `Send`, which Tauri requires of all of them.
+#[cfg(windows)]
+unsafe impl Send for JobObject {}
+#[cfg(windows)]
+unsafe impl Sync for JobObject {}
+
 #[cfg(windows)]
 impl JobObject {
     /// Put `child` (and, from now on, everything it starts) in a new job.
