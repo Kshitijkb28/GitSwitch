@@ -20,7 +20,9 @@ pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a timed-out command gets to leave on its own after SIGTERM —
 /// enough for git to remove its `index.lock` and for git-lfs to finish the
-/// object it is writing — before SIGKILL.
+/// object it is writing — before SIGKILL. Unix only: Windows ends the whole
+/// job object at once (spawn.rs), so there is no grace period there.
+#[cfg(unix)]
 pub const KILL_GRACE: Duration = Duration::from_secs(5);
 /// Git LFS transfers: a repository's large files can be many gigabytes, and a
 /// download that is still making progress must not be killed for taking longer
