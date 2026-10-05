@@ -140,7 +140,8 @@ fn validate_fields(name: &str, git_name: &str, git_email: &str, ssh_key_path: Op
             )));
         }
         if !std::path::Path::new(d).is_absolute() {
-            return Err(AppError::Config(format!("The folder `{}` needs a full path, like /Users/you/work.", d)));
+            let example = if cfg!(windows) { r"C:\Users\you\work" } else { "/Users/you/work" };
+            return Err(AppError::Config(format!("The folder `{}` needs a full path, like {}.", d, example)));
         }
     }
     Ok(())
@@ -390,7 +391,9 @@ mod tests {
 
     #[test]
     fn fields_that_would_corrupt_a_commit_or_a_config_are_refused_with_a_reason() {
-        let ok = validate_fields("Work", "Ann Example", "ann@example.test", Some("/k/id"), &["/w".into()]);
+        // A full path is platform-shaped: `/w` is relative on Windows.
+        let dir = if cfg!(windows) { r"C:\w" } else { "/w" };
+        let ok = validate_fields("Work", "Ann Example", "ann@example.test", Some("/k/id"), &[dir.into()]);
         assert!(ok.is_ok());
         // Odd but legitimate: quotes, a hash, a semicolon. Quoting handles these.
         assert!(validate_fields("W", r#"Ann #1 "The Hammer" O'Brien"#, "ann;x@example.test", None, &[]).is_ok());

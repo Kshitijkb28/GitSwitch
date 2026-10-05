@@ -153,7 +153,9 @@ mod tests {
         assert_eq!(h.port, 22);
         assert!(h.identities_only);
         assert_eq!(h.identity_files.len(), 2);
-        assert!(h.identity_files[0].ends_with("/.ssh/work_key") && !h.identity_files[0].starts_with('~'), "{:?}", h.identity_files);
+        // The home directory is joined by the platform (a backslash on Windows); ssh accepts either.
+        let first = h.identity_files[0].replace('\\', "/");
+        assert!(first.ends_with("/.ssh/work_key") && !first.starts_with('~'), "{:?}", h.identity_files);
         assert_eq!(h.identity_files[1], "/abs/other");
         // No answer at all: the alias is taken literally as the host.
         assert_eq!(parse_ssh_g("plain.host", "").hostname, "plain.host");
