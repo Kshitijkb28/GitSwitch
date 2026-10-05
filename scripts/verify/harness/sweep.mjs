@@ -3,7 +3,7 @@
 // and documentElement never reports overflow — measuring the wrong element once
 // hid a page that was visibly clipped.
 import { launch, serve, DIST_OK } from "./browser.mjs";
-import { REPOS, SCENARIOS, DIFF_TEXT, SUB_STATUSES, STASHES } from "./fixtures.mjs";
+import { REPOS, SCENARIOS, DIFF_TEXT, SUB_STATUSES, STASHES, SUBMODULES } from "./fixtures.mjs";
 
 if (!DIST_OK) {
   console.error("dist/ is missing — run `npm run build` first");
@@ -25,7 +25,7 @@ const status = {
   has_submodules: true,
   stash_count: 2,
 };
-const PAGES = ["Profiles", "SSH Keys", "GitHub Auth", "Repositories", "Clone", "Changes", "Auto Assign", "Doctor", "History", "Commit Audit", "Settings"];
+const PAGES = ["Profiles", "SSH Keys", "GitHub Auth", "Repositories", "Clone", "Repository", "Auto Assign", "Doctor", "Commit Audit", "Settings"];
 
 const server = await serve();
 const browser = await launch();
@@ -35,7 +35,7 @@ try {
     console.log(`\n\x1b[1m${width}px (half screen)\x1b[0m`);
     const page = await browser.newPage();
     await page.setViewport({ width, height: 900 });
-    await page.evaluateOnNewDocument((repos, st, d1, subs, stashes) => {
+    await page.evaluateOnNewDocument((repos, st, d1, subs, stashes, submods) => {
       localStorage.clear();
       localStorage.setItem("gitswitch:changes.repo", JSON.stringify("/repos/gitswitch"));
       localStorage.setItem("gitswitch:history.repo", JSON.stringify("/repos/gitswitch"));
@@ -63,6 +63,7 @@ try {
             case "clone_size_estimate": return Promise.resolve({ repo: "owner/repo", kb: 1258291 });
             case "changes_push_identity": return Promise.resolve({ remote: "origin", url: "git@github.com:octo-work/gitswitch.git", via: "ssh-key", login: "octo-work", key_path: "/Users/me/.ssh/id_work", host: "github.com", account: null, expected_login: null, detail: "github.com accepted the key id_work." });
             case "changes_submodule_statuses": return Promise.resolve(subs);
+            case "changes_submodules": return Promise.resolve(submods);
             case "changes_stash_list": return Promise.resolve(stashes);
             case "changes_file_diff": return Promise.resolve(d1);
             case "changes_lfs_progress": return Promise.resolve(null);
@@ -82,15 +83,18 @@ try {
           }
         },
       };
-    }, REPOS, status, DIFF_TEXT, SUB_STATUSES, STASHES);
+    }, REPOS, status, DIFF_TEXT, SUB_STATUSES, STASHES, SUBMODULES);
     await page.goto(`${server.url}/`, { waitUntil: "networkidle0" });
 
-    for (const name of PAGES) {
-      const clicked = await page.evaluate((n) => {
-        const a = [...document.querySelectorAll("a")].find((x) => x.innerText.trim() === n);
+    // The Repository page's other tabs are swept as pages of their own.
+    const STOPS = PAGES.flatMap((n) => (n === "Repository" ? [n, "tab:History", "tab:Submodules"] : [n]));
+    for (const stop of STOPS) {
+      const name = stop.replace(/^tab:/, "");
+      const clicked = await page.evaluate((n, isTab) => {
+        const a = [...document.querySelectorAll(isTab ? 'a[role="tab"]' : "nav a")].find((x) => x.innerText.trim().startsWith(n));
         if (a) { a.click(); return true; }
         return false;
-      }, name);
+      }, name, stop.startsWith("tab:"));
       if (!clicked) { console.log(`  ${name}: link not found`); bad++; continue; }
       await new Promise((r) => setTimeout(r, 450));
       const r = await page.evaluate(() => {
@@ -108,8 +112,32 @@ try {
       });
       const over = r.need > r.have + 1;
       if (over) bad++;
+      if (over && process.env.SWEEP_VERBOSE) {
+        // Which elements actually reach past main's right edge (the culprit
+        // list above names the deepest overflowing box, which can be a bystander).
+        const wide = await page.evaluate(() => {
+          const m = document.querySelector("main");
+          const right = m.getBoundingClientRect().right;
+          const out = [];
+          for (const el of m.querySelectorAll("*")) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.right > right + 1 && ![...el.children].some((c) => c.getBoundingClientRect().right > right + 1))
+              out.push(`${Math.round(r.right - right)}px past: <${el.tagName.toLowerCase()} class="${(el.className || "").toString().slice(0, 70)}"> "${(el.innerText || "").slice(0, 40).replace(/\n/g, " ")}"`);
+          }
+          return out.slice(0, 12);
+        });
+        for (const w of wide) console.log(`             ${w}`);
+      }
       console.log(`  ${over ? "\x1b[31mOVERFLOW\x1b[0m" : "\x1b[32mok      \x1b[0m"} ${name.padEnd(14)} needs ${String(r.need).padStart(4)} has ${r.have}`);
       for (const c of r.culprits) console.log(`             ${c}`);
+      // Every page re-reads on demand, under the same name.
+      if (!stop.startsWith("tab:")) {
+        const hasRefresh = await page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Refresh"));
+        if (!hasRefresh) {
+          bad++;
+          console.log(`             no Refresh button on ${name}`);
+        }
+      }
     }
 
     // The terminal drawer is `fixed`, so it sits outside `main` and can never
@@ -153,6 +181,19 @@ try {
         );
       }
     }
+    // What the rubber-band area past either end of a scroll shows is the
+    // document's own background: it must be the app's dark, never white.
+    const bg = await page.evaluate(() => [document.documentElement, document.body].map((el) => getComputedStyle(el).backgroundColor));
+    const parse = (c) => {
+      const m = c.match(/^rgba?\(([\d.]+), ([\d.]+), ([\d.]+)(?:, ([\d.]+))?\)$/);
+      return m ? { r: +m[1], g: +m[2], b: +m[3], a: m[4] === undefined ? 1 : +m[4] } : null;
+    };
+    const dark = bg.every((c) => {
+      const p = parse(c);
+      return p !== null && p.a > 0 && p.r < 64 && p.g < 64 && p.b < 64;
+    });
+    if (!dark) bad++;
+    console.log(`  ${dark ? "\x1b[32mok      \x1b[0m" : "\x1b[31mWHITE   \x1b[0m"} ${"Document".padEnd(14)} html/body background ${bg.join(" / ")}`);
     await page.close();
   }
 } finally {

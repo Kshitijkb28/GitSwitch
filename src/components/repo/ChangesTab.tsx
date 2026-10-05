@@ -1,51 +1,75 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { RefreshCw, Loader2, AlertTriangle, CircleSlash, Play } from "lucide-react";
-import { Button } from "../components/Button";
-import { Card } from "../components/Card";
-import { Select } from "../components/Select";
-import { useToast } from "../components/Toast";
-import { TreeLists, type DiscardVariant } from "../components/changes/TreeLists";
-import { CommitBox } from "../components/changes/CommitBox";
-import { DiffPanel } from "../components/changes/DiffPanel";
-import { BranchCard } from "../components/changes/BranchCard";
-import { BranchesModal, type RunOptions } from "../components/changes/BranchesModal";
-import { PushAccessCard } from "../components/changes/PushAccessCard";
-import { SubmodulesCard } from "../components/changes/SubmodulesCard";
-import { SubmoduleSection, needsSection, sectionId } from "../components/changes/SubmoduleSection";
-import { LfsCard } from "../components/changes/LfsCard";
-import { LfsFilesModal, formatBytes } from "../components/changes/LfsFilesModal";
-import { StashesCard } from "../components/changes/StashesCard";
-import { StashModal } from "../components/changes/StashModal";
-import { SyncCard, SyncPausedCard } from "../components/changes/SyncCard";
-import { ResultCard } from "../components/changes/ResultCard";
-import { DiscardConfirmModal } from "../components/changes/DiscardConfirmModal";
-import { ResetConfirmModal } from "../components/changes/ResetConfirmModal";
-import { DiscardAllModal } from "../components/changes/DiscardAllModal";
-import { baseName } from "../lib/paths";
-import { usePersistedState, handOff } from "../lib/persist";
-import { open as pickFolder } from "@tauri-apps/plugin-dialog";
-import { useRefreshOnFocus } from "../lib/focus";
-import { elapsedLabel, runJob, useGitJob, clearJob, type GitJobKind } from "../lib/gitJobs";
-import * as api from "../lib/api";
-import type { ChangeEntry, OpResult, PullMode, RepoRef, RepoStatus, SubmoduleStatus } from "../lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Loader2, AlertTriangle, CircleSlash, Play } from "lucide-react";
+import { Button } from "../Button";
+import { Card } from "../Card";
+import { useToast } from "../Toast";
+import { TreeLists, type DiscardVariant } from "../changes/TreeLists";
+import { CommitBox } from "../changes/CommitBox";
+import { DiffPanel } from "../changes/DiffPanel";
+import { TidyUpStrip } from "./TidyUpStrip";
+import type { RepoActions } from "./StatusStrip";
+import { BranchesModal, type RunOptions } from "../changes/BranchesModal";
+import { PushAccessCard } from "../changes/PushAccessCard";
+import { SubmodulesCard } from "../changes/SubmodulesCard";
+import { SubmoduleSection, needsSection, sectionId } from "../changes/SubmoduleSection";
+import { LfsCard } from "../changes/LfsCard";
+import { LfsFilesModal, formatBytes } from "../changes/LfsFilesModal";
+import { StashesCard } from "../changes/StashesCard";
+import { StashModal } from "../changes/StashModal";
+import { SyncCard, SyncPausedCard } from "../changes/SyncCard";
+import { ResultCard } from "../changes/ResultCard";
+import { DiscardConfirmModal } from "../changes/DiscardConfirmModal";
+import { ResetConfirmModal } from "../changes/ResetConfirmModal";
+import { DiscardAllModal } from "../changes/DiscardAllModal";
+import { usePersistedState } from "../../lib/persist";
+import { useRefreshOnFocus } from "../../lib/focus";
+import { elapsedLabel, runJob, useGitJob, clearJob, type GitJobKind } from "../../lib/gitJobs";
+import * as api from "../../lib/api";
+import type { ChangeEntry, OpResult, PullMode, RepoStatus, SubmoduleInfo, SubmoduleStatus } from "../../lib/api";
 
 type DiscardRequest = { paths: string[]; variant: DiscardVariant; target?: string };
 
-export function Changes() {
+interface Props {
+  /** The repository — or the submodule in scope — this tab works on. */
+  repoPath: string;
+  visible: boolean;
+  pullMode: PullMode;
+  onPullMode: (m: PullMode) => void;
+  pullLfs: boolean;
+  onPullLfs: (v: boolean) => void;
+  pullAutostash: boolean;
+  onPullAutostash: (v: boolean) => void;
+  /** Open another folder (a submodule as its own repository, or any path) on this page. */
+  onOpenRepo: (path: string) => void;
+  /** The status this tab read, for the strip above the tabs. */
+  onStatus: (s: RepoStatus | null, loading: boolean) => void;
+  /** The operations the strip's buttons run. Re-registered on every render. */
+  onActions: (a: RepoActions) => void;
+  onOpenHistory: () => void;
+}
+
+/**
+ * The working tree: what used to be the whole Changes page, minus its picker
+ * and branch line, which now sit above the tabs. It owns the status, the job
+ * slot's results and every operation on this repository; the strip above only
+ * calls into it.
+ */
+export function ChangesTab({
+  repoPath,
+  visible,
+  pullMode,
+  onPullMode,
+  pullLfs,
+  onPullLfs,
+  pullAutostash,
+  onPullAutostash,
+  onOpenRepo,
+  onStatus,
+  onActions,
+  onOpenHistory,
+}: Props) {
   const toast = useToast();
-  const navigate = useNavigate();
-  const [repos, setRepos] = useState<RepoRef[]>([]);
-  const [account, setAccount] = usePersistedState("changes.account", ""); // "" = all
-  const [repoPath, setRepoPath] = usePersistedState("changes.repo", "");
-  const [pullMode, setPullMode] = usePersistedState<PullMode>("changes.pullMode", "ff-only");
   const [drafts, setDrafts] = usePersistedState<Record<string, string>>("changes.drafts", {});
-  // On by default: with LFS filters configured git already downloads large
-  // files on pull, so this makes every repo behave the way people expect.
-  const [pullLfs, setPullLfs] = usePersistedState("changes.pullLfs", true);
-  // Off by default: stashing around a rebase can leave conflicts behind, so
-  // it is a choice, not a surprise.
-  const [pullAutostash, setPullAutostash] = usePersistedState("changes.pullAutostash", false);
 
   // Deliberately not persisted: amending must be a fresh decision every time,
   // and status/results must always be re-read rather than restored.
@@ -67,30 +91,10 @@ export function Changes() {
   const [discardAllOpen, setDiscardAllOpen] = useState(false);
   const [tick, setTick] = useState(0);
   const [subRefresh, setSubRefresh] = useState(0);
-  const [extraRepos, setExtraRepos] = useState<string[]>([]);
 
   const job = useGitJob(repoPath);
   const seq = useRef(0);
   const subSeq = useRef(0);
-
-  const accounts = useMemo(
-    () =>
-      Array.from(
-        new Map(repos.map((r) => [r.profile_id, { id: r.profile_id, name: r.profile_name }])).values()
-      ),
-    [repos]
-  );
-  const visibleRepos = useMemo(
-    () => (account ? repos.filter((r) => r.profile_id === account) : repos),
-    [account, repos]
-  );
-
-  const loadRepos = useCallback(() => {
-    api
-      .historyListRepos()
-      .then(setRepos)
-      .catch((e) => setError(String(e)));
-  }, []);
 
   /** Each submodule's own status, for its section. Only asked when there are any. */
   const loadSubStatuses = useCallback((path: string, hasSubmodules: boolean) => {
@@ -138,8 +142,6 @@ export function Changes() {
     [loadSubStatuses]
   );
 
-  useEffect(loadRepos, [loadRepos]);
-
   // Switching repos must not show the previous repo's files for a moment.
   useEffect(() => {
     setStatus(null);
@@ -157,18 +159,13 @@ export function Changes() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subRefresh]);
 
-  // If the chosen account doesn't own the current repo, move to one it does.
-  useEffect(() => {
-    if (!account || !repos.length) return;
-    const owned = repos.filter((r) => r.profile_id === account);
-    if (owned.length && !owned.some((r) => r.path === repoPath)) {
-      setRepoPath(owned[0].path);
-    }
-  }, [account, repos, repoPath, setRepoPath]);
-
   // Folders change behind the app's back: a terminal commit, a deleted clone.
   useRefreshOnFocus(() => loadStatus(repoPath), 4000);
-  useRefreshOnFocus(loadRepos, 15000);
+
+  // The strip above the tabs shows what this tab knows.
+  useEffect(() => {
+    onStatus(status, loading);
+  }, [status, loading, onStatus]);
 
   // Keep the elapsed time moving while a job runs.
   useEffect(() => {
@@ -239,10 +236,7 @@ export function Changes() {
   }, [job, repoPath, loadStatus]);
 
   /** Work in another repo (a submodule) without waiting for the scan. */
-  const openRepo = (path: string) => {
-    setExtraRepos((list) => (list.includes(path) ? list : [...list, path]));
-    setRepoPath(path);
-  };
+  const openRepo = (path: string) => onOpenRepo(path);
 
   const message = drafts[repoPath] ?? "";
   const setMessage = (m: string) => setDrafts((d) => ({ ...d, [repoPath]: m }));
@@ -306,14 +300,30 @@ export function Changes() {
    * moved to another repository is shown when they come back, not over the
    * one they are looking at.
    */
-  const runLong = (kind: GitJobKind, label: string, fn: () => Promise<OpResult>) => {
+  const runLongIn = (repo: string, kind: GitJobKind, label: string, fn: () => Promise<OpResult>) => {
     setResult(null);
     setError(null);
-    void runJob(repoPath, kind, label, fn).then((r) => {
+    return runJob(repo, kind, label, fn).then((r) => {
       if (!r) return;
       if (r.ok) toast.success(r.headline);
       else toast.error(r.refusal?.message ?? r.advice?.headline ?? "That didn't work");
     });
+  };
+  const runLong = (kind: GitJobKind, label: string, fn: () => Promise<OpResult>) => runLongIn(repoPath, kind, label, fn);
+
+  /**
+   * `git pull` inside one submodule, on its own branch, with the page's pull
+   * settings. It is a foreground operation on that submodule (`apply` with a
+   * target): the result carries the submodule's status, never the parent's,
+   * and the parent is re-read because its gitlink row moves.
+   */
+  const pullInside = (repo: string, s: SubmoduleInfo) => {
+    const abs = `${repo.replace(/\/+$/, "")}/${s.path}`;
+    return apply(
+      `pull:${s.path}`,
+      () => api.changesPull(abs, pullMode, (status?.uses_lfs ?? false) && pullLfs, pullMode === "rebase" && pullAutostash),
+      abs
+    );
   };
 
   const onCommit = async () => {
@@ -333,6 +343,41 @@ export function Changes() {
 
   const running = job?.running ?? false;
   const anyBusy = busy !== null || running;
+
+  // The strip's buttons: fresh closures every render, stored in a ref upstairs.
+  useEffect(() => {
+    onActions({
+      fetch: () =>
+        runLong("fetch", "Fetching…", async () => {
+          await api.historyFetch(repoPath);
+          const s = await api.changesRepoStatus(repoPath);
+          return {
+            ok: true,
+            headline: "Fetched.",
+            detail: `${s.behind} commit(s) waiting to be pulled.`,
+            status: s,
+          };
+        }),
+      pull: () =>
+        status
+          ? runLong(
+              "pull",
+              status.uses_lfs && pullLfs ? `Pulling (${pullMode}) and downloading LFS files…` : `Pulling (${pullMode})…`,
+              () => api.changesPull(repoPath, pullMode, status.uses_lfs && pullLfs, pullMode === "rebase" && pullAutostash)
+            )
+          : undefined,
+      push: () => (status ? runLong("push", "Pushing…", () => api.changesPush(repoPath, !status.upstream)) : undefined),
+      branches: () => setBranchesFor(repoPath),
+      refresh: () => loadStatus(repoPath),
+      initialise: (repo, paths) =>
+        runLongIn(repo, "submodules", `Initialising ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
+          api.changesSubmoduleUpdate(repo, paths)
+        ),
+      updateOne: (repo, sub) => runLongIn(repo, "submodules", `Updating ${sub}…`, () => api.changesSubmoduleUpdate(repo, [sub])),
+      pullInside,
+      recordPointers: (repo) => apply("record", () => api.changesRecordPointers(repo)),
+    });
+  });
 
   // The entries the discard confirmation describes: the parent's, or the submodule's.
   const confirmEntries = confirmDiscard?.target
@@ -367,8 +412,7 @@ export function Changes() {
       ? {
           label: "Open in History",
           onClick: () => {
-            handOff("history", repoPath);
-            navigate("/history");
+            onOpenHistory();
           },
         }
       : undefined;
@@ -384,65 +428,7 @@ export function Changes() {
       : undefined;
 
   return (
-    <div className="max-w-6xl mx-auto space-y-5">
-      <header className="flex flex-wrap items-end justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="text-2xl font-bold text-zinc-100">Changes</h1>
-          <p className="text-sm text-zinc-400 mt-0.5">
-            Stage, commit, pull and push — as the account this folder belongs to.
-          </p>
-        </div>
-        <div className="flex items-end gap-2 flex-wrap">
-          <div className="w-44">
-            <label className="block text-xs text-zinc-500 mb-1">Account</label>
-            <Select
-              value={account}
-              onChange={setAccount}
-              placeholder="All accounts"
-              options={[
-                { value: "", label: "All accounts" },
-                ...accounts.map((a) => ({ value: a.id, label: a.name })),
-              ]}
-            />
-          </div>
-          <div className="w-64">
-            <label className="block text-xs text-zinc-500 mb-1">Repository</label>
-            <Select
-              value={repoPath}
-              onChange={setRepoPath}
-              searchable
-              searchLabel="Search repositories"
-              placeholder={visibleRepos.length ? "Pick a repository" : "No repositories found"}
-              options={[
-                ...visibleRepos.map((r) => ({
-                  value: r.path,
-                  label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
-                })),
-                ...extraRepos
-                  .filter((p) => !visibleRepos.some((r) => r.path === p))
-                  .map((p) => ({ value: p, label: baseName(p) })),
-              ]}
-            />
-          </div>
-          <Button
-            variant="secondary"
-            size="sm"
-            disabled={!repoPath || loading}
-            onClick={() => {
-              loadRepos();
-              loadStatus(repoPath);
-            }}
-            className="min-w-[6.5rem]"
-          >
-            {loading ? (
-              <Loader2 size={14} className="animate-spin" />
-            ) : (
-              <RefreshCw size={14} />
-            )}
-            {loading ? "Reading…" : "Refresh"}
-          </Button>
-        </div>
-      </header>
+    <div className={`space-y-5 ${visible ? "" : "hidden"}`} role="tabpanel" aria-label="Changes">
 
       {error && (
         <Card className="border-red-500/30 bg-red-500/5">
@@ -473,28 +459,7 @@ export function Changes() {
 
       {!repoPath && (
         <Card>
-          <p className="text-sm text-zinc-400">
-            {visibleRepos.length
-              ? "Pick a repository to see what has changed in it."
-              : "No repositories found. Assign folders to a profile and the repositories inside them are listed here — or open one folder now."}
-          </p>
-          <div className="mt-3 flex items-center gap-2">
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={async () => {
-                const dir = await pickFolder({ directory: true, multiple: false, title: "Open a repository" });
-                if (typeof dir === "string" && dir) openRepo(dir);
-              }}
-            >
-              Open a folder…
-            </Button>
-            {!visibleRepos.length && (
-              <Button variant="secondary" size="sm" onClick={() => navigate("/profile/new")}>
-                Set up a profile
-              </Button>
-            )}
-          </div>
+          <p className="text-sm text-zinc-400">Pick a repository above to see what has changed in it.</p>
         </Card>
       )}
 
@@ -553,49 +518,18 @@ export function Changes() {
             </Card>
           )}
 
-          {/* Where this branch stands, the two ways to move it, and the tidy-up strip. */}
-          <BranchCard
-            repoPath={repoPath}
+          {/* How a pull behaves, and the tidy-up strip. The branch line and the
+              Fetch / Pull / Push buttons live on the strip above the tabs. */}
+          <TidyUpStrip
             status={status}
             busy={anyBusy}
             dirty={dirty}
             pullMode={pullMode}
-            onPullMode={setPullMode}
+            onPullMode={onPullMode}
             pullLfs={pullLfs}
-            onPullLfs={setPullLfs}
+            onPullLfs={onPullLfs}
             pullAutostash={pullAutostash}
-            onPullAutostash={setPullAutostash}
-            onFetch={() =>
-              runLong("fetch", "Fetching…", async () => {
-                await api.historyFetch(repoPath);
-                const s = await api.changesRepoStatus(repoPath);
-                return {
-                  ok: true,
-                  headline: "Fetched.",
-                  detail: `${s.behind} commit(s) waiting to be pulled.`,
-                  status: s,
-                };
-              })
-            }
-            onPull={() =>
-              runLong(
-                "pull",
-                status.uses_lfs && pullLfs
-                  ? `Pulling (${pullMode}) and downloading LFS files…`
-                  : `Pulling (${pullMode})…`,
-                () =>
-                  api.changesPull(
-                    repoPath,
-                    pullMode,
-                    status.uses_lfs && pullLfs,
-                    pullMode === "rebase" && pullAutostash
-                  )
-              )
-            }
-            onPush={() =>
-              runLong("push", "Pushing…", () => api.changesPush(repoPath, !status.upstream))
-            }
-            onBranches={() => setBranchesFor(repoPath)}
+            onPullAutostash={onPullAutostash}
             onUndoCommit={() => apply("undo", () => api.changesUndoCommit(repoPath))}
             onStash={() => setStashOpen(true)}
             onReset={() => setResetOpen(true)}
@@ -713,11 +647,13 @@ export function Changes() {
                 busy={anyBusy}
                 refreshKey={subRefresh}
                 onOpenRepo={openRepo}
-                onUpdate={() =>
-                  runLong("submodules", "Updating submodules…", () =>
-                    api.changesSubmoduleUpdate(repoPath)
+                onUpdate={(paths) =>
+                  runLong("submodules", `Initialising ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
+                    api.changesSubmoduleUpdate(repoPath, paths)
                   )
                 }
+                onPullInside={(s) => void pullInside(repoPath, s)}
+                onUpdateOne={(p) => void runLong("submodules", `Updating ${p}…`, () => api.changesSubmoduleUpdate(repoPath, [p]))}
                 sectionPaths={sectionPaths}
                 onJumpToSection={jumpToSubmodule}
               />

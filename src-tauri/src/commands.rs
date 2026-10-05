@@ -724,8 +724,8 @@ pub async fn changes_submodules(repo_path: String) -> Result<Vec<SubmoduleInfo>,
 }
 
 #[tauri::command]
-pub async fn changes_submodule_update(repo_path: String) -> Result<OpResult, AppError> {
-    git_ops::submodule_update(&repo_path).await
+pub async fn changes_submodule_update(repo_path: String, paths: Option<Vec<String>>) -> Result<OpResult, AppError> {
+    git_ops::submodule_update(&repo_path, paths).await
 }
 
 /// Are this repo's large files really here, or still LFS pointer stubs?

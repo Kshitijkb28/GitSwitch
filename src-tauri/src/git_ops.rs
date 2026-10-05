@@ -1458,7 +1458,9 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
 
 // --- Submodules ----------------------------------------------------------
 
-pub async fn submodule_update(repo_path: &str) -> Result<OpResult, AppError> {
+/// `paths`: only these submodules (the ones never initialised, from the UI);
+/// `None` means every listed one — the clone-time behaviour.
+pub async fn submodule_update(repo_path: &str, paths: Option<Vec<String>>) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Submodule, &StatusFacts::from(&before)) {
         return Ok(OpResult::refused(r, before));
@@ -1479,7 +1481,12 @@ pub async fn submodule_update(repo_path: &str) -> Result<OpResult, AppError> {
     // Reuse the clone path's per-submodule loop: a batch `submodule update`
     // aborts on the first gitlink missing from .gitmodules and leaves the rest
     // cloned-but-empty.
-    let report = crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url).await;
+    if let Some(p) = &paths {
+        for path in p {
+            validate_repo_path(path)?;
+        }
+    }
+    let report = crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url, paths.as_deref()).await;
     let after = snapshot(repo_path).await?;
 
     let headline = format!("{} of {} submodule(s) up to date.", report.downloaded, report.listed);

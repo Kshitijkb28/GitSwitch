@@ -1,37 +1,28 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
 import {
-  GitBranch,
   GitMerge,
   Loader2,
   ChevronLeft,
   ChevronRight,
   Search,
-  RefreshCw,
   CloudDownload,
   CheckCircle2,
   Crosshair,
   X,
-  Box,
-  Radar,
   UserRound,
 } from "lucide-react";
-import { GitHubIcon } from "../components/GitHubIcon";
-import { Button } from "../components/Button";
-import { Checkbox } from "../components/Checkbox";
-import { Card } from "../components/Card";
-import { Badge } from "../components/Badge";
-import { Input } from "../components/Input";
-import { Select } from "../components/Select";
-import { useToast } from "../components/Toast";
-import { ResultCard } from "../components/changes/ResultCard";
-import { CommitDetailPanel } from "../components/history/CommitDetailPanel";
-import { usePersistedState, handOff } from "../lib/persist";
-import { baseName } from "../lib/paths";
-import { open as pickFolder } from "@tauri-apps/plugin-dialog";
-import { useRefreshOnFocus } from "../lib/focus";
-import { useGitJob } from "../lib/gitJobs";
-import * as api from "../lib/api";
+import { Button } from "../Button";
+import { Checkbox } from "../Checkbox";
+import { Card } from "../Card";
+import { Badge } from "../Badge";
+import { Input } from "../Input";
+import { Select } from "../Select";
+import { useToast } from "../Toast";
+import { ResultCard } from "../changes/ResultCard";
+import { CommitDetailPanel } from "../history/CommitDetailPanel";
+import { usePersistedState } from "../../lib/persist";
+import { useGitJob } from "../../lib/gitJobs";
+import * as api from "../../lib/api";
 
 /** Refusals the detail panel answers inline (a note, a re-asked question) — it stays open for these. */
 const PANEL_HANDLES = new Set(["would-drop-pushed", "merge-commit-needs-mainline"]);
@@ -103,25 +94,27 @@ function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
   );
 }
 
-/** "staging ↑2 ↓1" — the submodule's own branch against its own upstream. */
-function subLabel(m: api.SubmoduleInfo): string {
-  const parts = [m.path];
-  if (m.own_ahead > 0) parts.push(`↑${m.own_ahead}`);
-  if (m.own_behind > 0) parts.push(`↓${m.own_behind}`);
-  return parts.join(" ");
+interface Props {
+  /** The repository — or the submodule in scope — whose history this is. */
+  repo: string;
+  /** The account filter's profile id ("" = all) and that profile's email, for "only mine". */
+  account: string;
+  accountEmail: string;
+  visible: boolean;
+  /** Bumped by the page when the repository moved (a fetch, a pull, any operation). */
+  reloadKey: number;
+  onOpenChanges: () => void;
+  /** This tab moved the repository (a fetch, a detach, a reset…): the strip must re-read it. */
+  onRepoChanged: () => void;
 }
 
-export function History() {
+/**
+ * Branches, the commit graph and the detail panel: what used to be the whole
+ * History page, minus its picker, Fetch and Check GitHub, which now sit above
+ * the tabs.
+ */
+export function HistoryTab({ repo, account, accountEmail, visible, reloadKey: outerReload, onOpenChanges, onRepoChanged }: Props) {
   const toast = useToast();
-  const navigate = useNavigate();
-  const [repos, setRepos] = useState<api.RepoRef[]>([]);
-  const [superRepo, setSuperRepo] = usePersistedState("history.repo", "");
-  /** A submodule path inside `superRepo` being browsed instead of the repository itself. */
-  const [sub, setSub] = usePersistedState("history.sub", "");
-  const [subs, setSubs] = useState<api.SubmoduleInfo[]>([]);
-  /** Everything below works on this path: the repository, or the chosen submodule inside it. */
-  const repo = sub && superRepo ? `${superRepo}/${sub}` : superRepo;
-  const [account, setAccount] = usePersistedState("history.account", ""); // profile id, "" = all
   const [onlyMine, setOnlyMine] = usePersistedState("history.onlyMine", false);
   // The people filter: an author email, "" for everyone. It beats "only this
   // account" when both are set, since it is the more specific choice.
@@ -140,35 +133,21 @@ export function History() {
   /** What "Go to commit" resolved — carried into the panel so the chooser needn't ask again. */
   const [target, setTarget] = useState<api.CommitTarget | null>(null);
   const [head, setHead] = useState<api.HeadInfo | null>(null);
-  /** Folders opened by hand, outside every profile's folders. */
-  const [extraRepos, setExtraRepos] = useState<string[]>([]);
   const [gotoText, setGotoText] = useState("");
   const [gotoError, setGotoError] = useState<string | null>(null);
   const [gotoBusy, setGotoBusy] = useState(false);
-  /** "Check GitHub": what is new on the remote branch, read without downloading anything. */
-  const [peek, setPeek] = useState<api.RemotePeek | null>(null);
-  const [peeking, setPeeking] = useState(false);
   /** The outcome of the last action taken from the detail panel. */
   const [result, setResult] = useState<api.OpResult | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const job = useGitJob(repo);
-  const [loadingRepos, setLoadingRepos] = useState(true);
   const [loadingBranches, setLoadingBranches] = useState(false);
   const [loadingPage, setLoadingPage] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sync, setSync] = useState<api.SyncStatus | null>(null);
-  const [fetching, setFetching] = useState(false);
+  const [, setFetching] = useState(false);
   const [autoFetch, setAutoFetch] = usePersistedState("history.autoFetch", false);
   const [reloadKey, setReloadKey] = useState(0);
   const pageSeq = useRef(0);
-
-  const accounts = Array.from(
-    new Map(
-      repos.map((r) => [r.profile_id, { id: r.profile_id, name: r.profile_name, email: r.profile_email }])
-    ).values()
-  );
-  const accountEmail = accounts.find((a) => a.id === account)?.email ?? "";
-  const visibleRepos = account ? repos.filter((r) => r.profile_id === account) : repos;
 
   const isRange = rev.includes("..");
 
@@ -194,26 +173,10 @@ export function History() {
     }
   }, []);
 
-  /** ls-remote — asks the remote where its branch is, writes nothing at all. */
-  async function doPeek() {
-    if (!repo) return;
-    setPeeking(true);
-    setError(null);
-    try {
-      setPeek(await api.historyPeek(repo));
-    } catch (e) {
-      setError(String(e));
-      setPeek(null);
-    } finally {
-      setPeeking(false);
-    }
-  }
-
   /** git fetch — updates remote refs only; the working tree is never touched. */
   async function doFetch(path = repo, silent = false) {
     if (!path) return;
     setFetching(true);
-    setPeek(null); // a fetch makes the check's answer stale
     if (!silent) setError(null);
     try {
       const res = await api.historyFetch(path);
@@ -221,6 +184,7 @@ export function History() {
       await loadSync(path, rev);
       await loadMergeInfo(path, rev);
       setReloadKey((k) => k + 1); // re-read the commit page with fresh refs
+      onRepoChanged();
       if (!silent) toast.success(res.message);
     } catch (e) {
       if (!silent) setError(String(e));
@@ -238,44 +202,16 @@ export function History() {
 
 
 
-  const loadRepos = useCallback(() => {
-    let cancelled = false;
-    api.historyListRepos()
-      .then((r) => {
-        if (cancelled) return;
-        setRepos(r);
-        // Keep the remembered repo only if it still exists.
-        setSuperRepo((prev) =>
-          prev && r.some((x) => x.path === prev) ? prev : r[0]?.path ?? ""
-        );
-      })
-      .catch((e) => !cancelled && setError(String(e)))
-      .finally(() => !cancelled && setLoadingRepos(false));
-    return () => { cancelled = true; };
-  }, [setSuperRepo]);
-  useEffect(loadRepos, [loadRepos]);
-
-  // The repository's populated, mapped submodules — each can be browsed as its
-  // own history. A remembered submodule that no longer exists falls back to the
-  // repository itself.
+  // The page above says when the repository moved (a fetch, a pull, any
+  // operation on the Changes tab): re-read everything that could have changed.
   useEffect(() => {
-    if (!superRepo) {
-      setSubs([]);
-      return;
-    }
-    let cancelled = false;
-    api.changesSubmodules(superRepo)
-      .then((list) => {
-        if (cancelled) return;
-        const usable = list.filter((m) => m.initialised && m.listed && m.gitdir_valid);
-        setSubs(usable);
-        setSub((cur) => (cur && !usable.some((m) => m.path === cur) ? "" : cur));
-      })
-      .catch(() => !cancelled && setSubs([]));
-    return () => { cancelled = true; };
-  }, [superRepo, reloadKey, setSub]);
-  // Repos get cloned and deleted outside the app; re-scan on return.
-  useRefreshOnFocus(loadRepos);
+    if (!outerReload || !repo) return;
+    loadBranches(repo);
+    loadSync(repo, rev);
+    loadMergeInfo(repo, rev);
+    setReloadKey((k) => k + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [outerReload]);
 
   const loadBranches = useCallback(async (path: string) => {
     if (!path) return;
@@ -368,6 +304,7 @@ export function History() {
       // A reset or a new branch changes which branches contain this one.
       await loadMergeInfo(repo, rev);
       setReloadKey((k) => k + 1);
+      onRepoChanged();
       return r;
     } catch (e) {
       setError(String(e));
@@ -397,20 +334,9 @@ export function History() {
       setResult(null);
       setDetail(null);
       setTarget(null);
-      setPeek(null);
     }
     loadBranches(repo);
   }, [repo, loadBranches]);
-
-  // If the chosen account doesn't own the current repo, move to one it does —
-  // otherwise the picker would show a repo the filter says shouldn't be there.
-  useEffect(() => {
-    if (!account) return;
-    const owned = repos.filter((r) => r.profile_id === account);
-    if (owned.length > 0 && !owned.some((r) => r.path === superRepo)) {
-      setSuperRepo(owned[0].path);
-    }
-  }, [account, repos, superRepo]);
 
   const effectiveAuthor = author || (onlyMine && accountEmail ? accountEmail : null);
   useEffect(() => {
@@ -461,163 +387,9 @@ export function History() {
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-start justify-between gap-4 flex-wrap">
-        <div className="min-w-0">
-          <h1 className="text-2xl font-bold text-zinc-100">History</h1>
-          <p className="text-sm text-zinc-400 mt-1">
-            Browse branches, commits and how they merged — one repo at a time.
-          </p>
-        </div>
-        <div className="flex items-center gap-2 min-w-0 flex-wrap">
-          <div className="w-52 max-w-full">
-            <Select
-              value={account}
-              onChange={(v) => { setAccount(v); setOffset(0); if (!v) setOnlyMine(false); }}
-              placeholder="All accounts"
-              optionIcon={<GitHubIcon size={14} />}
-              options={[
-                { value: "", label: "All accounts" },
-                ...accounts.map((a) => ({ value: a.id, label: a.name })),
-              ]}
-            />
-          </div>
-          <div className="w-64 max-w-full">
-            <Select
-              value={superRepo}
-              onChange={(v) => { setSuperRepo(v); setSub(""); }}
-              searchable
-              searchLabel="Search repositories"
-              placeholder={loadingRepos ? "Loading repos…" : "Pick a repository…"}
-              optionIcon={<GitBranch size={14} />}
-              options={[
-                ...visibleRepos.map((r) => ({
-                  value: r.path,
-                  label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
-                })),
-                ...extraRepos
-                  .filter((p) => !visibleRepos.some((r) => r.path === p))
-                  .map((p) => ({ value: p, label: baseName(p) })),
-              ]}
-            />
-          </div>
-          {subs.length > 0 && (
-            <div className="w-56 max-w-full">
-              <Select
-                value={sub}
-                onChange={(v) => { setSub(v); setOffset(0); }}
-                placeholder="This repository"
-                optionIcon={<Box size={14} />}
-                options={[
-                  { value: "", label: "This repository" },
-                  ...subs.map((m) => ({ value: m.path, label: subLabel(m) })),
-                ]}
-              />
-            </div>
-          )}
-          <Button
-            variant="secondary"
-            onClick={() => doFetch()}
-            disabled={!repo || fetching}
-            className="min-w-[8.25rem]" // fits "Fetching…" (≈125px), so the label swap never shifts Refresh
-            title={
-              sub
-                ? `git fetch inside ${sub} — updates that submodule's remote branches only`
-                : "git fetch — updates remote branches only, never your working tree; submodules are fetched on demand"
-            }
-          >
-            <CloudDownload size={16} className={fetching ? "animate-pulse" : ""} />
-            {fetching ? "Fetching…" : "Fetch"}
-          </Button>
-          <Button
-            variant="secondary"
-            onClick={doPeek}
-            disabled={!repo || peeking}
-            className="min-w-[8.5rem]"
-            title="Asks the remote where the branch is now — downloads nothing, writes nothing in this folder"
-          >
-            <Radar size={16} className={peeking ? "animate-pulse" : ""} />
-            {peeking ? "Checking…" : "Check GitHub"}
-          </Button>
-          <Button
-            variant="secondary"
-            onClick={() => { loadRepos(); loadBranches(repo); setOffset(0); setReloadKey((k) => k + 1); }}
-            disabled={!repo || loadingBranches}
-          >
-            <RefreshCw size={16} className={loadingBranches ? "animate-spin" : ""} />
-            Refresh
-          </Button>
-          <form onSubmit={gotoCommit} className="flex items-center gap-2 min-w-0">
-            <Input
-              aria-label="Go to commit"
-              placeholder="commit id, short id or ref"
-              value={gotoText}
-              onChange={(e) => { setGotoText(e.target.value); if (gotoError) setGotoError(null); }}
-              disabled={!repo}
-              spellCheck={false}
-              containerClassName="w-56 max-w-full"
-              className="font-mono text-sm"
-            />
-            <Button type="submit" variant="secondary" disabled={!repo || gotoBusy || !gotoText.trim()} title="Open a commit by its id or a ref like main~3">
-              {gotoBusy ? <Loader2 size={16} className="animate-spin" /> : <Crosshair size={16} />}
-              Go
-            </Button>
-          </form>
-        </div>
-      </div>
-
+    <div className={`space-y-6 ${visible ? "" : "hidden"}`} role="tabpanel" aria-label="History">
       {gotoError && (
-        <p className="text-sm text-red-400 break-words -mt-3">{gotoError}</p>
-      )}
-
-      {peek && (
-        <div className={`flex flex-wrap items-center gap-2 text-sm -mt-2 ${peek.changed ? "text-amber-200" : "text-zinc-400"}`}>
-          <Radar size={14} className={`shrink-0 ${peek.changed ? "text-amber-400" : "text-emerald-400"}`} />
-          <span className="break-words">{peek.message}</span>
-          {peek.changed && !peek.branch_gone && (
-            <Button size="sm" variant="secondary" onClick={() => doFetch()} disabled={fetching}>
-              Fetch now
-            </Button>
-          )}
-          <button type="button" onClick={() => setPeek(null)} className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer">
-            dismiss
-          </button>
-        </div>
-      )}
-
-      {subs.length > 0 && (
-        <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400 -mt-2">
-          {sub ? (
-            <>
-              <Box size={13} className="text-emerald-400 shrink-0" />
-              <span>
-                Browsing inside <span className="font-mono text-zinc-200">{sub}</span> — branches, commits, Fetch and every action here belong to this submodule.
-              </span>
-              <button
-                type="button"
-                onClick={() => { setSub(""); setOffset(0); }}
-                className="text-emerald-400 hover:text-emerald-300 cursor-pointer"
-              >
-                Back to the repository
-              </button>
-            </>
-          ) : (
-            <>
-              <span className="text-zinc-500">Submodules:</span>
-              {subs.map((m) => (
-                <button
-                  key={m.path}
-                  type="button"
-                  onClick={() => { setSub(m.path); setOffset(0); }}
-                  title={`Browse this submodule's history — ${m.summary}`}
-                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-zinc-700/60 bg-zinc-800/40 hover:border-emerald-500/50 hover:text-zinc-100 cursor-pointer font-mono"
-                >
-                  {subLabel(m)}
-                </button>
-              ))}
-            </>
-          )}
-        </div>
+        <p className="text-sm text-red-400 break-words">{gotoError}</p>
       )}
 
       {error && (
@@ -633,41 +405,10 @@ export function History() {
           onDismiss={() => setResult(null)}
           extraAction={{
             label: "Open in Changes",
-            onClick: () => {
-              handOff("changes", repo);
-              navigate("/changes");
-            },
+            onClick: onOpenChanges,
             primary: !result.ok || (result.status?.conflicted_count ?? 0) > 0,
           }}
         />
-      )}
-
-      {!loadingRepos && repos.length === 0 && (
-        <Card className="text-center py-10">
-          <GitBranch size={32} className="mx-auto text-zinc-600 mb-3" />
-          <h3 className="text-lg font-medium text-zinc-300">No repositories found</h3>
-          <p className="text-sm text-zinc-500 mt-1">
-            Assign folders to a profile and GitSwitch will list the repos inside them here.
-          </p>
-          <div className="mt-4 flex items-center justify-center gap-2">
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={async () => {
-                const dir = await pickFolder({ directory: true, multiple: false, title: "Open a repository" });
-                if (typeof dir !== "string" || !dir) return;
-                setExtraRepos((l) => (l.includes(dir) ? l : [...l, dir]));
-                setSuperRepo(dir);
-                setSub("");
-              }}
-            >
-              Open a folder…
-            </Button>
-            <Button variant="secondary" size="sm" onClick={() => navigate("/profile/new")}>
-              Set up a profile
-            </Button>
-          </div>
-        </Card>
       )}
 
       {repo && sync && (
@@ -868,9 +609,26 @@ export function History() {
           {/* ---------------- commits ---------------- */}
           <div className="flex-1 min-w-0 space-y-3">
             <Card>
+              <div className="flex flex-wrap items-center gap-2 mb-4">
+              <form onSubmit={gotoCommit} className="flex items-center gap-2 min-w-0">
+                <Input
+                  aria-label="Go to commit"
+                  placeholder="commit id, short id or ref"
+                  value={gotoText}
+                  onChange={(e) => { setGotoText(e.target.value); if (gotoError) setGotoError(null); }}
+                  disabled={!repo}
+                  spellCheck={false}
+                  containerClassName="w-56 max-w-full"
+                  className="font-mono text-sm"
+                />
+                <Button type="submit" variant="secondary" disabled={!repo || gotoBusy || !gotoText.trim()} title="Open a commit by its id or a ref like main~3">
+                  {gotoBusy ? <Loader2 size={16} className="animate-spin" /> : <Crosshair size={16} />}
+                  Go
+                </Button>
+              </form>
               <form
                 onSubmit={(e) => { e.preventDefault(); setOffset(0); setAppliedSearch(search); }}
-                className="flex gap-2 mb-4"
+                className="flex gap-2 flex-1 min-w-[16rem]"
               >
                 <Input
                   placeholder="Search commit messages…"
@@ -892,6 +650,7 @@ export function History() {
                   </Button>
                 )}
               </form>
+              </div>
 
               {authors.length > 1 && (
                 <div className="flex items-center gap-2 mb-3 flex-wrap">

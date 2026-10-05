@@ -537,7 +537,13 @@ pub struct SubmoduleReport {
 /// path gets its own call. (A bare `git submodule update --init` is no good
 /// either: it aborts on the first entry with no address in .gitmodules —
 /// some repos have dozens — and downloads nothing.)
-pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, key: Option<&str>, url: &str) -> SubmoduleReport {
+/// `only`: restrict the update to these .gitmodules paths. The Changes page
+/// passes the submodules that were never initialised, so `submodule update
+/// --init --recursive` is never run on a populated submodule from the app —
+/// under `update = merge` that command writes a merge commit inside it, which
+/// is exactly the tangle a superproject with CI pointer bumps keeps producing.
+/// The clone path passes `None` (a fresh clone has nothing populated).
+pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, key: Option<&str>, url: &str, only: Option<&[String]>) -> SubmoduleReport {
     // `-z` (`key\nvalue\0` records): a submodule's name defaults to its path,
     // and a path with a space would otherwise split the key in the middle.
     let listed: Vec<String> = run_git(Some(repo), &["config", "-f", ".gitmodules", "--get-regexp", "-z", r"\.path$"])
@@ -553,10 +559,15 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
         .await
         .map(|out| out.lines().filter(|l| l.starts_with("160000 ")).count())
         .unwrap_or(0);
+    let unlisted = gitlinks.saturating_sub(listed.len());
+    let listed: Vec<String> = match only {
+        Some(want) => listed.into_iter().filter(|p| want.iter().any(|w| crate::paths::norm(w) == crate::paths::norm(p))).collect(),
+        None => listed,
+    };
     let mut report = SubmoduleReport {
         listed: listed.len(),
         downloaded: 0,
-        unlisted: gitlinks.saturating_sub(listed.len()),
+        unlisted,
         failed_paths: Vec::new(),
         error: None,
     };
@@ -828,7 +839,7 @@ async fn clone_as_profile(
     // the repo is usable and `git submodule update` can be retried.
     let submodules = if with_submodules {
         set_progress(&dest_str, CloneProgress { phase: "Submodules".into(), percent: None, done: None, total: None, bytes: None, rate: None });
-        Some(update_submodules(&dest, ssh_override.as_deref(), key.as_deref(), url).await)
+        Some(update_submodules(&dest, ssh_override.as_deref(), key.as_deref(), url, None).await)
     } else {
         None
     };

@@ -12,6 +12,7 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { useToast } from "../components/Toast";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 type Step = {
   key: string;
@@ -150,19 +151,22 @@ export function Doctor() {
             and that every push lock is still in place.
           </p>
         </div>
-        <Button onClick={runChecks} disabled={running}>
-          {running ? (
-            <>
-              <Loader2 size={16} className="animate-spin" />
-              Checking…
-            </>
-          ) : (
-            <>
-              <Stethoscope size={16} />
-              Run checks
-            </>
-          )}
-        </Button>
+        <div className="flex items-center gap-2">
+          <RefreshButton onClick={runChecks} busy={running} title="Run the checks again" />
+          <Button onClick={runChecks} disabled={running}>
+            {running ? (
+              <>
+                <Loader2 size={16} className="animate-spin" />
+                Checking…
+              </>
+            ) : (
+              <>
+                <Stethoscope size={16} />
+                Run checks
+              </>
+            )}
+          </Button>
+        </div>
       </div>
 
       {error && (

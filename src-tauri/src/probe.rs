@@ -160,7 +160,7 @@ pub(crate) mod tests {
             "changes_commit" => forward!(c::changes_commit, args, repo_path, message, amend),
             "changes_push" => forward!(c::changes_push, args, repo_path, set_upstream),
             "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash),
-            "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path),
+            "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path, paths),
             "changes_lfs_pull" => forward!(c::changes_lfs_pull, args, repo_path),
             "changes_lfs_files" => forward!(c::changes_lfs_files, args, repo_path),
             "changes_lfs_pull_paths" => forward!(c::changes_lfs_pull_paths, args, repo_path, paths),
@@ -311,7 +311,7 @@ pub(crate) mod tests {
             },
             op if op.starts_with("tree_") => crate::tree::probe(op, &repo(), &a).await,
             op if op.starts_with("stash_") => crate::stash::probe(op, &repo(), &a).await,
-            "submodule" => show(git_ops::submodule_update(&repo()).await),
+            "submodule" => show(git_ops::submodule_update(&repo(), None).await),
             "abort" => show(git_ops::abort(&repo()).await),
             "continue" => show(git_ops::continue_op(&repo()).await),
             // PROBE_ARGS: "stash" | "nostash"

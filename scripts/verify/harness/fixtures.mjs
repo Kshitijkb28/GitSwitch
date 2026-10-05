@@ -89,7 +89,7 @@ export function lockedLock(over = {}) {
   });
 }
 
-function push(over = {}) {
+export function push(over = {}) {
   return {
     lock: lock(),
     profile_blocked: false,
@@ -563,7 +563,7 @@ export const DIFF_BINARY = {
 };
 
 /** Submodules shaped like the real `argos`: 32 gitlinks, 5 of them mapped. */
-function sub(over = {}) {
+export function sub(over = {}) {
   return {
     path: "vendor/lib",
     name: "lib",
@@ -589,6 +589,10 @@ function sub(over = {}) {
     dirty_untracked_capped: false,
     state: "clean",
     summary: "up to date with what this repo records; on main",
+    gitdir_valid: true,
+    operation: null,
+    conflicted: 0,
+    upstream_remote: "origin",
     ...over,
   };
 }

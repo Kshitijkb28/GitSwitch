@@ -8,6 +8,7 @@ import { useToast } from "../components/Toast";
 import { getCustomClientId, setOAuthClientId } from "../lib/oauth";
 import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { useAnyJobRunning } from "../lib/gitJobs";
@@ -34,6 +35,13 @@ export function Settings() {
     loadLocks();
     setClientId(getCustomClientId() ?? "");
   }, []);
+
+  const [reloading, setReloading] = useState(false);
+  async function reloadAll() {
+    setReloading(true);
+    await Promise.all([loadConfig(), loadLocks()]);
+    setReloading(false);
+  }
 
   async function loadLocks() {
     try {
@@ -172,11 +180,14 @@ export function Settings() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-zinc-100">Settings</h1>
-        <p className="text-sm text-zinc-400 mt-1">
-          View and manage your git configuration
-        </p>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-zinc-100">Settings</h1>
+          <p className="text-sm text-zinc-400 mt-1">
+            View and manage your git configuration
+          </p>
+        </div>
+        <RefreshButton onClick={reloadAll} busy={reloading} title="Re-read the git config and the push locks" />
       </div>
 
       {message && (

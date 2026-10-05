@@ -29,8 +29,7 @@ import {
   SUBMODULE_A,
   TREE_RESET_OUTCOME,
   STASH_DROP_OUTCOME,
-  BRANCH_DELETE_OUTCOME,
-} from "./fixtures.mjs";
+  BRANCH_DELETE_OUTCOME, sub } from "./fixtures.mjs";
 
 if (!DIST_OK) {
   console.error("dist/ is missing — run `npm run build` first");
@@ -326,7 +325,7 @@ async function openPage(browser, server, scenario, opts = {}) {
     DIFF_BINARY,
     cfg
   );
-  await page.goto(`${server.url}/changes`, { waitUntil: "networkidle0" });
+  await page.goto(`${server.url}/repo/changes`, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 5000 });
   return page;
 }
@@ -978,7 +977,7 @@ try {
     await page.evaluate(() => [...document.querySelectorAll("a")].find((a) => a.innerText.trim() === "Doctor")?.click());
     await sleep(400);
     ok("leaving the page works", !(await text(page)).includes("Not staged"));
-    await page.evaluate(() => [...document.querySelectorAll("a")].find((a) => a.innerText.trim() === "Changes")?.click());
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim() === "Repository")?.click());
     await page.waitForFunction(() => document.body.innerText.includes("Pulling"), { timeout: 4000 });
     ok("coming back still shows the pull running", (await text(page)).includes("Pulling"));
     ok("the elapsed time is shown", /\d+s/.test(await text(page)));
@@ -1043,6 +1042,54 @@ try {
     await sleep(500);
     const picked = await page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:changes.repo") ?? '""'));
     ok("Open switches the page to that submodule", picked.endsWith("/staging"), picked);
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Submodules tab: each row's own operations");
+  {
+    // One submodule whose checkout sits behind what the repository records.
+    const lagging = sub({ path: "lagging", name: "lagging", ahead: 0, behind: 3, state: "moved", actual: "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0", actual_short: "a0a0a0a", summary: "sits 3 commits behind what this repo records; on main" });
+    const page = await open(SCENARIOS.submodules, { submodules: [...SUBMODULES, lagging], subInner: SUB_INNER });
+    await page.waitForFunction(() => [...document.querySelectorAll('a[role="tab"]')].some((a) => a.innerText.trim().startsWith("Submodules")), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll('a[role="tab"]')].find((a) => a.innerText.trim().startsWith("Submodules")).click());
+    await page.waitForFunction(() => document.body.innerText.includes("populated"), { timeout: 4000 });
+    const rowButtons = (path) =>
+      page.evaluate((p) => {
+        const row = [...document.querySelectorAll("tr")].find((r) => r.innerText.includes(p));
+        return row ? [...row.querySelectorAll("button")].map((b) => b.innerText.trim()) : null;
+      }, path);
+    const clickInTr = (path, label) =>
+      page.evaluate(
+        (p, t) => {
+          const row = [...document.querySelectorAll("tr")].find((r) => r.innerText.includes(p));
+          const b = row && [...row.querySelectorAll("button")].find((x) => x.innerText.trim().startsWith(t));
+          if (!b) return false;
+          b.click();
+          return true;
+        },
+        path,
+        label
+      );
+    const scope = () => page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:repo.sub") ?? '""'));
+    ok("every row shows the submodule's own branch and upstream", (await text(page)).includes("main → origin/main"));
+    const trinity = await rowButtons("trinity");
+    ok("a submodule behind its own upstream offers Pull inside with the count", trinity?.includes("Pull inside (11)") === true, JSON.stringify(trinity));
+    ok("  but not Update to: its checkout is ahead of the record", !trinity?.some((b) => b.startsWith("Update to")));
+    const lag = await rowButtons("lagging");
+    ok("a submodule behind the record offers Update to <recorded>", lag?.includes("Update to dceaf0b") === true, JSON.stringify(lag));
+    ok("Pull inside on trinity", await clickInTr("trinity", "Pull inside"));
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_pull"), { timeout: 4000 });
+    const pull = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_pull").at(-1).args);
+    ok("  pulls inside the submodule, on its own branch", pull.repoPath === "/repos/gitswitch/trinity", JSON.stringify(pull));
+    ok("  and the scope stays the repository", (await scope()) === "");
+    ok("Update to on lagging", await clickInTr("lagging", "Update to"));
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_update"), { timeout: 4000 });
+    const upd = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_update").at(-1).args);
+    ok("  asks for that one path only, in the repository", upd.repoPath === "/repos/gitswitch" && JSON.stringify(upd.paths) === '["lagging"]', JSON.stringify(upd));
+    ok("Work inside on delivery", await clickInTr("delivery", "Work inside"));
+    await sleep(400);
+    ok("  makes it the scope and opens Changes", (await scope()) === "delivery" && (await page.evaluate(() => location.pathname)) === "/repo/changes", `${await scope()} ${await page.evaluate(() => location.pathname)}`);
     await page.close();
   }
 

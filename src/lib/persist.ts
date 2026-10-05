@@ -47,6 +47,9 @@ export function writePersisted<T>(key: string, value: T) {
 export function handOff(page: "changes" | "history", repo: string) {
   writePersisted(`${page}.repo`, repo);
   if (page === "history") writePersisted("history.sub", "");
+  // Both pages now live on the Repository page, which reads these keys.
+  writePersisted("repo.path", repo);
+  writePersisted("repo.sub", "");
 }
 
 export function usePersistedState<T>(key: string, initial: T) {

@@ -10,13 +10,33 @@ interface Props {
   repoPath: string;
   busy: boolean;
   onOpenRepo: (path: string) => void;
-  onUpdate: () => void;
+  /** Initialise exactly these never-populated submodules. Populated ones are never touched. */
+  onUpdate: (paths: string[]) => void;
+  /** `git pull` inside one submodule, on its own branch. */
+  onPullInside: (sub: SubmoduleInfo) => void;
+  /** `git submodule update -- <path>`: check out the commit this repository records. */
+  onUpdateOne: (path: string) => void;
   /** Bumped by the page after any operation, so the list re-reads. */
   refreshKey: number;
   /** Submodules that have their own section in the main column. */
   sectionPaths?: string[];
   onJumpToSection?: (path: string) => void;
 }
+
+const quiet = (s: SubmoduleInfo) => !s.operation && s.conflicted === 0;
+/** "Pull inside": a branch with an upstream, nothing in progress inside. */
+export const canPullInside = (s: SubmoduleInfo) => s.initialised && quiet(s) && !!s.own_branch && !!s.own_upstream;
+/**
+ * "Update to <recorded>": the record moved past the checkout (a pull of this
+ * repository does that). Never over commits of its own — those get recorded,
+ * not checked out from under.
+ */
+export const canUpdate = (s: SubmoduleInfo) =>
+  s.initialised && quiet(s) && s.behind > 0 && s.ahead === 0 && s.dirty_tracked === 0 && !s.recorded_missing;
+export const pullInsideTitle = (s: SubmoduleInfo) =>
+  `git pull inside ${s.path}: brings ${s.own_branch} up to date with ${s.own_upstream}${s.own_behind > 0 ? ` (${s.own_behind} behind)` : ""}. Nothing in this repository changes until you record the pointer.`;
+export const updateTitle = (s: SubmoduleInfo) =>
+  `git submodule update -- ${s.path}: checks out ${s.recorded_short}, the commit this repository records (${s.behind} commit${s.behind === 1 ? "" : "s"} past what is checked out now)`;
 
 /** A submodule is a repo, so its files open in the same diff panel. */
 function chipClass(state: SubmoduleInfo["state"]): string {
@@ -55,6 +75,8 @@ function SubmoduleRow({
   sub,
   busy,
   onOpenRepo,
+  onPullInside,
+  onUpdateOne,
   hasSection,
   onJumpToSection,
   refreshKey,
@@ -63,6 +85,8 @@ function SubmoduleRow({
   sub: SubmoduleInfo;
   busy: boolean;
   onOpenRepo: (path: string) => void;
+  onPullInside: (sub: SubmoduleInfo) => void;
+  onUpdateOne: (path: string) => void;
   /** The main column already shows this submodule's files — link there instead of re-reading them. */
   hasSection: boolean;
   onJumpToSection?: (path: string) => void;
@@ -128,6 +152,17 @@ function SubmoduleRow({
             >
               {chipLabel(sub.state)}
             </span>
+            {sub.initialised && (
+              <span
+                className="text-[10px] font-mono px-1.5 py-0.5 rounded shrink-0 bg-zinc-900/60 text-zinc-400"
+                title="This submodule's own branch, its upstream, and how far apart they are"
+              >
+                {sub.own_branch ?? "detached"}
+                {sub.own_upstream ? ` → ${sub.own_upstream}` : ""}
+                {sub.own_ahead > 0 ? ` ↑${sub.own_ahead}` : ""}
+                {sub.own_behind > 0 ? ` ↓${sub.own_behind}` : ""}
+              </span>
+            )}
           </div>
           <p className="text-xs text-zinc-400 leading-relaxed mt-0.5">{sub.summary}</p>
 
@@ -213,7 +248,26 @@ function SubmoduleRow({
           )}
         </div>
 
-        <div className="shrink-0">
+        <div className="shrink-0 flex flex-wrap justify-end items-center gap-0.5 max-w-[50%]">
+          {canPullInside(sub) && (
+            <Button
+              size="sm"
+              variant={sub.own_behind > 0 ? "secondary" : "ghost"}
+              disabled={busy}
+              onClick={() => onPullInside(sub)}
+              title={pullInsideTitle(sub)}
+              className="px-1.5"
+            >
+              <Download size={13} />
+              Pull inside{sub.own_behind > 0 ? ` (${sub.own_behind})` : ""}
+            </Button>
+          )}
+          {canUpdate(sub) && (
+            <Button size="sm" variant="secondary" disabled={busy} onClick={() => onUpdateOne(sub.path)} title={updateTitle(sub)} className="px-1.5">
+              <GitCommitHorizontal size={13} />
+              Update to {sub.recorded_short}
+            </Button>
+          )}
           {sub.initialised && (
             <Button
               size="sm"
@@ -223,6 +277,7 @@ function SubmoduleRow({
               className="px-1.5"
             >
               <FolderOpen size={13} />
+              Open
             </Button>
           )}
         </div>
@@ -240,6 +295,8 @@ export function SubmodulesCard({
   busy,
   onOpenRepo,
   onUpdate,
+  onPullInside,
+  onUpdateOne,
   refreshKey,
   sectionPaths = [],
   onJumpToSection,
@@ -280,10 +337,18 @@ export function SubmodulesCard({
           <span className="text-xs text-zinc-500 shrink-0">{subs.length}</span>
           {loading && <Loader2 size={12} className="animate-spin text-zinc-500 shrink-0" />}
         </div>
-        <Button size="sm" variant="ghost" disabled={busy} onClick={onUpdate}>
-          <Download size={13} />
-          Update
-        </Button>
+        {fetchable > 0 && (
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={busy}
+            onClick={() => onUpdate(missing.filter((s) => s.listed).map((s) => s.path))}
+            title="git submodule update --init for the never-initialised ones only — populated submodules are left exactly as they are"
+          >
+            <Download size={13} />
+            Initialise missing ({fetchable})
+          </Button>
+        )}
       </div>
 
       {error && <p className="px-3 py-2 text-xs text-red-400 break-words">{error}</p>}
@@ -296,6 +361,8 @@ export function SubmodulesCard({
             sub={s}
             busy={busy}
             onOpenRepo={onOpenRepo}
+            onPullInside={onPullInside}
+            onUpdateOne={onUpdateOne}
             hasSection={sectionPaths.includes(s.path)}
             onJumpToSection={onJumpToSection}
             refreshKey={refreshKey}
@@ -311,9 +378,9 @@ export function SubmodulesCard({
               <p className="text-xs text-zinc-400 leading-relaxed">
                 {missing.length} not initialised
                 {fetchable > 0 && unfetchable > 0
-                  ? ` — ${fetchable} can be fetched with Update, ${unfetchable} have no entry in .gitmodules so git can't fetch them`
+                  ? ` — ${fetchable} can be fetched with Initialise missing, ${unfetchable} have no entry in .gitmodules so git can't fetch them`
                   : fetchable > 0
-                    ? " — Update submodules will fetch them"
+                    ? " — Initialise missing will fetch them"
                     : " — none of them have an entry in .gitmodules, so git can't fetch them"}
                 .
               </p>

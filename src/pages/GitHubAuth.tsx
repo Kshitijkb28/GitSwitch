@@ -9,6 +9,7 @@ import { getEffectiveClientId } from "../lib/oauth";
 import { copyText } from "../lib/clipboard";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 type AuthStep = "idle" | "waiting" | "success" | "error";
 
@@ -208,11 +209,14 @@ export function GitHubAuth() {
   if (step === "idle") {
     return (
       <div className="space-y-6">
-        <div>
-          <h1 className="text-2xl font-bold text-zinc-100">Sign in with GitHub</h1>
-          <p className="text-sm text-zinc-400 mt-1">
-            Authenticate with your GitHub account to auto-configure your profile
-          </p>
+        <div className="flex items-start justify-between gap-4 flex-wrap">
+          <div>
+            <h1 className="text-2xl font-bold text-zinc-100">Sign in with GitHub</h1>
+            <p className="text-sm text-zinc-400 mt-1">
+              Authenticate with your GitHub account to auto-configure your profile
+            </p>
+          </div>
+          <RefreshButton onClick={refreshGhAccounts} busy={ghRefreshing} title="Re-check the accounts gh is signed in to" />
         </div>
 
         <Card className="text-center py-12">

@@ -2,6 +2,8 @@
 // Serves the built app and replaces Tauri's invoke bridge before any app code
 // runs, so every reset/revert/cherry-pick can be exercised without a real repo.
 import { launch, serve, tally, DIST_OK } from "./browser.mjs";
+// The Changes tab is mounted beside History now and renders every submodule row in full.
+import { sub } from "./fixtures.mjs";
 import {
   REPO,
   REPOS,
@@ -53,12 +55,19 @@ async function openHistoryPage(browser, server, opts = {}) {
   };
   const page = await browser.newPage();
   await page.setViewport({ width: cfg.width, height: 900 });
+  // A render crash leaves a blank page; keep its errors for the failure message.
+  const pageErrors = [];
+  page.on("pageerror", (e) => pageErrors.push(String(e?.stack ?? e?.message ?? e).slice(0, 600)));
+  page.on("console", (m) => {
+    if (m.type() === "error") pageErrors.push(m.text());
+  });
   await page.evaluateOnNewDocument(
     (fx, cfg) => {
       window.__CALLS__ = [];
       window.__CLIPBOARD__ = null;
       localStorage.clear();
       localStorage.setItem("gitswitch:history.repo", JSON.stringify(fx.repo));
+      localStorage.setItem("gitswitch:repo.path", JSON.stringify(fx.repo));
       // Headless Chrome has no clipboard permission; record what the app tried to copy.
       try {
         Object.defineProperty(navigator, "clipboard", {
@@ -87,6 +96,23 @@ async function openHistoryPage(browser, server, opts = {}) {
         invoke: (cmd, args) => {
           window.__CALLS__.push({ cmd, args });
           switch (cmd) {
+            // The Changes tab is mounted beside History now (hidden): its
+            // cards need quiet answers, never a null.
+            case "get_profiles":
+              return Promise.resolve([]);
+            case "changes_push_state":
+              return Promise.resolve({ ...cfg.status.push, blocked: false, repo_blocked: false, reason: "Pushing is allowed from this folder." });
+            case "changes_push_identity":
+              return Promise.resolve(null);
+            case "changes_submodule_statuses":
+            case "changes_stash_list":
+            case "console_entries":
+              return Promise.resolve([]);
+            case "changes_lfs_files":
+              return Promise.resolve({ installed: true, version: "git-lfs/3.8.0", uses_lfs: false, filters_configured: true, files: [], folders: [], total: 0, present: 0, missing: 0, total_bytes: 0, missing_bytes: 0, sizes_known: true, truncated: 0, folders_truncated: 0, summary: "This repository doesn't use Git LFS." });
+            case "changes_lfs_progress":
+            case "clone_progress":
+              return Promise.resolve(null);
             case "history_list_repos":
               return Promise.resolve(fx.repos);
             case "history_branches":
@@ -124,6 +150,8 @@ async function openHistoryPage(browser, server, opts = {}) {
             case "changes_cherry_pick":
               return act(cmd);
             default:
+              // Remembered so a crash can name the command that got a null.
+              (window.__UNMOCKED__ = window.__UNMOCKED__ || []).push(cmd);
               return Promise.resolve(null);
           }
         },
@@ -142,8 +170,17 @@ async function openHistoryPage(browser, server, opts = {}) {
     },
     cfg
   );
-  await page.goto(`${server.url}/history`, { waitUntil: "networkidle0" });
-  await page.waitForFunction(() => document.body.innerText.includes("All branches"), { timeout: 5000 });
+  await page.goto(`${server.url}/repo/history`, { waitUntil: "networkidle0" });
+  try {
+    await page.waitForFunction(() => document.body.innerText.includes("All branches"), { timeout: 5000 });
+  } catch (e) {
+    // Say what the page shows instead, so a moved anchor is diagnosable.
+    console.error("the History tab never showed 'All branches'; the page reads:\n" + (await page.evaluate(() => document.body.innerText.slice(0, 1500))));
+    if (pageErrors.length) console.error("page errors:\n" + pageErrors.slice(0, 5).join("\n"));
+    const unmocked = await page.evaluate(() => [...new Set(window.__UNMOCKED__ || [])]);
+    if (unmocked.length) console.error("commands answered with null by the mock: " + unmocked.join(", "));
+    throw e;
+  }
   return page;
 }
 
@@ -606,7 +643,7 @@ try {
     ok("a result card shows the outcome", s.includes("revert ok"));
     ok('  with "Open in Changes"', (await buttonCount(page, "Open in Changes")) === 1);
     ok("the branch list is still on screen", s.includes("All branches") && s.includes("feature/lfs"));
-    ok("  and the URL is still /history", (await page.evaluate(() => location.pathname)) === "/history");
+    ok("  and the URL is still /history", (await page.evaluate(() => location.pathname)) === "/repo/history");
     await sleep(200);
     ok("branches, sync and the page were re-read", (await calls(page, "history_page")).length > before && (await calls(page, "history_branches")).length >= 2 && (await calls(page, "history_sync_status")).length >= 2);
     await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "dismiss").click());
@@ -623,7 +660,7 @@ try {
     await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Open in Changes"), { timeout: 4000 });
     await (await button(page, "Open in Changes")).click();
     await sleep(200);
-    ok("Open in Changes goes to the Changes page for this repo", (await page.evaluate(() => location.pathname)) === "/changes" && (await page.evaluate(() => localStorage.getItem("gitswitch:changes.repo"))) === JSON.stringify(REPO));
+    ok("Open in Changes goes to the Changes page for this repo", (await page.evaluate(() => location.pathname)) === "/repo/changes" && (await page.evaluate(() => localStorage.getItem("gitswitch:repo.path"))) === JSON.stringify(REPO));
     await page.close();
   }
   {
@@ -668,9 +705,9 @@ try {
   section("Submodules: a submodule's history from the same page");
   {
     const SUBS = [
-      { path: "staging", name: "staging", initialised: true, listed: true, gitdir_valid: true, own_ahead: 2, own_behind: 0, summary: "2 commits of yours not on its upstream" },
-      { path: "harness", name: "harness", initialised: true, listed: true, gitdir_valid: true, own_ahead: 0, own_behind: 1, summary: "1 commit behind its upstream" },
-      { path: "forge-tooling/x", name: "x", initialised: false, listed: false, gitdir_valid: false, own_ahead: 0, own_behind: 0, summary: "not initialised" },
+      sub({ path: "staging", name: "staging", own_ahead: 2, own_behind: 0, summary: "2 commits of yours not on its upstream" }),
+      sub({ path: "harness", name: "harness", own_ahead: 0, own_behind: 1, summary: "1 commit behind its upstream" }),
+      sub({ path: "forge-tooling/x", name: "x", initialised: false, listed: false, gitdir_valid: false, state: "unmapped", actual: null, actual_short: null, summary: "not initialised" }),
     ];
     const page = await openHistoryPage(browser, server, { submodules: SUBS });
     await page.waitForFunction(() => document.body.innerText.includes("Submodules:"), { timeout: 5000 });

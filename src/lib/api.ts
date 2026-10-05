@@ -1657,8 +1657,9 @@ export async function changesPull(
   return invoke("changes_pull", { repoPath, mode, withLfs, autostash });
 }
 
-export async function changesSubmoduleUpdate(repoPath: string): Promise<OpResult> {
-  return invoke("changes_submodule_update", { repoPath });
+/** `paths`: only these submodules (the never-initialised ones); null = every listed one. */
+export async function changesSubmoduleUpdate(repoPath: string, paths: string[] | null = null): Promise<OpResult> {
+  return invoke("changes_submodule_update", { repoPath, paths });
 }
 
 export async function changesContinue(repoPath: string): Promise<OpResult> {

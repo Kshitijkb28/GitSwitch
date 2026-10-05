@@ -55,6 +55,9 @@ for l in sys.stdin:
   [ -n "$BIN" ] || { echo "could not build the test binary (is src-tauri/src/probe.rs registered in lib.rs?):"; tail -n 30 "$build_log"; exit 1; }
 }
 
+# pinvoke <tauri command> <json args as the UI sends them> -> what the command returned
+pinvoke() { PROBE_OP=invoke PROBE_CMD="$1" PROBE_JSON="$2" "$BIN" probe --ignored --nocapture 2>/dev/null | sed -n 's/^PROBE_OUT //p'; }
+
 # probe <op> <repo> [comma-separated args] -> the JSON the backend returned
 probe() {
   PROBE_OP="$1" PROBE_REPO="$2" PROBE_ARGS="${3:-}" "$BIN" probe --ignored --nocapture 2>/dev/null \

@@ -113,6 +113,35 @@ OUT=$(probe submodule "$SB/super")
 ok "the unmapped gitlink is reported, not fatal" "$OUT" "up to date"
 ok "  and the count of unfetchable ones is honest" "$(printf '%s' "$OUT" | jqf submodules.unlisted)" "1"
 
+section "Initialising one submodule leaves every other one exactly as it was"
+# A fresh clone of the superproject: every gitlink is an empty folder, and the
+# .gitmodules addresses are the local bare repos above. The Submodules tab's
+# "Initialise" buttons call changes_submodule_update with the paths they name.
+git clone -q "$SB/super" "$SB/super_fresh" 2>/dev/null
+cd "$SB/super_fresh"
+ok "the fixture: nothing populated yet" "$(find mapped moved orphan -mindepth 1 | wc -l | tr -d ' ')" "0"
+ARGS=$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"paths":["moved"]}))' "$SB/super_fresh")
+OUT=$(pinvoke changes_submodule_update "$ARGS")
+ok "asked for 'moved' only, it reports one of one" "$(printf '%s' "$OUT" | jqf value.headline)" "1 of 1 submodule(s) up to date."
+ok "  moved is checked out at the recorded commit" "$(git -C "$SB/super_fresh/moved" rev-parse HEAD)" "$(git rev-parse HEAD:moved)"
+ok "  mapped was not touched" "$(find mapped -mindepth 1 | wc -l | tr -d ' ')" "0"
+ok "  and is still listed as not initialised" "$(probe submodules_list "$SB/super_fresh" | sub mapped state)" "not-initialised"
+ok "  the unmapped gitlink is counted, not fatal" "$(printf '%s' "$OUT" | jqf value.submodules.unlisted)" "1"
+# Work inside the populated one, then initialise another: the work must survive.
+git -C moved checkout -q -b own-work
+echo "own" >> moved/file.txt
+git -C moved commit -qam "own work inside moved"
+OWN=$(git -C moved rev-parse HEAD)
+ARGS=$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"paths":["mapped"]}))' "$SB/super_fresh")
+OUT=$(pinvoke changes_submodule_update "$ARGS")
+ok "asked for 'mapped', it is populated" "$(git -C mapped rev-parse HEAD)" "$(git rev-parse HEAD:mapped)"
+ok "  and the commit made inside moved is still checked out" "$(git -C moved rev-parse HEAD)" "$OWN"
+git submodule update --quiet -- moved >/dev/null 2>&1
+ok "  (git's own update of that path moves it back — which is why the app names paths)" "$(git -C moved rev-parse HEAD)" "$(git rev-parse HEAD:moved)"
+ARGS=$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"paths":["../escape"]}))' "$SB/super_fresh")
+ok "a path outside the repository is refused" "$(pinvoke changes_submodule_update "$ARGS")" "isn't a path inside this repository"
+cd "$SB/super"
+
 section "A submodule path with a space and a non-ASCII character"
 git init -q --bare "$SB/uml.git"
 git clone -q "$SB/uml.git" "$SB/uml_work" 2>/dev/null

@@ -1,5 +1,8 @@
 // Repo states the History page has to handle, as the backend would report them.
-// Self-contained: the Changes fixtures in fixtures.mjs belong to another suite.
+// Self-contained but for the push state's shape, which fixtures.mjs owns: the
+// status strip and the Changes tab (mounted beside History now) read all of
+// it, and the real status always carries it.
+import { push } from "./fixtures.mjs";
 
 export const REPO = "/repos/gitswitch";
 
@@ -227,7 +230,8 @@ function repoStatus(over = {}) {
       profile_id: "p1", profile_name: "Kirmada", profile_email: "me@personal.test", matches_profile: true,
       signing_on: false, signing_key: null, guard: "none",
     },
-    push: { blocked: false, reason: "Pushing is allowed from this folder.", remotes: [], gaps: [], needs_repair: false },
+    push: push(),
+    conflict_source: null,
     can_amend: true,
     head_subject: "Tidy the settings page",
     merge_message: null,

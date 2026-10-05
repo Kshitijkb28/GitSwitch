@@ -27,6 +27,7 @@ import { usePersistedState, handOff } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 /** Longest matching folder wins — the same rule the generated gitconfig uses. */
 function profileForFolder(dir: string, profiles: Profile[]): Profile | null {
@@ -412,13 +413,16 @@ export function SparseClone() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-zinc-100">Clone</h1>
-        <p className="text-sm text-zinc-400 mt-1">
-          Clone over SSH as the right account — the destination folder's profile
-          decides which key is used. Choose a full clone, or a sparse one to
-          download only the folders you need.
-        </p>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-zinc-100">Clone</h1>
+          <p className="text-sm text-zinc-400 mt-1">
+            Clone over SSH as the right account — the destination folder's profile
+            decides which key is used. Choose a full clone, or a sparse one to
+            download only the folders you need.
+          </p>
+        </div>
+        <RefreshButton onClick={reloadProfiles} title="Re-read the profiles and their folders" />
       </div>
 
       {fromRepo && (

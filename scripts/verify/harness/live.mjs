@@ -288,6 +288,15 @@ async function clickInRow(page, rowText, pick) {
     pick
   );
 }
+/** Like clickInRow, but waits for the row and its button to appear (a card that re-reads after a scope change). */
+async function clickInRowWhen(page, rowText, pick, timeout = WAIT) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    if (await clickInRow(page, rowText, pick)) return true;
+    await sleep(150);
+  }
+  return false;
+}
 /** The open dialog titled `title` (Modal renders an <h2>), or null. */
 const modalPanel = (title) => {
   const h = [...document.querySelectorAll("h2")].find((x) => x.innerText.trim() === title);
@@ -397,6 +406,7 @@ await page.evaluateOnNewDocument((repo) => {
   // The remembered repository, as the app would have persisted it.
   localStorage.setItem("gitswitch:changes.repo", JSON.stringify(repo));
   localStorage.setItem("gitswitch:history.repo", JSON.stringify(repo));
+  localStorage.setItem("gitswitch:repo.path", JSON.stringify(repo));
   window.__TAURI_INTERNALS__ = {
     invoke: (cmd, args) => {
       window.__CALLS__.push({ cmd, args });
@@ -413,11 +423,11 @@ await page.evaluateOnNewDocument((repo) => {
 }, WORK);
 
 async function openChanges() {
-  await page.goto(`${server.url}/changes`, { waitUntil: "networkidle0", timeout: WAIT });
+  await page.goto(`${server.url}/repo/changes`, { waitUntil: "networkidle0", timeout: WAIT });
   if (!(await waitText(page, "Committing as"))) throw new Error("the Changes page never showed the repository: " + (await text(page)).slice(0, 400));
 }
 async function openHistory() {
-  await page.goto(`${server.url}/history`, { waitUntil: "networkidle0", timeout: WAIT });
+  await page.goto(`${server.url}/repo/history`, { waitUntil: "networkidle0", timeout: WAIT });
   await page.waitForFunction(() => /showing \d/.test(document.body.innerText), { timeout: WAIT });
 }
 /** "Go to commit" → the detail panel for `hash`. */
@@ -773,6 +783,61 @@ try {
     ok("  the branch is 1 ahead of upstream", git(WORK, "rev-list", "--count", "origin/main..HEAD") === "1");
     ok("  the History page lists the revert", await waitText(page, 'Revert "other 2 (live)"'));
     ok("  and says 1 to push (after the sync status was re-read)", await waitText(page, "Up to date with origin/main · 1 to push"));
+  });
+
+  // -----------------------------------------------------------------------
+  await scenario("k. A dot-named submodule: the folder icon scopes the page to it; Pull inside and Update to act on it alone", async () => {
+    // Argos's shape: submodule folders whose names start with a dot.
+    git(WORK, "submodule", "add", "-q", `${ENV.sb}/sub.git`, ".audit");
+    git(WORK, "commit", "-qm", "add .audit (live)");
+    git(WORK, "push", "-q", "origin", "main");
+    const AUDIT = `${WORK}/.audit`;
+    const subIs = async (v) => {
+      try {
+        await page.waitForFunction((x) => localStorage.getItem("gitswitch:repo.sub") === JSON.stringify(x), { timeout: WAIT }, v);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    await openChanges();
+    let s = await text(page);
+    const at = s.indexOf(".audit");
+    ok("the card lists .audit with its own branch and upstream", /\.audit[\s\S]{0,300}?main → origin\/main/.test(s), s.slice(at, at + 200));
+    ok("Open on the .audit row (the folder icon)", await clickInRowWhen(page, ".audit", { title: "Work in this submodule as its own repository" }));
+    ok("  the scope is .audit", await subIs(".audit"));
+    ok("  and the page reads the submodule itself: level with origin/main", await waitText(page, "Nothing to pull"));
+    ok("  git: it is on main", git(AUDIT, "symbolic-ref", "--short", "HEAD") === "main");
+    ok("Back to the repository", await click(page, "Back to the repository"));
+    ok("  the scope is the repository again", await subIs(""));
+    ok("  which lists its submodules", await waitText(page, "Submodules:"));
+
+    // Someone pushes to the submodule's own upstream: Pull inside brings it in; the parent then sees the move.
+    const SEED = `${ENV.sb}/seed/sub`;
+    git(SEED, "pull", "-q", "--ff-only");
+    write(`${SEED}/more.txt`, "more\n");
+    git(SEED, "add", "-A");
+    git(SEED, "commit", "-qm", "sub more (live)");
+    git(SEED, "push", "-q", "origin", "main");
+    ok("Pull inside on the .audit row", await clickInRowWhen(page, ".audit", { text: "Pull inside" }));
+    ok("  the page says Pulled 1 commit(s)", await waitText(page, "Pulled 1 commit(s)"));
+    ok("  git: .audit is at its upstream's tip, still on main", git(AUDIT, "rev-parse", "HEAD") === git(SEED, "rev-parse", "HEAD") && git(AUDIT, "symbolic-ref", "--short", "HEAD") === "main");
+    ok("  the parent still records the old commit", git(WORK, "rev-parse", "HEAD:.audit") !== git(AUDIT, "rev-parse", "HEAD"));
+    ok("  and the card says so", await waitText(page, "moved 1 commit ahead"));
+    ok("  vendor/sub was not touched", git(SUB, "rev-parse", "HEAD") === git(WORK, "rev-parse", "HEAD:vendor/sub"));
+
+    // The record moves past the checkout (a pull of the superproject does this): Update to <recorded> checks it out.
+    git(WORK, "add", ".audit");
+    git(WORK, "commit", "-qm", "bump .audit (live)");
+    git(AUDIT, "reset", "-q", "--hard", "HEAD~1");
+    const recorded = git(WORK, "rev-parse", "HEAD:.audit");
+    await openChanges();
+    ok("the row offers Update to <recorded>", await waitText(page, `Update to ${short(recorded)}`));
+    ok("Update to <recorded>", await clickInRowWhen(page, ".audit", { title: "git submodule update -- .audit" }));
+    ok("  the page says 1 of 1 submodule(s) up to date.", await waitText(page, "1 of 1 submodule(s) up to date."));
+    ok("  git: .audit is at the recorded commit", await waitUntil(() => git(AUDIT, "rev-parse", "HEAD") === recorded));
+    ok("  vendor/sub still was not touched", git(SUB, "rev-parse", "HEAD") === git(WORK, "rev-parse", "HEAD:vendor/sub"));
+    ok("  and the card calls it clean again", await waitText(page, "up to date with what this repo records"));
   });
 } finally {
   await browser.close();
