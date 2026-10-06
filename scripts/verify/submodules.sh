@@ -113,6 +113,85 @@ OUT=$(probe submodule "$SB/super")
 ok "the unmapped gitlink is reported, not fatal" "$OUT" "up to date"
 ok "  and the count of unfetchable ones is honest" "$(printf '%s' "$OUT" | jqf submodules.unlisted)" "1"
 
+section "Initialising one submodule leaves every other one exactly as it was"
+# A fresh clone of the superproject: every gitlink is an empty folder, and the
+# .gitmodules addresses are the local bare repos above. The Submodules tab's
+# "Initialise" buttons call changes_submodule_update with the paths they name.
+git clone -q "$SB/super" "$SB/super_fresh" 2>/dev/null
+cd "$SB/super_fresh"
+ok "the fixture: nothing populated yet" "$(find mapped moved orphan -mindepth 1 | wc -l | tr -d ' ')" "0"
+ARGS=$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"paths":["moved"]}))' "$SB/super_fresh")
+OUT=$(pinvoke changes_submodule_update "$ARGS")
+TRACE_INIT=$(probe_trace)      # read right after the call that really populated one
+ok "asked for 'moved' only, it reports one of one" "$(printf '%s' "$OUT" | jqf value.headline)" "1 of 1 submodule(s) up to date."
+ok "  moved is checked out at the recorded commit" "$(git -C "$SB/super_fresh/moved" rev-parse HEAD)" "$(git rev-parse HEAD:moved)"
+ok "  mapped was not touched" "$(find mapped -mindepth 1 | wc -l | tr -d ' ')" "0"
+ok "  and is still listed as not initialised" "$(probe submodules_list "$SB/super_fresh" | sub mapped state)" "not-initialised"
+ok "  the unmapped gitlink is counted, not fatal" "$(printf '%s' "$OUT" | jqf value.submodules.unlisted)" "1"
+# Work inside the populated one, then initialise another: the work must survive.
+git -C moved checkout -q -b own-work
+echo "own" >> moved/file.txt
+git -C moved commit -qam "own work inside moved"
+OWN=$(git -C moved rev-parse HEAD)
+ARGS=$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"paths":["mapped"]}))' "$SB/super_fresh")
+OUT=$(pinvoke changes_submodule_update "$ARGS")
+ok "asked for 'mapped', it is populated" "$(git -C mapped rev-parse HEAD)" "$(git rev-parse HEAD:mapped)"
+ok "  and the commit made inside moved is still checked out" "$(git -C moved rev-parse HEAD)" "$OWN"
+git submodule update --quiet -- moved >/dev/null 2>&1
+ok "  (git's own update of that path moves it back — which is why the app names paths)" "$(git -C moved rev-parse HEAD)" "$(git rev-parse HEAD:moved)"
+ARGS=$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"paths":["../escape"]}))' "$SB/super_fresh")
+ok "a path outside the repository is refused" "$(pinvoke changes_submodule_update "$ARGS")" "isn't a path inside this repository"
+cd "$SB/super"
+
+ok "  and initialising from the Changes page reports no clone progress — no clone is running there" "$TRACE_INIT" "[]"
+
+section "Cloning this superproject names each submodule as it arrives"
+mkdir -p "$SB/clones"
+OUT=$(probe clone "" "$SB/super,$SB/clones,fresh,submodules")
+ok "the clone lists the mapped submodules and fetches them" "$(printf '%s' "$OUT" | jqf submodules.listed):$(printf '%s' "$OUT" | jqf submodules.downloaded)" "2:2"
+TRACE=$(probe_trace)
+ok "  each was named while it was the one being fetched, in order" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;e=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")];print([p["done"] for p in e], [p["total"] for p in e], len(set(p["detail"] for p in e)))')" "[0, 1] [2, 2] 2"
+ok "  the last word on the submodules is both done, nothing named" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;p=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules"][-1];print(p["phase"],p["done"],p["total"],p["percent"],"detail" in p)')" "Submodules 2 2 100 False"
+
+section "A submodule download that makes no headway is stopped; one beside it still arrives"
+# A server that accepts the connection and never answers: git waits on it for
+# ever, and the app must not — nor must it give up on a download that is
+# merely slow, so the clock only runs while nothing is reported.
+"$PY" - > "$SB/stuck-port" <<'PYSRV' &
+import socket, sys, time
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(8)
+print(s.getsockname()[1], flush=True)
+while True:
+    c, _ = s.accept(); time.sleep(3600)
+PYSRV
+STUCK_PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SB/stuck-port" ] && break; sleep 0.5; done
+PORT="$(cat "$SB/stuck-port")"
+git config --global protocol.git.allow always          # the sandbox's own config: git:// is refused for submodules otherwise
+git init -q "$SB/super-stuck"; printf 'r\n' > "$SB/super-stuck/README.md"; git -C "$SB/super-stuck" add -A >/dev/null; git -C "$SB/super-stuck" commit -qm init
+( cd "$SB/super-stuck" && git submodule add -q "$SB/mapped.git" mapped 2>/dev/null )
+git -C "$SB/super-stuck" config -f .gitmodules submodule.stuck.path stuck; git -C "$SB/super-stuck" config -f .gitmodules "submodule.stuck.url" "git://127.0.0.1:$PORT/stuck.git"
+git -C "$SB/super-stuck" update-index --add --cacheinfo "160000,$(git -C "$SB/mapped.git" rev-parse HEAD),stuck"
+git -C "$SB/super-stuck" add .gitmodules; git -C "$SB/super-stuck" commit -qm "two submodules, one of them stuck"
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=3 probe clone "" "$SB/super-stuck,$SB/clones,stuckclone,submodules"); T1=$(date +%s)
+ok "the clone comes back with the good submodule, and the stuck one named" "$(printf '%s' "$OUT" | jqf submodules.downloaded):$(printf '%s' "$OUT" | jqf submodules.failed_paths)" "1:[\"stuck\"]"
+ok "  stopped for making no headway, not for taking long" "$(printf '%s' "$OUT" | jqf submodules.error)" "made no progress for 3s and was stopped"
+ok "  within seconds, not after the old three-minute limit" "$([ $((T1-T0)) -lt 60 ] && echo quick || echo "slow: $((T1-T0))s")" "quick"
+ok "  and the page's line named it while it hung" "$(probe_trace | "$PY" -c 'import sys,json;e=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="stuck"];print(len(e)>0)')" "True"
+ok "  the clone is still a repository the app can read" "$(probe status "$SB/clones/stuckclone" | jqf branch):$(git -C "$SB/clones/stuckclone" status --porcelain >/dev/null 2>&1 && echo readable || echo broken)" "main:readable"
+ok "  and nothing half-deleted is left for the stuck one" "$([ -e "$SB/clones/stuckclone/.git/modules/stuck" ] && echo leftover || echo clean)" "clean"
+kill "$STUCK_PID" 2>/dev/null; git config --global --unset protocol.git.allow
+# A download that is quiet because it is checking out (a smudge filter, say) is not a stall.
+git config --global filter.slow.smudge 'sleep 2; cat'; git config --global filter.slow.clean cat
+git init -q --bare "$SB/slow.git"; git clone -q "$SB/slow.git" "$SB/author-slow" 2>/dev/null
+printf '*.f filter=slow\n' > "$SB/author-slow/.gitattributes"; for i in 1 2 3; do printf '%s\n' "$i" > "$SB/author-slow/$i.f"; done
+git -C "$SB/author-slow" add -A >/dev/null; git -C "$SB/author-slow" commit -qm "slow files"; git -C "$SB/author-slow" push -q origin main 2>/dev/null
+git init -q "$SB/super-slow"; printf 'r\n' > "$SB/super-slow/README.md"; git -C "$SB/super-slow" add -A >/dev/null; git -C "$SB/super-slow" commit -qm init
+( cd "$SB/super-slow" && git submodule add -q "$SB/slow.git" slow 2>/dev/null ); git -C "$SB/super-slow" commit -qm "a slow submodule"
+OUT=$(GITSWITCH_STALL_SECS=3 probe clone "" "$SB/super-slow,$SB/clones,slowclone,submodules")
+ok "a six-second silent checkout is not stopped by a three-second stall window: the download had finished" "$(printf '%s' "$OUT" | jqf submodules.downloaded):$(printf '%s' "$OUT" | jqf submodules.failed_paths):$(ls "$SB/clones/slowclone/slow" | grep -c '\.f$')" "1:[]:3"
+git config --global --unset filter.slow.smudge; git config --global --unset filter.slow.clean
+
 section "A submodule path with a space and a non-ASCII character"
 git init -q --bare "$SB/uml.git"
 git clone -q "$SB/uml.git" "$SB/uml_work" 2>/dev/null
@@ -144,5 +223,112 @@ OUT=$(probe sub_statuses "$SB/embed")
 ok "  and the section list has it" "$(printf '%s' "$OUT" | python3 -c 'import sys,json;print([x["path"] for x in json.load(sys.stdin)])')" "['nested']"
 ok "  flagged as having no .gitmodules entry" "$(printf '%s' "$OUT" | sub nested listed)" "false"
 ok "  with its own branch" "$(printf '%s' "$OUT" | sub nested status | jqf branch)" "main"
+
+section "A push checks that the submodule commits it advertises are on a remote (what git push --recurse-submodules=check does)"
+PC="$SB/pushcheck"; mkdir -p "$PC"
+git init -q --bare "$PC/super.git"; git init -q --bare "$PC/lib.git"
+git clone -q "$PC/lib.git" "$PC/author-lib" 2>/dev/null; printf 'lib v1\n' > "$PC/author-lib/lib.txt"; git -C "$PC/author-lib" add -A >/dev/null; git -C "$PC/author-lib" commit -qm "lib: initial"; git -C "$PC/author-lib" push -q origin main 2>/dev/null
+git clone -q "$PC/super.git" "$PC/author" 2>/dev/null; printf 'readme\n' > "$PC/author/README.md"; git -C "$PC/author" add -A >/dev/null; git -C "$PC/author" commit -qm "super: initial"
+( cd "$PC/author" && git submodule add -q "$PC/lib.git" lib 2>/dev/null ); git -C "$PC/author" commit -qam "super: add lib"; git -C "$PC/author" push -q origin main 2>/dev/null
+git clone -q --recurse-submodules "$PC/super.git" "$PC/work" 2>/dev/null; git -C "$PC/work/lib" checkout -q main
+W="$PC/work"
+printf 'lib v2\n' > "$W/lib/lib.txt"; git -C "$W/lib" commit -qam "lib: v2"
+git -C "$W" add lib >/dev/null; git -C "$W" commit -qm "super: bump lib to v2"
+spush() { pinvoke changes_push "{\"repoPath\":\"$1\",\"setUpstream\":false,\"allowUnpushedSubmodules\":$2}"; }
+row() { probe submodules_list "$1" | "$PY" -c 'import sys,json;s=json.load(sys.stdin)[0];print(s["recorded_on_remote"], s["own_unpushed"], s["own_branch"])'; }
+ok "the submodule row knows its recorded commit is on no remote yet, and counts the commit" "$(row "$W")" "False 1 main"
+OUT=$(spush "$W" false)
+ok "pushing the superproject is refused, naming the submodule and its commit" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["refusal"]["code"], [(s["path"],s["state"]) for s in v["unpushed_submodules"]])')" "False submodules-unpushed [('lib', 'not-on-remote')]"
+ok "  in words that say what would go wrong" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["refusal"]["message"])')" "lib records $(git -C "$W/lib" rev-parse --short=7 HEAD), which none of lib's remote-tracking branches has — as far as this checkout knows. Anyone fetching this push could not check it out. Push lib first (or fetch it, if that commit was pushed from elsewhere), or push anyway."
+ok "  and nothing was pushed" "$(git -C "$PC/super.git" rev-parse main)" "$(git -C "$W" rev-parse HEAD~1)"
+OUT=$(spush "$W/lib" false)
+ok "pushing the submodule first works as any push" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["headline"])')" "True Pushed to origin."
+ok "  the row now says the recorded commit is on its remote" "$(row "$W")" "True 0 main"
+OUT=$(spush "$W" false)
+ok "  and the superproject's push goes through, with nothing left to say" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["headline"], v.get("unpushed_submodules"))')" "True Pushed to origin. None"
+printf 'lib v3\n' > "$W/lib/lib.txt"; git -C "$W/lib" commit -qam "lib: v3"; git -C "$W" add lib >/dev/null; git -C "$W" commit -qm "super: bump lib to v3"
+OUT=$(spush "$W" true)
+ok "push anyway pushes, and says what it leaves behind" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], [(s["path"],s["state"]) for s in v["unpushed_submodules"]], "Pushed anyway: lib records" in v["detail"])')" "True [('lib', 'not-on-remote')] True"
+ok "  the remote has the superproject commit" "$(git -C "$PC/super.git" rev-parse main)" "$(git -C "$W" rev-parse HEAD)"
+# A clone that never populated the submodule cannot be checked: said, not refused.
+git clone -q "$PC/super.git" "$PC/work2" 2>/dev/null
+git -C "$PC/work2" update-index --cacheinfo "160000,$(git -C "$PC/author-lib" rev-parse HEAD),lib" && git -C "$PC/work2" commit -qm "super: point lib at v1 again"
+OUT=$(spush "$PC/work2" false)
+ok "a pointer change in a never-populated submodule is pushed, with the check named as impossible" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], [(s["path"],s["state"]) for s in v["unpushed_submodules"]], "not initialised here" in v["detail"])')" "True [('lib', 'not-populated')] True"
+
+section "A detached submodule with its own commits can start a branch where it stands"
+git -C "$W/lib" checkout -q --detach HEAD
+printf 'lib v4\n' > "$W/lib/lib.txt"; git -C "$W/lib" commit -qam "lib: v4 while detached"
+ok "the row shows it detached, with its unpushed commits counted" "$(row "$W")" "False 2 None"
+D=$(git -C "$W/lib" rev-parse HEAD)
+OUT=$(pinvoke changes_create_branch "{\"repoPath\":\"$W/lib\",\"name\":\"fix/pointer\",\"from\":null,\"switchTo\":true}")
+ok "a branch is created at the checkout and checked out, the commit kept" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"])'):$(git -C "$W/lib" symbolic-ref --short HEAD):$(git -C "$W/lib" rev-parse HEAD):$(git -C "$W/lib" log --format=%s -1)" "True:fix/pointer:$D:lib: v4 while detached"
+ok "  the row shows the branch now" "$(row "$W")" "False 2 fix/pointer"
+OUT=$(pinvoke changes_push "{\"repoPath\":\"$W/lib\",\"setUpstream\":true,\"allowUnpushedSubmodules\":false}")
+ok "  and it can be published from there" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"])'):$(git -C "$PC/lib.git" rev-parse fix/pointer)" "True:$D"
+ok "  after which nothing of it is unpushed — and the recorded commit is on a remote too, through the new branch" "$(row "$W")" "True 0 fix/pointer"
+
+section "A submodule added upstream after the clone can be downloaded from the app — after a Pull, by Update, and inside a submodule"
+NS="$SB/newsub"; mkdir -p "$NS/clones"
+git init -q --bare "$NS/super.git"; for s in A B inner; do git init -q --bare "$NS/$s.git"; git clone -q "$NS/$s.git" "$NS/author-$s" 2>/dev/null; printf '%s v1\n' "$s" > "$NS/author-$s/$s.txt"; git -C "$NS/author-$s" add -A >/dev/null; git -C "$NS/author-$s" commit -qm "$s: initial"; git -C "$NS/author-$s" push -q origin main 2>/dev/null; done
+git clone -q "$NS/super.git" "$NS/author" 2>/dev/null; printf 'readme\n' > "$NS/author/README.md"; git -C "$NS/author" add -A >/dev/null; git -C "$NS/author" commit -qm "super: initial"
+( cd "$NS/author" && git submodule add -q "$NS/A.git" A 2>/dev/null ); git -C "$NS/author" commit -qam "super: add A" >/dev/null; git -C "$NS/author" push -q origin main 2>/dev/null
+OUT=$(probe clone "" "$NS/super.git,$NS/clones,work,submodules"); W="$NS/clones/work"
+ok "the fixture: cloned by the app with its one submodule" "$(printf '%s' "$OUT" | jqf submodules.downloaded):$([ -e "$W/A/.git" ] && echo yes || echo no)" "1:yes"
+# Upstream adds B.
+( cd "$NS/author" && git submodule add -q "$NS/B.git" B 2>/dev/null ); git -C "$NS/author" commit -qam "super: add B" >/dev/null; git -C "$NS/author" push -q origin main 2>/dev/null
+OUT=$(pinvoke changes_pull "{\"repoPath\":\"$W\",\"mode\":\"ff-only\",\"withLfs\":false,\"autostash\":false}")
+ok "after a Pull the new submodule is listed as not downloaded, with the download offered" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["ok"])'):$(probe submodules_list "$W" | "$PY" -c 'import sys,json;s=[x for x in json.load(sys.stdin) if x["path"]=="B"][0];print(s["initialised"], s["listed"], s["state"], s["summary"])')" "True:False True not-initialised not downloaded yet — Download fetches it (git submodule update --init)"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W\",\"paths\":[\"B\"]}")
+ok "  Download fetches it at the recorded commit" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["ok"])'):$(git -C "$W/B" rev-parse HEAD 2>/dev/null)" "True:$(git -C "$W" rev-parse HEAD:B)"
+# Through Update: upstream adds C (declared in .gitmodules) and a gitlink D without an entry.
+git init -q --bare "$NS/C.git"; git clone -q "$NS/C.git" "$NS/author-C" 2>/dev/null; printf 'C v1\n' > "$NS/author-C/C.txt"; git -C "$NS/author-C" add -A >/dev/null; git -C "$NS/author-C" commit -qm "C: initial"; git -C "$NS/author-C" push -q origin main 2>/dev/null
+# `submodule add` stages C and .gitmodules; D is a gitlink staged by hand with no folder, so no `-a` (it would stage D's "deletion").
+( cd "$NS/author" && git submodule add -q "$NS/C.git" C 2>/dev/null ); git -C "$NS/author" update-index --add --cacheinfo "160000,$(git -C "$NS/author-C" rev-parse HEAD),D"; git -C "$NS/author" commit -qm "super: add C, and D without an entry" >/dev/null; git -C "$NS/author" push -q origin main 2>/dev/null
+OUT=$(probe sync_plan "$W")
+ok "the preview names the submodule upstream added and says it will be downloaded, and the one nothing can fetch" "$(printf '%s' "$OUT" | jqf superproject.new_submodules):$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;d=json.load(sys.stdin);print([n for n in d["superproject"]["notes"] if "upstream added" in n])')" "[\"C\"]:['upstream added 1 submodule: C — downloaded after the rebase, at the commit it records (git submodule update --init).', 'upstream added 1 submodule without an entry in .gitmodules: D — git cannot fetch it, so it stays empty.']"
+OUT=$(probe sync_run "$W")
+ok "the update downloads it at the recorded commit and says so" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["sync"];print([(s["path"],s["action"],s["ok"]) for s in d["submodules"] if s["path"]=="C"])'):$(git -C "$W/C" rev-parse HEAD 2>/dev/null)" "True:[('C', 'downloaded', True)]:$(git -C "$W" rev-parse HEAD:C)"
+ok "  the checks still pass, and the unmapped one stays empty" "$(printf '%s' "$OUT" | jqf sync.verified.submodules_aligned):$(ls -A "$W/D" 2>/dev/null | wc -l | tr -d ' ')" "True:0"
+# Inside a submodule: upstream's A gains a submodule of its own; the app downloads it with A as the scope.
+( cd "$NS/author-A" && git submodule add -q "$NS/inner.git" inner 2>/dev/null ); git -C "$NS/author-A" commit -qam "A: add inner" >/dev/null; git -C "$NS/author-A" push -q origin main 2>/dev/null
+git -C "$NS/author/A" pull -q --ff-only origin main 2>/dev/null; git -C "$NS/author" add A >/dev/null; git -C "$NS/author" commit -qm "super: bump A (it gained inner)" >/dev/null; git -C "$NS/author" push -q origin main 2>/dev/null
+OUT=$(probe sync_plan "$W" >/dev/null; probe sync_run "$W")
+ok "after the update, A's own new submodule is listed with A as the scope, not downloaded yet" "$(printf '%s' "$OUT" | jqf ok):$(probe submodules_list "$W/A" | "$PY" -c 'import sys,json;print([(s["path"],s["initialised"],s["listed"]) for s in json.load(sys.stdin)])')" "True:[('inner', False, True)]"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W/A\",\"paths\":[\"inner\"]}")
+ok "  and Download works there too" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["ok"])'):$(git -C "$W/A/inner" rev-parse HEAD 2>/dev/null)" "True:$(git -C "$W/A" rev-parse HEAD:inner)"
+
+section "The push check sees what git's own check sees"
+# A fresh superproject + submodule pair with the submodule at a given path; work/ is a recursive clone on main.
+pair() { local D="$1" SP="$2"; mkdir -p "$D"; git init -q --bare "$D/super.git"; git init -q --bare "$D/lib.git"
+  git clone -q "$D/lib.git" "$D/author-lib" 2>/dev/null; printf 'lib v1\n' > "$D/author-lib/lib.txt"; git -C "$D/author-lib" add -A >/dev/null; git -C "$D/author-lib" commit -qm "lib: initial"; git -C "$D/author-lib" push -q origin main 2>/dev/null
+  git clone -q "$D/super.git" "$D/author" 2>/dev/null; printf 'readme\n' > "$D/author/README.md"; git -C "$D/author" add -A >/dev/null; git -C "$D/author" commit -qm "super: initial"
+  ( cd "$D/author" && git submodule add -q "$D/lib.git" "$SP" 2>/dev/null ); git -C "$D/author" commit -qam "super: add $SP" >/dev/null; git -C "$D/author" push -q origin main 2>/dev/null
+  git clone -q --recurse-submodules "$D/super.git" "$D/work" 2>/dev/null; git -C "$D/work/$SP" checkout -q main; }
+bump() { local W="$1" SP="$2" V="$3"; printf 'lib %s\n' "$V" > "$W/$SP/lib.txt"; git -C "$W/$SP" commit -qam "lib: $V"; git -C "$W" add -- "$SP" >/dev/null; git -C "$W" commit -qm "super: bump $SP to $V"; }
+spush2() { pinvoke changes_push "{\"repoPath\":\"$1\",\"setUpstream\":false,\"allowUnpushedSubmodules\":false}" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], (v.get("refusal") or {}).get("code"), [(s["path"],s["recorded_short"],s["state"],s["branch"]) for s in v.get("unpushed_submodules") or []])'; }
+# (a) a path with non-ASCII bytes: git quotes it in plain --name-only output; the check reads it with -z.
+pair "$SB/pcq" "lïb"; bump "$SB/pcq/work" "lïb" v2
+ok "a submodule at a non-ASCII path is checked like any other" "$(spush2 "$SB/pcq/work")" "False submodules-unpushed [('lïb', '$(git -C "$SB/pcq/work/lïb" rev-parse --short=7 HEAD)', 'not-on-remote', 'main')]"
+# (b) a pointer set by an intermediate commit of the push and moved back in HEAD: a clone may check that commit out.
+pair "$SB/pci" lib; bump "$SB/pci/work" lib v2; git -C "$SB/pci/work/lib" push -q origin main 2>/dev/null
+bump "$SB/pci/work" lib v3; V3=$(git -C "$SB/pci/work/lib" rev-parse --short=7 HEAD)
+git -C "$SB/pci/work/lib" checkout -q "$(git -C "$SB/pci/work/lib" rev-parse HEAD~1)" 2>/dev/null; git -C "$SB/pci/work" add lib >/dev/null; git -C "$SB/pci/work" commit -qm "super: back to v2"
+ok "a pointer only an intermediate pushed commit sets is checked too, though HEAD's own is on the remote" "$(spush2 "$SB/pci/work")" "False submodules-unpushed [('lib', '$V3', 'not-on-remote', None)]"
+# (c) a gitlink removed from the index but still recorded by HEAD, which is what gets pushed.
+pair "$SB/pcr" lib; bump "$SB/pcr/work" lib v2; git -C "$SB/pcr/work" rm -q --cached lib
+ok "a gitlink staged for removal is still checked: HEAD records it" "$(spush2 "$SB/pcr/work")" "False submodules-unpushed [('lib', '$(git -C "$SB/pcr/work/lib" rev-parse --short=7 HEAD)', 'not-on-remote', 'main')]"
+git -C "$SB/pcr/work" reset -q -- lib
+# (d) the commit is on a remote — but not the one a clone fetches from, the address .gitmodules declares.
+pair "$SB/pcf" lib; git init -q --bare "$SB/pcf/fork.git"; git -C "$SB/pcf/work/lib" remote add fork "$SB/pcf/fork.git"; bump "$SB/pcf/work" lib v2; git -C "$SB/pcf/work/lib" push -q fork main 2>/dev/null
+ok "a commit pushed only to another remote of the submodule does not count: a clone fetches from the declared address" "$(spush2 "$SB/pcf/work")" "False submodules-unpushed [('lib', '$(git -C "$SB/pcf/work/lib" rev-parse --short=7 HEAD)', 'not-on-remote', 'main')]"
+ok "  and the row says so too" "$(probe submodules_list "$SB/pcf/work" | "$PY" -c 'import sys,json;s=json.load(sys.stdin)[0];print(s["recorded_on_remote"], s["own_unpushed"])')" "False 1"
+git -C "$SB/pcf/work/lib" push -q origin main 2>/dev/null
+ok "  pushed to the declared remote, it counts" "$(spush2 "$SB/pcf/work")" "True None []"
+# (e) a detached submodule: the refusal asks for a branch there first, since a push from it needs one.
+pair "$SB/pcd" lib; git -C "$SB/pcd/work/lib" checkout -q --detach; bump "$SB/pcd/work" lib v2
+# (the call on its own line: macOS bash 3.2 mangles \" inside "$( )")
+OUT=$(pinvoke changes_push "{\"repoPath\":\"$SB/pcd/work\",\"setUpstream\":false,\"allowUnpushedSubmodules\":false}")
+ok "for a detached submodule the refusal asks for a branch there first" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["refusal"]["message"])')" "Push lib first (it is detached — start a branch there first), or push anyway."
 
 verify_result

@@ -114,10 +114,13 @@ pub(crate) mod tests {
 
     /// `forward!(c::changes_stage, args, repo_path, paths)`: read each named
     /// parameter from the JSON object, call the command, print the outcome.
+    // Boxed: `invoke` holds every command's state machine in one future, and
+    // the larger ones (an update's continue reads the status a dozen times)
+    // overflowed the test thread's 2 MiB stack when inlined.
     macro_rules! forward {
         ($f:path, $args:expr $(, $p:ident)*) => {{
             $( let $p = match arg(&$args, stringify!($p)) { Ok(v) => v, Err(e) => return reply_err(e) }; )*
-            reply($f($($p),*).await)
+            reply(Box::pin($f($($p),*)).await)
         }};
     }
 
@@ -125,7 +128,7 @@ pub(crate) mod tests {
     macro_rules! forward_plain {
         ($f:path, $args:expr $(, $p:ident)*) => {{
             $( let $p = match arg(&$args, stringify!($p)) { Ok(v) => v, Err(e) => return reply_err(e) }; )*
-            reply(Ok::<_, crate::error::AppError>($f($($p),*).await))
+            reply(Ok::<_, crate::error::AppError>(Box::pin($f($($p),*)).await))
         }};
     }
 
@@ -153,27 +156,33 @@ pub(crate) mod tests {
             "changes_lfs_status" => forward!(c::changes_lfs_status, args, repo_path),
             "lfs_available" => forward_plain!(c::lfs_available, args),
             // Changes page: operations
-            "changes_stage" => forward!(c::changes_stage, args, repo_path, paths),
+            "changes_stage" => forward!(c::changes_stage, args, repo_path, paths, allow_markers),
             "changes_stage_all" => forward!(c::changes_stage_all, args, repo_path),
             "changes_unstage" => forward!(c::changes_unstage, args, repo_path, paths),
             "changes_discard" => forward!(c::changes_discard, args, repo_path, paths),
             "changes_commit" => forward!(c::changes_commit, args, repo_path, message, amend),
-            "changes_push" => forward!(c::changes_push, args, repo_path, set_upstream),
+            "changes_push" => forward!(c::changes_push, args, repo_path, set_upstream, allow_unpushed_submodules),
             "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash),
-            "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path),
+            "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path, paths),
             "changes_lfs_pull" => forward!(c::changes_lfs_pull, args, repo_path),
             "changes_lfs_files" => forward!(c::changes_lfs_files, args, repo_path),
             "changes_lfs_pull_paths" => forward!(c::changes_lfs_pull_paths, args, repo_path, paths),
-            "changes_continue" => forward!(c::changes_continue, args, repo_path),
+            "changes_lfs_progress" => forward_plain!(c::changes_lfs_progress, args, repo_path),
+            "console_entries" => forward_plain!(c::console_entries, args, since_id, repo_path),
+            "console_clear" => forward_plain!(c::console_clear, args),
+            "changes_continue" => forward!(c::changes_continue, args, repo_path, allow_markers),
             "changes_abort" => forward!(c::changes_abort, args, repo_path),
             // sync
             "changes_sync_plan" => forward!(c::changes_sync_plan, args, repo_path, stash, fetch),
             "changes_sync_run" => forward!(c::changes_sync_run, args, repo_path, stash, bundles, fingerprint),
-            "changes_sync_continue" => forward!(c::changes_sync_continue, args, repo_path),
+            "changes_sync_continue" => forward!(c::changes_sync_continue, args, repo_path, allow_markers),
             "changes_sync_abort" => forward!(c::changes_sync_abort, args, repo_path),
-            "changes_record_pointers" => forward!(c::changes_record_pointers, args, repo_path),
+            "changes_open_path" => forward!(c::changes_open_path, args, repo_path, path, reveal),
+            "changes_conflict_view" => forward!(c::changes_conflict_view, args, repo_path, path),
+            "changes_record_pointers" => forward!(c::changes_record_pointers, args, repo_path, paths),
             // push access
             "changes_push_state" => forward!(c::changes_push_state, args, repo_path),
+            "changes_push_identity" => forward!(c::changes_push_identity, args, repo_path, refresh),
             "changes_set_push_mode" => forward!(c::changes_set_push_mode, args, repo_path, mode),
             "changes_repair_push_lock" => forward!(c::changes_repair_push_lock, args, repo_path),
             "changes_repair_push_block" => forward!(c::changes_repair_push_block, args, repo_path),
@@ -201,11 +210,22 @@ pub(crate) mod tests {
             "changes_stash_restore_file" => forward!(c::changes_stash_restore_file, args, repo_path, index, path, oid),
             // History page
             "history_branches" => forward!(c::history_branches, args, repo_path),
-            "history_page" => forward!(c::history_page, args, repo_path, rev, offset, limit, search, author),
+            "history_page" => forward!(c::history_page, args, repo_path, rev, offset, limit, search, authors, hide_pointer_only, unpushed_only),
             "history_commit_detail" => forward!(c::history_commit_detail, args, repo_path, hash),
             "history_branch_merges" => forward!(c::history_branch_merges, args, repo_path, branch),
             "history_fetch" => forward!(c::history_fetch, args, repo_path),
             "history_sync_status" => forward!(c::history_sync_status, args, repo_path, branch),
+            "history_head" => forward!(c::history_head, args, repo_path),
+            "history_authors" => forward!(c::history_authors, args, repo_path, rev),
+            "clone_progress" => forward_plain!(c::clone_progress, args, dest_path),
+            "clone_size_estimate" => forward_plain!(c::clone_size_estimate, args, url),
+            // doctor
+            "doctor_check_environment" => forward!(c::doctor_check_environment, args),
+            "doctor_check_profiles" => forward!(c::doctor_check_profiles, args),
+            "doctor_check_keys" => forward!(c::doctor_check_keys, args),
+            "doctor_check_repos" => forward!(c::doctor_check_repos, args),
+            "doctor_unset_local" => forward!(c::doctor_unset_local, args, repo_path, key),
+            "history_peek" => forward!(c::history_peek, args, repo_path),
             "history_commit_file_diff" => forward!(c::history_commit_file_diff, args, repo_path, hash, path),
             "history_resolve" => forward!(c::history_resolve, args, repo_path, text),
             // These take a `tauri::AppHandle` (tray label updates) and cannot run outside the app.
@@ -227,6 +247,22 @@ pub(crate) mod tests {
         match op.as_str() {
             // --- the UI's IPC, forwarded (scripts/verify/harness/live.mjs) ---
             "invoke" => invoke().await,
+            // --- identity: a profile written into the sandbox HOME's gitconfig ---
+            // first = a JSON file {name, git_name, git_email, ssh_key_path?, directories[]}
+            "profile_apply" => {
+                let text = std::fs::read_to_string(first).expect("profile json file");
+                let v: serde_json::Value = serde_json::from_str(&text).expect("profile json");
+                let str_of = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+                let dirs: Vec<String> = v["directories"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default();
+                let remotes: Vec<String> = v["remote_patterns"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default();
+                match crate::profiles::create_profile(str_of("name"), str_of("git_name"), str_of("git_email"), v["ssh_key_path"].as_str().map(String::from), dirs, v["allow_push"].as_bool().unwrap_or(true), false, remotes, v["github_login"].as_str().map(String::from)) {
+                    Ok(p) => match crate::git_config::apply_git_config() {
+                        Ok(()) => emit(&p),
+                        Err(e) => emit_err(e),
+                    },
+                    Err(e) => emit_err(e),
+                }
+            }
             // --- Changes page ---
             "status" => match git_status::repo_status(&repo()).await {
                 Ok(s) => emit(&s),
@@ -240,7 +276,8 @@ pub(crate) mod tests {
                     Err(e) => emit_err(e),
                 }
             }
-            "stage" => show(git_ops::stage(&repo(), a).await),
+            "stage" => show(git_ops::stage(&repo(), a, false).await),
+            "stage_anyway" => show(git_ops::stage(&repo(), a, true).await),
             "stage_all" => show(git_ops::stage_all(&repo()).await),
             "unstage" => show(git_ops::unstage(&repo(), a).await),
             "discard" => show(git_ops::discard(&repo(), a).await),
@@ -248,7 +285,7 @@ pub(crate) mod tests {
                 let amend = a.get(1).map(|s| s == "amend").unwrap_or(false);
                 show(git_ops::commit(&repo(), first, amend).await)
             }
-            "push" => show(git_ops::push(&repo(), first == "upstream").await),
+            "push" => show(git_ops::push(&repo(), first == "upstream", false).await),
             // PROBE_ARGS: "<mode>[,lfs][,autostash]"
             "pull" => {
                 let with_lfs = a.iter().skip(1).any(|s| s == "lfs");
@@ -280,9 +317,10 @@ pub(crate) mod tests {
             },
             op if op.starts_with("tree_") => crate::tree::probe(op, &repo(), &a).await,
             op if op.starts_with("stash_") => crate::stash::probe(op, &repo(), &a).await,
-            "submodule" => show(git_ops::submodule_update(&repo()).await),
+            "submodule" => show(git_ops::submodule_update(&repo(), None).await),
             "abort" => show(git_ops::abort(&repo()).await),
-            "continue" => show(git_ops::continue_op(&repo()).await),
+            "continue" => show(git_ops::continue_op(&repo(), false).await),
+            "continue_anyway" => show(git_ops::continue_op(&repo(), true).await),
             // PROBE_ARGS: "stash" | "nostash"
             "sync_plan" => match crate::sync::sync_plan(&repo(), first != "nostash", true).await {
                 Ok(p) => emit(&p),
@@ -290,9 +328,11 @@ pub(crate) mod tests {
             },
             // PROBE_ARGS: "[nostash][,bundles]" — no fingerprint: the run measures afresh
             "sync_run" => show(crate::sync::sync_run(&repo(), crate::sync::RunOptions { stash: !a.iter().any(|s| s == "nostash"), bundles: a.iter().any(|s| s == "bundles"), fingerprint: Vec::new() }).await),
-            "sync_continue" => show(crate::sync::sync_continue(&repo()).await),
+            "sync_continue" => show(crate::sync::sync_continue(&repo(), false).await),
+            "sync_continue_anyway" => show(crate::sync::sync_continue(&repo(), true).await),
             "sync_abort" => show(crate::sync::sync_abort(&repo()).await),
-            "record_pointers" => show(crate::sync::record_pointers(&repo()).await),
+            // PROBE_ARGS: "[<path>[,<path>…]]" — none records every submodule that is ahead
+            "record_pointers" => show(crate::sync::record_pointers(&repo(), if a.is_empty() { None } else { Some(&a) }).await),
             "block" => match crate::push_lock::set_push_mode(&repo(), if first == "on" { "guardrail" } else { "allowed" }).await {
                 Ok(r) => match r.state {
                     Some(s) => emit(&s),
@@ -354,6 +394,12 @@ pub(crate) mod tests {
                     Err(e) => emit_err(e),
                 }
             }
+            // Run a real status read — ~18 commands through GitCmd — then dump
+            // what was recorded. One process, because the log is in memory.
+            "cmdlog" => {
+                let _ = crate::git_status::repo_status(&repo()).await;
+                emit(&crate::cmdlog::since(0, Some(&repo())))
+            }
             "term_shim" => emit(&serde_json::json!({
                 "script": crate::terminal::shim_script("/usr/bin/git"),
             })),
@@ -408,11 +454,18 @@ pub(crate) mod tests {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),
             },
-            "hpage" => match crate::git_history::history_page(&repo(), "HEAD", 0, 20, None, None) {
+            "hpage" => match crate::git_history::history_page(&repo(), "HEAD", 0, 20, None, None, a.iter().any(|s| s == "hide-pointer-only"), a.iter().any(|s| s == "unpushed-only")) {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),
             },
             other => panic!("unknown op {}", other),
+        }
+        // Every clone-progress entry the op set, in order, for the suites to
+        // read back: against a local remote a phase lasts milliseconds, so
+        // sampling `clone_progress` from outside could miss it.
+        if let Ok(path) = std::env::var("PROBE_TRACE_FILE") {
+            let trace = crate::sparse::progress_trace().lock().map(|t| t.clone()).unwrap_or_default();
+            let _ = std::fs::write(path, serde_json::to_string(&trace).unwrap_or_else(|_| "[]".into()));
         }
     }
 }

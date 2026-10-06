@@ -195,7 +195,7 @@ pub fn check_tree(intent: &TreeIntent, f: &StatusFacts) -> Option<Refusal> {
         if *submodule_selected {
             return Some(refuse(
                 "submodule-conflict",
-                "Submodule pointer conflicts are resolved by bringing the submodule to the right commit — Sync does that, or do it inside the submodule.",
+                "Submodule pointer conflicts are resolved by bringing the submodule to the right commit — Update does that, or do it inside the submodule.",
             ));
         }
         if *not_conflicted_selected {
@@ -774,7 +774,9 @@ pub async fn switch_branch(repo_path: &str, name: &str) -> Result<OpResult, AppE
         return Ok(OpResult::refused(invalid_name(name), before));
     }
 
-    let out = g(repo_path)
+    let lfs = crate::git_ops::lfs_before(repo_path, &before).await;
+    let out = lfs
+        .apply(g(repo_path))
         .args(["switch", "--no-guess", "--", name])
         .timeout(NET_TIMEOUT)
         .run()
@@ -795,11 +797,12 @@ pub async fn switch_branch(repo_path: &str, name: &str) -> Result<OpResult, AppE
     }
     tree.submodule_mismatch = submodule_mismatch(&after);
     tree.recovery = switch_back(&before);
-    let detail = format!(
+    let mut detail = format!(
         "Was {}.{}",
         before.branch.as_ref().map(|b| format!("on {}", b)).unwrap_or_else(|| format!("detached at {}", sync::short(before.head_oid.as_deref().unwrap_or("")))),
         submodule_note(&tree.submodule_mismatch)
     );
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     Ok(OpResult { tree: Some(tree), ..OpResult::done(format!("Switched to {}.", name), detail, after) })
 }
 
@@ -839,7 +842,8 @@ pub async fn create_branch(repo_path: &str, name: &str, from: Option<&str>, swit
         None => None,
     };
     let start = tracking.clone().unwrap_or_else(|| from_oid.clone());
-    let cmd = g(repo_path).cfg("branch.autoSetupMerge", "true");
+    let lfs = if switch_to { crate::git_ops::lfs_before(repo_path, &before).await } else { crate::git_ops::LfsAround::none() };
+    let cmd = lfs.apply(g(repo_path)).cfg("branch.autoSetupMerge", "true");
     let out = if switch_to {
         cmd.args(["switch", "--no-guess", "-c", name, &start]).timeout(NET_TIMEOUT).run().await?
     } else {
@@ -868,12 +872,13 @@ pub async fn create_branch(repo_path: &str, name: &str, from: Option<&str>, swit
         _ => format!("git branch -D {}", name),
     });
     let headline = if switch_to { format!("Created and switched to {}.", name) } else { format!("Created {}.", name) };
-    let detail = format!(
+    let mut detail = format!(
         "Starts at {}{}.{}",
         tree.commit.as_ref().map(|c| c.label()).unwrap_or_default(),
         tracking.as_ref().map(|t| format!(", tracking {}", t.trim_start_matches("refs/remotes/"))).unwrap_or_default(),
         submodule_note(&tree.submodule_mismatch)
     );
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     Ok(OpResult { tree: Some(tree), ..OpResult::done(headline, detail, after) })
 }
 
@@ -1003,10 +1008,53 @@ pub async fn undo_commit(repo_path: &str) -> Result<OpResult, AppError> {
     })
 }
 
+/// Files `target` adds relative to HEAD that already exist on disk without
+/// being in the index — untracked or ignored. `git switch` refuses to clobber
+/// those itself; `git reset --hard` does not, so this is the check it lacks.
+/// A STAGED new file is in the index and is left out: the caller's dialog has
+/// already said staged changes are thrown away (or stashed first).
+async fn untracked_in_the_way(repo: &str, target: &str) -> Vec<String> {
+    let nul_list = |out: Result<crate::git_exec::GitOutput, AppError>| -> Vec<String> {
+        out.ok()
+            .filter(|o| o.ok())
+            .map(|o| o.text().split('\0').filter(|p| !p.is_empty()).map(String::from).collect())
+            .unwrap_or_default()
+    };
+    let added = nul_list(
+        g(repo)
+            .args(["diff", "--name-only", "-z", "--diff-filter=A", "HEAD", target, "--"])
+            .run()
+            .await,
+    );
+    let on_disk: Vec<String> = added
+        .into_iter()
+        .filter(|p| std::fs::symlink_metadata(Path::new(repo).join(p)).is_ok())
+        .collect();
+    if on_disk.is_empty() {
+        return on_disk;
+    }
+    let indexed: std::collections::HashSet<String> = nul_list(g(repo).args(["ls-files", "-z"]).run().await).into_iter().collect();
+    on_disk.into_iter().filter(|p| !indexed.contains(p)).collect()
+}
+
+fn untracked_in_the_way_message(files: &[String]) -> String {
+    let shown: Vec<&str> = files.iter().take(5).map(String::as_str).collect();
+    let more = files.len() - shown.len();
+    format!(
+        "A hard reset would overwrite {} file{} that git isn't tracking: {}{}. Move or delete {} first — nothing was changed.",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+        shown.join(", "),
+        if more > 0 { format!(" and {} more", more) } else { String::new() },
+        if files.len() == 1 { "it" } else { "them" }
+    )
+}
+
 /// Move the branch to `target`. Commits that would leave it are kept on a
 /// backup branch first; commits any remote branch already has are never
 /// dropped. `stash_first` stashes the staged and unstaged changes before the
-/// move (untracked files are left on disk: no reset touches them).
+/// move. Untracked files are left on disk — and when the target would
+/// overwrite one, the reset is refused rather than letting git delete it.
 pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_first: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     let target = target.trim();
@@ -1026,6 +1074,15 @@ pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_firs
         return Ok(OpResult::refused(r, before));
     }
     let oid = oid.unwrap_or_default();
+    // `git reset --hard` protects only what it knows about: a file the target
+    // has and HEAD does not, already on disk untracked, is overwritten without
+    // a word. The dialog promised untracked files are left alone, so keep it.
+    if mode == ResetMode::Hard {
+        let in_the_way = untracked_in_the_way(repo_path, &oid).await;
+        if !in_the_way.is_empty() {
+            return Ok(OpResult::refused(refuse("untracked-in-the-way", untracked_in_the_way_message(&in_the_way)), before));
+        }
+    }
     let head_before = before.head_oid.clone().unwrap_or_default();
     let target_ref = commit_ref(repo_path, &oid).await;
     let mut tree = outcome("reset", &before, &before);
@@ -1058,7 +1115,8 @@ pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_firs
         }
     }
 
-    let out = g(repo_path).args(["reset", mode.flag(), "--quiet", &oid]).timeout(LOCAL_TIMEOUT).run().await?;
+    let lfs = if mode == ResetMode::Hard { crate::git_ops::lfs_before(repo_path, &before).await } else { crate::git_ops::LfsAround::none() };
+    let out = lfs.apply(g(repo_path)).args(["reset", mode.flag(), "--quiet", &oid]).timeout(LOCAL_TIMEOUT).run().await?;
     let after = snapshot(repo_path).await?;
     tree.head_after = after.head_oid.clone();
     tree.branch_after = after.branch.clone();
@@ -1087,6 +1145,7 @@ pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_firs
     }
     detail.push_str(&format!(" Undo with `{}`.", tree.recovery.clone().unwrap_or_default()));
     detail.push_str(&submodule_note(&tree.submodule_mismatch));
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     Ok(OpResult { tree: Some(tree), ..OpResult::done(format!("Reset to {} ({}).", target_ref.short, mode.label()), detail, after) })
 }
 
@@ -1106,7 +1165,8 @@ pub async fn detach(repo_path: &str, target: &str) -> Result<OpResult, AppError>
     }
     let oid = oid.unwrap_or_default();
 
-    let out = g(repo_path).args(["switch", "--detach", &oid]).timeout(NET_TIMEOUT).run().await?;
+    let lfs = crate::git_ops::lfs_before(repo_path, &before).await;
+    let out = lfs.apply(g(repo_path)).args(["switch", "--detach", &oid]).timeout(NET_TIMEOUT).run().await?;
     let after = snapshot(repo_path).await?;
     let mut tree = outcome("detach", &before, &after);
     tree.commit = Some(commit_ref(repo_path, &oid).await);
@@ -1119,11 +1179,12 @@ pub async fn detach(repo_path: &str, target: &str) -> Result<OpResult, AppError>
     }
     tree.submodule_mismatch = submodule_mismatch(&after);
     tree.recovery = switch_back(&before);
-    let detail = format!(
+    let mut detail = format!(
         "You're not on a branch: commits made here belong to no branch until you start one. Go back with `{}`.{}",
         tree.recovery.clone().unwrap_or_default(),
         submodule_note(&tree.submodule_mismatch)
     );
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     let headline = format!("Looking at {}.", tree.commit.as_ref().map(|c| c.label()).unwrap_or_default());
     Ok(OpResult { tree: Some(tree), ..OpResult::done(headline, detail, after) })
 }
@@ -1191,7 +1252,8 @@ pub async fn revert(repo_path: &str, target: &str, mainline: Option<u32>) -> Res
         args.push(m.to_string());
     }
     args.push(oid.clone());
-    let out = g(repo_path).args(args).timeout(LOCAL_TIMEOUT).run().await?;
+    let lfs = crate::git_ops::lfs_before(repo_path, &before).await;
+    let out = lfs.apply(g(repo_path)).args(args).timeout(LOCAL_TIMEOUT).run().await?;
     let after = snapshot(repo_path).await?;
     let mut tree = outcome("revert", &before, &after);
     tree.commit = Some(reverted.clone());
@@ -1215,11 +1277,13 @@ pub async fn revert(repo_path: &str, target: &str, mainline: Option<u32>) -> Res
     }
     let new = commit_ref(repo_path, after.head_oid.as_deref().unwrap_or_default()).await;
     tree.recovery = Some(format!("git reset --soft {}", head_before));
+    let mut detail = format!("New commit `{}` undoes `{}`. Undo the revert with `git reset --soft {}` (keeps its changes staged).", new.label(), reverted.label(), head_before);
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     Ok(OpResult {
         tree: Some(tree),
         ..OpResult::done(
             format!("Reverted {}.", reverted.short),
-            format!("New commit `{}` undoes `{}`. Undo the revert with `git reset --soft {}` (keeps its changes staged).", new.label(), reverted.label(), head_before),
+            detail,
             after,
         )
     })
@@ -1243,7 +1307,8 @@ pub async fn cherry_pick(repo_path: &str, target: &str) -> Result<OpResult, AppE
     let head_before = before.head_oid.clone().unwrap_or_default();
     let picked = commit_ref(repo_path, &oid).await;
 
-    let out = g(repo_path).args(["cherry-pick", &oid]).timeout(LOCAL_TIMEOUT).run().await?;
+    let lfs = crate::git_ops::lfs_before(repo_path, &before).await;
+    let out = lfs.apply(g(repo_path)).args(["cherry-pick", &oid]).timeout(LOCAL_TIMEOUT).run().await?;
     let mut after = snapshot(repo_path).await?;
     let mut tree = outcome("cherry-pick", &before, &after);
     tree.commit = Some(picked.clone());
@@ -1272,11 +1337,13 @@ pub async fn cherry_pick(repo_path: &str, target: &str) -> Result<OpResult, AppE
     }
     let new = commit_ref(repo_path, after.head_oid.as_deref().unwrap_or_default()).await;
     tree.recovery = Some(format!("git reset --soft {}", head_before));
+    let mut detail = format!("New commit `{}` carries `{}`. Undo with `git reset --soft {}` (keeps its changes staged).", new.label(), picked.label(), head_before);
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     Ok(OpResult {
         tree: Some(tree),
         ..OpResult::done(
             format!("Picked {}.", picked.short),
-            format!("New commit `{}` carries `{}`. Undo with `git reset --soft {}` (keeps its changes staged).", new.label(), picked.label(), head_before),
+            detail,
             after,
         )
     })

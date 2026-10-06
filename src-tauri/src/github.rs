@@ -3,10 +3,18 @@ use serde::{Deserialize, Serialize};
 
 /// All GitHub API calls share a client with a hard timeout so one stalled
 /// connection can never hang a command (and with it the UI) indefinitely.
+/// Built once: a reqwest client owns a connection pool and a TLS context, and
+/// building one per request threw both away between the pages of a listing.
 pub(crate) fn http_client() -> Result<reqwest::Client, AppError> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .clone()
         .map_err(|e| AppError::Command(format!("Failed to build HTTP client: {}", e)))
 }
 

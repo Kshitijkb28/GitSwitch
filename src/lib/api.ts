@@ -20,6 +20,8 @@ export async function createProfile(params: {
   directories: string[];
   allowPush?: boolean | null;
   signingEnabled?: boolean | null;
+  remotePatterns?: string[] | null;
+  githubLogin?: string | null;
 }): Promise<Profile> {
   return invoke("create_profile", params);
 }
@@ -33,6 +35,8 @@ export async function updateProfile(params: {
   directories?: string[] | null;
   allowPush?: boolean | null;
   signingEnabled?: boolean | null;
+  remotePatterns?: string[] | null;
+  githubLogin?: string | null;
 }): Promise<Profile> {
   return invoke("update_profile", params);
 }
@@ -162,6 +166,14 @@ export interface HistoryCommit {
   subject: string;
   refs: string[];
   is_merge: boolean;
+  /** The author date, stable across rebases; `date` is the committer date. */
+  author_date: string;
+  /** Submodule pointers this commit moves. */
+  touches_submodules: string[];
+  /** Changes nothing but submodule pointers: a bump, not work. */
+  only_submodules: boolean;
+  /** No remote-tracking branch has it: it exists only here (meaningful when the page has `remote_refs`). */
+  unpushed: boolean;
   lane: number;
   parent_lanes: number[];
   active_lanes: number[];
@@ -174,6 +186,10 @@ export interface HistoryPage {
   limit: number;
   has_more: boolean;
   max_lane: number;
+  /** At least one remote-tracking branch exists; without one nothing here is known to be pushed. */
+  remote_refs: boolean;
+  /** The comparison with the remote-tracking branches failed: no row is marked, and this says why. */
+  marks_error?: string | null;
 }
 
 export interface FileChange {
@@ -228,6 +244,46 @@ export async function historyFetch(repoPath: string): Promise<FetchResult> {
   return invoke("history_fetch", { repoPath });
 }
 
+/** Who a push from this repository would authenticate as. */
+export interface PushIdentity {
+  remote: string | null;
+  url: string | null;
+  via: "ssh-key" | "ssh-agent" | "https-credential" | "blocked" | "local" | "none" | "unknown";
+  login: string | null;
+  key_path: string | null;
+  host: string | null;
+  account: string | null;
+  expected_login: string | null;
+  detail: string;
+}
+
+export async function changesPushIdentity(repoPath: string, refresh = false): Promise<PushIdentity> {
+  return invoke("changes_push_identity", { repoPath, refresh });
+}
+
+/** One person who committed on the viewed revision, with how often. */
+export interface AuthorCount {
+  name: string;
+  email: string;
+  commits: number;
+}
+
+export async function historyAuthors(repoPath: string, rev: string): Promise<AuthorCount[]> {
+  return invoke("history_authors", { repoPath, rev });
+}
+
+export interface HeadInfo {
+  branch: string | null;
+  detached: boolean;
+  unborn: boolean;
+}
+
+/** Which branch HEAD is on, or that it is detached or unborn: three git reads
+ *  where the full repository status is seventeen. */
+export async function historyHead(repoPath: string): Promise<HeadInfo> {
+  return invoke("history_head", { repoPath });
+}
+
 export async function historySyncStatus(
   repoPath: string,
   branch: string
@@ -254,7 +310,9 @@ export async function historyPage(
   offset: number,
   limit: number,
   search?: string | null,
-  author?: string | null
+  authors?: string[] | null,
+  hidePointerOnly = false,
+  unpushedOnly = false
 ): Promise<HistoryPage> {
   return invoke("history_page", {
     repoPath,
@@ -262,7 +320,9 @@ export async function historyPage(
     offset,
     limit,
     search: search ?? null,
-    author: author ?? null,
+    authors: authors ?? null,
+    hidePointerOnly,
+    unpushedOnly,
   });
 }
 
@@ -346,6 +406,11 @@ export async function doctorCheckKeys(): Promise<Finding[]> {
 
 export async function doctorCheckRepos(): Promise<Finding[]> {
   return invoke("doctor_check_repos");
+}
+
+/** Doctor's repair for a repository-local identity override. */
+export async function doctorUnsetLocal(repoPath: string, key: string): Promise<string> {
+  return invoke("doctor_unset_local", { repoPath, key });
 }
 
 export async function doctorFixSshConfig(): Promise<string> {
@@ -435,6 +500,32 @@ export async function lfsAvailable(): Promise<LfsTool> {
 }
 
 /** `cloneAs` = profile id to authenticate as; null lets the folder decide. */
+/** One line of `git clone --progress`, while a clone runs. */
+export interface CloneProgress {
+  phase: string;
+  percent: number | null;
+  done: number | null;
+  total: number | null;
+  bytes: string | null;
+  rate: string | null;
+  /** What is being worked on right now: the submodule being fetched, the large file being downloaded. */
+  detail?: string;
+}
+
+export async function cloneProgress(destPath: string): Promise<CloneProgress | null> {
+  return invoke("clone_progress", { destPath });
+}
+
+/** GitHub's size for a repository (kilobytes of git data; LFS content is extra). */
+export interface CloneSizeEstimate {
+  repo: string;
+  kb: number;
+}
+
+export async function cloneSizeEstimate(url: string): Promise<CloneSizeEstimate | null> {
+  return invoke("clone_size_estimate", { url });
+}
+
 export async function sparseClone(
   url: string,
   parentDir: string,
@@ -733,9 +824,23 @@ export interface SyncSummary {
   root: string;
   /** False when this repository is a submodule of the one being synced. */
   is_root: boolean;
+  /** Conflicted files still unmerged where the pause is: 0 means Continue update can be pressed. */
+  unresolved: number;
+  /** The superproject's upstream, what "theirs" means in every rebase the update runs. */
+  upstream: string;
+  /** For a submodule's own status: its path in the superproject and the commit it is rebased onto. */
+  sub_path: string | null;
+  sub_target: string | null;
+  /**
+   * The pause is a submodule pointer the update could not place itself, still
+   * unmerged here: stage it in this repository ("Mark resolved" on its row).
+   */
+  handed_over?: boolean;
 }
 
 export interface SyncNeedsUser {
+  /** The commit of yours being replayed when the superproject's rebase stopped. */
+  at_commit?: string | null;
   /** superproject | submodule:<path> | submodule-autostash:<path> | autostash-conflict */
   where_: string;
   paths: string[];
@@ -954,6 +1059,14 @@ export interface SubmoduleInfo {
   operation: string | null;
   conflicted: number;
   upstream_remote: string | null;
+  /**
+   * The recorded commit is on one of the submodule's remote-tracking branches,
+   * so a clone of this repository can get it. `null` when that cannot be known
+   * here (not initialised, the commit missing, or no remote-tracking branch).
+   */
+  recorded_on_remote: boolean | null;
+  /** Commits at its checkout that no remote-tracking branch has; `null` without one to compare with. */
+  own_unpushed: number | null;
 }
 
 export interface LfsStatus {
@@ -968,6 +1081,8 @@ export interface LfsStatus {
   pointer_paths: string[];
   more_pointers: number;
   summary: string;
+  /** How to install git-lfs on this platform, for when it is missing. */
+  install_hint: string;
 }
 
 export async function changesLfsStatus(repoPath: string): Promise<LfsStatus> {
@@ -1116,6 +1231,8 @@ export interface PullOutcome {
   /** A rebase with autostash finished but the stash could not be re-applied cleanly. */
   autostash_conflict?: boolean;
   autostash_left?: string | null;
+  /** Submodule pointers the pull moved: the repository now records other commits than are checked out. */
+  submodules_moved?: number;
 }
 
 /** What every git operation returns: the outcome plus the re-read repo state. */
@@ -1134,6 +1251,28 @@ export interface OpResult {
   sync?: SyncOutcome;
   tree?: TreeOutcome;
   stash?: StashOutcome;
+  /** Submodules a push would leave a clone unable to check out, or could not check. */
+  unpushed_submodules?: SubmodulePush[];
+  /**
+   * Set by the page on a result that belongs to a submodule it ran an operation
+   * in (its path), not to the repository on screen: actions keyed on the
+   * result's codes are not offered for it.
+   */
+  inside?: string;
+}
+
+/**
+ * A submodule whose recorded commit a push advertises while none of the
+ * submodule's remotes has it (`not-on-remote`), or where that could not be
+ * checked (`not-here`: the commit is not in its checkout; `not-populated`).
+ */
+export interface SubmodulePush {
+  path: string;
+  recorded: string;
+  recorded_short: string;
+  state: "not-on-remote" | "not-here" | "not-populated";
+  /** Its checked-out branch; null when detached, where a push from it needs a branch first. */
+  branch: string | null;
 }
 
 // --- Tree management: branches, undo, reset, revert, cherry-pick, conflicts ----
@@ -1396,6 +1535,16 @@ export interface SyncCommitRef {
   subject: string;
   /** Submodule paths whose pointer this commit moves. */
   touches: string[];
+  author_name: string;
+  author_email: string;
+  /** The author date, ISO 8601 — stable across the rebases an update performs. */
+  date: string;
+  /** Changes nothing but submodule pointers (a CI bump). */
+  only_pointers: boolean;
+  /** Upstream already carries this change: the rebase drops it. */
+  already_upstream: boolean;
+  /** In an outcome: left out because nothing of it remained once its conflict was resolved. */
+  resolved_away?: boolean;
 }
 
 export interface SyncSubPlan {
@@ -1416,11 +1565,30 @@ export interface SyncSubPlan {
   untracked: number;
   fetch_error: string | null;
   notes: string[];
+  /**
+   * When blocked, a stable code for the remedy (also: untracked-inside |
+   * commit-first): reinit | finish-operation |
+   * resolve-conflicts | removed-upstream | fetch-failed | unreachable |
+   * record-pointers | squash-own | stash-inside. Buttons key on this, never
+   * on the sentence.
+   */
+  remedy: string | null;
+  /** What the update brings into this submodule, and what is its own (capped). */
+  incoming_commits: SyncCommitRef[];
+  own_commits: SyncCommitRef[];
+  /** It has submodules of its own; the update does not go inside them. */
+  has_nested: boolean;
+  /** Upstream moved it to another address; the update re-points it there (git submodule sync). */
+  url_change: { from: string; to: string } | null;
+  /** The remote its branch's upstream lives on. */
+  remote: string | null;
 }
 
 export interface SyncSuperPlan {
   branch: string;
   upstream: string;
+  /** The remote the update fetches from. */
+  remote?: string;
   head: string;
   upstream_oid: string;
   ahead: number;
@@ -1433,6 +1601,17 @@ export interface SyncSuperPlan {
   untracked: number;
   will_stash: boolean;
   notes: string[];
+  /** turn-on-stash | stash-collides | untracked-in-the-way | identity, in the blockers' order. */
+  remedies: string[];
+  /** Where you and upstream last agreed, shortened. */
+  base_short: string;
+  /** The first 30 files with uncommitted changes. */
+  dirty_paths: string[];
+  /** Commits beyond the 30 listed on each side. */
+  more_incoming: number;
+  more_own: number;
+  /** Of the commits beyond the listed ones, how many upstream already has (they are dropped too). */
+  more_own_dropped?: number;
 }
 
 export interface SyncSkipped {
@@ -1450,6 +1629,8 @@ export interface SyncPlan {
   submodules: SyncSubPlan[];
   skipped: SyncSkipped[];
   /** Oids the run re-checks: ["", upstream] then [path, target] per submodule. */
+  /** The superproject HEAD the plan was made for; a plan for another HEAD is stale. */
+  head_oid?: string | null;
   fingerprint: [string, string][];
   summary: string;
 }
@@ -1491,6 +1672,8 @@ export interface SyncOutcome {
   head_after: string;
   incoming: number;
   own_kept: SyncCommitRef[];
+  /** How many commits of yours are on top — all of them; `own_kept` lists the newest. */
+  own_kept_total?: number;
   own_dropped: SyncCommitRef[];
   stashed: boolean;
   /** An autostash entry git could not re-apply is still in `git stash list`. */
@@ -1516,17 +1699,57 @@ export async function changesSyncRun(
   return invoke("changes_sync_run", { repoPath, stash, bundles, fingerprint });
 }
 
-export async function changesSyncContinue(repoPath: string): Promise<OpResult> {
-  return invoke("changes_sync_continue", { repoPath });
+export async function changesSyncContinue(repoPath: string, allowMarkers = false): Promise<OpResult> {
+  return invoke("changes_sync_continue", { repoPath, allowMarkers });
 }
 
 export async function changesSyncAbort(repoPath: string): Promise<OpResult> {
   return invoke("changes_sync_abort", { repoPath });
 }
 
-/** One commit recording every submodule checked out ahead of what the branch records. */
-export async function changesRecordPointers(repoPath: string): Promise<OpResult> {
-  return invoke("changes_record_pointers", { repoPath });
+/**
+ * Opens a file of the repository in the system's default application, or
+ * reveals it in the file manager. The backend checks the path is inside the
+ * repository first.
+ */
+export async function changesOpenPath(repoPath: string, path: string, reveal: boolean): Promise<void> {
+  return invoke("changes_open_path", { repoPath, path, reveal });
+}
+
+export interface ConflictHunk {
+  /** 1-based line of the `<<<<<<<` marker. */
+  line: number;
+  mine: string[];
+  /** The common ancestor's lines, when the file carries diff3 markers. */
+  base: string[];
+  theirs: string[];
+}
+
+export interface ConflictView {
+  path: string;
+  /** No hunks to show: Keep mine or Take theirs decides it. */
+  binary: boolean;
+  marker_count: number;
+  hunks: ConflictHunk[];
+  truncated: boolean;
+  sides: Sides;
+  total_lines: number;
+  /** The file is larger than what was read: a count of zero does not mean resolved. */
+  partial?: boolean;
+}
+
+/** A conflicted file split into what each side wants, for the resolution view. */
+export async function changesConflictView(repoPath: string, path: string): Promise<ConflictView> {
+  return invoke("changes_conflict_view", { repoPath, path });
+}
+
+/**
+ * One commit recording submodule pointers checked out ahead of what the branch
+ * records. `paths`: exactly these submodules — each is refused when it is not
+ * a populated, listed submodule or not strictly ahead; null = every such one.
+ */
+export async function changesRecordPointers(repoPath: string, paths: string[] | null = null): Promise<OpResult> {
+  return invoke("changes_record_pointers", { repoPath, paths });
 }
 
 export type PullMode = "ff-only" | "merge" | "rebase";
@@ -1544,8 +1767,9 @@ export async function changesFileDiff(
   return invoke("changes_file_diff", { repoPath, path, staged, untracked });
 }
 
-export async function changesStage(repoPath: string, paths: string[]): Promise<OpResult> {
-  return invoke("changes_stage", { repoPath, paths });
+/** `allowMarkers`: stage a conflicted file even though conflict markers are still in it (the "anyway" button). */
+export async function changesStage(repoPath: string, paths: string[], allowMarkers = false): Promise<OpResult> {
+  return invoke("changes_stage", { repoPath, paths, allowMarkers });
 }
 
 export async function changesStageAll(repoPath: string): Promise<OpResult> {
@@ -1568,8 +1792,9 @@ export async function changesCommit(
   return invoke("changes_commit", { repoPath, message, amend });
 }
 
-export async function changesPush(repoPath: string, setUpstream: boolean): Promise<OpResult> {
-  return invoke("changes_push", { repoPath, setUpstream });
+/** `allowUnpushedSubmodules`: push although a submodule's recorded commit is on none of that submodule's remotes. */
+export async function changesPush(repoPath: string, setUpstream: boolean, allowUnpushedSubmodules = false): Promise<OpResult> {
+  return invoke("changes_push", { repoPath, setUpstream, allowUnpushedSubmodules });
 }
 
 /** `withLfs` also downloads LFS content — a plain pull leaves pointer stubs. `autostash` lets a rebase pull run on a dirty tree. */
@@ -1582,12 +1807,13 @@ export async function changesPull(
   return invoke("changes_pull", { repoPath, mode, withLfs, autostash });
 }
 
-export async function changesSubmoduleUpdate(repoPath: string): Promise<OpResult> {
-  return invoke("changes_submodule_update", { repoPath });
+/** `paths`: only these submodules (the never-initialised ones); null = every listed one. */
+export async function changesSubmoduleUpdate(repoPath: string, paths: string[] | null = null): Promise<OpResult> {
+  return invoke("changes_submodule_update", { repoPath, paths });
 }
 
-export async function changesContinue(repoPath: string): Promise<OpResult> {
-  return invoke("changes_continue", { repoPath });
+export async function changesContinue(repoPath: string, allowMarkers = false): Promise<OpResult> {
+  return invoke("changes_continue", { repoPath, allowMarkers });
 }
 
 export async function changesAbort(repoPath: string): Promise<OpResult> {
@@ -1629,6 +1855,34 @@ export async function doctorCheckPushLocks(): Promise<Finding[]> {
 
 export async function changesRepairPushBlock(repoPath: string): Promise<PushState> {
   return invoke("changes_repair_push_block", { repoPath });
+}
+
+// --- The command log -----------------------------------------------------
+
+/** One git command this app ran, already redacted. */
+export interface ConsoleEntry {
+  id: number;
+  at: string;
+  repo: string;
+  /** Exactly what ran. `argv[0]` is the program. */
+  argv: string[];
+  /** -1 when git could not be started, -9 when it was killed on a timeout. */
+  exit_code: number;
+  duration_ms: number;
+  stdout: string;
+  stderr: string;
+  /** A read rather than a change; hidden by default because most are. */
+  is_read: boolean;
+  truncated: boolean;
+}
+
+/** Commands newer than `sinceId`. An empty `repoPath` means every repository. */
+export async function consoleEntries(sinceId: number, repoPath: string): Promise<ConsoleEntry[]> {
+  return invoke("console_entries", { sinceId, repoPath });
+}
+
+export async function consoleClear(): Promise<void> {
+  return invoke("console_clear", {});
 }
 
 // --- Terminal ------------------------------------------------------------

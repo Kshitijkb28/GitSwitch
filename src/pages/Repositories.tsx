@@ -3,7 +3,6 @@ import { useNavigate } from "react-router-dom";
 import {
   BookMarked,
   Loader2,
-  RefreshCw,
   Search,
   Lock,
   Globe,
@@ -27,6 +26,7 @@ import { usePersistedState } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 const PAGE_SIZE = 25;
 
@@ -156,8 +156,7 @@ export function Repositories() {
     return orgUser ? `${orgUser}@github.com:${r.owner}/${r.name}.git` : r.clone_url;
   };
 
-  useEffect(() => {
-    api.getProfiles().then(setProfiles).catch(() => setProfiles([]));
+  function reloadAccounts() {
     api.repoAccounts()
       .then((a) => {
         setAccounts(a);
@@ -165,6 +164,10 @@ export function Repositories() {
         setAccount((prev) => (a.some((x) => x.key === prev) ? prev : a[0]?.key ?? ""));
       })
       .catch(() => setAccounts([]));
+  }
+  useEffect(() => {
+    api.getProfiles().then(setProfiles).catch(() => setProfiles([]));
+    reloadAccounts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -172,6 +175,10 @@ export function Repositories() {
     if (!key) return;
     const cached = listingCache.get(key);
     if (cached && !force) {
+      // Taking the cached answer is a load too: a slower fetch for another
+      // account that is still in flight must not paint over it when it lands.
+      ++loadSeq.current;
+      setLoading(false);
       listingKey.current = key;
       setListing(cached.listing);
       setFetchedAt(cached.fetchedAt);
@@ -311,8 +318,8 @@ export function Repositories() {
             Everything your GitHub accounts can reach — clone any of them as the right account.
           </p>
         </div>
-        {!noAccounts && (
-          <div className="flex items-center gap-2 flex-wrap min-w-0">
+        <div className="flex items-center gap-2 flex-wrap min-w-0">
+          {!noAccounts && (
             <div className="w-64 max-w-full">
               <Select
                 value={account}
@@ -322,17 +329,19 @@ export function Repositories() {
                 options={(accounts ?? []).map((a) => ({ value: a.key, label: a.label }))}
               />
             </div>
-            <Button
-              variant="secondary"
-              onClick={() => load(account, true)}
-              disabled={!account || loading}
-              className="min-w-[8rem]" // fits "Loading…" (≈120px) so the swap doesn't shift the picker
-            >
-              <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
-              {loading ? "Loading…" : "Refresh"}
-            </Button>
-          </div>
-        )}
+          )}
+          <RefreshButton
+            onClick={() => {
+              // Everything a fresh visit reads, again.
+              api.getProfiles().then(setProfiles).catch(() => setProfiles([]));
+              refreshLocal();
+              reloadAccounts();
+              if (account) load(account, true);
+            }}
+            busy={loading}
+            title="Re-check the signed-in accounts, re-read the local clones, and list the repositories again"
+          />
+        </div>
       </div>
 
       {noAccounts && (

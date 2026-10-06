@@ -44,6 +44,8 @@ pub struct LfsStatus {
     pub more_pointers: usize,
     /// One plain sentence.
     pub summary: String,
+    /// How to install git-lfs on this platform — for the card, when it is missing.
+    pub install_hint: String,
 }
 
 /// Parse `git lfs ls-files`: one `<oid> <*|-> <path>` line per tracked file.
@@ -372,7 +374,10 @@ pub fn summarise(installed: bool, uses_lfs: bool, tracked: usize, pointers: usiz
         return "This repository doesn't use Git LFS.".to_string();
     }
     if !installed {
-        return "This repository uses Git LFS, but git-lfs isn't installed on this Mac — large files will stay as pointer stubs until it is.".to_string();
+        return format!(
+            "This repository uses Git LFS, but git-lfs isn't installed on this computer — large files will stay as pointer stubs until it is. Install it with {}.",
+            install_hint()
+        );
     }
     if tracked == 0 {
         return "Git LFS is set up here, but no files in this checkout are tracked by it.".to_string();
@@ -404,7 +409,7 @@ pub fn missing_lfs_message(stderr: &str) -> Option<String> {
         || stderr.contains("not found");
     if mentions_lfs && missing {
         Some(
-            "This repository requires Git LFS (its config sets filter.lfs.required), but git-lfs isn't installed on this Mac, so git refuses to read its files. Install it with `brew install git-lfs` and try again."
+            format!("This repository requires Git LFS (its config sets filter.lfs.required), but git-lfs isn't installed on this computer, so git refuses to read its files. Install it with {} and try again.", install_hint())
                 .to_string(),
         )
     } else {
@@ -638,6 +643,7 @@ impl LfsListing {
             uses_lfs: self.uses_lfs,
             filters_configured: self.filters_configured,
             tracked: self.total,
+            install_hint: install_hint(),
             pointers: self.missing,
             more_pointers: self.missing.saturating_sub(pointer_paths.len().min(MAX_LISTED)),
             pointer_paths: pointer_paths.into_iter().take(MAX_LISTED).collect(),
@@ -690,6 +696,7 @@ pub async fn lfs_status(repo_path: &str) -> Result<LfsStatus, AppError> {
         pointers,
         pointer_paths: pointer_paths.into_iter().take(MAX_LISTED).collect(),
         more_pointers,
+        install_hint: install_hint(),
     })
 }
 
@@ -731,7 +738,7 @@ mod tests {
     fn a_missing_git_lfs_is_named_instead_of_blamed_on_the_network() {
         let stderr = "git-lfs filter-process: git-lfs: command not found\nfatal: the remote end hung up unexpectedly";
         let msg = missing_lfs_message(stderr).expect("recognised");
-        assert!(msg.contains("brew install git-lfs"));
+        assert!(msg.contains(&install_hint()), "{msg}");
         assert!(msg.contains("filter.lfs.required"));
         // A genuine network failure must not be mistaken for it.
         assert!(missing_lfs_message("fatal: the remote end hung up unexpectedly").is_none());

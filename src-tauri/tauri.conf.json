@@ -35,8 +35,14 @@
       "icons/icon.ico"
     ],
     "externalBin": [
-      "binaries/gitswitch-lock-helper"
-    ]
+      "binaries/gitswitch-lock-helper",
+      "binaries/gitswitch-git-shim"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine"
+      }
+    }
   },
   "plugins": {
     "updater": {

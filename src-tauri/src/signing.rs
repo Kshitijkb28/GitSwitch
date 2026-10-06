@@ -106,10 +106,11 @@ pub fn signing_config_block(profile: &Profile) -> Option<String> {
         return None;
     }
     let key = profile.ssh_key_path.as_ref()?;
+    // Quoted: a space or `#` in either path would otherwise end the value early.
     Some(format!(
-        "[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tallowedSignersFile = {}\n[user]\n\tsigningkey = {}.pub\n[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n",
-        crate::paths::norm(&allowed_signers_path().to_string_lossy()),
-        crate::paths::norm(key)
+        "[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tallowedSignersFile = {}\n[user]\n\tsigningkey = {}\n[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n",
+        crate::paths::config_value(&crate::paths::norm(&allowed_signers_path().to_string_lossy())),
+        crate::paths::config_value(&format!("{}.pub", crate::paths::norm(key)))
     ))
 }
 
@@ -210,6 +211,8 @@ mod tests {
             is_default: false,
             allow_push: true,
             signing_enabled: signing,
+            remote_patterns: Vec::new(),
+            github_login: None,
             directories: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -224,8 +227,8 @@ mod tests {
         assert!(block.contains("format = ssh"));
         // A backslash here would make git report "bad config line".
         assert!(!block.contains('\\'), "config values must never contain backslashes");
-        // SSH signing points signingkey at the PUBLIC half.
-        assert!(block.contains("signingkey = /k.pub"));
+        // SSH signing points signingkey at the PUBLIC half; values are quoted.
+        assert!(block.contains("signingkey = \"/k.pub\""), "{block}");
         assert!(block.contains("gpgsign = true"));
         assert!(block.contains("allowedSignersFile ="));
     }

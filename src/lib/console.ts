@@ -11,8 +11,12 @@ import { readPersisted, writePersisted } from "./persist";
  * module store also means any page can open the drawer without threading props
  * through the whole tree.
  */
+export type ConsoleTab = "terminal" | "activity";
+
 export type ConsoleState = {
   open: boolean;
+  /** Which panel is on screen. Both stay mounted; see ConsoleDrawer. */
+  tab: ConsoleTab;
   /** Profile id the repository list is filtered by; "" means every account. */
   account: string;
   /** Absolute path of the repository the shell runs in. */
@@ -26,6 +30,7 @@ const MAX_HEIGHT = 900;
 
 let state: ConsoleState = {
   open: false, // never restored open: a shell should start when asked for
+  tab: readPersisted<ConsoleTab>("console.tab", "terminal"),
   account: readPersisted<string>("console.account", "") || readPersisted<string>("changes.account", ""),
   repo: readPersisted<string>("console.repo", "") || readPersisted<string>("changes.repo", ""),
   height: clampHeight(readPersisted<number>("console.height", 300)),
@@ -80,6 +85,11 @@ export function toggleConsole() {
 export function setConsoleRepo(repo: string) {
   writePersisted("console.repo", repo);
   set({ repo });
+}
+
+export function setConsoleTab(tab: ConsoleTab) {
+  writePersisted("console.tab", tab);
+  set({ tab });
 }
 
 export function setConsoleAccount(account: string) {

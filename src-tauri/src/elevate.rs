@@ -14,6 +14,7 @@ use std::time::Duration;
 
 /// The prompt can sit for as long as the person needs; a job never takes long.
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+#[cfg(target_os = "macos")]
 pub const PROMPT_TEXT: &str = "GitSwitch needs an administrator to change a push lock.";
 
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -99,11 +100,11 @@ fn test_mode() -> Option<String> {
 /// passwordless sudo, so the real root code path is exercised there.
 async fn run_direct(helper: &Path, job: &Path, sha: &str, bootstrap: bool, via_sudo: bool) -> Elevated {
     let mut cmd = if via_sudo {
-        let mut c = tokio::process::Command::new("sudo");
+        let mut c = crate::spawn::async_command("sudo");
         c.arg("-n").arg(helper);
         c
     } else {
-        tokio::process::Command::new(helper)
+        crate::spawn::async_command(helper)
     };
     cmd.args(helper_args(job, sha, bootstrap));
     let out = tokio::time::timeout(PROMPT_TIMEOUT, cmd.output()).await;
@@ -214,6 +215,7 @@ fn windows_blocking(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> El
 
 /// The AppleScript error number at the end of osascript's stderr, e.g.
 /// `execution error: User canceled. (-128)`.
+#[cfg(target_os = "macos")]
 pub fn applescript_error_code(stderr: &str) -> Option<i64> {
     let t = stderr.trim_end();
     let close = t.rfind(')')?;
@@ -222,6 +224,7 @@ pub fn applescript_error_code(stderr: &str) -> Option<i64> {
 }
 
 /// Everything before the trailing `(code)`, minus osascript's own prefix.
+#[cfg(target_os = "macos")]
 pub fn applescript_error_text(stderr: &str) -> String {
     let t = stderr.trim();
     let body = match t.rfind('(') {
@@ -250,7 +253,7 @@ async fn macos(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> Elevate
     );
     let out = tokio::time::timeout(
         PROMPT_TIMEOUT,
-        tokio::process::Command::new("/usr/bin/osascript")
+        crate::spawn::async_command("/usr/bin/osascript")
             .arg("-e")
             .arg(&script)
             .arg(helper)
@@ -291,7 +294,7 @@ async fn linux(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> Elevate
     let manual = manual_command(helper, job, sha, bootstrap);
     let out = tokio::time::timeout(
         PROMPT_TIMEOUT,
-        tokio::process::Command::new("pkexec").arg(helper).args(helper_args(job, sha, bootstrap)).output(),
+        crate::spawn::async_command("pkexec").arg(helper).args(helper_args(job, sha, bootstrap)).output(),
     )
     .await;
     let no_agent = match out {
@@ -319,7 +322,7 @@ async fn linux(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> Elevate
         if let Some(askpass) = askpass_program() {
             let out = tokio::time::timeout(
                 PROMPT_TIMEOUT,
-                tokio::process::Command::new("sudo")
+                crate::spawn::async_command("sudo")
                     .env("SUDO_ASKPASS", &askpass)
                     .arg("-A")
                     .arg(helper)
@@ -365,6 +368,7 @@ fn askpass_program() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn applescript_errors_are_parsed_by_their_trailing_code() {
         let cancel = "42:200: execution error: User canceled. (-128)\n";

@@ -422,7 +422,7 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
             if has("'lfs' is not a git command") || has("git-lfs: command not found") {
                 return advice(
                     "git-lfs isn't installed.",
-                    "This repository stores large files with Git LFS, but the git-lfs tool isn't on this Mac. Install it (brew install git-lfs), then pull the files again.",
+                    &format!("This repository stores large files with Git LFS, but the git-lfs tool isn't on this computer. Install it with {}, then pull the files again.", crate::lfs::install_hint()),
                     None,
                     s,
                 );

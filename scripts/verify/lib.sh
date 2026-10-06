@@ -42,23 +42,34 @@ EOF
   PASS=0; FAIL=0
   # tauri-build refuses to compile the app unless the lock-helper sidecar file
   # exists, so build it (debug) before the app's test binary.
-  (HOME="$REAL_HOME" bash "$ROOT/scripts/build-lock-helper.sh" debug >/dev/null 2>&1) || { echo "could not build the lock helper sidecar"; exit 1; }
+  local build_log; build_log="$(mktemp)"
+  (HOME="$REAL_HOME" bash "$ROOT/scripts/build-lock-helper.sh" debug >"$build_log" 2>&1) || { echo "could not build the lock helper sidecar:"; tail -n 30 "$build_log"; exit 1; }
   HELPER_BUNDLED="$SRC/target/debug/gitswitch-lock-helper"; [ -x "$HELPER_BUNDLED.exe" ] && HELPER_BUNDLED="$HELPER_BUNDLED.exe"
-  BIN="$(cd "$SRC" && HOME="$REAL_HOME" cargo test -p gitswitch --lib --no-run --message-format=json 2>/dev/null | "$PY" -c "
+  BIN="$(cd "$SRC" && HOME="$REAL_HOME" cargo test -p gitswitch --lib --no-run --message-format=json 2>"$build_log" | "$PY" -c "
 import sys,json
 for l in sys.stdin:
     try: d=json.loads(l)
     except: continue
     if d.get('profile',{}).get('test') and d.get('executable') and d.get('target',{}).get('name')=='gitswitch_lib': print(d['executable'])
 " | tail -1)"
-  [ -n "$BIN" ] || { echo "could not build the test binary (is src-tauri/src/probe.rs registered in lib.rs?)"; exit 1; }
+  [ -n "$BIN" ] || { echo "could not build the test binary (is src-tauri/src/probe.rs registered in lib.rs?):"; tail -n 30 "$build_log"; exit 1; }
 }
 
+# pinvoke <tauri command> <json args as the UI sends them> -> what the command returned
+pinvoke() { PROBE_OP=invoke PROBE_CMD="$1" PROBE_JSON="$2" PROBE_TRACE_FILE="$SB/probe-trace.json" "$BIN" probe --ignored --nocapture 2>/dev/null | sed -n 's/^PROBE_OUT //p'; }
+
 # probe <op> <repo> [comma-separated args] -> the JSON the backend returned
+# The probe also writes every clone-progress entry the op set to a file next to
+# the sandbox (see probe_trace): a clone's phases last milliseconds against a
+# local remote, so polling for them from outside would prove nothing.
 probe() {
-  PROBE_OP="$1" PROBE_REPO="$2" PROBE_ARGS="${3:-}" "$BIN" probe --ignored --nocapture 2>/dev/null \
+  PROBE_OP="$1" PROBE_REPO="$2" PROBE_ARGS="${3:-}" PROBE_TRACE_FILE="$SB/probe-trace.json" "$BIN" probe --ignored --nocapture 2>/dev/null \
     | sed -n 's/^PROBE_OUT //p'
 }
+
+# probe_trace -> the clone-progress entries the LAST probe or pinvoke call set,
+# in order, as a JSON list ("[]" when it set none)
+probe_trace() { cat "$SB/probe-trace.json" 2>/dev/null || echo '[]'; }
 
 # jqf <dotted.path>  — read one field from JSON on stdin (python, no jq needed)
 jqf() {

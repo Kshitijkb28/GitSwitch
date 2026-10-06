@@ -2,6 +2,8 @@
 // Serves the built app and replaces Tauri's invoke bridge before any app code
 // runs, so every reset/revert/cherry-pick can be exercised without a real repo.
 import { launch, serve, tally, DIST_OK } from "./browser.mjs";
+// The Changes tab is mounted beside History now and renders every submodule row in full.
+import { sub } from "./fixtures.mjs";
 import {
   REPO,
   REPOS,
@@ -25,7 +27,7 @@ import {
   STATUS_CLEAN,
   STATUS_DIRTY,
   STATUS_DETACHED,
-} from "./history-fixtures.mjs";
+  AUTHORS, HISTORY_PAGE_BUMP } from "./history-fixtures.mjs";
 
 if (!DIST_OK) {
   console.error("dist/ is missing — run `bun run build` first");
@@ -48,16 +50,36 @@ async function openHistoryPage(browser, server, opts = {}) {
     refuse: opts.refuse ?? {},
     hang: opts.hang ?? false,
     submodules: opts.submodules ?? [],
+    historyPage: opts.historyPage ?? null,
+    /** The selected account's profile id, when a test needs "this account". */
+    account: opts.account ?? null,
+    /** Persisted settings to seed before the page loads: { "history.hidePointerOnly": true }. */
+    persist: opts.persist ?? null,
+    /** Milliseconds the list of repositories (and with it the accounts) takes to arrive. */
+    reposDelay: opts.reposDelay ?? 0,
+    /** The people who commit here, when a test needs others than the fixture's. */
+    authors: opts.authors ?? null,
+    /** The repositories (and with them the accounts), when a test needs others than the fixture's. */
+    repos: opts.repos ?? null,
     peek: opts.peek ?? { branch: "main", upstream: "origin/main", remote: "origin", remote_tip: "440d0af1234567890abcdef1234567890abcdef12", known_tip: "e81d1c51234567890abcdef1234567890abcdef12", changed: true, branch_gone: false, new_commits: 3, counted_by: "github", message: "3 new commits on origin/main since your last fetch (440d0af). Nothing was downloaded — Fetch to see them." },
   };
   const page = await browser.newPage();
   await page.setViewport({ width: cfg.width, height: 900 });
+  // A render crash leaves a blank page; keep its errors for the failure message.
+  const pageErrors = [];
+  page.on("pageerror", (e) => pageErrors.push(String(e?.stack ?? e?.message ?? e).slice(0, 600)));
+  page.on("console", (m) => {
+    if (m.type() === "error") pageErrors.push(m.text());
+  });
   await page.evaluateOnNewDocument(
     (fx, cfg) => {
       window.__CALLS__ = [];
       window.__CLIPBOARD__ = null;
       localStorage.clear();
       localStorage.setItem("gitswitch:history.repo", JSON.stringify(fx.repo));
+      localStorage.setItem("gitswitch:repo.path", JSON.stringify(fx.repo));
+      if (cfg.account) localStorage.setItem("gitswitch:repo.account", JSON.stringify(cfg.account));
+      if (cfg.persist) for (const [k, v] of Object.entries(cfg.persist)) localStorage.setItem(`gitswitch:${k}`, JSON.stringify(v));
       // Headless Chrome has no clipboard permission; record what the app tried to copy.
       try {
         Object.defineProperty(navigator, "clipboard", {
@@ -86,12 +108,31 @@ async function openHistoryPage(browser, server, opts = {}) {
         invoke: (cmd, args) => {
           window.__CALLS__.push({ cmd, args });
           switch (cmd) {
+            // The Changes tab is mounted beside History now (hidden): its
+            // cards need quiet answers, never a null.
+            case "get_profiles":
+              return Promise.resolve([]);
+            case "changes_push_state":
+              return Promise.resolve({ ...cfg.status.push, blocked: false, repo_blocked: false, reason: "Pushing is allowed from this folder." });
+            case "changes_push_identity":
+              return Promise.resolve(null);
+            case "changes_submodule_statuses":
+            case "changes_stash_list":
+            case "console_entries":
+              return Promise.resolve([]);
+            case "changes_lfs_files":
+              return Promise.resolve({ installed: true, version: "git-lfs/3.8.0", uses_lfs: false, filters_configured: true, files: [], folders: [], total: 0, present: 0, missing: 0, total_bytes: 0, missing_bytes: 0, sizes_known: true, truncated: 0, folders_truncated: 0, summary: "This repository doesn't use Git LFS." });
+            case "changes_lfs_progress":
+            case "clone_progress":
+              return Promise.resolve(null);
             case "history_list_repos":
-              return Promise.resolve(fx.repos);
+              return cfg.reposDelay ? new Promise((res) => setTimeout(() => res(cfg.repos ?? fx.repos), cfg.reposDelay)) : Promise.resolve(cfg.repos ?? fx.repos);
             case "history_branches":
               return Promise.resolve(cfg.branches);
             case "history_page":
-              return Promise.resolve(fx.historyPage);
+              return Promise.resolve(cfg.historyPage ?? fx.historyPage);
+            case "history_authors":
+              return Promise.resolve(cfg.authors ?? fx.authors);
             case "history_sync_status":
               return Promise.resolve(fx.syncStatus);
             case "history_commit_detail":
@@ -108,6 +149,8 @@ async function openHistoryPage(browser, server, opts = {}) {
               return Promise.resolve({ message: "fetched", head_unchanged: true, worktree_unchanged: true, local_branches_unchanged: true, updated_remote_refs: 0 });
             case "changes_repo_status":
               return Promise.resolve(cfg.status);
+            case "history_head":
+              return Promise.resolve({ branch: cfg.status.branch, detached: cfg.status.detached, unborn: cfg.status.unborn });
             case "changes_submodules":
               return Promise.resolve(cfg.submodules);
             case "history_peek":
@@ -119,6 +162,8 @@ async function openHistoryPage(browser, server, opts = {}) {
             case "changes_cherry_pick":
               return act(cmd);
             default:
+              // Remembered so a crash can name the command that got a null.
+              (window.__UNMOCKED__ = window.__UNMOCKED__ || []).push(cmd);
               return Promise.resolve(null);
           }
         },
@@ -128,6 +173,7 @@ async function openHistoryPage(browser, server, opts = {}) {
       repo: REPO,
       repos: REPOS,
       historyPage: HISTORY_PAGE,
+  authors: AUTHORS,
       syncStatus: SYNC_STATUS,
       detail: COMMIT_DETAIL,
       detailMerge: COMMIT_DETAIL_MERGE,
@@ -136,8 +182,17 @@ async function openHistoryPage(browser, server, opts = {}) {
     },
     cfg
   );
-  await page.goto(`${server.url}/history`, { waitUntil: "networkidle0" });
-  await page.waitForFunction(() => document.body.innerText.includes("All branches"), { timeout: 5000 });
+  await page.goto(`${server.url}/repo/history`, { waitUntil: "networkidle0" });
+  try {
+    await page.waitForFunction(() => document.body.innerText.includes("All branches"), { timeout: 5000 });
+  } catch (e) {
+    // Say what the page shows instead, so a moved anchor is diagnosable.
+    console.error("the History tab never showed 'All branches'; the page reads:\n" + (await page.evaluate(() => document.body.innerText.slice(0, 1500))));
+    if (pageErrors.length) console.error("page errors:\n" + pageErrors.slice(0, 5).join("\n"));
+    const unmocked = await page.evaluate(() => [...new Set(window.__UNMOCKED__ || [])]);
+    if (unmocked.length) console.error("commands answered with null by the mock: " + unmocked.join(", "));
+    throw e;
+  }
   return page;
 }
 
@@ -217,6 +272,166 @@ const open = (opts) => openHistoryPage(browser, server, opts);
 
 try {
   // -----------------------------------------------------------------
+  section("People: who commits here, and when");
+  {
+    const page = await open();
+    await page.waitForFunction(() => document.body.innerText.includes("People"), { timeout: 4000 });
+    const s = await text(page);
+    ok("the people list was read for this repository and revision", (await calls(page, "history_authors")).length >= 1);
+    ok("every row shows the date AND the time", /\d{4}-\d\d-\d\d \d\d:\d\d/.test(s), s.slice(0, 300));
+    // The author's time is what a row shows (it survives a rebase); the committer's is in the title.
+    const local = (iso) =>
+      page.evaluate((iso) => {
+        const d = new Date(iso);
+        const p = (n) => String(n).padStart(2, "0");
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+      }, iso);
+    const authored = await local("2026-09-20T09:30:00+02:00");
+    const committed = await local("2026-09-20T10:00:00+02:00");
+    const stamps = await page.evaluate(() => [...document.querySelectorAll("span.tabular-nums[title]")].filter((e) => /^\d{4}-\d\d-\d\d \d\d:\d\d$/.test(e.innerText.trim())).map((e) => ({ text: e.innerText.trim(), title: e.title })));
+    ok("  it is the author's time", stamps.length > 0 && stamps.every((x) => x.text === authored) && !stamps.some((x) => x.text === committed), JSON.stringify(stamps.slice(0, 2)));
+    ok("  with the committer's time in the title", stamps.every((x) => x.title.includes("committed 2026-09-20T10:00:00+02:00")), JSON.stringify(stamps.slice(0, 1)));
+    ok("  everyone is the default, with the total", s.includes("Everyone · 8"));
+    const pick = async (trigger, option) => {
+      await page.evaluate((t) => [...document.querySelectorAll("button")].find((b) => b.innerText.includes(t)).click(), trigger);
+      await page.waitForFunction((o) => [...document.querySelectorAll("button")].some((b) => b.innerText.includes(o)), { timeout: 4000 }, option);
+      await page.evaluate((o) => [...document.querySelectorAll("button")].find((b) => b.innerText.includes(o)).click(), option);
+    };
+    await pick("Everyone · 8", "Other Person · 1");
+    await page.waitForFunction(() => document.body.innerText.includes("by Other Person"), { timeout: 4000 });
+    const last = await lastCall(page, "history_page");
+    ok("choosing a person re-reads the page filtered by their email, from the first page", last && JSON.stringify(last.args.authors) === '["other@example.test"]' && last.args.offset === 0, JSON.stringify(last && last.args));
+    ok("  and says so in the summary line", (await text(page)).includes("by Other Person"));
+    // Open the list again: the bot is marked, and a preset leaves bots out.
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Other Person · 1")).click());
+    await page.waitForFunction(() => document.body.innerText.includes("People only (hide bots and CI) · 3"), { timeout: 4000 });
+    const opened = await text(page);
+    ok("  a bot is marked as one in the list", opened.includes("github-actions[bot] (bot) · 5"));
+    ok("  People only is offered because a bot commits here, with the human total", opened.includes("People only (hide bots and CI) · 3"));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("People only (hide bots and CI) · 3")).click());
+    await page.waitForFunction(() => document.body.innerText.includes("by people only"), { timeout: 4000 });
+    const ppl = await lastCall(page, "history_page");
+    ok("  choosing it sends every human's email and no bot", ppl && JSON.stringify(ppl.args.authors) === '["me@personal.test","other@example.test"]' && ppl.args.offset === 0, JSON.stringify(ppl && ppl.args));
+    await page.close();
+  }
+  {
+    // Which commits are pushed: a row no remote-tracking branch has carries a mark, and a toggle lists only those.
+    const local = { ...HISTORY_PAGE, commits: [{ ...HISTORY_PAGE.commits[0], refs: ["HEAD -> main"], unpushed: true }, ...HISTORY_PAGE.commits.slice(1)] };
+    const page = await openHistoryPage(browser, server, { historyPage: local });
+    await page.waitForFunction(() => document.body.innerText.includes("not pushed"), { timeout: 4000 });
+    const marked = await page.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.includes("not pushed")).map((b) => b.innerText.replace(/\s+/g, " ")));
+    ok("a commit no remote has carries a 'not pushed' mark on its row, and only that row", marked.length === 1 && marked[0].includes("Tidy the settings page"), JSON.stringify(marked));
+    const box = await page.$('input[aria-label="Only commits not pushed yet"]');
+    ok("  the list offers to show only such commits", box !== null);
+    await box.evaluate((el) => el.click());
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "history_page").some((c) => c.args.unpushedOnly === true), { timeout: 4000 });
+    const only = await lastCall(page, "history_page");
+    ok("  which re-reads the page from the start with only what no remote has", only && only.args.unpushedOnly === true && only.args.offset === 0, JSON.stringify(only && only.args));
+    ok("  and the summary line says so", (await text(page)).includes("not pushed yet"));
+    await page.close();
+  }
+  {
+    // No remote-tracking branch at all: nothing is known to be pushed, and no row is marked.
+    const none = { ...HISTORY_PAGE, remote_refs: false, commits: HISTORY_PAGE.commits.map((c) => ({ ...c, unpushed: true })) };
+    const page = await openHistoryPage(browser, server, { historyPage: none });
+    await page.waitForFunction(() => document.body.innerText.includes("No remote-tracking branch here"), { timeout: 4000 });
+    const marked = await page.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.includes("not pushed")).length);
+    ok("without a remote-tracking branch the page says nothing is known to be pushed, and marks no row", marked === 0);
+    await page.close();
+  }
+  {
+    // A repository without submodules, opened with the toggle left on from another one.
+    const page = await open({ persist: { "history.hidePointerOnly": true } });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_page"), { timeout: 4000 });
+    const first = await lastCall(page, "history_page");
+    ok("a toggle left on elsewhere hides nothing where there are no submodules", first && first.args.hidePointerOnly === false, JSON.stringify(first && first.args));
+    ok("  and is not offered there", (await page.$('input[aria-label="Hide pointer-only commits"]')) === null);
+    await page.close();
+  }
+  {
+    // With the repository's account selected, "Just me" is one of the people.
+    const page = await open({ account: "p1" });
+    await page.waitForFunction(() => document.body.innerText.includes("Everyone · 8"), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Everyone · 8")).click());
+    await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Just me · 2"), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Just me · 2").click());
+    await page.waitForFunction(() => document.body.innerText.includes("by me"), { timeout: 4000 });
+    const mine = await lastCall(page, "history_page");
+    ok("Just me filters by the account's own address, from the first page", mine && JSON.stringify(mine.args.authors) === '["me@personal.test"]' && mine.args.offset === 0, JSON.stringify(mine && mine.args));
+    await page.close();
+  }
+  {
+    // "Just me", left on from the last visit — and the people are read before the accounts are.
+    const page = await open({ account: "p1", persist: { "history.author": "me" }, reposDelay: 700 });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_authors"), { timeout: 4000 });
+    await page.waitForFunction(() => document.body.innerText.includes("by me"), { timeout: 4000 }).catch(() => {});
+    await sleep(900);
+    const kept = await page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:history.author")));
+    ok("Just me, left on from the last visit, survives the people arriving before the accounts", kept === "me", JSON.stringify(kept));
+    const mine = await lastCall(page, "history_page");
+    ok("  and filters by the account's address once that is known", mine && JSON.stringify(mine.args.authors) === '["me@personal.test"]', JSON.stringify(mine && mine.args));
+    ok("  the summary line says so", (await text(page)).includes("by me"));
+    const pages = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "history_page").map((c) => c.args.authors));
+    ok("  nobody else's commits were shown as mine meanwhile: the page waited for the accounts", pages.length === 1 && JSON.stringify(pages[0]) === '["me@personal.test"]', JSON.stringify(pages));
+    await page.close();
+  }
+  {
+    // The older checkbox ("Only commits authored by this account") waits for the accounts the same way.
+    const page = await open({ account: "p1", persist: { "history.onlyMine": true }, reposDelay: 700 });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_page"), { timeout: 4000 });
+    await sleep(300);
+    const pages = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "history_page").map((c) => c.args.authors));
+    ok("the account-only checkbox also waits for the accounts: one request, filtered", pages.length === 1 && JSON.stringify(pages[0]) === '["me@personal.test"]', JSON.stringify(pages));
+    await page.close();
+  }
+  {
+    // An account whose "address" is not an address (an import's `sam <sam>`): "me" is asked for as that whole identity.
+    const repos = [{ path: REPO, name: "gitswitch", profile_id: "p1", profile_name: "Sam", profile_email: "sam" }];
+    const people = [{ name: "Sam", email: "sam", commits: 2 }, { name: "Samantha Lee", email: "samantha@x.test", commits: 1 }];
+    const page = await open({ account: "p1", repos, authors: people, persist: { "history.author": "me" } });
+    await page.waitForFunction(() => document.body.innerText.includes("by me"), { timeout: 4000 });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_page" && c.args.authors && c.args.authors[0] === "Sam <sam>"), { timeout: 4000 }).catch(() => {});
+    const me = await lastCall(page, "history_page");
+    ok("Just me for an account without an @ sends the whole identity, not a word everyone's name may contain", me && JSON.stringify(me.args.authors) === '["Sam <sam>"]', JSON.stringify(me && me.args.authors));
+    await page.close();
+  }
+  {
+    // With no account selected there is no "me" here: the preset is dropped, as before.
+    const page = await open({ persist: { "history.author": "me" }, reposDelay: 300 });
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem("gitswitch:history.author")) === "", { timeout: 4000 }).catch(() => {});
+    const kept = await page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:history.author")));
+    ok("  with no account selected, a Just me left on elsewhere is still let go", kept === "", JSON.stringify(kept));
+    await page.close();
+  }
+  {
+    // People whose commits carry no address, or one that is not an address, are picked by their whole identity.
+    const people = [
+      { name: "Sam", email: "", commits: 2 },
+      { name: "Samantha Lee", email: "samantha@x.test", commits: 1 },
+      { name: "jdoe", email: "jdoe", commits: 1 },
+    ];
+    const page = await open({ authors: people });
+    await page.waitForFunction(() => document.body.innerText.includes("Everyone · 4"), { timeout: 4000 });
+    const pick = async (trigger, option) => {
+      await page.evaluate((t) => [...document.querySelectorAll("button")].find((b) => b.innerText.includes(t)).click(), trigger);
+      await page.waitForFunction((o) => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === o), { timeout: 4000 }, option);
+      await page.evaluate((o) => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === o).click(), option);
+    };
+    await pick("Everyone · 4", "Sam · 2");
+    await page.waitForFunction(() => document.body.innerText.includes("by Sam"), { timeout: 4000 });
+    const sam = await lastCall(page, "history_page");
+    ok("a person with no address is asked for by their whole identity, not a name that others contain", sam && JSON.stringify(sam.args.authors) === '["Sam <>"]', JSON.stringify(sam && sam.args));
+    await pick("Sam · 2", "jdoe · 1");
+    await page.waitForFunction(() => document.body.innerText.includes("by jdoe"), { timeout: 4000 });
+    const jd = await lastCall(page, "history_page");
+    ok("  and so is one whose address is not an address", jd && JSON.stringify(jd.args.authors) === '["jdoe <jdoe>"]', JSON.stringify(jd && jd.args));
+    await pick("jdoe · 1", "Samantha Lee · 1");
+    await page.waitForFunction(() => document.body.innerText.includes("by Samantha Lee"), { timeout: 4000 });
+    const sl = await lastCall(page, "history_page");
+    ok("  a real address is still sent as the address", sl && JSON.stringify(sl.args.authors) === '["samantha@x.test"]', JSON.stringify(sl && sl.args));
+    await page.close();
+  }
+
   section("Go to commit");
   {
     const page = await open();
@@ -279,7 +494,9 @@ try {
     ok("  the detached-HEAD row explains nothing is lost", rows[0]?.includes("detached HEAD") && rows[0]?.includes("Nothing is lost"));
     ok("  the branch rows name the current branch", rows[1]?.includes("Move main here") && rows[3]?.includes("drop everything after it"));
     ok("opening it resolved the commit", (await calls(page, "history_resolve")).length >= 2);
-    ok("  and read the repo status", (await calls(page, "changes_repo_status")).length >= 1);
+    // The chooser itself reads the repo status (it needs the dirty-tree facts);
+    // the page's own HEAD question is the cheap one.
+    ok("  and read where HEAD is", (await calls(page, "history_head")).length >= 1);
     ok("no confirm dialog is stacked on the chooser", !(await text(page)).includes("Move main back to"));
 
     ok("Do it on Look at it", await clickInRow(page, "Look at it", { text: "Do it" }));
@@ -580,7 +797,7 @@ try {
     ok("a result card shows the outcome", s.includes("revert ok"));
     ok('  with "Open in Changes"', (await buttonCount(page, "Open in Changes")) === 1);
     ok("the branch list is still on screen", s.includes("All branches") && s.includes("feature/lfs"));
-    ok("  and the URL is still /history", (await page.evaluate(() => location.pathname)) === "/history");
+    ok("  and the URL is still /history", (await page.evaluate(() => location.pathname)) === "/repo/history");
     await sleep(200);
     ok("branches, sync and the page were re-read", (await calls(page, "history_page")).length > before && (await calls(page, "history_branches")).length >= 2 && (await calls(page, "history_sync_status")).length >= 2);
     await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "dismiss").click());
@@ -597,7 +814,7 @@ try {
     await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Open in Changes"), { timeout: 4000 });
     await (await button(page, "Open in Changes")).click();
     await sleep(200);
-    ok("Open in Changes goes to the Changes page for this repo", (await page.evaluate(() => location.pathname)) === "/changes" && (await page.evaluate(() => localStorage.getItem("gitswitch:changes.repo"))) === JSON.stringify(REPO));
+    ok("Open in Changes goes to the Changes page for this repo", (await page.evaluate(() => location.pathname)) === "/repo/changes" && (await page.evaluate(() => localStorage.getItem("gitswitch:repo.path"))) === JSON.stringify(REPO));
     await page.close();
   }
   {
@@ -642,12 +859,21 @@ try {
   section("Submodules: a submodule's history from the same page");
   {
     const SUBS = [
-      { path: "staging", name: "staging", initialised: true, listed: true, gitdir_valid: true, own_ahead: 2, own_behind: 0, summary: "2 commits of yours not on its upstream" },
-      { path: "harness", name: "harness", initialised: true, listed: true, gitdir_valid: true, own_ahead: 0, own_behind: 1, summary: "1 commit behind its upstream" },
-      { path: "forge-tooling/x", name: "x", initialised: false, listed: false, gitdir_valid: false, own_ahead: 0, own_behind: 0, summary: "not initialised" },
+      sub({ path: "staging", name: "staging", own_ahead: 2, own_behind: 0, summary: "2 commits of yours not on its upstream" }),
+      sub({ path: "harness", name: "harness", own_ahead: 0, own_behind: 1, summary: "1 commit behind its upstream" }),
+      sub({ path: "forge-tooling/x", name: "x", initialised: false, listed: false, gitdir_valid: false, state: "unmapped", actual: null, actual_short: null, summary: "not initialised" }),
     ];
-    const page = await openHistoryPage(browser, server, { submodules: SUBS });
+    const page = await openHistoryPage(browser, server, { submodules: SUBS, historyPage: HISTORY_PAGE_BUMP });
     await page.waitForFunction(() => document.body.innerText.includes("Submodules:"), { timeout: 5000 });
+    ok("a commit that only bumps a submodule pointer says so on its row", (await text(page)).includes("submodule bump: trinity"));
+    const hideBox = await page.$('input[aria-label="Hide pointer-only commits"]');
+    ok("  and the list offers to hide such commits", hideBox !== null);
+    await hideBox.evaluate((el) => el.click());
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "history_page").some((c) => c.args.hidePointerOnly === true), { timeout: 4000 });
+    const hidden = await lastCall(page, "history_page");
+    ok("  which re-reads the page from the start with the bumps left out", hidden && hidden.args.hidePointerOnly === true && hidden.args.offset === 0, JSON.stringify(hidden && hidden.args));
+    await hideBox.evaluate((el) => el.click());
+    await page.waitForFunction(() => { const l = window.__CALLS__.filter((c) => c.cmd === "history_page"); return l.length > 0 && l[l.length - 1].args.hidePointerOnly === false; }, { timeout: 4000 });
     let s = await text(page);
     ok("populated, mapped submodules are listed as chips with their own ahead/behind", s.includes("staging ↑2") && s.includes("harness ↓1"));
     ok("  an uninitialised gitlink is not offered", !s.includes("forge-tooling"));
@@ -659,7 +885,7 @@ try {
     s = await text(page);
     ok("clicking a chip browses that submodule and says so", s.includes("Browsing inside") && s.includes("staging"));
     const subCalls = await page.evaluate(() => window.__CALLS__.filter((c) => c.args?.repoPath === "/repos/gitswitch/staging").map((c) => c.cmd));
-    ok("  branches, status, sync and the commit page are read from the submodule", ["history_branches", "changes_repo_status", "history_sync_status", "history_page"].every((c) => subCalls.includes(c)));
+    ok("  branches, status, sync and the commit page are read from the submodule", ["history_branches", "history_head", "history_sync_status", "history_page"].every((c) => subCalls.includes(c)));
     await (await button(page, "Fetch")).click();
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_fetch"), { timeout: 5000 });
     const fetched = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "history_fetch").map((c) => c.args.repoPath));

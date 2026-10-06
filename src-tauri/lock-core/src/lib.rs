@@ -7,7 +7,15 @@
 //! exactly what the helper *should* have written, which is how tampering is
 //! measured rather than guessed.
 
-#![forbid(unsafe_code)]
+// win.rs is the one exception: Win32's security API is unsafe by nature,
+// so on Windows the lint is `deny` and that module allows it for itself
+// (`forbid` could not be lifted). Everywhere else it stays forbidden.
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![cfg_attr(windows, deny(unsafe_code))]
+
+/// Windows file ownership, shared with the privileged helper.
+#[cfg(windows)]
+pub mod win;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

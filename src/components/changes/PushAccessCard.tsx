@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Lock,
   LockOpen,
@@ -10,6 +10,8 @@ import {
   Terminal,
   CheckCircle2,
   XCircle,
+  RefreshCw,
+  UserRound,
 } from "lucide-react";
 import { Button } from "../Button";
 import * as api from "../../lib/api";
@@ -20,6 +22,8 @@ interface Props {
   repoPath: string;
   push: PushState;
   onChanged: (p: PushState) => void;
+  /** Bumped by the page's Refresh: the pushing identity is read again. */
+  refreshKey: number;
 }
 
 type Segment = { value: PushMode; label: string; icon: typeof Lock; what: string };
@@ -84,7 +88,94 @@ const OUTCOME_STYLE: Record<JobOutcomeKind, string> = {
  * written and which prompt will appear before anything runs, and every outcome
  * of that prompt — cancelled included — comes back as a sentence.
  */
-export function PushAccessCard({ repoPath, push, onChanged }: Props) {
+/**
+ * Who a push from here would authenticate as. Read once per repository (and
+ * on Re-check), never polled: it may ask github.com over ssh.
+ */
+function PushesAs({ repoPath, refreshKey }: { repoPath: string; refreshKey: number }) {
+  const [who, setWho] = useState<api.PushIdentity | null>(null);
+  const [loading, setLoading] = useState(true);
+  const seq = useRef(0);
+
+  const read = (refresh: boolean) => {
+    const mine = ++seq.current;
+    setLoading(true);
+    api
+      .changesPushIdentity(repoPath, refresh)
+      .then((w) => {
+        if (mine === seq.current) setWho(w);
+      })
+      .catch(() => {
+        if (mine === seq.current) setWho(null);
+      })
+      .finally(() => {
+        if (mine === seq.current) setLoading(false);
+      });
+  };
+  useEffect(() => {
+    read(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoPath, refreshKey]);
+
+  if (loading && !who) {
+    return <p className="text-xs text-zinc-500">Checking which account would push…</p>;
+  }
+  if (!who || who.via === "blocked" || who.via === "local") return null;
+
+  const mismatch =
+    !!who.login && !!who.expected_login && who.login.toLowerCase() !== who.expected_login.toLowerCase();
+  const how =
+    who.via === "ssh-key" && who.key_path
+      ? `key ${who.key_path.split(/[\\/]/).pop()}`
+      : who.via === "ssh-agent"
+        ? "the ssh agent's key"
+        : who.via === "https-credential"
+          ? `HTTPS credential${who.account && who.account !== who.login ? ` (${who.account})` : ""}`
+          : null;
+
+  return (
+    <div className="space-y-1" aria-label="Who pushes">
+      <div className="flex items-center gap-1.5 text-xs">
+        <UserRound size={13} className={`shrink-0 ${mismatch ? "text-amber-400" : "text-zinc-500"}`} />
+        {who.login ? (
+          <span className="text-zinc-300">
+            Pushes as <span className="font-medium text-zinc-100">@{who.login}</span>
+            {how && <span className="text-zinc-500"> · {how}</span>}
+          </span>
+        ) : (
+          <span className="text-zinc-500">Can't tell who would push: {who.detail}</span>
+        )}
+        <button
+          type="button"
+          aria-label="Re-check who pushes"
+          title="Ask again"
+          onClick={() => read(true)}
+          disabled={loading}
+          className="ml-auto shrink-0 rounded p-0.5 text-zinc-600 hover:bg-zinc-700 hover:text-zinc-300 cursor-pointer disabled:cursor-default"
+        >
+          <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+        </button>
+      </div>
+      {mismatch && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-100/90 leading-relaxed">
+          <AlertTriangle size={13} className="shrink-0 mt-0.5 text-amber-400" />
+          <span>
+            This folder's profile is <span className="font-medium">@{who.expected_login}</span>, but a push
+            would go as <span className="font-medium">@{who.login}</span>
+            {who.key_path ? ` — the key ${who.key_path.split(/[\\/]/).pop()} belongs to that account.` : "."}{" "}
+            {who.via === "ssh-key"
+              ? "Check the profile's SSH key, or the remote."
+              : who.via === "ssh-agent"
+                ? "The profile names no SSH key, so ssh used the agent's. Pick a key in the profile, or change the remote."
+                : "Switch the stored HTTPS credential (gh auth switch, or your credential helper), or change the remote to SSH."}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props) {
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const [pending, setPending] = useState<PushMode | null>(null);
@@ -188,6 +279,7 @@ export function PushAccessCard({ repoPath, push, onChanged }: Props) {
       </div>
 
       <p className="text-xs text-zinc-400 leading-relaxed">{push.reason}</p>
+      <PushesAs repoPath={repoPath} refreshKey={refreshKey} />
 
       <div className="flex rounded-lg border border-zinc-700 overflow-hidden w-fit max-w-full" role="radiogroup" aria-label="Push access">
         {SEGMENTS.map((s) => {

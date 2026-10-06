@@ -16,6 +16,7 @@ import type { Profile } from "../types/profile";
 import { baseName, isWithin, normPath } from "../lib/paths";
 import { usePersistedState } from "../lib/persist";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 type Phase = "idle" | "scanning" | "resolving" | "checking" | "ready" | "applying";
 
@@ -274,12 +275,15 @@ export function AutoAssign() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-zinc-100">Auto Assign</h1>
-        <p className="text-sm text-zinc-400 mt-1">
-          Scan a folder for repos, detect which of your GitHub accounts has
-          access to each, and map them to the right profile automatically.
-        </p>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-zinc-100">Auto Assign</h1>
+          <p className="text-sm text-zinc-400 mt-1">
+            Scan a folder for repos, detect which of your GitHub accounts has
+            access to each, and map them to the right profile automatically.
+          </p>
+        </div>
+        <RefreshButton onClick={runScan} busy={busy} disabled={!root} title={root ? "Scan the folder again" : "Choose a folder to scan first"} />
       </div>
 
       {error && (

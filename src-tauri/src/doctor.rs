@@ -118,7 +118,7 @@ pub fn manual_includeif_rules(gitconfig: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 async fn command_exists(bin: &str) -> bool {
-    tokio::process::Command::new(bin)
+    crate::spawn::async_command(bin)
         .arg("--version")
         .output()
         .await
@@ -141,6 +141,22 @@ pub async fn check_environment() -> Result<Vec<Finding>, AppError> {
             "git is not installed",
             "GitSwitch drives your system's git. Install the Xcode command line tools (`xcode-select --install`) or git for your platform.",
         ));
+    }
+    // Remote rules are `includeIf "hasconfig:…"`, which git before 2.36 does
+    // not know — and silently ignores, so nothing else would ever say why a
+    // clone outside every folder still commits as the default.
+    let store = profiles::load_profiles().unwrap_or_else(|_| profiles::ProfileStore::new());
+    if store.profiles.iter().any(|p| !p.remote_patterns.is_empty()) {
+        if let Some(v) = git_version().await {
+            if !gitswitch_lock_core::version_at_least(&v, "2.36.0") {
+                out.push(Finding::new(
+                    "git-too-old-for-remote-rules",
+                    "warning",
+                    format!("git {} is too old for remote rules", v),
+                    "A profile claims remotes (`owner/` rules). Those are applied through `includeIf \"hasconfig:remote.*.url\"`, which exists from git 2.36 (April 2022); this git ignores them, so such clones commit as the default profile. Update git.",
+                ));
+            }
+        }
     }
     if !command_exists("gh").await {
         out.push(Finding::new(
@@ -175,7 +191,7 @@ pub async fn check_environment() -> Result<Vec<Finding>, AppError> {
     }
 
     // Hand-written includeIf rules can overlap the managed ones.
-    let gitconfig_path = home().join(".gitconfig");
+    let gitconfig_path = crate::git_config::git_home().join(".gitconfig");
     if let Ok(gc) = fs::read_to_string(&gitconfig_path) {
         let manual = manual_includeif_rules(&gc);
         if !manual.is_empty() {
@@ -400,6 +416,34 @@ pub async fn check_repos() -> Result<Vec<Finding>, AppError> {
                 checked.push(r.path.clone());
                 let name = crate::paths::base_name(&r.path);
 
+                // A value in the repository's own .git/config wins over every
+                // profile rule, silently. The Changes page shows that for the
+                // open repository; this is the same check for all of them.
+                if let Some(owner) = crate::commit_audit::owning_profile(&r.path, &store.profiles) {
+                    for (key, value) in local_overrides(&r.path).await {
+                        let expected = expected_local_value(owner, &key);
+                        if expected.as_deref() == Some(value.as_str()) {
+                            continue; // the same value twice: redundant, not wrong
+                        }
+                        out.push(
+                            Finding::new(
+                                "local-override",
+                                "warning",
+                                format!("{} overrides {} in its own config", name, key),
+                                format!(
+                                    "{} sets {} = {} in .git/config, which wins over the profile \"{}\" ({}). Removing the local setting lets the profile apply again.",
+                                    r.path,
+                                    key,
+                                    value,
+                                    owner.name,
+                                    expected.map(|e| format!("which expects {}", e)).unwrap_or_else(|| "which sets nothing for it".into())
+                                ),
+                            )
+                            .with_fix(format!("unset-local:{}:{}", key, r.path), "Remove the local setting"),
+                        );
+                    }
+                }
+
                 if r.remote_url.is_empty() {
                     continue; // no origin — nothing to push to yet
                 }
@@ -431,12 +475,98 @@ pub async fn check_repos() -> Result<Vec<Finding>, AppError> {
                         )
                         .with_fix(format!("convert-ssh:{}", r.path), "Convert to SSH"),
                     );
+                } else if let Some(sr) = crate::ssh_config::ssh_host_of_url(&r.remote_url) {
+                    // `git@gh-work:…` or `git@github.com-work:…` is an ssh alias:
+                    // which host and which key it means is in ~/.ssh/config, and
+                    // only `ssh -G` reads that the way ssh does (Match blocks
+                    // included). resolve() is cached, so every remote is asked.
+                    let host = sr.host;
+                    {
+                        if let Some(h) = crate::ssh_config::resolve(&host).await {
+                            if !h.hostname.eq_ignore_ascii_case(&host) {
+                                let profile_key = crate::commit_audit::owning_profile(&r.path, &store.profiles).and_then(|p| p.ssh_key_path.clone());
+                                let key_note = match (&profile_key, h.identity_files.iter().find(|f| std::path::Path::new(f).is_file())) {
+                                    (Some(k), _) => format!("This folder's profile sets the key {} through core.sshCommand, so that is the key used — the profile's key wins over the alias's.", crate::paths::base_name(k)),
+                                    (None, Some(f)) => format!("This folder's profile has no key of its own, so ssh will use the alias's: {}.", f),
+                                    (None, None) => "Neither the profile nor the alias names a key that exists, so ssh will try whatever the agent holds.".to_string(),
+                                };
+                                out.push(Finding::new(
+                                    "ssh-alias",
+                                    "info",
+                                    format!("{} pushes through the ssh alias {}", name, host),
+                                    format!("{} → {} (ssh -G). {}", r.remote_url, h.hostname, key_note),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     Ok(out)
+}
+
+/// The identity-related keys git may hold in a repository's own config.
+const LOCAL_IDENTITY_KEYS: &[&str] = &["user.name", "user.email", "user.signingkey", "core.sshcommand", "commit.gpgsign", "gpg.format"];
+
+/// `(key, value)` for every identity-related key set in the repository's own
+/// config — `--local`, so a worktree or submodule is read correctly too.
+async fn local_overrides(repo: &str) -> Vec<(String, String)> {
+    let out = crate::git_exec::GitCmd::at(repo)
+        .args(["config", "--local", "-z", "--get-regexp", r"^(user\.(name|email|signingkey)|core\.sshcommand|commit\.gpgsign|gpg\.format)$"])
+        .run()
+        .await;
+    let Ok(out) = out else { return Vec::new() };
+    if !out.ok() {
+        return Vec::new(); // exit 1: nothing matched
+    }
+    out.text()
+        .split('\0')
+        .filter(|e| !e.is_empty())
+        .map(|entry| {
+            let (k, v) = entry.split_once('\n').unwrap_or((entry, ""));
+            (k.to_ascii_lowercase(), v.to_string())
+        })
+        .collect()
+}
+
+/// What the owning profile would set for `key` — None when it sets nothing.
+fn expected_local_value(p: &profiles::Profile, key: &str) -> Option<String> {
+    match key {
+        "user.name" => Some(p.git_name.clone()),
+        "user.email" => Some(p.git_email.clone()),
+        "core.sshcommand" => p.ssh_key_path.as_deref().map(crate::git_config::ssh_command_for),
+        "user.signingkey" if p.signing_enabled => p.ssh_key_path.as_ref().map(|k| format!("{}.pub", crate::paths::norm(k))),
+        "commit.gpgsign" if p.signing_enabled => Some("true".into()),
+        "gpg.format" if p.signing_enabled => Some("ssh".into()),
+        _ => None,
+    }
+}
+
+/// The repair: drop one identity key from the repository's own config so the
+/// profile's rule applies again. Only the keys above may be touched.
+pub async fn unset_local(repo_path: &str, key: &str) -> Result<String, AppError> {
+    let key_lc = key.to_ascii_lowercase();
+    if !LOCAL_IDENTITY_KEYS.contains(&key_lc.as_str()) {
+        return Err(AppError::Config(format!("{} is not an identity setting GitSwitch manages.", key)));
+    }
+    let out = crate::git_exec::GitCmd::at(repo_path)
+        .args(["config", "--local", "--unset-all", &key_lc])
+        .run()
+        .await?;
+    // 5 = the key was not set, which is the state we wanted anyway.
+    if !out.ok() && out.code != 5 {
+        return Err(AppError::Command(format!("git config --unset-all {} failed: {}", key_lc, out.stderr)));
+    }
+    Ok(format!("Removed {} from {}'s own config; the profile applies again.", key_lc, crate::paths::base_name(repo_path)))
+}
+
+/// "2.50.1" from `git --version` ("git version 2.50.1 (Apple Git-155)").
+async fn git_version() -> Option<String> {
+    let out = crate::spawn::async_command("git").arg("--version").output().await.ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace().nth(2).map(|v| v.to_string())
 }
 
 /// The first `git` on PATH, resolved the way a shell would.
@@ -454,7 +584,7 @@ fn git_on_path() -> Option<PathBuf> {
 #[cfg(unix)]
 async fn sudo_would_not_ask() -> bool {
     // `-n` never prompts: success means a live timestamp or a NOPASSWD rule.
-    let run = tokio::process::Command::new("sudo").args(["-n", "true"]).output();
+    let run = crate::spawn::async_command("sudo").args(["-n", "true"]).output();
     matches!(tokio::time::timeout(std::time::Duration::from_secs(5), run).await, Ok(Ok(o)) if o.status.success())
 }
 

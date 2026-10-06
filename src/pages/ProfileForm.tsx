@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, type SubmitEvent } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ArrowLeft, FolderPlus, X, Key, FolderOpen, Link2, Loader2, CheckCircle2 } from "lucide-react";
+import { ArrowLeft, FolderPlus, X, Key, FolderOpen, Link2, Loader2, CheckCircle2, Globe } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
@@ -31,6 +31,12 @@ export function ProfileForm() {
   const [isDefaultProfile, setIsDefaultProfile] = useState(false);
   const [directories, setDirectories] = useState<string[]>([]);
   const [dirInput, setDirInput] = useState("");
+  const [remotePatterns, setRemotePatterns] = useState<string[]>([]);
+  const [remoteInput, setRemoteInput] = useState("");
+  // The GitHub account this profile pushes as — from the sign-in page, or the
+  // account picked in "Autofill from GitHub". The Changes page checks a push
+  // against it.
+  const [githubLogin, setGithubLogin] = useState(searchParams.get("github_name") || "");
   const [sshKeys, setSshKeys] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -160,6 +166,8 @@ export function ProfileForm() {
       setSigningEnabled(profile.signing_enabled);
         setIsDefaultProfile(profile.is_default);
         setDirectories(profile.directories);
+        setRemotePatterns(profile.remote_patterns ?? []);
+        setGithubLogin(profile.github_login ?? "");
         setOriginalIdentity({ name: profile.git_name, email: profile.git_email });
 
         // Work out which GitHub account this profile is, in the background.
@@ -210,6 +218,10 @@ export function ProfileForm() {
           directories,
           allowPush,
           signingEnabled,
+          remotePatterns,
+          // Only a pick the person made changes the stored account; the
+          // background preselection is a display guess, not a decision.
+          githubLogin: userPicked.current && autofillAccount ? autofillAccount : githubLogin,
         });
         toast.success(`Profile "${name}" updated successfully`);
       } else {
@@ -221,6 +233,8 @@ export function ProfileForm() {
           directories,
           allowPush,
           signingEnabled,
+          remotePatterns,
+          githubLogin: (userPicked.current && autofillAccount) || githubLogin || null,
         });
         toast.success(`Profile "${name}" created successfully`);
       }
@@ -266,6 +280,20 @@ export function ProfileForm() {
 
   function removeDirectory(dir: string) {
     setDirectories((prev) => prev.filter((d) => d !== dir));
+  }
+
+  // `acme` and `acme/` mean the same thing; the backend normalises the rest
+  // (and refuses what it cannot read), so only the obvious is tidied here.
+  function addRemotePattern() {
+    const raw = remoteInput.trim();
+    if (!raw) return;
+    const p = /^[A-Za-z0-9_.-]+$/.test(raw) ? `${raw}/` : raw;
+    setRemotePatterns((prev) => (prev.includes(p) ? prev : [...prev, p]));
+    setRemoteInput("");
+  }
+
+  function removeRemotePattern(p: string) {
+    setRemotePatterns((prev) => prev.filter((x) => x !== p));
   }
 
   async function registerSigning() {
@@ -386,6 +414,30 @@ export function ProfileForm() {
               {autofilling && (
                 <Loader2 size={18} className="animate-spin text-emerald-400 shrink-0" />
               )}
+            </div>
+          </Card>
+        )}
+
+        {(githubLogin || (userPicked.current && autofillAccount)) && (
+          <Card>
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <p className="text-xs text-zinc-400">
+                Pushes from this profile's repositories are expected to go as{" "}
+                <span className="text-zinc-200">@{(userPicked.current && autofillAccount) || githubLogin}</span>.
+                The Changes page says so when a push would go as someone else.
+              </p>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => {
+                  setGithubLogin("");
+                  setAutofillAccount("");
+                  userPicked.current = true;
+                }}
+              >
+                Isn't this account? Clear
+              </Button>
             </div>
           </Card>
         )}
@@ -580,6 +632,59 @@ export function ProfileForm() {
                   )}
                 </div>
               )}
+            </div>
+          )}
+        </Card>
+
+        <Card>
+          <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider mb-4 flex items-center gap-2">
+            <Globe size={14} className="text-zinc-500" />
+            Remotes
+          </h2>
+          <p className="text-xs text-zinc-500 mb-3">
+            Claim GitHub owners or repositories: any clone whose remote is{" "}
+            <span className="font-mono">github.com/owner/…</span> commits as this profile, wherever
+            its folder is. A folder rule above still wins where both apply. Needs git 2.36 or newer.
+            The Changes page knows such a clone's profile once it is opened there; Doctor's
+            per-repository checks cover profile folders only.
+          </p>
+          <div className="flex gap-2 mb-3">
+            <Input
+              placeholder="owner/   or   owner/repo   or   https://gitlab.example.com/team/**"
+              value={remoteInput}
+              onChange={(e) => setRemoteInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  addRemotePattern();
+                }
+              }}
+              aria-label="Remote rule"
+              className="flex-1"
+            />
+            <Button type="button" variant="secondary" onClick={addRemotePattern}>
+              <Globe size={16} />
+              Add
+            </Button>
+          </div>
+          {remotePatterns.length > 0 && (
+            <div className="space-y-1.5">
+              {remotePatterns.map((p) => (
+                <div
+                  key={p}
+                  className="flex items-center justify-between px-3 py-2 rounded-lg bg-zinc-800/70 border border-zinc-700/50"
+                >
+                  <span className="text-sm text-zinc-300 font-mono truncate min-w-0">{p}</span>
+                  <button
+                    type="button"
+                    aria-label={`Remove remote rule ${p}`}
+                    onClick={() => removeRemotePattern(p)}
+                    className="p-1 rounded hover:bg-zinc-700 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer"
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+              ))}
             </div>
           )}
         </Card>

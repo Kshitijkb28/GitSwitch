@@ -106,6 +106,37 @@ ok "  the remote really advanced" "$(git -C "$SB/remote.git" log -1 --format=%s 
 OUT=$(probe push "$SB/work" "")
 ok "a second push says up to date" "$(printf '%s' "$OUT" | jqf headline)" "Already up to date"
 
+section "A branch started from main with tracking is never pushed into main"
+# `git switch -c feature --track origin/main` leaves feature tracking main.
+# Pushing "to the upstream" would land the feature's commit in main. git's own
+# default (push.default=simple) refuses exactly this, and so does the app —
+# offering to publish the branch under its own name instead.
+git -C "$SB/work" switch -q -c feature --track origin/main 2>/dev/null
+printf 'f1\n' > "$SB/work/feature.txt"; git -C "$SB/work" add -A >/dev/null; git -C "$SB/work" commit -qm "feature work"
+OUT=$(probe push "$SB/work" "")
+ok "the push is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "upstream-name-differs"
+ok "  saying where it would have gone" "$(printf '%s' "$OUT" | jqf refusal.message)" "origin/main"
+ok "  and offering the way out" "$(printf '%s' "$OUT" | jqf refusal.message)" "origin/feature"
+ok "  main on the remote did not move" "$(git -C "$SB/remote.git" log -1 --format=%s main)" "to push"
+OUT=$(probe push "$SB/work" "upstream")
+ok "publishing sends it under its own name" "$(printf '%s' "$OUT" | jqf headline)" "Pushed to origin"
+ok "  the remote has the branch" "$(git -C "$SB/remote.git" log -1 --format=%s feature)" "feature work"
+ok "  which the branch now tracks" "$(git -C "$SB/work" rev-parse --abbrev-ref '@{u}')" "origin/feature"
+ok "  and main is still untouched" "$(git -C "$SB/remote.git" log -1 --format=%s main)" "to push"
+OUT=$(probe push "$SB/work" "")
+ok "  a plain push now goes to its own branch" "$(printf '%s' "$OUT" | jqf headline)" "Already up to date"
+
+section "A branch tracking a local branch has nowhere remote to go"
+git -C "$SB/work" switch -q -c local-child --track main 2>/dev/null
+OUT=$(probe push "$SB/work" "")
+ok "the push is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "local-upstream"
+ok "  naming the local branch" "$(printf '%s' "$OUT" | jqf refusal.message)" '`main`'
+ok "  pulling is refused for the same reason, not sent to a remote called main" "$(probe pull "$SB/work" "ff-only" | jqf refusal.code)" "local-upstream"
+OUT=$(probe push "$SB/work" "upstream")
+ok "publishing it works" "$(printf '%s' "$OUT" | jqf headline)" "Pushed to origin"
+ok "  and it tracks the remote now" "$(git -C "$SB/work" rev-parse --abbrev-ref '@{u}')" "origin/local-child"
+git -C "$SB/work" switch -q main; git -C "$SB/work" branch -q -D feature local-child
+
 section "Push blocking holds in a plain terminal"
 OUT=$(probe block "$SB/work" "on")
 ok "block reports itself as on" "$(printf '%s' "$OUT" | jqf repo_blocked)" "True"
@@ -305,6 +336,88 @@ git -C "$SB/work" add big.txt >/dev/null
 OUT=$(probe diff "$SB/work" "big.txt,staged")
 ok "caps a huge diff instead of shipping it all" "$(printf '%s' "$OUT" | jqf truncated)" "True"
 git -C "$SB/work" reset -q
+
+section "Who would push: the account behind the remote, before anything is sent"
+# A fake ssh stands in for github.com: it greets with the key it was handed, or
+# "agent-user" with none. -G and -F go to the real ssh, so alias resolution is
+# the real thing. GITSWITCH_SSH_CONFIG (debug builds) points ssh at a sandbox
+# config, because ssh finds ~ through passwd, not $HOME.
+FAKE="$SB/fakebin"; mkdir -p "$FAKE" "$SB/keys"; REAL_SSH="$(command -v ssh)"
+printf 'not a key\n' > "$SB/keys/work_key"; printf 'not a key\n' > "$SB/keys/alias_key"
+cat > "$FAKE/ssh" <<FAKESSH
+#!/bin/sh
+case "\$1" in -G|-F) exec "$REAL_SSH" "\$@" ;; esac
+# As ssh does: an explicit -i wins; otherwise the agent's key is offered first
+# unless the Host block says IdentitiesOnly, in which case its IdentityFile is.
+key=""; port=""; prev=""; dest=""
+for a in "\$@"; do
+  [ "\$prev" = "-i" ] && key="\$a"; [ "\$prev" = "-p" ] && port="\$a"; prev="\$a"; dest="\$a"
+done
+host="\${dest#*@}"
+if [ -z "\$key" ]; then
+  cfg="\$("$REAL_SSH" -F "\$GITSWITCH_SSH_CONFIG" -G "\$host" 2>/dev/null)"
+  if printf '%s\n' "\$cfg" | grep -q '^identitiesonly yes'; then key="\$(printf '%s\n' "\$cfg" | awk '/^identityfile /{print \$2; exit}')"; fi
+fi
+if [ -n "\$key" ]; then who="\$(basename "\$key")"; elif [ -n "\$port" ]; then who="port-\$port"; else who="agent-user"; fi
+echo "Hi \$who! You've successfully authenticated, but GitHub does not provide shell access." >&2
+exit 1
+FAKESSH
+chmod +x "$FAKE/ssh"
+# The alias names a key; every other host names one that does not exist, so
+# this machine's own ~/.ssh keys never leak into the answers.
+printf 'Host gh-work\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\nHost *\n  IdentityFile %s\n' "$SB/keys/alias_key" "$SB/keys/none" > "$SB/sshcfg"
+WJ="$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"refresh":False}))' "$SB/work")"
+who() { PATH="$FAKE:$PATH" GITSWITCH_SSH_CONFIG="$SB/sshcfg" GITSWITCH_GITHUB_API="http://127.0.0.1:9" PROBE_OP=invoke PROBE_CMD=changes_push_identity PROBE_JSON="$WJ" "$BIN" probe --ignored --nocapture 2>/dev/null | sed -n 's/^PROBE_OUT //p'; }
+ok "a local-path remote involves no account" "$(who | jqf value.via)" "local"
+git -C "$SB/work" remote set-url --push origin git@github.com:acme/thing.git
+git -C "$SB/work" config core.sshCommand "ssh -i $SB/keys/work_key -o IdentitiesOnly=yes"
+OUT=$(who)
+ok "with a profile key (core.sshCommand) the push uses that key" "$(printf '%s' "$OUT" | jqf value.via):$(printf '%s' "$OUT" | jqf value.key_path)" "ssh-key:$SB/keys/work_key"
+ok "  and github.com's greeting names the account" "$(printf '%s' "$OUT" | jqf value.login)" "work_key"
+ok "  the push URL is reported" "$(printf '%s' "$OUT" | jqf value.url)" "git@github.com:acme/thing.git"
+git -C "$SB/work" config --unset core.sshCommand
+git -C "$SB/work" remote set-url --push origin git@gh-work:acme/thing.git
+OUT=$(who)
+ok "an ssh alias is resolved through ssh -G to its real host" "$(printf '%s' "$OUT" | jqf value.host)" "github.com"
+ok "  and, with IdentitiesOnly, to the key the Host block pins" "$(printf '%s' "$OUT" | jqf value.key_path)" "$SB/keys/alias_key"
+ok "  which is the account that would push" "$(printf '%s' "$OUT" | jqf value.login)" "alias_key"
+git -C "$SB/work" remote set-url --push origin ssh://git@ssh.github.com:443/acme/thing.git
+OUT=$(who)
+ok "the firewall form ssh://…:443 is probed on its own port" "$(printf '%s' "$OUT" | jqf value.host):$(printf '%s' "$OUT" | jqf value.login)" "ssh.github.com:port-443"
+git -C "$SB/work" remote set-url --push origin git@github.com:acme/thing.git
+OUT=$(who)
+ok "with no key configured anywhere, the agent decides" "$(printf '%s' "$OUT" | jqf value.via):$(printf '%s' "$OUT" | jqf value.login)" "ssh-agent:agent-user"
+git -C "$SB/work" remote set-url --push origin git@gitlab.example.com:acme/thing.git
+OUT=$(who)
+ok "a host that isn't GitHub is named, not guessed at" "$(printf '%s' "$OUT" | jqf value.login):$(printf '%s' "$OUT" | jqf value.detail)" "None:gitlab.example.com isn't GitHub"
+git -C "$SB/work" remote set-url --push origin https://github.com/acme/thing.git
+OUT=$(who)
+ok "an HTTPS remote with no stored credential says the push would fail" "$(printf '%s' "$OUT" | jqf value.via):$(printf '%s' "$OUT" | jqf value.login)" "https-credential:None"
+ok "  and why" "$(printf '%s' "$OUT" | jqf value.detail)" "No credential is stored"
+git -C "$SB/work" config credential.helper '!f() { echo username=hthelper; echo password=not-a-real-secret; }; f'
+OUT=$(who)
+# For github.com the account comes from GitHub's answer to the token, never from
+# the stored user name (a name is whatever was typed when it was saved). The
+# API here is a closed port, so the honest answer is "could not confirm".
+ok "a stored GitHub credential is named, but not trusted as the account" "$(printf '%s' "$OUT" | jqf value.account):$(printf '%s' "$OUT" | jqf value.login)" "hthelper:None"
+ok "  and says GitHub could not be asked" "$(printf '%s' "$OUT" | jqf value.detail)" "could not be reached"
+ok "  without the secret anywhere in the answer" "$(printf '%s' "$OUT" | grep -c "not-a-real-secret" || true)" "0"
+git -C "$SB/work" config credential.helper '!f() { echo username=ghp_000000000000000000000000000000000000; echo password=x-oauth-basic; }; f'
+OUT=$(who)
+ok "a token travelling as the user name is treated as the secret, not shown" "$(printf '%s' "$OUT" | grep -c "ghp_0000" || true)" "0"
+git -C "$SB/work" remote set-url --push origin https://gitlab.example.com/acme/thing.git
+git -C "$SB/work" config credential.helper '!f() { echo username=hthelper; echo password=not-a-real-secret; }; f'
+OUT=$(who)
+ok "for a host that is not GitHub, the stored user name is the best available answer" "$(printf '%s' "$OUT" | jqf value.login)" "hthelper"
+git -C "$SB/work" config --unset credential.helper
+# A block rewrites the remote's URL, never an explicit pushurl (git's rule, and
+# the guard's documented gap that the hook covers), so the URL itself moves here.
+git -C "$SB/work" config --unset remote.origin.pushurl
+git -C "$SB/work" remote set-url origin https://github.com/acme/thing.git
+probe block "$SB/work" "on" >/dev/null
+ok "a blocked repository says so instead of naming an account" "$(who | jqf value.via)" "blocked"
+probe block "$SB/work" "off" >/dev/null
+git -C "$SB/work" remote set-url origin "$SB/remote.git"
 
 section "Submodules"
 git init -q --bare "$SB/sub.git"

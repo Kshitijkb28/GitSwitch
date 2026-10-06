@@ -39,10 +39,22 @@ fn https_to_ssh(url: &str) -> Option<String> {
 }
 
 fn get_origin(dir: &Path) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let started = std::time::Instant::now();
+    let out = crate::spawn::command("git")
         .args(["-C", &dir.to_string_lossy(), "remote", "get-url", "origin"])
         .output()
         .ok()?;
+    crate::cmdlog::record(
+        dir,
+        ["git", "-C", &dir.to_string_lossy(), "remote", "get-url", "origin"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect(),
+        out.status.code().unwrap_or(-1),
+        started.elapsed(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    );
     if !out.status.success() {
         return None;
     }
@@ -56,9 +68,23 @@ fn convert_one(dir: &Path) -> Option<RemoteChange> {
     let masked = mask_token(&old_url);
     match https_to_ssh(&old_url) {
         Some(ssh) => {
-            let set = std::process::Command::new("git")
+            let started = std::time::Instant::now();
+            let set = crate::spawn::command("git")
                 .args(["-C", &repo, "remote", "set-url", "origin", &ssh])
                 .output();
+            if let Ok(o) = &set {
+                crate::cmdlog::record(
+                    Path::new(&repo),
+                    ["git", "-C", &repo, "remote", "set-url", "origin", &ssh]
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect(),
+                    o.status.code().unwrap_or(-1),
+                    started.elapsed(),
+                    &String::from_utf8_lossy(&o.stdout),
+                    &String::from_utf8_lossy(&o.stderr),
+                );
+            }
             match set {
                 Ok(o) if o.status.success() => Some(RemoteChange {
                     repo,
@@ -94,16 +120,7 @@ fn convert_one(dir: &Path) -> Option<RemoteChange> {
 }
 
 fn mask_token(url: &str) -> String {
-    // Mask ANY embedded credentials, both `user:token@` and the
-    // token-as-username `token@` form, for https and http alike.
-    for scheme in ["https://", "http://"] {
-        if let Some(rest) = url.strip_prefix(scheme) {
-            if let Some((_creds, host)) = rest.split_once('@') {
-                return format!("{}***@{}", scheme, host);
-            }
-        }
-    }
-    url.to_string()
+    crate::cmdlog::redact(url)
 }
 
 /// Find git repos within `root` (up to a few levels deep) and convert their origin to SSH.

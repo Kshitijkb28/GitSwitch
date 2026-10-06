@@ -15,6 +15,7 @@ import { Modal } from "../components/Modal";
 import { useToast } from "../components/Toast";
 import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 export function CommitAudit() {
   const toast = useToast();
@@ -100,19 +101,22 @@ export function CommitAudit() {
             you haven't pushed yet.
           </p>
         </div>
-        <Button onClick={scan} disabled={scanning}>
-          {scanning ? (
-            <>
-              <Loader2 size={16} className="animate-spin" />
-              Scanning…
-            </>
-          ) : (
-            <>
-              <History size={16} />
-              Scan commits
-            </>
-          )}
-        </Button>
+        <div className="flex items-center gap-2">
+          <RefreshButton onClick={scan} busy={scanning} title="Scan the commits again" />
+          <Button onClick={scan} disabled={scanning}>
+            {scanning ? (
+              <>
+                <Loader2 size={16} className="animate-spin" />
+                Scanning…
+              </>
+            ) : (
+              <>
+                <History size={16} />
+                Scan commits
+              </>
+            )}
+          </Button>
+        </div>
       </div>
 
       {error && (

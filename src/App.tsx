@@ -1,6 +1,6 @@
 import { useEffect } from "react";
-import { Routes, Route, NavLink, useLocation } from "react-router-dom";
-import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, GitGraph, BookMarked, GitPullRequestArrow, SquareTerminal } from "lucide-react";
+import { Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
+import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequestArrow, SquareTerminal } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
 import { ProfileForm } from "./pages/ProfileForm";
@@ -12,8 +12,7 @@ import { Repositories } from "./pages/Repositories";
 import { AutoAssign } from "./pages/AutoAssign";
 import { Doctor } from "./pages/Doctor";
 import { CommitAudit } from "./pages/CommitAudit";
-import { History } from "./pages/History";
-import { Changes } from "./pages/Changes";
+import { Repo } from "./pages/Repo";
 import { ConsoleDrawer } from "./components/console/ConsoleDrawer";
 import { toggleConsole, useConsole } from "./lib/console";
 
@@ -61,17 +60,18 @@ function App() {
           <SidebarLink to="/sparse" icon={<GitBranch size={18} />}>
             Clone
           </SidebarLink>
-          <SidebarLink to="/changes" icon={<GitPullRequestArrow size={18} />}>
-            Changes
+          <SidebarLink
+            to="/repo/changes"
+            icon={<GitPullRequestArrow size={18} />}
+            active={/^\/repo(\/|$)/.test(location.pathname)}
+          >
+            Repository
           </SidebarLink>
           <SidebarLink to="/auto-assign" icon={<ScanSearch size={18} />}>
             Auto Assign
           </SidebarLink>
           <SidebarLink to="/doctor" icon={<Stethoscope size={18} />}>
             Doctor
-          </SidebarLink>
-          <SidebarLink to="/history" icon={<GitGraph size={18} />}>
-            History
           </SidebarLink>
           <SidebarLink to="/commits" icon={<HistoryIcon size={18} />}>
             Commit Audit
@@ -110,10 +110,12 @@ function App() {
           <Route path="/github" element={<GitHubAuth />} />
           <Route path="/repos" element={<Repositories />} />
           <Route path="/sparse" element={<SparseClone />} />
-          <Route path="/changes" element={<Changes />} />
+          <Route path="/repo/:tab" element={<Repo />} />
+          <Route path="/repo" element={<Navigate to="/repo/changes" replace />} />
+          <Route path="/changes" element={<Navigate to="/repo/changes" replace />} />
           <Route path="/auto-assign" element={<AutoAssign />} />
           <Route path="/doctor" element={<Doctor />} />
-          <Route path="/history" element={<History />} />
+          <Route path="/history" element={<Navigate to="/repo/history" replace />} />
           <Route path="/commits" element={<CommitAudit />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>

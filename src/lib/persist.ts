@@ -38,6 +38,20 @@ export function writePersisted<T>(key: string, value: T) {
   }
 }
 
+/**
+ * Hand a repository to another page before navigating there. It sets that
+ * page's repository AND clears its narrower selection (History's submodule),
+ * so a sub-selection left over from an earlier visit cannot hijack the
+ * hand-off and show a different repository than the one that was sent.
+ */
+export function handOff(page: "changes" | "history", repo: string) {
+  writePersisted(`${page}.repo`, repo);
+  if (page === "history") writePersisted("history.sub", "");
+  // Both pages now live on the Repository page, which reads these keys.
+  writePersisted("repo.path", repo);
+  writePersisted("repo.sub", "");
+}
+
 export function usePersistedState<T>(key: string, initial: T) {
   const [value, setValue] = useState<T>(() => read(key, initial));
 

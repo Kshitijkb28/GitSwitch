@@ -78,21 +78,31 @@ pub fn parse_github_owner_name(url: &str) -> Option<(String, String)> {
 /// Hide any credentials embedded in a remote URL — covers BOTH forms GitHub
 /// documents: `https://user:token@…` and the token-as-username `https://token@…`.
 pub(crate) fn mask_token(url: &str) -> String {
-    for scheme in ["https://", "http://"] {
-        if let Some(rest) = url.strip_prefix(scheme) {
-            if let Some((_creds, host)) = rest.split_once('@') {
-                return format!("{}***@{}", scheme, host);
-            }
-        }
-    }
-    url.to_string()
+    // One redactor for the whole app. This used to be two byte-identical
+    // copies that only understood a URL anchored at the start of the string;
+    // `cmdlog::redact` also catches one quoted back mid-sentence by git, and
+    // the bare `ghp_` token shapes. It still produces `***@`, which is what
+    // Doctor's remote-embedded-token check looks for.
+    crate::cmdlog::redact(url)
 }
 
 fn get_origin(dir: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let started = std::time::Instant::now();
+    let out = crate::spawn::command("git")
         .args(["-C", &dir.to_string_lossy(), "remote", "get-url", "origin"])
         .output()
         .ok()?;
+    crate::cmdlog::record(
+        dir,
+        ["git", "-C", &dir.to_string_lossy(), "remote", "get-url", "origin"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect(),
+        out.status.code().unwrap_or(-1),
+        started.elapsed(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    );
     if !out.status.success() {
         return None;
     }

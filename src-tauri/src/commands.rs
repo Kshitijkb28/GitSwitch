@@ -38,6 +38,8 @@ pub fn create_profile(
     directories: Vec<String>,
     allow_push: Option<bool>,
     signing_enabled: Option<bool>,
+    remote_patterns: Option<Vec<String>>,
+    github_login: Option<String>,
 ) -> Result<Profile, AppError> {
     let profile = profiles::create_profile(
         name,
@@ -47,6 +49,8 @@ pub fn create_profile(
         directories,
         allow_push.unwrap_or(true),
         signing_enabled.unwrap_or(false),
+        remote_patterns.unwrap_or_default(),
+        github_login,
     )?;
     git_config::apply_git_config()?;
     crate::tray::update_active_label(&app);
@@ -65,9 +69,11 @@ pub fn update_profile(
     directories: Option<Vec<String>>,
     allow_push: Option<bool>,
     signing_enabled: Option<bool>,
+    remote_patterns: Option<Vec<String>>,
+    github_login: Option<String>,
 ) -> Result<Profile, AppError> {
     let profile = profiles::update_profile(
-        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled,
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login,
     )?;
     git_config::apply_git_config()?;
     crate::tray::update_active_label(&app);
@@ -184,6 +190,19 @@ pub async fn doctor_check_keys() -> Result<Vec<Finding>, AppError> {
 #[tauri::command]
 pub async fn doctor_check_repos() -> Result<Vec<Finding>, AppError> {
     doctor::check_repos().await
+}
+
+/// Which account a push from this repository would authenticate as.
+/// `refresh` forgets the cached answers first (the Re-check button).
+#[tauri::command]
+pub async fn changes_push_identity(repo_path: String, refresh: bool) -> Result<crate::push_identity::PushIdentity, AppError> {
+    crate::push_identity::push_identity(&repo_path, refresh).await
+}
+
+/// Doctor's repair for a `local-override` finding.
+#[tauri::command]
+pub async fn doctor_unset_local(repo_path: String, key: String) -> Result<String, AppError> {
+    doctor::unset_local(&repo_path, &key).await
 }
 
 #[tauri::command]
@@ -439,6 +458,9 @@ pub async fn history_branches(repo_path: String) -> Result<Vec<BranchInfo>, AppE
 
 /// Paginated: git log is fast, but a 100k-commit repo would still choke the UI
 /// if we handed it everything at once.
+// The page's filters are the IPC arguments, one each; a struct would change
+// the contract every frontend call site and harness fixture is written to.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn history_page(
     repo_path: String,
@@ -446,7 +468,9 @@ pub async fn history_page(
     offset: usize,
     limit: usize,
     search: Option<String>,
-    author: Option<String>,
+    authors: Option<Vec<String>>,
+    hide_pointer_only: Option<bool>,
+    unpushed_only: Option<bool>,
 ) -> Result<HistoryPage, AppError> {
     tokio::task::spawn_blocking(move || {
         git_history::history_page(
@@ -455,7 +479,9 @@ pub async fn history_page(
             offset,
             limit,
             search.as_deref(),
-            author.as_deref(),
+            authors.as_deref(),
+            hide_pointer_only.unwrap_or(false),
+            unpushed_only.unwrap_or(false),
         )
     })
     .await
@@ -488,6 +514,35 @@ pub async fn history_fetch(repo_path: String) -> Result<FetchResult, AppError> {
     tokio::task::spawn_blocking(move || git_history::fetch_repo(&repo_path))
         .await
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Who commits on the viewed revision, most frequent first.
+#[tauri::command]
+pub async fn history_authors(repo_path: String, rev: String) -> Result<Vec<git_history::AuthorCount>, AppError> {
+    tokio::task::spawn_blocking(move || git_history::authors(&repo_path, &rev))
+        .await
+        .map_err(|e| AppError::Command(format!("task failed: {}", e)))?
+}
+
+/// Live progress of a clone into `dest_path`, while it runs.
+#[tauri::command]
+pub async fn clone_progress(dest_path: String) -> Option<sparse::CloneProgress> {
+    sparse::clone_progress(&dest_path)
+}
+
+/// How big a GitHub repository is before cloning it, when GitHub will say.
+#[tauri::command]
+pub async fn clone_size_estimate(url: String) -> Option<sparse::CloneSizeEstimate> {
+    sparse::clone_size_estimate(&url).await
+}
+
+/// Which branch HEAD is on — or that it is detached or unborn. The one fact
+/// the branch list cannot give, read without the full repository status.
+#[tauri::command]
+pub async fn history_head(repo_path: String) -> Result<git_history::HeadInfo, AppError> {
+    tokio::task::spawn_blocking(move || git_history::head_info(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("task failed: {}", e)))?
 }
 
 /// Ahead/behind vs the remote, plus how stale that answer is.
@@ -616,8 +671,8 @@ pub async fn changes_repair_push_block(repo_path: String) -> Result<PushState, A
 /// Stage the named files. Never "everything" by accident: an empty list is an
 /// error, and staging all is a separate command.
 #[tauri::command]
-pub async fn changes_stage(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
-    git_ops::stage(&repo_path, paths).await
+pub async fn changes_stage(repo_path: String, paths: Vec<String>, allow_markers: Option<bool>) -> Result<OpResult, AppError> {
+    git_ops::stage(&repo_path, paths, allow_markers.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -649,8 +704,11 @@ pub async fn changes_commit(
 }
 
 #[tauri::command]
-pub async fn changes_push(repo_path: String, set_upstream: bool) -> Result<OpResult, AppError> {
-    git_ops::push(&repo_path, set_upstream).await
+/// `allow_unpushed_submodules`: push although a submodule's recorded commit is
+/// on none of that submodule's remotes — the person's call, after the refusal
+/// named it.
+pub async fn changes_push(repo_path: String, set_upstream: bool, allow_unpushed_submodules: Option<bool>) -> Result<OpResult, AppError> {
+    git_ops::push(&repo_path, set_upstream, allow_unpushed_submodules.unwrap_or(false)).await
 }
 
 /// `mode` is one of "ff-only", "merge", "rebase" — chosen by the user, never
@@ -676,8 +734,8 @@ pub async fn changes_submodules(repo_path: String) -> Result<Vec<SubmoduleInfo>,
 }
 
 #[tauri::command]
-pub async fn changes_submodule_update(repo_path: String) -> Result<OpResult, AppError> {
-    git_ops::submodule_update(&repo_path).await
+pub async fn changes_submodule_update(repo_path: String, paths: Option<Vec<String>>) -> Result<OpResult, AppError> {
+    git_ops::submodule_update(&repo_path, paths).await
 }
 
 /// Are this repo's large files really here, or still LFS pointer stubs?
@@ -704,6 +762,21 @@ pub async fn changes_lfs_pull_paths(repo_path: String, paths: Vec<String>) -> Re
 #[tauri::command]
 pub async fn changes_lfs_progress(repo_path: String) -> Option<LfsProgress> {
     lfs::read_progress(&repo_path)
+}
+
+/// Every git command this app has run, newest last. `since_id` is the highest
+/// id already seen, so a poll asks only for what is new; an empty `repo_path`
+/// means every repository.
+#[tauri::command]
+pub async fn console_entries(since_id: u64, repo_path: String) -> Vec<crate::cmdlog::Entry> {
+    crate::cmdlog::since(since_id, Some(&repo_path))
+}
+
+/// Forget the recorded commands. The log is a convenience, not a record of
+/// account — the push lock keeps its own, which this cannot touch.
+#[tauri::command]
+pub async fn console_clear() {
+    crate::cmdlog::clear();
 }
 
 /// Start a shell in this repository. Output arrives on `on_output` rather than
@@ -764,8 +837,8 @@ pub async fn changes_sync_run(
 
 /// Resume a paused sync after conflicts were resolved and staged.
 #[tauri::command]
-pub async fn changes_sync_continue(repo_path: String) -> Result<OpResult, AppError> {
-    crate::sync::sync_continue(&repo_path).await
+pub async fn changes_sync_continue(repo_path: String, allow_markers: Option<bool>) -> Result<OpResult, AppError> {
+    crate::sync::sync_continue(&repo_path, allow_markers.unwrap_or(false)).await
 }
 
 /// Undo a paused sync.
@@ -774,16 +847,38 @@ pub async fn changes_sync_abort(repo_path: String) -> Result<OpResult, AppError>
     crate::sync::sync_abort(&repo_path).await
 }
 
-/// One commit recording submodule pointers that sit ahead of the branch.
+/// Open a file of the repository in the system's default application, or
+/// reveal it in the file manager. The path is checked to be inside the
+/// repository first (`within_repo`), so no "open any path" capability is
+/// granted to the JavaScript side.
 #[tauri::command]
-pub async fn changes_record_pointers(repo_path: String) -> Result<OpResult, AppError> {
-    crate::sync::record_pointers(&repo_path).await
+pub async fn changes_open_path(repo_path: String, path: String, reveal: bool) -> Result<(), AppError> {
+    let full = git_ops::shell_path(&git_ops::within_repo(&repo_path, &path)?);
+    if !reveal && git_ops::opens_by_running(&full) {
+        // The system "open" would run it, not show it.
+        return Err(AppError::Command(format!("{} is a program, not a text file — Reveal it instead of opening it.", path)));
+    }
+    let r = if reveal { tauri_plugin_opener::reveal_item_in_dir(&full) } else { tauri_plugin_opener::open_path(&full, None::<&str>) };
+    r.map_err(|e| AppError::Command(format!("Could not open {}: {}", path, e)))
+}
+
+/// A conflicted file split into its sides, for the resolution view.
+#[tauri::command]
+pub async fn changes_conflict_view(repo_path: String, path: String) -> Result<git_status::ConflictView, AppError> {
+    git_status::conflict_view(&repo_path, &path).await
+}
+
+/// One commit recording submodule pointers that sit ahead of the branch:
+/// every such submodule, or exactly `paths` (a row's "Record this pointer").
+#[tauri::command]
+pub async fn changes_record_pointers(repo_path: String, paths: Option<Vec<String>>) -> Result<OpResult, AppError> {
+    crate::sync::record_pointers(&repo_path, paths.as_deref()).await
 }
 
 /// Finish the operation in progress once its conflicts are staged.
 #[tauri::command]
-pub async fn changes_continue(repo_path: String) -> Result<OpResult, AppError> {
-    git_ops::continue_op(&repo_path).await
+pub async fn changes_continue(repo_path: String, allow_markers: Option<bool>) -> Result<OpResult, AppError> {
+    git_ops::continue_op(&repo_path, allow_markers.unwrap_or(false)).await
 }
 
 #[tauri::command]

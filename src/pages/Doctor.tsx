@@ -12,6 +12,7 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { useToast } from "../components/Toast";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 type Step = {
   key: string;
@@ -103,6 +104,12 @@ export function Doctor() {
         toast.success(
           changed > 0 ? "Remote converted to SSH" : "Nothing needed converting"
         );
+      } else if (finding.fix.startsWith("unset-local:")) {
+        // unset-local:<key>:<repo path> — the key has no colon; the path may.
+        const rest = finding.fix.slice("unset-local:".length);
+        const cut = rest.indexOf(":");
+        const msg = await api.doctorUnsetLocal(rest.slice(cut + 1), rest.slice(0, cut));
+        toast.success(msg);
       } else if (finding.fix.startsWith("lock-")) {
         // Most of these open the administrator prompt; the outcome — cancelled
         // included — comes back as a sentence rather than an exception.
@@ -144,19 +151,22 @@ export function Doctor() {
             and that every push lock is still in place.
           </p>
         </div>
-        <Button onClick={runChecks} disabled={running}>
-          {running ? (
-            <>
-              <Loader2 size={16} className="animate-spin" />
-              Checking…
-            </>
-          ) : (
-            <>
-              <Stethoscope size={16} />
-              Run checks
-            </>
-          )}
-        </Button>
+        <div className="flex items-center gap-2">
+          <RefreshButton onClick={runChecks} busy={running} title="Run the checks again" />
+          <Button onClick={runChecks} disabled={running}>
+            {running ? (
+              <>
+                <Loader2 size={16} className="animate-spin" />
+                Checking…
+              </>
+            ) : (
+              <>
+                <Stethoscope size={16} />
+                Run checks
+              </>
+            )}
+          </Button>
+        </div>
       </div>
 
       {error && (

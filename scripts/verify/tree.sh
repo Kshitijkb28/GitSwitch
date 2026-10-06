@@ -259,6 +259,33 @@ ok "  the backup still holds the merge" "$(git -C "$W" rev-parse "$BK")" "$MERGE
 OUT=$(probe tree_reset "$W" "HEAD,soft")
 ok "a reset to HEAD is nothing to do" "$(printf '%s' "$OUT" | jqf refusal.code)" "nothing-to-do"
 
+section "A hard reset never overwrites an untracked file without saying so"
+# A commit adds gen/out.txt; step back below it and recreate the file by hand,
+# exactly what a build tool does. A forward `git reset --hard` would replace
+# it without a word: git protects only the files it tracks.
+mkdir -p "$W/gen"; printf 'committed\n' > "$W/gen/out.txt"; git -C "$W" add -A >/dev/null; git -C "$W" commit -qm "adds gen/out.txt"
+FWD="$(head_of "$W")"
+git -C "$W" reset -q --hard HEAD~1
+mkdir -p "$W/gen"; printf 'mine, unsaved\n' > "$W/gen/out.txt"
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "the reset is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "untracked-in-the-way"
+ok "  naming the file" "$(printf '%s' "$OUT" | jqf refusal.message)" "gen/out.txt"
+ok "  the file is untouched" "$(cat "$W/gen/out.txt")" "mine, unsaved"
+ok "  and HEAD did not move" "$(head_of "$W")" "$(git -C "$W" rev-parse "$FWD~1")"
+git -C "$W" add gen/out.txt
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "a STAGED file at that path is the person's stated choice: the reset runs" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  and the committed content is in place" "$(cat "$W/gen/out.txt")" "committed"
+git -C "$W" reset -q --hard HEAD~1
+mkdir -p "$W/gen"; printf 'gen/\n' >> "$W/.gitignore"; printf 'ignored, unsaved\n' > "$W/gen/out.txt"
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "an ignored file in the way is just as lost, so it is refused too" "$(printf '%s' "$OUT" | jqf refusal.code)" "untracked-in-the-way"
+ok "  and kept" "$(cat "$W/gen/out.txt")" "ignored, unsaved"
+git -C "$W" checkout -q -- .gitignore; rm -rf "$W/gen"
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "with nothing in the way the same reset runs" "$(printf '%s' "$OUT" | jqf ok)" "True"
+git -C "$W" reset -q --hard HEAD~1
+
 section "Pushed means on any remote branch — for reset and undo alike"
 printf 'elsewhere\n' > "$W/else.txt"; git -C "$W" add -A >/dev/null; git -C "$W" commit -qm "pushed elsewhere"
 git -C "$W" push -q origin main:refs/heads/backup 2>/dev/null
@@ -354,6 +381,10 @@ git -C "$W" switch -q main; printf 'MINE\n' > "$W/c.txt"; git -C "$W" commit -qa
 C_MINE="$(head_of "$W")"
 git -C "$W" merge -q cf >/dev/null 2>&1
 ok "the merge conflicts" "$(git -C "$W" status --porcelain -- c.txt)" "UU c.txt"
+OUT=$(probe stage "$W" "c.txt")
+ok "marking it resolved with the markers still in it is refused by name" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "c.txt still contains conflict markers (line 1)"
+ok "  and nothing was staged" "$(git -C "$W" ls-files -u c.txt | wc -l | tr -d ' ')" "3"
 OUT=$(probe tree_resolve_side "$W" "mine,c.txt")
 ok "Keep mine during a merge keeps my content" "$(cat "$W/c.txt")" "MINE"
 ok "  the result says what ran" "$(printf '%s' "$OUT" | jqf tree.mapping_note)" "Keep mine ran \`git checkout --ours\`"
@@ -463,5 +494,141 @@ OUT=$(probe commit_diff "$W" "$RENAME_SHA,docs/big.txt")
 ok "  and the old path's diff shows the deletion" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(" ".join(l["text"] for l in json.load(sys.stdin)["lines"] if l["kind"]=="meta"))')" "deleted file mode"
 OUT=$(probe commit_diff "$W" "$RENAME_SHA,docs/{big.txt => renamed.txt}")
 ok "  git's notation, sent back as a path, is an empty diff rather than an error" "$(printf '%s' "$OUT" | jqf empty_reason)" "No changes to this file"
+
+section "A renamed file cannot carry its conflict markers into the commit"
+M="$SB/markers"; git init -q -b main "$M"
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do printf 'line %s\n' "$i"; done > "$M/r.txt"
+git -C "$M" add -A >/dev/null; git -C "$M" commit -qm "r base"
+git -C "$M" switch -q -c rf; sed -i.bak 's/^line 10$/line 10 (theirs)/' "$M/r.txt"; rm -f "$M/r.txt.bak"; git -C "$M" commit -qam "r theirs"
+git -C "$M" switch -q main; sed -i.bak 's/^line 10$/line 10 (mine)/' "$M/r.txt"; rm -f "$M/r.txt.bak"; git -C "$M" commit -qam "r mine"
+git -C "$M" merge -q rf >/dev/null 2>&1
+ok "the merge conflicts" "$(git -C "$M" status --porcelain -- r.txt)" "UU r.txt"
+# "Resolved" by moving the file away, markers and all.
+cp "$M/r.txt" "$M/moved.txt"; git -C "$M" rm -q -f r.txt; git -C "$M" add moved.txt
+ok "  git sees a rename, which an edit-only filter would skip" "$(git -C "$M" diff --cached --name-status -M | cut -c1)" "R"
+OUT=$(probe continue "$M")
+ok "finishing the merge is refused: the markers would be committed" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the file where they are now, and the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "moved.txt still contains conflict markers (line 10)"
+ok "  and the merge is still open" "$([ -e "$M/.git/MERGE_HEAD" ] && echo open || echo closed)" "open"
+# A wider marker, as the conflict-marker-size attribute makes git write them.
+git -C "$M" merge --abort 2>/dev/null; git -C "$M" reset -q --hard; git -C "$M" clean -fdq
+printf 'r.txt conflict-marker-size=10\n' > "$M/.gitattributes"; git -C "$M" add .gitattributes; git -C "$M" commit -qm "wide markers"
+git -C "$M" merge -q rf >/dev/null 2>&1
+ok "with conflict-marker-size=10 git writes ten" "$(grep -c '^<<<<<<<<<< ' "$M/r.txt")" "1"
+OUT=$(probe stage "$M" "r.txt")
+ok "  and marking it resolved is still refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "r.txt still contains conflict markers (line 10)"
+OUT=$(pinvoke changes_conflict_view "{\"repoPath\":\"$M\",\"path\":\"r.txt\"}")
+ok "  the conflict view reads the same hunk" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin)['value'];print(d['marker_count'],d['hunks'][0]['mine'],d['hunks'][0]['theirs'])")" "1 ['line 10 (mine)'] ['line 10 (theirs)']"
+
+section "The marker check at Continue does not depend on settings, attributes or the marker's width"
+# Each time: a fresh conflict in r.txt, staged from a terminal with its markers, then Continue.
+fresh_conflict() { git -C "$M" merge --abort 2>/dev/null; git -C "$M" reset -q --hard; git -C "$M" clean -fdq; git -C "$M" merge -q rf >/dev/null 2>&1; }
+staged_then_continue() { git -C "$M" add r.txt; probe continue "$M" | jqf refusal.code; }
+fresh_conflict
+ok "staged with its markers, Continue is refused" "$(staged_then_continue)" "conflict-markers"
+git -C "$M" config color.ui always; fresh_conflict
+ok "  also with color.ui=always" "$(staged_then_continue)" "conflict-markers"
+git -C "$M" config --unset color.ui; git -C "$M" config color.grep always; fresh_conflict
+ok "  and with color.grep=always" "$(staged_then_continue)" "conflict-markers"
+git -C "$M" config --unset color.grep
+fresh_conflict; git -C "$M" merge --abort
+printf 'r.txt -diff conflict-marker-size=10\n' > "$M/.gitattributes"; git -C "$M" commit -qam "no diff for r.txt"
+fresh_conflict
+ok "  a file an attribute hides from diffs is still read" "$(staged_then_continue)" "conflict-markers"
+fresh_conflict; git -C "$M" merge --abort
+printf 'r.txt conflict-marker-size=5\n' > "$M/.gitattributes"; git -C "$M" commit -qam "narrow markers"
+fresh_conflict
+ok "with conflict-marker-size=5 git writes five" "$(grep -c '^<<<<< ' "$M/r.txt")" "1"
+ok "  and Continue is refused for them too" "$(staged_then_continue)" "conflict-markers"
+fresh_conflict; git -C "$M" merge --abort
+git -C "$M" rm -q .gitattributes; git -C "$M" commit -qm "default markers again"
+fresh_conflict
+# A hand edit that left bare markers, in a file saved with CRLF line endings.
+printf 'line 1\r\n<<<<<<<\r\nline 10 (mine)\r\n=======\r\nline 10 (theirs)\r\n>>>>>>>\r\nline 11\r\n' > "$M/r.txt"
+OUT=$(git -C "$M" add r.txt 2>/dev/null; probe continue "$M")
+ok "bare markers in a CRLF file are refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "r.txt still contains conflict markers (line 2)"
+ok "  nothing was committed in any of these" "$([ -e "$M/.git/MERGE_HEAD" ] && echo open || echo closed):$(git -C "$M" log --format=%s -1)" "open:default markers again"
+
+section "A path that changed its type is read for markers too"
+git -C "$M" merge --abort 2>/dev/null; git -C "$M" reset -q --hard; git -C "$M" clean -fdq
+# `link` is a symbolic link in the branch; during the merge it is staged as an ordinary file with markers in it.
+LB="$(printf 'r.txt' | git -C "$M" hash-object -w --stdin)"
+git -C "$M" update-index --add --cacheinfo "120000,$LB,link"; git -C "$M" commit -qm "a link"; git -C "$M" checkout -q -- link 2>/dev/null
+git -C "$M" merge -q rf >/dev/null 2>&1
+git -C "$M" checkout -q --ours -- r.txt; git -C "$M" add r.txt
+MB="$(printf 'a\n<<<<<<< HEAD\nmine\n=======\ntheirs\n>>>>>>> rf\nb\n' | git -C "$M" hash-object -w --stdin)"
+git -C "$M" update-index --cacheinfo "100644,$MB,link"
+ok "the staged change is a change of type" "$(git -C "$M" diff --cached --raw --no-abbrev -- link | cut -c1-14)" ":120000 100644"
+OUT=$(probe continue "$M")
+ok "  and Continue is refused for the markers in it" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the path and the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "link still contains conflict markers (line 2)"
+ok "  the merge is still open" "$([ -e "$M/.git/MERGE_HEAD" ] && echo open || echo closed)" "open"
+
+section "Thousands of staged files do not stall Continue"
+git -C "$M" merge --abort 2>/dev/null; git -C "$M" reset -q --hard; git -C "$M" clean -fdq
+# The other side of a merge adds 4,000 files; one conflict, resolved and staged. The check reads every
+# staged file through commands that answer while they are still being told what to read.
+git -C "$M" switch -q -c wide rf
+"$PY" -c "
+import os,sys
+d=os.path.join(sys.argv[1],'some','fairly','ordinary','source','dir'); os.makedirs(d)
+for i in range(4000):
+    with open(os.path.join(d,'file_%05d.txt'%i),'w') as f: f.write('content %d\n'%i)
+" "$M"
+git -C "$M" add -A >/dev/null; git -C "$M" commit -qm "four thousand files"; git -C "$M" switch -q main
+git -C "$M" merge -q wide >/dev/null 2>&1
+git -C "$M" checkout -q --ours -- r.txt; git -C "$M" add r.txt
+ok "the merge is open with 4,000 files staged" "$([ -e "$M/.git/MERGE_HEAD" ] && echo open || echo closed):$([ "$(git -C "$M" diff --cached --name-only | wc -l)" -ge 4000 ] && echo many || echo few)" "open:many"
+( probe continue "$M" > "$SB/wide.out" 2>/dev/null ) & WPID=$!
+WAITED=0; while kill -0 "$WPID" 2>/dev/null && [ "$WAITED" -lt 120 ]; do sleep 1; WAITED=$((WAITED+1)); done
+if kill -0 "$WPID" 2>/dev/null; then
+  # Only the probe's own descendants — gathered before the kill, since a killed parent's children re-parent to pid 1.
+  KIDS=""; gather() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do gather "$c"; done; KIDS="$KIDS $1"; }; gather "$WPID"
+  kill $KIDS 2>/dev/null
+  WIDE="still running after ${WAITED}s"
+else
+  WIDE="$(jqf ok < "$SB/wide.out"):$(jqf headline < "$SB/wide.out")"
+fi
+ok "Continue comes back, with the merge finished" "$WIDE" "True:"
+ok "  the merge is closed and the files are in it" "$([ -e "$M/.git/MERGE_HEAD" ] && echo open || echo closed):$(git -C "$M" ls-tree -r --name-only HEAD -- some | wc -l | tr -d ' ')" "closed:4000"
+
+section "Continue of a rebase keeps the stopped commit's message, commits it once, and honours the rebase's own options"
+# rb_world <dir> <subject of the commit that will conflict>
+rb_world() {
+  git init -q "$1"; printf 'l1\nl2\nl3\nl4\nl5\nl6\n' > "$1/f.txt"; printf 'n\n' > "$1/notes.txt"; git -C "$1" add -A >/dev/null; git -C "$1" commit -qm base
+  git -C "$1" switch -q -c other; printf 'l1\nl2 other\nl3\nl4\nl5\nl6\n' > "$1/f.txt"; git -C "$1" commit -qam "other: l2"
+  git -C "$1" switch -q main; printf 'l1\nl2 mine\nl3\nl4\nl5\nl6\n' > "$1/f.txt"; GIT_AUTHOR_DATE="2020-01-01T10:00:00+0000" git -C "$1" commit -qam "$2"
+  printf 'l1\nl2 mine\nl3\nl4\nl5\nl6 mine\n' > "$1/f.txt"; GIT_AUTHOR_DATE="2020-01-02T10:00:00+0000" git -C "$1" commit -qam "B more"
+}
+resolve_rb() { printf 'l1\nl2 both\nl3\nl4\nl5\nl6\n' > "$1/f.txt"; git -C "$1" add f.txt; }
+RB="$SB/rb"; rb_world "$RB" "#42 l2 mine"
+GIT_EDITOR=true git -C "$RB" -c rebase.backend=merge rebase other >/dev/null 2>&1
+resolve_rb "$RB"; printf 'edit\n' >> "$RB/notes.txt"          # an unstaged edit to another tracked file
+OUT=$(probe continue "$RB")
+ok "an unstaged edit elsewhere: Continue is refused by git, and nothing was committed" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$RB" log --format=%s -1)" "False:other: l2"
+git -C "$RB" checkout -q -- notes.txt
+OUT=$(probe continue "$RB")
+ok "  then Continue finishes: the stopped commit once, its '#' message whole" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$RB" log --format=%s other..HEAD | tr '\n' '|')" "True:B more|#42 l2 mine|"
+ok "  and it is not called skipped" "$(printf '%s' "$OUT" | jqf detail | grep -c skipped || true)" "0"
+ok "  with the author's date kept" "$(git -C "$RB" log --format=%at -1 HEAD~1)" "1577872800"
+RB2="$SB/rb2"; rb_world "$RB2" "#42 l2 mine"
+GIT_EDITOR=true git -C "$RB2" -c rebase.backend=merge rebase --signoff other >/dev/null 2>&1
+resolve_rb "$RB2"
+OUT=$(probe continue "$RB2")
+ok "a --signoff rebase: the resolved commit carries the trailer like its siblings" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$RB2" log --format=%B other..HEAD | grep -c '^Signed-off-by: ' || true):$(git -C "$RB2" log --format=%s -1 HEAD~1)" "True:2:#42 l2 mine"
+RB3="$SB/rb3"; rb_world "$RB3" "l2 mine"
+GIT_EDITOR=true git -C "$RB3" -c rebase.backend=merge rebase --committer-date-is-author-date other >/dev/null 2>&1
+resolve_rb "$RB3"
+OUT=$(probe continue "$RB3")
+ok "a --committer-date-is-author-date rebase keeps its dates: that stop is left to git" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$RB3" log --format='%at=%ct' -1 HEAD~1)" "True:1577872800=1577872800"
+# The apply backend (someone's own `git rebase --apply`): a resolution that leaves nothing is still skipped.
+RB4="$SB/rb4"; rb_world "$RB4" "l2 mine"
+GIT_EDITOR=true git -C "$RB4" rebase --apply other >/dev/null 2>&1
+git -C "$RB4" checkout -q --ours -- f.txt 2>/dev/null || git -C "$RB4" show other:f.txt > "$RB4/f.txt"; git -C "$RB4" add f.txt
+ok "an apply-backend stop, resolved to what is already there" "$([ -d "$RB4/.git/rebase-apply" ] && echo apply || echo other):$(git -C "$RB4" diff --cached --quiet HEAD && echo empty || echo staged)" "apply:empty"
+OUT=$(probe continue "$RB4")
+ok "  is skipped by Continue, and said so" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf detail):$(git -C "$RB4" log --format=%s other..HEAD | tr '\n' '|')" "True:The stopped commit had nothing left to apply after the resolution, so it was skipped.:B more|"
 
 verify_result

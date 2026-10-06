@@ -11,6 +11,8 @@ type Props = {
   onRecordPointers?: () => void;
   /** Rendered after the guidance: e.g. "Open in Changes" / "Open in History". */
   extraAction?: { label: string; onClick: () => void; primary?: boolean };
+  /** Several at once (a push refused for more than one submodule); wins over `extraAction`. */
+  extraActions?: { label: string; onClick: () => void; primary?: boolean }[];
 };
 
 /** Undo/drop counts for a tree or stash outcome, in one sentence. */
@@ -26,7 +28,8 @@ function treeSentence(t: NonNullable<OpResult["tree"]>): string | null {
 }
 
 /** The outcome of the last operation: headline, detail, advice, undo lines. */
-export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAction }: Props) {
+export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAction, extraActions }: Props) {
+  const actions = extraActions ?? (extraAction ? [extraAction] : []);
   const tree = result.tree;
   const stash = result.stash;
   const treeLine = tree ? treeSentence(tree) : null;
@@ -45,15 +48,23 @@ export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAct
           {result.advice?.guidance && result.advice.guidance !== result.detail && (
             <p className="text-xs text-zinc-300 break-words">{result.advice.guidance}</p>
           )}
-          {extraAction && (
-            <div>
-              <Button size="sm" variant={extraAction.primary ? "primary" : "secondary"} onClick={extraAction.onClick} disabled={busy}>
-                {extraAction.label}
-              </Button>
+          {actions.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {actions.map((a) => (
+                <Button key={a.label} size="sm" variant={a.primary ? "primary" : "secondary"} onClick={a.onClick} disabled={busy}>
+                  {a.label}
+                </Button>
+              ))}
             </div>
           )}
           {result.pull?.recovery && (
             <p className="text-xs text-zinc-500 font-mono break-all">undo: {result.pull.recovery}</p>
+          )}
+          {(result.pull?.submodules_moved ?? 0) > 0 && (
+            <p className="text-xs text-sky-300/90 break-words">
+              {result.pull?.submodules_moved} submodule pointer{result.pull?.submodules_moved === 1 ? "" : "s"} moved — this repository now
+              records other commits than are checked out. Update aligns them.
+            </p>
           )}
           {result.pull?.autostash_conflict && (
             <p className="text-xs text-amber-300/90 break-words">

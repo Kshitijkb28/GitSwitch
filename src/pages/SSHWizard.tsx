@@ -17,6 +17,7 @@ import { GitHubIcon } from "../components/GitHubIcon";
 import { baseName } from "../lib/paths";
 import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 type Step = "generate" | "pubkey" | "test";
 
@@ -45,6 +46,14 @@ export function SSHWizard() {
 
   function loadKeys() {
     api.listSshKeys().then(setExistingKeys).catch(() => {});
+  }
+  const [reloading, setReloading] = useState(false);
+  function reloadAll() {
+    setReloading(true);
+    Promise.all([
+      api.listSshKeys().then(setExistingKeys).catch(() => {}),
+      api.ghListAccounts().then(setGhAccounts).catch(() => setGhAccounts([])),
+    ]).finally(() => setReloading(false));
   }
 
   // Keys are created and deleted in Terminal too.
@@ -142,11 +151,14 @@ export function SSHWizard() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-zinc-100">SSH Key Wizard</h1>
-        <p className="text-sm text-zinc-400 mt-1">
-          Generate a new SSH key for GitHub authentication
-        </p>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-zinc-100">SSH Key Wizard</h1>
+          <p className="text-sm text-zinc-400 mt-1">
+            Generate a new SSH key for GitHub authentication
+          </p>
+        </div>
+        <RefreshButton onClick={reloadAll} busy={reloading} title="Re-read the keys on disk and the gh accounts" />
       </div>
 
       <div className="flex items-center gap-2">

@@ -1,5 +1,8 @@
 // Repo states the History page has to handle, as the backend would report them.
-// Self-contained: the Changes fixtures in fixtures.mjs belong to another suite.
+// Self-contained but for the push state's shape, which fixtures.mjs owns: the
+// status strip and the Changes tab (mounted beside History now) read all of
+// it, and the real status always carries it.
+import { push } from "./fixtures.mjs";
 
 export const REPO = "/repos/gitswitch";
 
@@ -24,15 +27,41 @@ function commit(hash, subject, over = {}) {
     author_name: "Me",
     author_email: "me@personal.test",
     date: "2026-09-20T10:00:00+02:00",
+    author_date: "2026-09-20T09:30:00+02:00",
     subject,
     refs: [],
     is_merge: false,
+    touches_submodules: [],
+    only_submodules: false,
+    unpushed: false,
     lane: 0,
     parent_lanes: [0],
     active_lanes: [0],
     ...over,
   };
 }
+
+/** Who commits here, as `git shortlog -sne` orders them. */
+export const AUTHORS = [
+  // The address of the account the repository belongs to, so "Just me" applies.
+  { name: "Me", email: "me@personal.test", commits: 2 },
+  { name: "Other Person", email: "other@example.test", commits: 1 },
+  { name: "github-actions[bot]", email: "41898282+github-actions[bot]@users.noreply.github.com", commits: 5 },
+];
+
+/** A superproject's page: one real commit and one CI bump of a submodule pointer. */
+export const HISTORY_PAGE_BUMP = {
+  commits: [
+    commit(C1, "ci: bump trinity submodule to d9b93c5", { parents: [C2], refs: ["HEAD -> main", "origin/main"], author_name: "github-actions[bot]", touches_submodules: ["trinity"], only_submodules: true }),
+    commit(C2, "Teach the clone page about LFS", { parents: [C3] }),
+  ],
+  total: 2,
+  offset: 0,
+  limit: 50,
+  has_more: false,
+  max_lane: 0,
+  remote_refs: true,
+};
 
 export const HISTORY_PAGE = {
   commits: [
@@ -45,6 +74,7 @@ export const HISTORY_PAGE = {
   limit: 50,
   has_more: false,
   max_lane: 0,
+  remote_refs: true,
 };
 
 function branch(name, over = {}) {
@@ -221,7 +251,8 @@ function repoStatus(over = {}) {
       profile_id: "p1", profile_name: "Kirmada", profile_email: "me@personal.test", matches_profile: true,
       signing_on: false, signing_key: null, guard: "none",
     },
-    push: { blocked: false, reason: "Pushing is allowed from this folder.", remotes: [], gaps: [], needs_repair: false },
+    push: push(),
+    conflict_source: null,
     can_amend: true,
     head_subject: "Tidy the settings page",
     merge_message: null,

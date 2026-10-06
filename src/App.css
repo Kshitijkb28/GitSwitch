@@ -1,5 +1,16 @@
 @import "tailwindcss";
 
+/* The window is dark everywhere — including the rubber-band area WebKit shows
+   past either end of a scroll, which it paints with the document's own
+   background. With the default white there, a trackpad swipe that overshoots
+   flashed (or left) a white band above the dark page. */
+html,
+body {
+  background-color: #18181b; /* zinc-900, the app shell's colour */
+  color-scheme: dark;
+  overscroll-behavior: none;
+}
+
 @keyframes toastIn {
   from {
     opacity: 0;

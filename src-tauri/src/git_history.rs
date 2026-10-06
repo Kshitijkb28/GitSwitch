@@ -2,6 +2,7 @@ use crate::error::AppError;
 use crate::profiles;
 use crate::repo_scan;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Unit separator — safe inside git format strings, never appears in messages.
@@ -38,10 +39,21 @@ pub struct HistoryCommit {
     pub parents: Vec<String>,
     pub author_name: String,
     pub author_email: String,
+    /// The committer date — what the graph is ordered by.
     pub date: String,
     pub subject: String,
     pub refs: Vec<String>,
     pub is_merge: bool,
+    /// The author date: stable across the rebases an update performs, so a
+    /// row keeps its time when its id changes. Shown; `date` sits in the title.
+    pub author_date: String,
+    /// Submodule pointers this commit moves.
+    pub touches_submodules: Vec<String>,
+    /// It changes nothing but submodule pointers — a bump, not work.
+    pub only_submodules: bool,
+    /// No remote-tracking branch has it: it exists only here. Meaningful
+    /// only when the page says there are remote-tracking branches at all.
+    pub unpushed: bool,
     // graph placement
     pub lane: usize,
     pub parent_lanes: Vec<usize>,
@@ -56,6 +68,14 @@ pub struct HistoryPage {
     pub limit: usize,
     pub has_more: bool,
     pub max_lane: usize,
+    /// The repository has at least one remote-tracking branch to compare
+    /// with. Without one nothing here is known to be pushed, and the rows
+    /// carry no mark.
+    pub remote_refs: bool,
+    /// The comparison with the remote-tracking branches failed (a
+    /// remote-tracking ref pointing at a missing object, say): the rows carry
+    /// no mark, and this says why.
+    pub marks_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -150,12 +170,32 @@ pub(crate) fn is_remote_head(full_ref: &str) -> bool {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, AppError> {
-    let out = std::process::Command::new("git")
+    let started = std::time::Instant::now();
+    // Signature checks must never land in output that is parsed.
+    let safe: Vec<&str> = match args.first().and_then(|sub| crate::git_exec::parse_safe_cfg(sub)) {
+        Some(kv) => vec!["-c", kv],
+        None => Vec::new(),
+    };
+    let out = crate::spawn::command("git")
         .arg("-C")
         .arg(repo)
+        .args(&safe)
         .args(args)
         .output()
         .map_err(|e| AppError::Command(format!("failed to run git: {}", e)))?;
+    crate::cmdlog::record(
+        repo,
+        ["git", "-C", &repo.to_string_lossy()]
+            .iter()
+            .map(|a| a.to_string())
+            .chain(safe.iter().map(|a| a.to_string()))
+            .chain(args.iter().map(|a| a.to_string()))
+            .collect(),
+        out.status.code().unwrap_or(-1),
+        started.elapsed(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    );
     if !out.status.success() {
         return Err(AppError::Command(
             String::from_utf8_lossy(&out.stderr).trim().to_string(),
@@ -284,10 +324,48 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
     Ok(out)
 }
 
+/// Where HEAD is, in three facts. The History page only needs these; it used
+/// to ask for the Changes page's whole status (seventeen git commands, some
+/// proportional to the size of the repository) to learn them.
+#[derive(Debug, Serialize, Clone)]
+pub struct HeadInfo {
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub unborn: bool,
+}
+
+pub fn head_info(repo_path: &str) -> Result<HeadInfo, AppError> {
+    let repo = PathBuf::from(repo_path);
+    // Unborn: HEAD names a branch that has no commit yet, so symbolic-ref
+    // answers but rev-parse does not. Detached: the other way round.
+    let branch = git(&repo, &["symbolic-ref", "-q", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let has_commit = git(&repo, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).is_ok();
+    Ok(HeadInfo { detached: branch.is_none() && has_commit, unborn: !has_commit, branch })
+}
+
+/// `%(upstream:track,nobracket)`: "ahead 1, behind 2", "ahead 1", "behind 2",
+/// "" (level), or "gone" (the upstream no longer exists).
+pub fn parse_track(s: &str) -> (usize, usize) {
+    let mut ahead = 0;
+    let mut behind = 0;
+    for part in s.split(',') {
+        let mut it = part.split_whitespace();
+        match (it.next(), it.next().and_then(|n| n.parse::<usize>().ok())) {
+            (Some("ahead"), Some(n)) => ahead = n,
+            (Some("behind"), Some(n)) => behind = n,
+            _ => {}
+        }
+    }
+    (ahead, behind)
+}
+
 pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
     let repo = PathBuf::from(repo_path);
     let fmt = format!(
-        "%(refname){US}%(refname:short){US}%(upstream:short){US}%(objectname){US}%(objectname:short){US}%(authorname){US}%(committerdate:iso8601){US}%(HEAD){US}%(subject)",
+        "%(refname){US}%(refname:short){US}%(upstream:short){US}%(objectname){US}%(objectname:short){US}%(authorname){US}%(committerdate:iso8601){US}%(HEAD){US}%(upstream:track,nobracket){US}%(subject)",
         US = US
     );
     let raw = git(
@@ -298,8 +376,8 @@ pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
     let mut branches = Vec::new();
     for line in raw.lines() {
         // subject is last so any separator inside it can't shift the other fields
-        let f: Vec<&str> = line.splitn(9, US).collect();
-        if f.len() < 9 {
+        let f: Vec<&str> = line.splitn(10, US).collect();
+        if f.len() < 10 {
             continue;
         }
         let full_ref = f[0];
@@ -311,14 +389,11 @@ pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
         let is_remote = full_ref.starts_with("refs/remotes/");
 
         // ahead/behind only makes sense for a local branch with an upstream.
-        let (mut ahead, mut behind) = (0usize, 0usize);
-        if let (false, Some(up)) = (is_remote, upstream.as_ref()) {
-            if let Ok(counts) = git(&repo, &["rev-list", "--left-right", "--count", &format!("{}...{}", name, up)]) {
-                let mut it = counts.split_whitespace();
-                ahead = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-                behind = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            }
-        }
+        // for-each-ref computes it in the same walk (`%(upstream:track)`);
+        // this used to be one `rev-list --count` process per branch, which on
+        // a repository with two hundred branches was two hundred processes
+        // every time the History page opened.
+        let (ahead, behind) = if is_remote || upstream.is_none() { (0, 0) } else { parse_track(f[8]) };
 
         branches.push(BranchInfo {
             is_current: f[7].trim() == "*",
@@ -331,7 +406,7 @@ pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
             short_tip: f[4].to_string(),
             last_author: f[5].to_string(),
             last_date: f[6].to_string(),
-            last_subject: f[8].to_string(),
+            last_subject: f[9].to_string(),
         });
     }
     Ok(branches)
@@ -341,8 +416,8 @@ fn parse_log(raw: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
     // (hash, parents, remaining fields)
     raw.lines()
         .filter_map(|line| {
-            let f: Vec<&str> = line.splitn(8, US).collect();
-            if f.len() < 8 {
+            let f: Vec<&str> = line.splitn(9, US).collect();
+            if f.len() < 9 {
                 return None;
             }
             let parents = f[2]
@@ -358,14 +433,160 @@ fn parse_log(raw: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
         .collect()
 }
 
+/// One person who has committed to the viewed revision, with how often.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct AuthorCount {
+    pub name: String,
+    pub email: String,
+    pub commits: usize,
+}
+
+/// `git shortlog -sne`: `   12\tName <email>` per line, most frequent first.
+pub fn parse_shortlog(out: &str) -> Vec<AuthorCount> {
+    out.lines()
+        .filter_map(|line| {
+            let (count, who) = line.trim().split_once('\t')?;
+            let commits: usize = count.trim().parse().ok()?;
+            let (name, email) = match (who.rfind(" <"), who.ends_with('>')) {
+                (Some(i), true) => (who[..i].trim().to_string(), who[i + 2..who.len() - 1].trim().to_string()),
+                _ => (who.trim().to_string(), String::new()),
+            };
+            Some(AuthorCount { name, email, commits })
+        })
+        .collect()
+}
+
+/// Who commits on the viewed revision (or everywhere, for "--all"), most
+/// frequent first — the list behind the History page's people filter. Capped:
+/// a long-lived repository can have thousands of one-off authors.
+pub fn authors(repo_path: &str, rev: &str) -> Result<Vec<AuthorCount>, AppError> {
+    let repo = PathBuf::from(repo_path);
+    if rev != "--all" && rev.starts_with('-') {
+        return Err(AppError::Config(format!("Invalid revision: {}", rev)));
+    }
+    let raw = git(&repo, &["shortlog", "-sne", rev])?;
+    let mut list = parse_shortlog(&raw);
+    list.truncate(300);
+    Ok(list)
+}
+
+/// Every gitlink path in the index — the submodules, mapped or not.
+fn gitlink_paths(repo: &Path) -> Vec<String> {
+    git(repo, &["ls-files", "-s", "-z"])
+        .map(|out| {
+            out.split('\0')
+                .filter(|rec| rec.starts_with("160000 "))
+                .filter_map(|rec| rec.split_once('\t').map(|(_, p)| p.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The files each listed commit touches — one git call for the page, so a
+/// commit can be told apart from a submodule-pointer bump.
+fn files_per_commit(repo: &Path, hashes: &[String]) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    if hashes.is_empty() {
+        return out;
+    }
+    // -z: names as they are (no quoting of non-ASCII paths). Gitlink changes
+    // are listed whatever `submodule.<name>.ignore` or `diff.ignoreSubmodules`
+    // says, and a merge lists nothing — its combined diff is not what it
+    // "changed".
+    // --no-show-signature: with `log.showSignature` set, the verification
+    // text would land among the names.
+    let mut args: Vec<&str> = vec!["show", "--no-show-signature", "--name-only", "-z", "--format=%x1e%H", "--no-renames", "--ignore-submodules=none", "--no-diff-merges"];
+    args.extend(hashes.iter().map(String::as_str));
+    let Ok(text) = git(repo, &args) else { return out };
+    out.extend(parse_name_only(&text));
+    out
+}
+
+/// `--name-only -z --format=%x1e%H` output, from `show` or `log`: one record
+/// per commit — the hash and a NUL, then, when it touches anything, a
+/// newline and its files, each ended by a NUL.
+pub(crate) fn parse_name_only(text: &str) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for chunk in text.split('\x1e') {
+        let mut fields = chunk.split('\0');
+        let Some(hash) = fields.next().map(str::trim).filter(|h| !h.is_empty()) else { continue };
+        let files = fields.map(|f| f.strip_prefix('\n').unwrap_or(f)).filter(|f| !f.is_empty()).map(String::from).collect();
+        out.insert(hash.to_string(), files);
+    }
+    out
+}
+
+/// A pathspec that leaves out exactly this path — the gitlink entry — and
+/// nothing under it. A plain or literal pathspec is a prefix match: it would
+/// also hide every commit that touched files there while the path was still
+/// an ordinary folder, earlier in history or on another branch. A pattern
+/// with a wildcard is matched against the whole path instead, so one
+/// character is written as a one-character class (or escaped, when there is
+/// no plain one to use).
+/// `s` as a basic regular expression that matches exactly that text. Only
+/// the characters that mean something in a BRE are escaped; "+", "?", "(",
+/// "{" and "|" are literal there already.
+fn bre_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '.' | '*' | '[' | '^' | '$') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn exact_exclude(path: &str) -> String {
+    let mut out = String::from(":(exclude,glob)");
+    let mut classed = false;
+    let any_plain = path.chars().any(|c| c.is_ascii_alphanumeric());
+    for (i, c) in path.chars().enumerate() {
+        match c {
+            '\\' | '*' | '?' | '[' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if !classed && c.is_ascii_alphanumeric() => {
+                out.push('[');
+                out.push(c);
+                out.push(']');
+                classed = true;
+            }
+            c if !any_plain && i == 0 => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Which of a commit's files are submodule pointers, and whether that is all
+/// it changes. A commit that touches nothing (a merge, an empty commit) is
+/// not a bump: it would otherwise vanish behind the "pointer-only" toggle.
+fn classify_touches(files: &[String], gitlinks: &[String]) -> (Vec<String>, bool) {
+    let touched: Vec<String> = files.iter().filter(|p| gitlinks.contains(p)).cloned().collect();
+    let only = !files.is_empty() && touched.len() == files.len();
+    (touched, only)
+}
+
 /// One page of history for a branch (or every branch when `rev` is "--all").
+/// `authors`: only commits by any of these (emails or names, literal);
+/// `hide_pointer_only`: leave out commits that change nothing but submodule
+/// pointers (the CI bumps a superproject's history fills up with);
+/// `unpushed_only`: only commits no remote-tracking branch has.
+#[allow(clippy::too_many_arguments)]
 pub fn history_page(
     repo_path: &str,
     rev: &str,
     offset: usize,
     limit: usize,
     search: Option<&str>,
-    author: Option<&str>,
+    authors: Option<&[String]>,
+    hide_pointer_only: bool,
+    unpushed_only: bool,
 ) -> Result<HistoryPage, AppError> {
     let repo = PathBuf::from(repo_path);
     // Ranges (main..origin/main) are legitimate revisions; only flags are not.
@@ -373,13 +594,24 @@ pub fn history_page(
         return Err(AppError::Config(format!("Invalid revision: {}", rev)));
     }
     let fmt = format!(
-        "%H{US}%h{US}%P{US}%an{US}%ae{US}%cI{US}%D{US}%s",
+        "%H{US}%h{US}%P{US}%aN{US}%aE{US}%cI{US}%D{US}%s{US}%aI",
         US = US
     );
+    let gitlinks = gitlink_paths(&repo);
 
-    let mut count_args: Vec<String> = vec!["rev-list".into(), "--count".into()];
+    // Counting an author filter has to be done by `log`: it matches authors
+    // through .mailmap, as the People list (shortlog) and the rows do, and
+    // `rev-list` cannot — the two would disagree on the total.
+    let by_author = authors.is_some_and(|a| a.iter().any(|s| !s.trim().is_empty()));
+    // --use-mailmap on the command line: the people list is always mapped,
+    // and `log.mailmap=false` in someone's config must not make the rows and
+    // the count disagree with it.
+    let mut count_args: Vec<String> =
+        if by_author { vec!["log".into(), "--use-mailmap".into(), "--no-show-signature".into(), "--format=%x2e".into()] } else { vec!["rev-list".into(), "--count".into()] };
     let mut log_args: Vec<String> = vec![
         "log".into(),
+        "--use-mailmap".into(),
+        "--no-show-signature".into(),
         format!("--skip={}", offset),
         format!("-n{}", limit),
         "--date-order".into(),
@@ -390,13 +622,29 @@ pub fn history_page(
     // `1234+user@users.noreply.github.com` must match literally.
     let mut limits: Vec<String> = Vec::new();
     if let Some(q) = search.filter(|s| !s.trim().is_empty()) {
-        limits.push(format!("--grep={}", q.trim()));
+        limits.push(format!("--grep={}", bre_literal(q.trim())));
     }
-    if let Some(a) = author.filter(|s| !s.trim().is_empty()) {
-        limits.push(format!("--author={}", a.trim()));
+    // Several --author patterns are ORed by git; capped so the argument list
+    // stays well under Windows' limit. Every pattern is the text itself (a
+    // "+" or "[bot]" in an address is literal): an address is wrapped in its
+    // angle brackets so me@x.test does not also match someone@x.testing; a
+    // whole identity ("Sam <>", for a commit without an address) is anchored
+    // at both ends, so it does not also mean "Uncle Sam <>".
+    for a in authors.unwrap_or(&[]).iter().map(|s| s.trim()).filter(|s| !s.is_empty()).take(200) {
+        if a.starts_with('<') && a.ends_with('>') {
+            // An address in its brackets, whatever the name before it.
+            limits.push(format!("--author={}", bre_literal(a)));
+        } else if a.contains('<') {
+            limits.push(format!("--author=^{}$", bre_literal(a)));
+        } else if a.contains('@') {
+            limits.push(format!("--author=<{}>", bre_literal(a)));
+        } else {
+            limits.push(format!("--author={}", bre_literal(a)));
+        }
     }
     if !limits.is_empty() {
-        for a in ["--fixed-strings".to_string(), "--regexp-ignore-case".to_string()] {
+        // Basic regular expressions by name, whatever grep.patternType says.
+        for a in ["--basic-regexp".to_string(), "--regexp-ignore-case".to_string()] {
             count_args.push(a.clone());
             log_args.push(a);
         }
@@ -412,20 +660,43 @@ pub fn history_page(
         count_args.push(rev.to_string());
         log_args.push(rev.to_string());
     }
+    // Only what no remote-tracking branch has: `--not` turns every ref that
+    // `--remotes` adds into an exclusion.
+    if unpushed_only {
+        for args in [&mut count_args, &mut log_args] {
+            args.push("--not".into());
+            args.push("--remotes".into());
+        }
+    }
+    // Everything but the gitlinks: a commit that touches only pointers has
+    // nothing left and drops out of the list (and the count). Full history
+    // with merge simplification keeps every commit that did real work and
+    // rewrites parents past the hidden ones, so the graph stays connected
+    // instead of running lanes off to commits that are not shown.
+    if hide_pointer_only && !gitlinks.is_empty() {
+        for args in [&mut count_args, &mut log_args] {
+            args.push("--full-history".into());
+            args.push("--simplify-merges".into());
+            args.push("--".into());
+            args.push(".".into());
+            for p in &gitlinks {
+                args.push(exact_exclude(p));
+            }
+        }
+    }
 
     let count_ref: Vec<&str> = count_args.iter().map(String::as_str).collect();
-    let total: usize = git(&repo, &count_ref)
-        .unwrap_or_default()
-        .trim()
-        .parse()
-        .unwrap_or(0);
+    let counted = git(&repo, &count_ref).unwrap_or_default();
+    let total: usize = if by_author { counted.lines().filter(|l| l.trim() == ".").count() } else { counted.trim().parse().unwrap_or(0) };
 
     let log_ref: Vec<&str> = log_args.iter().map(String::as_str).collect();
     // A repo with no commits yet makes `git log` exit non-zero; that's an empty
     // history, not an error worth showing the user.
+    // (With the unpushed filter a failure is a failure: an empty list would
+    // claim everything is pushed.)
     let raw = match git(&repo, &log_ref) {
         Ok(r) => r,
-        Err(_) if total == 0 => String::new(),
+        Err(_) if total == 0 && !unpushed_only => String::new(),
         Err(e) => return Err(e),
     };
     let parsed = parse_log(&raw);
@@ -456,13 +727,45 @@ pub fn history_page(
             author_email: f[4].clone(),
             date: f[5].clone(),
             subject: f[7].clone(),
+            author_date: f[8].clone(),
             refs,
             hash,
             parents,
             lane: row.lane,
             parent_lanes: row.parent_lanes.clone(),
             active_lanes: row.active.clone(),
+            touches_submodules: Vec::new(),
+            only_submodules: false,
+            unpushed: false,
         });
+    }
+    if !gitlinks.is_empty() {
+        let hashes: Vec<String> = commits.iter().map(|c| c.hash.clone()).collect();
+        let files = files_per_commit(&repo, &hashes);
+        for c in commits.iter_mut() {
+            if let Some(f) = files.get(&c.hash) {
+                (c.touches_submodules, c.only_submodules) = classify_touches(f, &gitlinks);
+            }
+        }
+    }
+    let remote_refs = has_remote_refs(&repo);
+    let mut marks_error = None;
+    if remote_refs {
+        if unpushed_only {
+            for c in commits.iter_mut() {
+                c.unpushed = true;
+            }
+        } else {
+            let hashes: Vec<String> = commits.iter().map(|c| c.hash.clone()).collect();
+            match unpushed_among(&repo, &hashes) {
+                Ok(unpushed) => {
+                    for c in commits.iter_mut() {
+                        c.unpushed = unpushed.contains(&c.hash);
+                    }
+                }
+                Err(e) => marks_error = Some(e),
+            }
+        }
     }
 
     Ok(HistoryPage {
@@ -472,7 +775,34 @@ pub fn history_page(
         limit,
         max_lane,
         commits,
+        remote_refs,
+        marks_error,
     })
+}
+
+/// At least one remote-tracking branch exists — something a commit can have
+/// been pushed to.
+fn has_remote_refs(repo: &Path) -> bool {
+    git(repo, &["for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes/"]).map(|o| !o.trim().is_empty()).unwrap_or(false)
+}
+
+/// Which of these commits no remote-tracking branch has. `--no-walk` lists
+/// only the commits named, while `--not --remotes` still excludes everything
+/// a remote-tracking branch reaches — so the answer costs one walk of the
+/// remote side down to the oldest commit asked about, never a walk of the
+/// whole history. Two hundred at a time, for Windows' argument limit.
+fn unpushed_among(repo: &Path, hashes: &[String]) -> Result<std::collections::HashSet<String>, String> {
+    let mut out = std::collections::HashSet::new();
+    for chunk in hashes.chunks(200) {
+        let mut args: Vec<&str> = vec!["rev-list", "--no-walk=unsorted"];
+        args.extend(chunk.iter().map(String::as_str));
+        args.extend(["--not", "--remotes"]);
+        // A failure (a remote-tracking ref at a missing object, say) is not
+        // "everything is pushed": the caller says it could not tell.
+        let o = git(repo, &args).map_err(|e| e.to_string())?;
+        out.extend(o.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()));
+    }
+    Ok(out)
 }
 
 pub fn commit_detail(repo_path: &str, hash: &str) -> Result<CommitDetail, AppError> {
@@ -558,7 +888,7 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
     .filter(|s| s != branch)
     .collect();
 
-    let page = history_page(repo_path, branch, 0, 400, None, None)?;
+    let page = history_page(repo_path, branch, 0, 400, None, None, false, false)?;
     let merges = page.commits.into_iter().filter(|c| c.is_merge).take(50).collect();
 
     Ok(MergeInfo {
@@ -636,7 +966,10 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
 
 fn seconds_since_last_fetch(repo: &Path) -> Option<u64> {
     // git rewrites FETCH_HEAD on every fetch, so its mtime is the fetch time.
-    let meta = std::fs::metadata(repo.join(".git").join("FETCH_HEAD")).ok()?;
+    // Resolved through git: a submodule's `.git` is a file pointing elsewhere,
+    // and the banner used to call such a repository "never fetched".
+    let path = git(repo, &["rev-parse", "--path-format=absolute", "--git-path", "FETCH_HEAD"]).ok()?;
+    let meta = std::fs::metadata(path.trim()).ok()?;
     let modified = meta.modified().ok()?;
     std::time::SystemTime::now()
         .duration_since(modified)
@@ -691,6 +1024,69 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_line_needs_all_nine_fields_and_keeps_the_author_date_last() {
+        let line = ["h1", "h", "p1 p2", "Ann", "ann@x", "2026-10-05T10:00:00+02:00", "HEAD -> main", "fix: it", "2026-10-01T09:00:00+02:00"].join("\x1f");
+        let parsed = parse_log(&line);
+        assert_eq!(parsed.len(), 1);
+        let (hash, parents, f) = &parsed[0];
+        assert_eq!(hash, "h1");
+        assert_eq!(parents, &["p1", "p2"]);
+        assert_eq!(f[7], "fix: it");
+        assert_eq!(f[8], "2026-10-01T09:00:00+02:00", "the author date rides last");
+        // The old eight-field shape is not silently accepted as a commit.
+        let eight = ["h1", "h", "", "Ann", "ann@x", "2026-10-05T10:00:00+02:00", "", "fix: it"].join("\x1f");
+        assert!(parse_log(&eight).is_empty());
+    }
+
+    #[test]
+    fn name_only_records_are_split_per_commit_and_a_bump_is_told_from_work() {
+        // The bytes git writes with -z: hash, NUL, then (when there are files) a newline and each name with its NUL.
+        let text = "\x1eaaa\0\ntrinity\0\x1ebbb\0\nsrc/main.rs\0trinity\0\x1eccc\0\x1eddd\0\nm\u{f3}dulo file.txt\0";
+        let files = parse_name_only(text);
+        assert_eq!(files["ddd"], vec!["m\u{f3}dulo file.txt".to_string()], "a name is taken as it is, spaces and all");
+        assert_eq!(files["aaa"], vec!["trinity".to_string()]);
+        assert_eq!(files["bbb"], vec!["src/main.rs".to_string(), "trinity".to_string()]);
+        assert!(files["ccc"].is_empty(), "a merge lists no files");
+        let gitlinks = vec!["trinity".to_string(), "vendor/sub".to_string()];
+        assert_eq!(classify_touches(&files["aaa"], &gitlinks), (vec!["trinity".to_string()], true));
+        assert_eq!(classify_touches(&files["bbb"], &gitlinks), (vec!["trinity".to_string()], false));
+        assert_eq!(classify_touches(&files["ccc"], &gitlinks), (vec![], false), "nothing touched is not a bump");
+        assert_eq!(classify_touches(&["README.md".to_string()], &gitlinks), (vec![], false));
+    }
+
+    #[test]
+    fn hiding_a_pointer_leaves_out_that_entry_and_nothing_under_it() {
+        // One character becomes a class, so git matches the whole path rather than a prefix.
+        assert_eq!(bre_literal("1234+user@users.noreply.github.com"), "1234+user@users\\.noreply\\.github\\.com");
+        assert_eq!(bre_literal("A.B [bot] <>"), "A\\.B \\[bot] <>");
+        assert_eq!(bre_literal("a\\b*^$"), "a\\\\b\\*\\^\\$");
+        assert_eq!(exact_exclude("vendor/lib"), ":(exclude,glob)[v]endor/lib");
+        // Characters a glob would read are escaped.
+        assert_eq!(exact_exclude("libs/my sub[1]*"), ":(exclude,glob)[l]ibs/my sub\\[1]\\*");
+        // No plain character to class: the first one is escaped, which makes it a pattern all the same.
+        assert_eq!(exact_exclude("\u{65e5}\u{672c}"), ":(exclude,glob)\\\u{65e5}\u{672c}");
+    }
+
+    #[test]
+    fn a_shortlog_becomes_people_with_counts_in_the_order_git_gave() {
+        let list = parse_shortlog("    12\tAnn Example <ann@example.test>\n     3\tBob <bob@x>\n     1\tNo Email\n");
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], AuthorCount { name: "Ann Example".into(), email: "ann@example.test".into(), commits: 12 });
+        assert_eq!(list[1].email, "bob@x");
+        assert_eq!(list[2], AuthorCount { name: "No Email".into(), email: String::new(), commits: 1 });
+        assert!(parse_shortlog("").is_empty());
+    }
+
+    #[test]
+    fn upstream_track_is_read_in_every_shape_git_prints() {
+        assert_eq!(parse_track("ahead 3, behind 2"), (3, 2));
+        assert_eq!(parse_track("ahead 1"), (1, 0));
+        assert_eq!(parse_track("behind 7"), (0, 7));
+        assert_eq!(parse_track(""), (0, 0));
+        assert_eq!(parse_track("gone"), (0, 0));
+    }
 
     fn c(h: &str, parents: &[&str]) -> (String, Vec<String>) {
         (h.into(), parents.iter().map(|s| s.to_string()).collect())

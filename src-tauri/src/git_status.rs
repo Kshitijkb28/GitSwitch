@@ -81,7 +81,7 @@ pub struct ParsedStatus {
 /// The two sides of a conflict, named the way the user thinks of them —
 /// during a rebase git's "ours" is the upstream and "theirs" is your commit,
 /// which is exactly the confusion these labels exist to remove.
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Clone, PartialEq, Default)]
 pub struct Sides {
     pub mine: String,
     pub theirs: String,
@@ -121,6 +121,164 @@ pub fn sides_for(kind: &str, branch: Option<&str>, upstream: Option<&str>, onto:
         "revert" => Sides { mine: mine_branch, theirs: "the revert".into() },
         _ => Sides { mine: mine_branch, theirs: "the branch being merged in".into() },
     }
+}
+
+/// One conflict in a file, split into what each side wants there.
+#[derive(Debug, Serialize, Clone, Default, PartialEq)]
+pub struct ConflictHunk {
+    /// 1-based line of the `<<<<<<<` marker.
+    pub line: usize,
+    pub mine: Vec<String>,
+    /// The common ancestor's lines, when the file carries diff3 markers.
+    pub base: Vec<String>,
+    pub theirs: Vec<String>,
+}
+
+/// A conflicted file read for resolution: its hunks side by side, and how
+/// many markers are still in it.
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct ConflictView {
+    pub path: String,
+    /// A binary file has no hunks to show: Keep mine or Take theirs decides it.
+    pub binary: bool,
+    /// How many `<<<<<<<` markers the file still has.
+    pub marker_count: usize,
+    pub hunks: Vec<ConflictHunk>,
+    /// Hunks or lines beyond the caps were left out.
+    pub truncated: bool,
+    pub sides: Sides,
+    pub total_lines: usize,
+    /// The file is larger than what was read: the count is of that part
+    /// only, and no count of zero means the file is resolved.
+    pub partial: bool,
+}
+
+const MAX_CONFLICT_HUNKS: usize = 40;
+const MAX_CONFLICT_SIDE_LINES: usize = 200;
+
+/// A conflict marker line: `size` identical `<`, `|`, `=` or `>` at the
+/// start, followed by the end of the line or a space. Seven is what git
+/// writes unless the `conflict-marker-size` attribute says otherwise.
+pub(crate) fn marker_kind(line: &str, size: usize) -> Option<char> {
+    let size = size.max(1);
+    for c in ['<', '|', '=', '>'] {
+        let m: String = std::iter::repeat_n(c, size).collect();
+        if line == m || line.starts_with(&(m + " ")) {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// What a side line can be at most in the view: enough to read, never a
+/// minified file in one go.
+const MAX_SIDE_LINE_CHARS: usize = 500;
+
+fn clip(line: &str) -> String {
+    if line.chars().count() <= MAX_SIDE_LINE_CHARS {
+        line.to_string()
+    } else {
+        let mut s: String = line.chars().take(MAX_SIDE_LINE_CHARS).collect();
+        s.push('…');
+        s
+    }
+}
+
+/// Split a conflicted file into hunks. Text outside the markers is not kept:
+/// the point is what each side wants, not the whole file. The count follows
+/// the same rule as the staging guard (`git_ops::conflict_marker_lines`): an
+/// opener finished or not, plus a close with nothing open.
+pub fn parse_conflict_markers(text: &str, size: usize) -> (Vec<ConflictHunk>, usize, bool) {
+    let mut hunks: Vec<ConflictHunk> = Vec::new();
+    let mut markers = 0;
+    let mut truncated = false;
+    let mut current: Option<(ConflictHunk, char)> = None;
+    // Whether an opener is waiting for its close — kept apart from `current`,
+    // which is empty for hunks past the cap although they are open all the same.
+    let mut open = false;
+    for (i, line) in text.lines().enumerate() {
+        match (marker_kind(line, size), current.as_mut()) {
+            (Some('<'), _) => {
+                markers += 1;
+                open = true;
+                // A hunk never closed before the next begins: keep what it had.
+                if let Some((h, _)) = current.take() {
+                    hunks.push(h);
+                }
+                if hunks.len() >= MAX_CONFLICT_HUNKS {
+                    truncated = true;
+                    current = None;
+                } else {
+                    current = Some((ConflictHunk { line: i + 1, ..Default::default() }, '<'));
+                }
+            }
+            (Some('|'), Some((_, side))) => *side = '|',
+            (Some('='), Some((_, side))) => *side = '=',
+            (Some('>'), Some(_)) => {
+                open = false;
+                if let Some((h, _)) = current.take() {
+                    hunks.push(h);
+                }
+            }
+            // A close with nothing open is a leftover of a half-done edit; the
+            // close of a hunk past the cap is just that hunk's end.
+            (Some('>'), None) => {
+                if !open {
+                    markers += 1;
+                }
+                open = false;
+            }
+            (None, Some((h, side))) => {
+                let bucket = match side {
+                    '<' => &mut h.mine,
+                    '|' => &mut h.base,
+                    _ => &mut h.theirs,
+                };
+                if bucket.len() < MAX_CONFLICT_SIDE_LINES {
+                    bucket.push(clip(line));
+                } else {
+                    truncated = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // A hunk never closed: the file is being edited, or the markers are
+    // damaged. Show what there is.
+    if let Some((h, _)) = current.take() {
+        hunks.push(h);
+    }
+    (hunks, markers, truncated)
+}
+
+/// The conflicted file at `path` (inside the repository), split for the
+/// resolution view. The sides are named as the operation in progress names
+/// them, so "mine" and "theirs" mean the same thing as on the file list.
+pub async fn conflict_view(repo_path: &str, path: &str) -> Result<ConflictView, AppError> {
+    let full = crate::git_ops::within_repo(repo_path, path)?;
+    if full.is_dir() {
+        return Err(AppError::Command(format!(
+            "{} is a submodule, not a file — Keep mine or Take theirs decides which commit it records.",
+            path
+        )));
+    }
+    // As much of the file as "Mark resolved" itself judges, so the two cannot
+    // disagree; what is sent on is bounded by the hunk and line caps.
+    let (bytes, more) = crate::git_ops::read_head(&full, crate::git_ops::MARKER_SCAN_MAX)?;
+    let sides = Box::pin(repo_status(repo_path))
+        .await?
+        .operation
+        .and_then(|o| o.sides)
+        .unwrap_or(Sides { mine: "mine".into(), theirs: "theirs".into() });
+    let binary = bytes.iter().take(8000).any(|b| *b == 0);
+    if binary {
+        return Ok(ConflictView { path: path.to_string(), binary: true, sides, ..Default::default() });
+    }
+    let sizes = crate::git_ops::marker_sizes(std::path::Path::new(repo_path), &[path.to_string()]).await;
+    let text = String::from_utf8_lossy(&bytes);
+    let total_lines = text.lines().count();
+    let (hunks, marker_count, truncated) = parse_conflict_markers(&text, crate::git_ops::marker_size_for(&sizes, path));
+    Ok(ConflictView { path: path.to_string(), binary: false, marker_count, hunks, truncated: truncated || more, sides, total_lines, partial: more })
 }
 
 /// An interrupted merge/rebase/cherry-pick. Detected and shown; never acted on
@@ -773,7 +931,10 @@ async fn read_identity(repo: &Path, hooks: &Path) -> RepoIdentity {
 
     let repo_str = crate::paths::norm(&repo.to_string_lossy());
     let store = profiles::load_profiles().unwrap_or_else(|_| profiles::ProfileStore::new());
-    let profile = crate::commit_audit::owning_profile(&repo_str, &store.profiles);
+    // By folder first; else by the include file git actually read the email
+    // from, which is how a remote rule's clone outside every folder is known.
+    let profile = crate::commit_audit::owning_profile(&repo_str, &store.profiles)
+        .or_else(|| email_origin.as_deref().and_then(|o| profiles::profile_for_include_origin(o, &store.profiles)));
 
     let matches_profile = match profile {
         Some(p) => p.git_email.trim().eq_ignore_ascii_case(email.trim()),
@@ -890,6 +1051,7 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
 
     let paths = git_paths(&repo).await?;
     let mut presence = presence_from_disk(&paths);
+    let onto_oid = presence.onto.clone().filter(|o| is_full_oid(o));
     // git stores the rebase base as a full id; a person knows it by name.
     if let Some(onto) = presence.onto.clone().filter(|o| is_full_oid(o)) {
         if let Some(name) = onto_name(&repo, presence.head_name.as_deref(), &onto).await {
@@ -899,6 +1061,24 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
     let mut operation = parse_in_progress(&presence);
     if let Some(op) = operation.as_mut() {
         op.sides = Some(sides_for(&op.kind, parsed.branch.as_deref(), parsed.upstream.as_deref(), presence.onto.as_deref()));
+    }
+    // A rebase the superproject's update runs inside this submodule: "theirs"
+    // is the commit upstream's superproject records for it, so it is named
+    // that way — "origin/main's A (9f8e7d6)" — rather than by a bare id.
+    // Boxed: this future sits inside almost every operation's, and an inline
+    // copy of the summary's state machine pushed worker threads past their
+    // 2 MiB stacks.
+    let sync = Box::pin(crate::sync::summary_for(&repo)).await;
+    if let (Some(op), Some(sy)) = (operation.as_mut(), sync.as_ref()) {
+        if !sy.is_root && op.kind.starts_with("rebase") {
+            if let (Some(sub), Some(target), Some(onto)) = (sy.sub_path.as_deref(), sy.sub_target.as_deref(), onto_oid.as_deref()) {
+                if onto == target {
+                    if let Some(sides) = op.sides.as_mut() {
+                        sides.theirs = format!("{}'s {} ({})", sy.upstream, sub, short_oid(target));
+                    }
+                }
+            }
+        }
     }
     let merge_message = if paths.merge_head.exists() {
         std::fs::read_to_string(&paths.merge_msg)
@@ -994,7 +1174,7 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         merge_message,
         has_submodules,
         uses_lfs,
-        sync: crate::sync::summary_for(&repo).await,
+        sync,
         conflict_source,
     })
 }
@@ -1005,12 +1185,29 @@ pub(crate) fn owning_profile_id(repo_path: &str) -> Option<String> {
     crate::commit_audit::owning_profile(&repo, &store.profiles).map(|p| p.id.clone())
 }
 
+/// The profile that applies to this repository: by folder, else the one whose
+/// include file git read `user.email` from (a remote rule's clone).
+pub(crate) async fn profile_for_repo(repo_path: &str) -> Option<profiles::Profile> {
+    let store = profiles::load_profiles().ok()?;
+    let repo = crate::paths::norm(repo_path);
+    if let Some(p) = crate::commit_audit::owning_profile(&repo, &store.profiles) {
+        return Some(p.clone());
+    }
+    let origin = GitCmd::at(repo_path)
+        .args(["config", "--show-origin", "--get", "user.email"])
+        .ok_text()
+        .await?;
+    let file = origin.split('\t').next()?.trim().trim_start_matches("file:");
+    profiles::profile_for_include_origin(file, &store.profiles).cloned()
+}
+
 /// Push state on its own, for the toggle — resolves the hooks directory the
 /// same way `repo_status` does.
 pub async fn push_state_for(repo_path: &str) -> Result<crate::push_guard::PushState, AppError> {
     let repo = PathBuf::from(repo_path);
     let paths = git_paths(&repo).await?;
-    Ok(crate::push_guard::push_state(&repo, &paths.hooks, owning_profile_id(repo_path).as_deref()).await)
+    let profile_id = profile_for_repo(repo_path).await.map(|p| p.id);
+    Ok(crate::push_guard::push_state(&repo, &paths.hooks, profile_id.as_deref()).await)
 }
 
 pub async fn repair_push_block_for(repo_path: &str) -> Result<crate::push_guard::PushState, AppError> {
@@ -1392,6 +1589,49 @@ mod tests {
         assert_eq!(st.branch.as_deref(), Some("main"));
         assert_eq!(st.entries.len(), 1);
         assert_eq!(st.entries[0].path, "real.txt");
+    }
+
+    #[test]
+    fn conflict_markers_are_split_into_sides_and_counted() {
+        let text = "a\n<<<<<<< HEAD\nmine 1\nmine 2\n||||||| base\nold\n=======\ntheirs 1\n>>>>>>> origin/main\nb\n<<<<<<< HEAD\nm\n=======\nt\n>>>>>>> theirs\n";
+        let (hunks, markers, truncated) = parse_conflict_markers(text, 7);
+        assert_eq!(markers, 2);
+        assert!(!truncated);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].line, 2);
+        assert_eq!(hunks[0].mine, vec!["mine 1", "mine 2"]);
+        assert_eq!(hunks[0].base, vec!["old"]);
+        assert_eq!(hunks[0].theirs, vec!["theirs 1"]);
+        assert_eq!(hunks[1].mine, vec!["m"]);
+        assert!(hunks[1].base.is_empty());
+        assert_eq!(hunks[1].theirs, vec!["t"]);
+        // A separator inside normal text is not a marker: it needs exactly seven.
+        let (hunks, markers, _) = parse_conflict_markers("========\nplain\n<<<<<<<<\n", 7);
+        assert_eq!(markers, 0);
+        assert!(hunks.is_empty());
+        // Half-edited: an unclosed hunk is still shown.
+        let (hunks, markers, _) = parse_conflict_markers("<<<<<<< HEAD\nx\n=======\ny\n", 7);
+        assert_eq!(markers, 1);
+        assert_eq!(hunks[0].theirs, vec!["y"]);
+        // An unclosed hunk followed by another keeps both; an orphan close counts.
+        let (hunks, markers, _) = parse_conflict_markers("<<<<<<< HEAD\nx\n=======\ny\n<<<<<<< HEAD\nm\n=======\nt\n>>>>>>> b\n>>>>>>> stray\n", 7);
+        assert_eq!(markers, 3);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].theirs, vec!["y"]);
+        assert_eq!(hunks[1].mine, vec!["m"]);
+        // The width follows the attribute; the guard in git_ops agrees line for line.
+        let wide = "<<<<<<<<<< HEAD\na\n==========\nb\n>>>>>>>>>> theirs\n";
+        assert_eq!(parse_conflict_markers(wide, 10).1, 1);
+        assert_eq!(parse_conflict_markers(wide, 7).1, 0);
+        assert_eq!(crate::git_ops::conflict_marker_lines(wide, 10), vec![1]);
+        // Hunks past the cap are counted once each, as the guard counts them.
+        let many: String = (0..45).map(|i| format!("<<<<<<< HEAD\nm{i}\n=======\nt{i}\n>>>>>>> b\n")).collect();
+        let (hunks, markers, truncated) = parse_conflict_markers(&many, 7);
+        assert_eq!((hunks.len(), markers, truncated), (40, 45, true));
+        assert_eq!(crate::git_ops::conflict_marker_lines(&many, 7).len(), 45);
+        // A side line is clipped, never a whole minified file.
+        let long = format!("<<<<<<< HEAD\n{}\n=======\nb\n>>>>>>> t\n", "x".repeat(2000));
+        assert_eq!(parse_conflict_markers(&long, 7).0[0].mine[0].chars().count(), 501);
     }
 
     #[test]

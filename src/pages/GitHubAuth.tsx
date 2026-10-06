@@ -6,7 +6,10 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { Modal } from "../components/Modal";
 import { getEffectiveClientId } from "../lib/oauth";
+import { copyText } from "../lib/clipboard";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 type AuthStep = "idle" | "waiting" | "success" | "error";
 
@@ -181,14 +184,21 @@ export function GitHubAuth() {
 
   async function copyCode() {
     if (!deviceCode) return;
-    await navigator.clipboard.writeText(deviceCode.user_code);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    // The webview's clipboard API can be unavailable; copyText has the fallback.
+    if (await copyText(deviceCode.user_code)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
   }
 
   function openGitHub() {
     if (!deviceCode) return;
-    window.open(deviceCode.verification_uri, "_blank");
+    // window.open inside the webview opens nothing a person can use; the
+    // opener plugin hands the address to the system browser.
+    const uri = deviceCode.verification_uri;
+    openUrl(uri).catch(() => {
+      window.open(uri, "_blank");
+    });
   }
 
   function handleCreateProfile() {
@@ -199,11 +209,14 @@ export function GitHubAuth() {
   if (step === "idle") {
     return (
       <div className="space-y-6">
-        <div>
-          <h1 className="text-2xl font-bold text-zinc-100">Sign in with GitHub</h1>
-          <p className="text-sm text-zinc-400 mt-1">
-            Authenticate with your GitHub account to auto-configure your profile
-          </p>
+        <div className="flex items-start justify-between gap-4 flex-wrap">
+          <div>
+            <h1 className="text-2xl font-bold text-zinc-100">Sign in with GitHub</h1>
+            <p className="text-sm text-zinc-400 mt-1">
+              Authenticate with your GitHub account to auto-configure your profile
+            </p>
+          </div>
+          <RefreshButton onClick={refreshGhAccounts} busy={ghRefreshing} title="Re-check the accounts gh is signed in to" />
         </div>
 
         <Card className="text-center py-12">
