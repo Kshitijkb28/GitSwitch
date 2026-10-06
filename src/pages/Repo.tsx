@@ -199,11 +199,14 @@ export function Repo() {
       push: () => actionsRef.current?.push(),
       branches: () => actionsRef.current?.branches(),
       refresh: () => {
+        // Everything a fresh visit reads: the repository, its submodules and
+        // the history (reloadKey), and the list of repositories to pick from.
         actionsRef.current?.refresh();
         setReloadKey((k) => k + 1);
+        loadRepos();
       },
     }),
-    []
+    [loadRepos]
   );
 
   /** ls-remote — asks the remote where its branch is, writes nothing at all. */
@@ -580,6 +583,7 @@ export function Repo() {
         onRecordPointers={() => runOnRepo((a) => a.recordPointers(sel.path))}
         onPullInside={(s) => runOnRepo((a) => a.pullInside(sel.path, s))}
         onUpdateOne={(p) => runOnRepo((a) => a.updateOne(sel.path, p))}
+        onRecordOne={(p) => runOnRepo((a) => a.recordOne(sel.path, p))}
         onPreview={() => {
           // The whole repository is what updates; the drawer is opened for it
           // in the same step, so the scope change does not close it.

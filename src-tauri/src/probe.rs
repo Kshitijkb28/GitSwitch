@@ -179,7 +179,7 @@ pub(crate) mod tests {
             "changes_sync_abort" => forward!(c::changes_sync_abort, args, repo_path),
             "changes_open_path" => forward!(c::changes_open_path, args, repo_path, path, reveal),
             "changes_conflict_view" => forward!(c::changes_conflict_view, args, repo_path, path),
-            "changes_record_pointers" => forward!(c::changes_record_pointers, args, repo_path),
+            "changes_record_pointers" => forward!(c::changes_record_pointers, args, repo_path, paths),
             // push access
             "changes_push_state" => forward!(c::changes_push_state, args, repo_path),
             "changes_push_identity" => forward!(c::changes_push_identity, args, repo_path, refresh),
@@ -331,7 +331,8 @@ pub(crate) mod tests {
             "sync_continue" => show(crate::sync::sync_continue(&repo(), false).await),
             "sync_continue_anyway" => show(crate::sync::sync_continue(&repo(), true).await),
             "sync_abort" => show(crate::sync::sync_abort(&repo()).await),
-            "record_pointers" => show(crate::sync::record_pointers(&repo()).await),
+            // PROBE_ARGS: "[<path>[,<path>…]]" — none records every submodule that is ahead
+            "record_pointers" => show(crate::sync::record_pointers(&repo(), if a.is_empty() { None } else { Some(&a) }).await),
             "block" => match crate::push_lock::set_push_mode(&repo(), if first == "on" { "guardrail" } else { "allowed" }).await {
                 Ok(r) => match r.state {
                     Some(s) => emit(&s),
@@ -458,6 +459,13 @@ pub(crate) mod tests {
                 Err(e) => emit_err(e),
             },
             other => panic!("unknown op {}", other),
+        }
+        // Every clone-progress entry the op set, in order, for the suites to
+        // read back: against a local remote a phase lasts milliseconds, so
+        // sampling `clone_progress` from outside could miss it.
+        if let Ok(path) = std::env::var("PROBE_TRACE_FILE") {
+            let trace = crate::sparse::progress_trace().lock().map(|t| t.clone()).unwrap_or_default();
+            let _ = std::fs::write(path, serde_json::to_string(&trace).unwrap_or_else(|_| "[]".into()));
         }
     }
 }

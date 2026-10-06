@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use crate::profiles::{self, Profile};
 use std::path::{Path, PathBuf};
 
@@ -19,7 +19,7 @@ pub struct SparseInfo {
 // ---------------------------------------------------------------------------
 
 /// One line of `git clone --progress`, as the page shows it.
-#[derive(Debug, Serialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct CloneProgress {
     /// "Counting objects", "Receiving objects", "Resolving deltas", "Updating files", "Submodules", "Large files"…
     pub phase: String,
@@ -30,6 +30,78 @@ pub struct CloneProgress {
     pub bytes: Option<String>,
     /// "2.00 MiB/s"
     pub rate: Option<String>,
+    /// What is being worked on right now — the submodule being fetched, the
+    /// large file being downloaded. Left out of the JSON when there is none,
+    /// so a reader written before this field existed still parses the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `done` out of `total`, as a whole percentage; `None` with no total to
+/// divide by. Capped at 100 so a count that overshoots never shows 112%.
+fn percent_of(done: u64, total: u64) -> Option<u8> {
+    if total == 0 {
+        return None;
+    }
+    Some((done.min(total) * 100 / total) as u8)
+}
+
+impl CloneProgress {
+    fn phase(name: &str) -> Self {
+        CloneProgress { phase: name.to_string(), percent: None, done: None, total: None, bytes: None, rate: None, detail: None }
+    }
+
+    /// `done` submodules checked out of `total`; `current` is the one being
+    /// fetched now, `None` once the loop is through.
+    fn submodules(done: usize, total: usize, current: Option<&str>) -> Self {
+        CloneProgress {
+            percent: percent_of(done as u64, total as u64),
+            done: Some(done as u64),
+            total: Some(total as u64),
+            detail: current.map(str::to_string),
+            ..CloneProgress::phase("Submodules")
+        }
+    }
+
+    /// What git-lfs itself reported: the file it is on, out of how many, and
+    /// the bytes so far — relayed, not reinterpreted.
+    fn large_files(p: &crate::lfs::LfsProgress) -> Self {
+        CloneProgress {
+            percent: percent_of(p.done as u64, p.total as u64),
+            done: Some(p.done as u64),
+            total: Some(p.total as u64),
+            bytes: Some(format!("{} of {}", human_bytes(p.bytes), human_bytes(p.total_bytes))),
+            detail: Some(p.file.clone()),
+            ..CloneProgress::phase("Large files")
+        }
+    }
+
+    /// The large-files phase at its two measured ends: nothing downloaded yet
+    /// out of the pointer stubs counted, and afterwards how many arrived.
+    fn large_files_counted(done: usize, total: usize) -> Self {
+        CloneProgress {
+            percent: percent_of(done as u64, total as u64),
+            done: Some(done as u64),
+            total: Some(total as u64),
+            ..CloneProgress::phase("Large files")
+        }
+    }
+}
+
+/// "1.0 MiB", as git prints sizes.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} B", n)
+    } else {
+        format!("{:.1} {}", v, UNITS[i])
+    }
 }
 
 /// `Receiving objects:  45% (556/1234), 10.00 MiB | 2.00 MiB/s` and its
@@ -39,7 +111,7 @@ pub fn parse_clone_progress(line: &str) -> Option<CloneProgress> {
     let line = line.trim().trim_start_matches("remote: ").trim();
     let phase = PHASES.iter().find(|p| line.starts_with(*p))?;
     let rest = line[phase.len()..].trim_start_matches(':').trim();
-    let mut p = CloneProgress { phase: phase.to_string(), percent: None, done: None, total: None, bytes: None, rate: None };
+    let mut p = CloneProgress { phase: phase.to_string(), percent: None, done: None, total: None, bytes: None, rate: None, detail: None };
     // "45% (556/1234), 10.00 MiB | 2.00 MiB/s, done." — pieces separated by commas.
     for (i, piece) in rest.split(',').enumerate() {
         let piece = piece.trim();
@@ -71,9 +143,44 @@ fn progress_map() -> &'static std::sync::Mutex<ProgressMap> {
 }
 
 fn set_progress(dest: &str, p: CloneProgress) {
+    #[cfg(test)]
+    if let Ok(mut t) = progress_trace().lock() {
+        t.push(p.clone());
+    }
     if let Ok(mut m) = progress_map().lock() {
         m.insert(crate::paths::norm(dest), p);
     }
+}
+
+/// Every progress entry set in this process, in order — the verification
+/// suites read it back through the probe to prove the counts were set, since
+/// against a local remote a phase lasts milliseconds and a poller would miss
+/// it. Test binary only.
+#[cfg(test)]
+pub(crate) fn progress_trace() -> &'static std::sync::Mutex<Vec<CloneProgress>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<Vec<CloneProgress>>> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// How often the LFS progress file is read while a download runs: half the
+/// page's own poll, and only a file read.
+const LFS_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Relay what `git lfs pull` writes to its progress file into the clone's
+/// progress entry until the returned task is aborted. Starts the phase at
+/// "0 of `total`" so the line changes the moment the download begins.
+fn relay_lfs_progress(dest: &str, repo: &str, total: usize) -> tokio::task::JoinHandle<()> {
+    set_progress(dest, CloneProgress::large_files_counted(0, total));
+    let dest = dest.to_string();
+    let repo = repo.to_string();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(LFS_PROGRESS_EVERY).await;
+            if let Some(p) = crate::lfs::read_progress(&repo) {
+                set_progress(&dest, CloneProgress::large_files(&p));
+            }
+        }
+    })
 }
 
 /// Removes the entry when the clone is over, however it ended.
@@ -90,26 +197,73 @@ pub fn clone_progress(dest: &str) -> Option<CloneProgress> {
     progress_map().lock().ok().and_then(|m| m.get(&crate::paths::norm(dest)).cloned())
 }
 
-/// `git clone --progress …` with stderr read as it comes, so the page can show
-/// a bar instead of a spinner. git writes progress to stderr with `\r` between
-/// updates and only when asked (`--progress`), since there is no terminal.
-async fn run_git_with_progress(repo: Option<&Path>, args: &[&str], dest: &str) -> Result<String, AppError> {
+/// How long a submodule download may report nothing before it is stopped.
+/// Long: a server packing a large repository is quiet for a while before
+/// the first byte comes. A download that is merely slow keeps reporting, and
+/// is never cut short for taking long.
+const SUBMODULE_STALL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn submodule_stall() -> std::time::Duration {
+    // The suites prove the stop with a stuck server; waiting ten minutes for
+    // it would prove the same thing slowly.
+    #[cfg(test)]
+    if let Some(secs) = std::env::var("GITSWITCH_STALL_SECS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        return std::time::Duration::from_secs(secs);
+    }
+    SUBMODULE_STALL
+}
+
+/// `git … --progress` with stderr read as it comes: each progress line git
+/// writes (with `\r` between updates, and only when asked, since there is no
+/// terminal) goes to `on_progress` for the page's bar. With `stall` set, a
+/// command that reports nothing for that long is stopped, its whole process
+/// tree with it — never one that is still reporting, however long it takes.
+/// `cfg` are `-c key=value` pairs for this one command.
+async fn run_git_streaming(
+    repo: Option<&Path>,
+    cfg: &[String],
+    args: &[&str],
+    stall: Option<std::time::Duration>,
+    on_progress: &(dyn Fn(CloneProgress) + Sync),
+) -> Result<String, AppError> {
     use tokio::io::AsyncReadExt;
     let mut cmd = crate::spawn::async_command("git");
     if let Some(dir) = repo {
         cmd.current_dir(dir);
     }
-    cmd.env("GIT_TERMINAL_PROMPT", "0")
-        .args(args)
+    for (key, value) in crate::git_exec::hardened_env() {
+        match value {
+            Some(v) => {
+                cmd.env(key, v);
+            }
+            None => {
+                cmd.env_remove(key);
+            }
+        }
+    }
+    for key in crate::git_exec::inherited_git_env_to_strip() {
+        cmd.env_remove(key);
+    }
+    for kv in cfg {
+        cmd.arg("-c").arg(kv);
+    }
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Its own process group, so a stalled download's helpers go with it.
+    #[cfg(unix)]
+    cmd.process_group(0);
     let started = std::time::Instant::now();
     let mut child = cmd.spawn().map_err(|e| AppError::Command(format!("Failed to run git: {}", e)))?;
-    let key = crate::paths::norm(dest);
+    #[cfg(windows)]
+    let job = crate::spawn::JobObject::adopt(&child);
     let stderr = child.stderr.take();
     let stdout = child.stdout.take();
+    // Every line as it arrives, for the bar and for the stall clock; the task
+    // keeps one copy of each distinct line for the error message and the log.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let err_task = tokio::spawn(async move {
         let mut full = String::new();
         let Some(mut pipe) = stderr else { return full };
@@ -127,14 +281,11 @@ async fn run_git_with_progress(repo: Option<&Path>, args: &[&str], dest: &str) -
                     if line.trim().is_empty() {
                         continue;
                     }
-                    if let Some(p) = parse_clone_progress(&line) {
-                        set_progress(&key, p);
-                    }
-                    // Keep one copy of each distinct line for the error message and the log.
                     if !full.ends_with(&format!("{}\n", line)) {
                         full.push_str(&line);
                         full.push('\n');
                     }
+                    let _ = tx.send(line);
                 } else {
                     acc.push(b);
                 }
@@ -152,19 +303,80 @@ async fn run_git_with_progress(repo: Option<&Path>, args: &[&str], dest: &str) -
         }
         s
     });
-    let status = child.wait().await.map_err(|e| AppError::Command(format!("git {} failed: {}", args.first().unwrap_or(&"clone"), e)))?;
+    let mut last_word = std::time::Instant::now();
+    let mut last_line = String::new();
+    let mut lines_open = true;
+    let mut stalled = false;
+    // The stall clock runs only while a transfer is in flight: from
+    // "Cloning into" (printed before the transport connects, so a server
+    // that never answers is still caught) to git's own "done." — what
+    // follows is local work that says nothing while it works (a long
+    // checkout, a smudge filter downloading large files) and must never
+    // be called a stall. A nested submodule's next "Cloning into" re-arms.
+    let mut transferring = stall.is_some();
+    let status = loop {
+        tokio::select! {
+            s = child.wait() => break Some(s),
+            line = rx.recv(), if lines_open => match line {
+                Some(l) => {
+                    last_word = std::time::Instant::now();
+                    let t = l.trim();
+                    if t.starts_with("Cloning into") {
+                        transferring = true;
+                    } else if !t.starts_with("remote:") && t.ends_with("done.") {
+                        transferring = false;
+                    }
+                    if let Some(p) = parse_clone_progress(&l) {
+                        on_progress(p);
+                    }
+                    last_line = l;
+                }
+                None => lines_open = false,
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)), if stall.is_some() => {
+                if transferring && last_word.elapsed() > stall.unwrap_or_default() {
+                    stalled = true;
+                    break None;
+                }
+            }
+        }
+    };
+    let sub = args.iter().find(|a| !a.starts_with('-') && !a.contains('=')).copied().unwrap_or("clone");
+    if stalled {
+        #[cfg(windows)]
+        if let Some(j) = &job {
+            j.terminate();
+        }
+        crate::git_exec::terminate_tree(&mut child).await;
+        let stderr_text = tokio::time::timeout(std::time::Duration::from_secs(2), err_task).await.ok().and_then(|r| r.ok()).unwrap_or_default();
+        let secs = stall.unwrap_or_default().as_secs();
+        crate::cmdlog::record(
+            repo.unwrap_or(Path::new(".")),
+            std::iter::once("git".to_string()).chain(cfg.iter().flat_map(|kv| ["-c".to_string(), kv.clone()])).chain(args.iter().map(|a| a.to_string())).collect(),
+            -9,
+            started.elapsed(),
+            "",
+            &format!("stopped: no progress for {}s\n{}", secs, stderr_text),
+        );
+        let far = if last_line.is_empty() { String::new() } else { format!(" It had got as far as: {}", last_line.trim()) };
+        return Err(AppError::Command(format!(
+            "git {} made no progress for {}s and was stopped — the remote may be unreachable, or the connection very slow.{}",
+            sub, secs, far
+        )));
+    }
+    let status = status.unwrap_or_else(|| Err(std::io::Error::other("stopped")));
+    let status = status.map_err(|e| AppError::Command(format!("git {} failed: {}", sub, e)))?;
     let stderr_text = err_task.await.unwrap_or_default();
     let stdout_text = out_task.await.unwrap_or_default();
     crate::cmdlog::record(
         repo.unwrap_or(Path::new(".")),
-        std::iter::once("git".to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
+        std::iter::once("git".to_string()).chain(cfg.iter().flat_map(|kv| ["-c".to_string(), kv.clone()])).chain(args.iter().map(|a| a.to_string())).collect(),
         status.code().unwrap_or(-1),
         started.elapsed(),
         &stdout_text,
         &stderr_text,
     );
     if !status.success() {
-        let sub = args.iter().find(|a| !a.starts_with('-') && !a.contains('=')).copied().unwrap_or("clone");
         return Err(AppError::Command(format!("git {} failed: {}", sub, stderr_text.trim())));
     }
     Ok(stdout_text.trim().to_string())
@@ -448,7 +660,11 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// and possible, and in every case say what state the large files are in.
 /// `None` when the repository does not use LFS. Never an error — the
 /// repository is usable and the Changes page can retry.
-pub(crate) async fn lfs_after_checkout(repo: &Path, requested: bool) -> Option<LfsReport> {
+/// `progress_for` is the clone destination whose progress line should show
+/// the download ("Large files · 2 of 5"): this repository while a clone of it
+/// is in flight. `None` from the sparse "Apply selection" step, which has no
+/// clone running and nothing polling for one.
+pub(crate) async fn lfs_after_checkout(repo: &Path, requested: bool, progress_for: Option<&str>) -> Option<LfsReport> {
     let repo_str = repo.to_string_lossy().to_string();
     let before = crate::lfs::lfs_status(&repo_str).await.ok()?;
     if !before.uses_lfs {
@@ -457,8 +673,19 @@ pub(crate) async fn lfs_after_checkout(repo: &Path, requested: bool) -> Option<L
     let stubs = |n: usize| plural(n, "large file is a pointer stub", "large files are pointer stubs");
     let go_to_changes = "open the repository in Changes → Git LFS → Pull LFS files";
     if requested && before.installed && before.pointers > 0 {
-        return Some(match crate::git_ops::fetch_lfs_content(&repo_str).await {
+        // The counts appear only while a download really runs.
+        let relay = progress_for.map(|dest| relay_lfs_progress(dest, &repo_str, before.pointers));
+        let fetched = crate::git_ops::fetch_lfs_content(&repo_str).await;
+        if let Some(task) = relay {
+            task.abort();
+        }
+        return Some(match fetched {
             Ok(f) => {
+                // The last word is measured: pointer stubs counted before and
+                // after, the same numbers the result card shows.
+                if let Some(dest) = progress_for {
+                    set_progress(dest, CloneProgress::large_files_counted(f.fetched, before.pointers));
+                }
                 let note = if let Some(a) = &f.error {
                     format!("The large files could not be downloaded: {} To retry, {}.", a.headline, go_to_changes)
                 } else if f.after.pointers == 0 {
@@ -543,7 +770,13 @@ pub struct SubmoduleReport {
 /// under `update = merge` that command writes a merge commit inside it, which
 /// is exactly the tangle a superproject with CI pointer bumps keeps producing.
 /// The clone path passes `None` (a fresh clone has nothing populated).
-pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, key: Option<&str>, url: &str, only: Option<&[String]>) -> SubmoduleReport {
+/// `progress_for` is the clone destination whose progress line should name
+/// each submodule as it is fetched ("Submodules · 3 of 8 · libs/sub") — this
+/// same `repo` while a clone of it is in flight. The Changes page's
+/// "Initialise missing" passes `None`: no clone is running, nothing polls for
+/// an entry, and one no clone's guard owned would stay behind as stale state
+/// for the next clone into that folder.
+pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, key: Option<&str>, url: &str, only: Option<&[String]>, progress_for: Option<&str>) -> SubmoduleReport {
     // `-z` (`key\nvalue\0` records): a submodule's name defaults to its path,
     // and a path with a space would otherwise split the key in the middle.
     let listed: Vec<String> = run_git(Some(repo), &["config", "-f", ".gitmodules", "--get-regexp", "-z", r"\.path$"])
@@ -585,19 +818,33 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
     // then thinks they're up to date, leaving empty folders behind.
     let mut failed: Vec<String> = Vec::new();
     let mut first_error: Option<String> = None;
-    for path in &listed {
-        // The hardened runner: a network timeout, no credential prompt that
-        // could hang a GUI forever, and the ssh override as a `-c` for this
-        // command only.
-        let mut cmd = crate::git_exec::GitCmd::at(repo);
-        if let Some(kv) = ssh_override {
-            cmd = cmd.cfg_raw(kv);
+    for (finished, path) in listed.iter().enumerate() {
+        // Before, not after: the line should name the submodule while it is
+        // the one taking the time.
+        if let Some(dest) = progress_for {
+            set_progress(dest, CloneProgress::submodules(finished, listed.len(), Some(path)));
         }
-        let res = cmd
-            .args(["submodule", "update", "--init", "--recursive", "--", path])
-            .timeout(crate::git_exec::NET_TIMEOUT)
-            .text()
-            .await;
+        // Streamed, with the inner clone's progress on the page's line, and
+        // stopped only when it reports nothing for a long while — never for
+        // taking long: a big submodule on an ordinary connection needs more
+        // than any fixed limit. No credential prompt can hang it, and the
+        // ssh override is a `-c` for this command only.
+        let cfg: Vec<String> = ssh_override.map(|kv| vec![kv.to_string()]).unwrap_or_default();
+        let total = listed.len();
+        let on_progress = |inner: CloneProgress| {
+            if let Some(dest) = progress_for {
+                // The bar is the submodules' share, filling once per
+                // submodule as its download comes in; the other inner phases
+                // (counting, compressing, deltas) do not move it back.
+                let percent = if inner.phase == "Receiving objects" {
+                    Some(((finished as u64 * 100 + inner.percent.unwrap_or(0) as u64) / total.max(1) as u64) as u8)
+                } else {
+                    percent_of(finished as u64, total as u64)
+                };
+                set_progress(dest, CloneProgress { percent, bytes: inner.bytes, rate: inner.rate, ..CloneProgress::submodules(finished, total, Some(path)) });
+            }
+        };
+        let res = run_git_streaming(Some(repo), &cfg, &["submodule", "update", "--init", "--recursive", "--progress", "--", path], Some(submodule_stall()), &on_progress).await;
         if let Err(e) = res {
             failed.push(path.clone());
             if first_error.is_none() {
@@ -607,6 +854,11 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
                 });
             }
         }
+    }
+    // The loop is through — a failed one still counts as attempted here; the
+    // report's `downloaded` below is the measured number.
+    if let Some(dest) = progress_for {
+        set_progress(dest, CloneProgress::submodules(listed.len(), listed.len(), None));
     }
     report.failed_paths = failed.clone();
     if let Some(err) = first_error {
@@ -827,8 +1079,9 @@ async fn clone_as_profile(
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let _progress = ProgressGuard(crate::paths::norm(&dest_str));
-    set_progress(&dest_str, CloneProgress { phase: "Connecting".into(), percent: None, done: None, total: None, bytes: None, rate: None });
-    run_git_with_progress(Some(&parent), &arg_refs, &dest_str)
+    set_progress(&dest_str, CloneProgress::phase("Connecting"));
+    let progress_key = crate::paths::norm(&dest_str);
+    run_git_streaming(Some(&parent), &[], &arg_refs, None, &|p| set_progress(&progress_key, p))
         .await
         .map_err(|e| match e {
             AppError::Command(msg) => AppError::Command(explain_clone_error(&msg, key.as_deref(), url)),
@@ -838,8 +1091,8 @@ async fn clone_as_profile(
     // The main clone succeeded; submodule trouble is reported, not fatal —
     // the repo is usable and `git submodule update` can be retried.
     let submodules = if with_submodules {
-        set_progress(&dest_str, CloneProgress { phase: "Submodules".into(), percent: None, done: None, total: None, bytes: None, rate: None });
-        Some(update_submodules(&dest, ssh_override.as_deref(), key.as_deref(), url, None).await)
+        set_progress(&dest_str, CloneProgress::phase("Submodules"));
+        Some(update_submodules(&dest, ssh_override.as_deref(), key.as_deref(), url, None, Some(&dest_str)).await)
     } else {
         None
     };
@@ -848,8 +1101,8 @@ async fn clone_as_profile(
     let lfs = if extra_args.contains(&"--no-checkout") {
         None
     } else {
-        set_progress(&dest_str, CloneProgress { phase: "Large files".into(), percent: None, done: None, total: None, bytes: None, rate: None });
-        lfs_after_checkout(&dest, with_lfs).await
+        set_progress(&dest_str, CloneProgress::phase("Large files"));
+        lfs_after_checkout(&dest, with_lfs, Some(&dest_str)).await
     };
 
     let mut mapped_to = None;
@@ -966,7 +1219,8 @@ pub async fn sparse_set(repo_path: &str, dirs: Vec<String>, with_lfs: bool) -> R
     let branch = run_git(Some(&repo), &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
     run_git(Some(&repo), &["checkout", &branch]).await?;
 
-    Ok(SparseSetResult { lfs: lfs_after_checkout(&repo, with_lfs).await })
+    // No clone is in flight here; the page shows its own "Checking out…".
+    Ok(SparseSetResult { lfs: lfs_after_checkout(&repo, with_lfs, None).await })
 }
 
 /// Add folders to an existing sparse checkout: `git sparse-checkout add <dirs>`.
@@ -984,6 +1238,28 @@ pub async fn sparse_add(repo_path: &str, dirs: Vec<String>) -> Result<(), AppErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn progress_counts_are_the_finished_share() {
+        assert_eq!(percent_of(0, 8), Some(0));
+        assert_eq!(percent_of(3, 8), Some(37));
+        assert_eq!(percent_of(9, 8), Some(100), "a count that overshoots is capped");
+        assert_eq!(percent_of(1, 0), None, "nothing to divide by");
+        let p = CloneProgress::submodules(3, 8, Some("libs/sub"));
+        assert_eq!((p.phase.as_str(), p.done, p.total, p.percent, p.detail.as_deref()), ("Submodules", Some(3), Some(8), Some(37), Some("libs/sub")));
+        let last = CloneProgress::submodules(8, 8, None);
+        assert_eq!((last.done, last.percent, last.detail), (Some(8), Some(100), None));
+        let lfs = crate::lfs::parse_progress_line("download 2/5 1048576/4194304 media/video/intro.mp4").expect("parsed");
+        let p = CloneProgress::large_files(&lfs);
+        assert_eq!((p.phase.as_str(), p.done, p.total, p.percent), ("Large files", Some(2), Some(5), Some(40)));
+        assert_eq!(p.bytes.as_deref(), Some("1.0 MiB of 4.0 MiB"));
+        assert_eq!(p.detail.as_deref(), Some("media/video/intro.mp4"));
+        // Left out of the JSON when there is nothing in flight; still read when present.
+        let json = serde_json::to_string(&CloneProgress::large_files_counted(0, 3)).unwrap();
+        assert!(!json.contains("detail"), "{}", json);
+        let back: CloneProgress = serde_json::from_str(r#"{"phase":"Submodules","percent":37,"done":3,"total":8,"bytes":null,"rate":null,"detail":"libs/sub"}"#).unwrap();
+        assert_eq!(back.detail.as_deref(), Some("libs/sub"));
+    }
 
     #[test]
     fn clone_progress_lines_are_read_in_every_shape_git_prints() {

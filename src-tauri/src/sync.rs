@@ -121,6 +121,11 @@ pub struct SubFacts {
     pub own_commits_moving_gitlink: usize,
     pub my_commits_move_gitlink: bool,
     pub upstream_moves_gitlink: bool,
+    /// Several commits of mine move this pointer, and every one of them points
+    /// at a plain commit on its checked-out line, past where we parted from
+    /// upstream — so each can record the rewritten copy of what it pointed at.
+    #[serde(default)]
+    pub own_pointers_on_line: bool,
     /// My branch records a commit that is not ahead of the one we both
     /// started from: the pointer was moved back, or onto another line.
     #[serde(default)]
@@ -405,12 +410,13 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
                 "it is checked out at {} but this branch records {}; commit that pointer (Record submodule pointers) or move it back before updating",
                 short(&head), short(&f.recorded)
             ));
-        } else if f.own_commits_moving_gitlink > 1 && f.upstream_moves_gitlink {
+        } else if f.own_commits_moving_gitlink > 1 && f.upstream_moves_gitlink && !f.own_pointers_on_line {
             // Only when upstream moved the pointer too: otherwise every one
             // of my pointer commits replays onto the pointer it started from
-            // and the rebase cannot stop on it.
+            // and the rebase cannot stop on it. With all of them along the
+            // checked-out line the update keeps them one by one (below).
             block(&mut p, "squash-own", format!(
-                "{} of your commits move this submodule's pointer; the update handles one — squash them, or do this one by hand",
+                "{} of your commits move this submodule's pointer and not every one points at a commit on its checked-out line; squash them, or do this one by hand",
                 f.own_commits_moving_gitlink
             ));
         } else {
@@ -515,6 +521,12 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
                     }
                     if f.dirty_tracked > 0 {
                         p.notes.push(format!("its {} stashed and re-applied around the rebase", plural(f.dirty_tracked, "uncommitted change is", "uncommitted changes are")));
+                    }
+                    if f.own_commits_moving_gitlink > 1 {
+                        p.notes.push(format!(
+                            "{} commits of yours move its pointer; each will record the rewritten copy of the commit it pointed at",
+                            f.own_commits_moving_gitlink
+                        ));
                     }
                 }
             }
@@ -693,6 +705,11 @@ pub struct SyncState {
     /// Submodule pointers the update handed over for the person to place.
     #[serde(default)]
     pub handed_over: Vec<String>,
+    /// Stops whose pointer turned out to be upstream's own (what my commit
+    /// pointed at was dropped by the submodule's rebase as a twin): when
+    /// nothing else of the commit remains, it was already upstream.
+    #[serde(default)]
+    pub pointer_upstreams: Vec<String>,
 }
 
 /// `rebase` announces each commit it leaves out as empty: "dropping <oid>
@@ -1389,6 +1406,7 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
                 (None, Some(_)) | (Some(_), None) => true,
                 _ => false,
             },
+            own_pointers_on_line: false,
             pointer_rewound: false,
             index_pointer: s.recorded.clone(),
             dirty_tracked: s.dirty_tracked,
@@ -1445,6 +1463,25 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
                             .await
                             .and_then(|n| n.trim().parse().ok())
                             .unwrap_or(f.own_commits.len());
+                    }
+                    // Several commits of mine move this pointer: the update
+                    // can keep them one by one only when each points at a
+                    // plain commit along the checked-out line, past where we
+                    // parted from upstream.
+                    if f.own_commits_moving_gitlink > 1 && f.upstream_moves_gitlink {
+                        let mut on_line = true;
+                        for m in moving.iter().filter(|m| !own_commits.iter().any(|c| &c.oid == *m && c.already_upstream)) {
+                            let Some(ptr) = gitlink_at(&repo, m, &s.path).await else {
+                                on_line = false;
+                                break;
+                            };
+                            let merge = g(&sub).args(["rev-parse", "--verify", "--quiet", &format!("{}^2", ptr)]).ok_text().await.is_some();
+                            if merge || !is_ancestor(&sub, &ptr, h).await || is_ancestor(&sub, &ptr, t).await {
+                                on_line = false;
+                                break;
+                            }
+                        }
+                        f.own_pointers_on_line = on_line;
                     }
                     // Diverged: its commits would be re-written, so the
                     // identity git has there matters — as it does for a commit.
@@ -1822,8 +1859,20 @@ async fn remember_resolved(repo: &Path, st: &mut SyncState) {
     st.resolved.retain(|o| o != &sha);
     st.emptied.retain(|o| o != &sha);
     if nothing_staged {
-        st.emptied.push(sha);
+        // Nothing left of it. When that is because its pointer was upstream's
+        // own, upstream already contained it; otherwise its resolution
+        // emptied it.
+        if st.pointer_upstreams.contains(&sha) {
+            if !st.dropped_by_git.contains(&sha) {
+                st.dropped_by_git.push(sha);
+            }
+        } else {
+            st.emptied.push(sha);
+        }
     } else {
+        // Something of it stays (files it changed, say): on top, whatever
+        // became of its pointer.
+        st.dropped_by_git.retain(|o| o != &sha);
         st.resolved.push(sha);
     }
 }
@@ -1854,7 +1903,13 @@ async fn resolve_gitlink_stop(repo: &Path, st: &mut SyncState, state_file: &Path
         return write_state_at(state_file, st);
     };
     let already_rebased = ss.rebased && ss.head_after.as_deref() == Some(head.as_str());
-    if !same_oid(&head, &theirs) && !already_rebased {
+    let old_tip = ss.head_before.clone();
+    let target_for_stop = ss.target.clone();
+    // My commit may point at an earlier commit of the checked-out line (one of
+    // several pointer commits of mine): then the line is rebased once and this
+    // stop records the rewritten copy of what it pointed at.
+    let pointer_on_line = same_oid(&head, &theirs) || is_ancestor(&sub, &theirs, &head).await;
+    if !pointer_on_line && !already_rebased {
         hand_over(st, format!(
             "{} is checked out at {} but your commit records {}. Put it where you want it (with your commits on top of {}), stage it, then Continue update.",
             path, short(&head), short(&theirs), short(&ours)
@@ -1915,14 +1970,110 @@ async fn resolve_gitlink_stop(repo: &Path, st: &mut SyncState, state_file: &Path
         ss.head_after = Some(new_head.clone());
         ss.note = format!("rebased onto {}", short(&ours));
     }
-    let out = g(repo).top_flag("--literal-pathspecs").args(["add", "--", &path]).timeout(LOCAL_TIMEOUT).run().await?;
-    if !out.ok() {
+    // What this commit records for the pointer: with mine already containing
+    // upstream's, exactly what it pointed at; after a rebase, the rewritten
+    // copy of that.
+    let new_head = oid(&sub, "HEAD").await.unwrap_or_default();
+    // The line was rebased onto the plan's target; at a later stop `ours` is
+    // what the previous pick recorded (one of my own copies), so the copies
+    // are looked for from the target on.
+    let onto = if target_for_stop.is_empty() { ours.clone() } else { target_for_stop.clone() };
+    let record = if !needs_rebase && !already_rebased {
+        theirs.clone()
+    } else {
+        match rewritten_pointer(&sub, &theirs, &onto, &old_tip, &new_head).await {
+            Ok(Some(copy)) => copy,
+            Ok(None) => {
+                // What it pointed at is upstream's own now. Whether the whole
+                // commit is then already upstream is measured when it is
+                // continued: nothing else of it may remain. The pointer never
+                // moves back for it: when what the previous commit recorded
+                // already contains upstream's, that stays.
+                if let Some(sha) = &at_commit {
+                    if !st.pointer_upstreams.contains(sha) {
+                        st.pointer_upstreams.push(sha.clone());
+                    }
+                }
+                if same_oid(&onto, &ours) || is_ancestor(&sub, &onto, &ours).await { ours.clone() } else { onto.clone() }
+            }
+            Err(why) => {
+                hand_over(st, why);
+                return write_state_at(state_file, st);
+            }
+        }
+    };
+    if let Err(e) = stage_pointer(repo, &path, &record, &new_head).await {
         // What was done to the submodule is on record either way, so an
         // abort can still put it back.
         write_state_at(state_file, st)?;
-        return Err(AppError::Command(format!("Could not record {}: {}", path, out.stderr.trim())));
+        return Err(e);
     }
     write_state_at(state_file, st)
+}
+
+/// The commits in `range` with this author, time and subject.
+async fn commits_like(repo: &Path, key: &str, range: &str) -> Vec<String> {
+    g(repo)
+        .args(["log", "--format=%H%x1f%an%x1f%at%x1f%s", range])
+        .ok_text()
+        .await
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('\x1f').filter(|(_, k)| *k == key).map(|(h, _)| h.to_string()))
+        .collect()
+}
+
+/// Stage `record` as the pointer of `path` — through `git add` when it is
+/// the submodule's checkout, exactly by id otherwise (a stop that is not the
+/// last of several pointer commits records an earlier commit of the line).
+async fn stage_pointer(repo: &Path, path: &str, record: &str, sub_head: &str) -> Result<(), AppError> {
+    let out = if same_oid(record, sub_head) {
+        g(repo).top_flag("--literal-pathspecs").args(["add", "--", path]).timeout(LOCAL_TIMEOUT).run().await?
+    } else {
+        g(repo).args(["update-index", "--cacheinfo", &format!("160000,{},{}", record, path)]).timeout(LOCAL_TIMEOUT).run().await?
+    };
+    if !out.ok() {
+        return Err(AppError::Command(format!("Could not record {}: {}", path, out.stderr.trim())));
+    }
+    Ok(())
+}
+
+/// The commit a pointer stop records once the submodule's line has been
+/// rebased onto `onto` (the plan's target): the copy of `theirs` — what my
+/// commit pointed at — on the rewritten line, found by its author, time and
+/// subject (a rebase keeps those). `Ok(None)` when that commit was left out
+/// as upstream's own (its twin sits on upstream's side of the line): the
+/// pointer is upstream's then. An error carries the hint for a hand-over:
+/// no copy, or more than one.
+async fn rewritten_pointer(sub: &Path, theirs: &str, onto: &str, old_tip: &str, new_head: &str) -> Result<Option<String>, String> {
+    let key = g(sub)
+        .args(["log", "-1", "--format=%an%x1f%at%x1f%s", theirs])
+        .ok_text()
+        .await
+        .ok_or_else(|| format!("Your commit records this submodule at {}, which cannot be read here. Put the pointer where you want it, stage it, then Continue update.", short(theirs)))?;
+    let copies = commits_like(sub, &key, &format!("{}..{}", onto, new_head)).await;
+    match copies.len() {
+        1 => return Ok(Some(copies[0].clone())),
+        0 => {}
+        _ => {
+            return Err(format!(
+                "Your commit records this submodule at {} ({}), and its rebased line carries more than one commit like it. Put the pointer where you want it, stage it, then Continue update.",
+                short(theirs),
+                key.split('\x1f').nth(2).unwrap_or("")
+            ))
+        }
+    }
+    // Left out of the rebased line: upstream's own copy of it, if there is one.
+    if let Some(mb) = g(sub).args(["merge-base", onto, old_tip]).ok_text().await.filter(|m| !m.is_empty()) {
+        if commits_like(sub, &key, &format!("{}..{}", mb, onto)).await.len() == 1 {
+            return Ok(None);
+        }
+    }
+    Err(format!(
+        "Your commit records this submodule at {} ({}), which has no counterpart on its rebased line. Put the pointer where you want it, stage it, then Continue update.",
+        short(theirs),
+        key.split('\x1f').nth(2).unwrap_or("")
+    ))
 }
 
 /// After a detached rebase: the branch the submodule was on before (or, when
@@ -2677,6 +2828,7 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         stash_before: None,
         git_said: String::new(),
         handed_over: Vec::new(),
+        pointer_upstreams: Vec::new(),
     };
     write_state_at(&state_file, &st)?;
 
@@ -2895,10 +3047,45 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
 /// align whatever is left.
 async fn resume_after_submodule(repo_path: &str, repo: &Path, st: &mut SyncState, state_file: &Path, path: &str) -> Result<OpResult, AppError> {
     if rebase_in_progress(repo).await {
-        let out = g(repo).top_flag("--literal-pathspecs").args(["add", "--", path]).run().await?;
-        if !out.ok() {
-            return Err(AppError::Command(format!("Could not record {}: {}", path, out.stderr.trim())));
-        }
+        // The stop this pause belongs to: what my commit pointed at (stage 3)
+        // and what upstream records (stage 2), so the rewritten copy of the
+        // former is what gets recorded.
+        let sub = repo.join(path);
+        let new_head = oid(&sub, "HEAD").await.unwrap_or_default();
+        let stop = unmerged(repo).await.into_iter().find(|c| c.path == path && c.stage_oids.len() == 3);
+        let (old_tip, target) = st
+            .subs
+            .iter()
+            .find(|s| s.path == path)
+            .map(|s| (s.head_before.clone(), s.target.clone()))
+            .unwrap_or_default();
+        let record = match &stop {
+            Some(c) => {
+                let onto = if target.is_empty() { c.stage_oids[1].clone() } else { target.clone() };
+                match rewritten_pointer(&sub, &c.stage_oids[2], &onto, &old_tip, &new_head).await {
+                    Ok(Some(copy)) => copy,
+                    Ok(None) => {
+                        if let Some(sha) = stopped_sha(repo).await {
+                            if !st.pointer_upstreams.contains(&sha) {
+                                st.pointer_upstreams.push(sha);
+                            }
+                        }
+                        let ours = c.stage_oids[1].clone();
+                        if same_oid(&onto, &ours) || is_ancestor(&sub, &onto, &ours).await { ours } else { onto }
+                    }
+                    Err(why) => {
+                        st.needs_user = Some(NeedsUser { where_: format!("submodule:{}", path), paths: vec![path.to_string()], hint: why, at_commit: stopped_sha(repo).await });
+                        if !st.handed_over.contains(&path.to_string()) {
+                            st.handed_over.push(path.to_string());
+                        }
+                        write_state_at(state_file, st)?;
+                        return finish(repo_path, st, state_file).await;
+                    }
+                }
+            }
+            None => new_head.clone(),
+        };
+        stage_pointer(repo, path, &record, &new_head).await?;
         // The commit being replayed now records a rewritten pointer.
         remember_resolved(repo, st).await;
         crate::git_ops::commit_resolved_pick(repo).await;
@@ -3044,20 +3231,85 @@ pub async fn sync_abort(repo_path: &str) -> Result<OpResult, AppError> {
     Ok(r)
 }
 
-/// One commit recording every submodule whose checkout sits ahead of what
-/// the branch records — offered, never automatic.
-pub async fn record_pointers(repo_path: &str) -> Result<OpResult, AppError> {
+/// Why one named submodule's pointer cannot be recorded. Each is a stable
+/// code with a sentence that names the path and says what it found there.
+async fn pointer_refusal(repo: &Path, subs: &[crate::submodules::SubmoduleInfo], path: &str) -> Option<Refusal> {
+    if crate::git_ops::validate_repo_path(path).is_err() {
+        return Some(Refusal { code: "outside-repository".into(), message: format!("{} isn't a path inside this repository; nothing to record.", path) });
+    }
+    let Some(s) = subs.iter().find(|s| s.path == path) else {
+        return Some(Refusal { code: "not-a-submodule".into(), message: format!("{} is not a submodule of this repository; nothing to record.", path) });
+    };
+    if !s.listed {
+        return Some(Refusal { code: "not-a-submodule".into(), message: format!("{} has no entry in .gitmodules, so git does not treat it as a submodule; nothing to record.", path) });
+    }
+    let Some(actual) = s.actual.as_deref().filter(|_| s.initialised) else {
+        return Some(Refusal { code: "not-populated".into(), message: format!("{} is not initialised, so nothing is checked out there to record.", path) });
+    };
+    let (a, r) = (short(actual), short(&s.recorded));
+    if same_oid(actual, &s.recorded) {
+        // `recorded` is the index's; a pointer staged by hand is not the
+        // branch's yet, and the sentence must not say it is.
+        let committed = gitlink_at(repo, "HEAD", path).await;
+        return Some(match committed {
+            Some(c) if !same_oid(&c, &s.recorded) => Refusal {
+                code: "not-ahead".into(),
+                message: format!("{} is checked out at {}, which is already staged as its pointer; this branch's last commit still records {} — commit the staged change instead; nothing more to record.", path, a, short(&c)),
+            },
+            _ => Refusal { code: "not-ahead".into(), message: format!("{} is checked out at {}, the commit this branch records already; nothing to record.", path, r) },
+        });
+    }
+    if s.recorded_missing {
+        // Neither side can be compared until the submodule has the recorded commit.
+        return Some(Refusal { code: "recorded-missing".into(), message: format!("{} is checked out at {}, but the {} this branch records is not in the submodule yet, so the two cannot be compared; fetch inside it first.", path, a, r) });
+    }
+    let sub = repo.join(path);
+    if is_ancestor(&sub, &s.recorded, actual).await {
+        return None;
+    }
+    let how = if is_ancestor(&sub, actual, &s.recorded).await { "it is behind it" } else { "the two have diverged" };
+    Some(Refusal { code: "not-ahead".into(), message: format!("{} is checked out at {} which is not ahead of the {} this branch records ({}); nothing to record.", path, a, r, how) })
+}
+
+/// One commit recording submodule pointers whose checkout sits ahead of what
+/// the branch records — offered, never automatic. `None` records every such
+/// submodule; `Some(paths)` records exactly those, and refuses the whole
+/// request when one of them is not a populated, listed submodule or is not
+/// strictly ahead (equal, behind or diverged), naming the path and why.
+pub async fn record_pointers(repo_path: &str, only: Option<&[String]>) -> Result<OpResult, AppError> {
     let (status, f) = facts_for_check(repo_path).await?;
     // Nothing is staged yet, so the commit pre-check is run as if the pointers
     // it is about to stage already were: every other rule (paused sync,
     // conflicts, identity, an operation in progress) applies unchanged.
     let repo = PathBuf::from(repo_path);
     let subs = crate::submodules::list_submodules(repo_path).await?;
-    let mut paths = Vec::new();
-    for s in subs.iter().filter(|s| s.initialised && s.listed) {
-        if let Some(a) = &s.actual {
-            if !same_oid(a, &s.recorded) && is_ancestor(&repo.join(&s.path), &s.recorded, a).await {
-                paths.push(s.path.clone());
+    let mut paths: Vec<String> = Vec::new();
+    let mut refusal: Option<Refusal> = None;
+    match only {
+        None => {
+            for s in subs.iter().filter(|s| s.initialised && s.listed) {
+                if let Some(a) = &s.actual {
+                    if !same_oid(a, &s.recorded) && is_ancestor(&repo.join(&s.path), &s.recorded, a).await {
+                        paths.push(s.path.clone());
+                    }
+                }
+            }
+        }
+        Some(wanted) => {
+            // The first refusal stands for the request: nothing is recorded
+            // until every named path can be.
+            for p in wanted {
+                let p = p.trim_end_matches(['/', '\\']);
+                if paths.iter().any(|x| x == p) {
+                    continue;
+                }
+                match pointer_refusal(&repo, &subs, p).await {
+                    Some(r) => {
+                        refusal = Some(r);
+                        break;
+                    }
+                    None => paths.push(p.to_string()),
+                }
             }
         }
     }
@@ -3066,8 +3318,12 @@ pub async fn record_pointers(repo_path: &str) -> Result<OpResult, AppError> {
     if let Some(r) = check(&Intent::Commit { amend: false, message_empty: false }, &as_if_staged) {
         return Ok(OpResult::refused(r, status));
     }
+    if let Some(r) = refusal {
+        return Ok(OpResult::refused(r, status));
+    }
     if paths.is_empty() {
-        return Ok(OpResult::refused(Refusal { code: "nothing-to-record".into(), message: "Every submodule is at the commit this branch records.".into() }, status));
+        let message = if only.is_some() { "No submodule was named; nothing to record." } else { "Every submodule is at the commit this branch records." };
+        return Ok(OpResult::refused(Refusal { code: "nothing-to-record".into(), message: message.into() }, status));
     }
     let mut args = vec!["add", "--"];
     args.extend(paths.iter().map(String::as_str));
@@ -3286,10 +3542,20 @@ mod tests {
 
     #[test]
     fn several_own_pointer_commits_block_only_when_upstream_moved_the_pointer_too() {
-        // Upstream moved it as well: a stop is possible and the update handles one.
+        // Upstream moved it as well, and my pointers do not all sit along the
+        // checked-out line: nothing to record them against — a blocker.
         let mut a = sub("A");
         a.own_commits_moving_gitlink = 2;
         assert_eq!(plan(&facts(vec![a.clone()]), true).submodules[0].remedy.as_deref(), Some("squash-own"));
+        // Along the line: the submodule is rebased once and each pointer
+        // commit records its rewritten copy — said in the plan.
+        a.own_pointers_on_line = true;
+        let p = plan(&facts(vec![a.clone()]), true);
+        assert!(p.can_run, "{:?}", p.blockers);
+        assert_eq!(p.submodules[0].action, "rebase");
+        assert!(p.submodules[0].predicted_gitlink_conflict);
+        assert!(p.submodules[0].notes.iter().any(|n| n.contains("2 commits of yours move its pointer")), "{:?}", p.submodules[0].notes);
+        a.own_pointers_on_line = false;
         // Upstream left it alone: every pointer commit replays onto the pointer
         // it started from, and the checkout is already where the last one put it.
         a.upstream_moves_gitlink = false;
@@ -3449,6 +3715,7 @@ mod tests {
             stash_before: None,
             git_said: String::new(),
             handed_over: vec![],
+            pointer_upstreams: vec![],
         };
         let a = "a".repeat(40);
         let stderr = format!(
@@ -3673,6 +3940,7 @@ mod tests {
             stash_before: Some(String::new()),
             git_said: "error: hook declined".into(),
             handed_over: vec!["A".into()],
+            pointer_upstreams: vec![],
             bundles: vec![],
         };
         let json = serde_json::to_string(&st).unwrap();

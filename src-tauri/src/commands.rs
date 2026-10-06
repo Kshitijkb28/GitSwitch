@@ -860,10 +860,11 @@ pub async fn changes_conflict_view(repo_path: String, path: String) -> Result<gi
     git_status::conflict_view(&repo_path, &path).await
 }
 
-/// One commit recording submodule pointers that sit ahead of the branch.
+/// One commit recording submodule pointers that sit ahead of the branch:
+/// every such submodule, or exactly `paths` (a row's "Record this pointer").
 #[tauri::command]
-pub async fn changes_record_pointers(repo_path: String) -> Result<OpResult, AppError> {
-    crate::sync::record_pointers(&repo_path).await
+pub async fn changes_record_pointers(repo_path: String, paths: Option<Vec<String>>) -> Result<OpResult, AppError> {
+    crate::sync::record_pointers(&repo_path, paths.as_deref()).await
 }
 
 /// Finish the operation in progress once its conflicts are staged.

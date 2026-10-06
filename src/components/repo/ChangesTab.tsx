@@ -102,6 +102,9 @@ export function ChangesTab({
   const [discardAllOpen, setDiscardAllOpen] = useState(false);
   const [tick, setTick] = useState(0);
   const [subRefresh, setSubRefresh] = useState(0);
+  // Bumped by Refresh only: the pushing identity may ask github.com, which
+  // is not something every Stage or Commit should do.
+  const [identityRefresh, setIdentityRefresh] = useState(0);
   /**
    * The retry a "conflict-markers" refusal offers — the very operation that was
    * refused, run again with markers allowed. Set by the call that was refused
@@ -432,7 +435,13 @@ export function ChangesTab({
           : undefined,
       push: () => (status ? runLong("push", "Pushing…", () => api.changesPush(repoPath, !status.upstream)) : undefined),
       branches: () => setBranchesFor(repoPath),
-      refresh: () => loadStatus(repoPath),
+      // Everything a fresh visit reads: the status, the submodules, the
+      // stashes and the pushing identity.
+      refresh: () => {
+        loadStatus(repoPath);
+        setSubRefresh((k) => k + 1);
+        setIdentityRefresh((k) => k + 1);
+      },
       initialise: (repo, paths) =>
         runLongIn(repo, "submodules", `Initialising ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
           api.changesSubmoduleUpdate(repo, paths)
@@ -440,6 +449,7 @@ export function ChangesTab({
       updateOne: (repo, sub) => runLongIn(repo, "submodules", `Updating ${sub}…`, () => api.changesSubmoduleUpdate(repo, [sub])),
       pullInside,
       recordPointers: (repo) => apply("record", () => api.changesRecordPointers(repo)),
+      recordOne: (repo, sub) => apply(`record:${sub}`, () => api.changesRecordPointers(repo, [sub])),
       update: (repo, stash, bundles, fingerprint) =>
         runLongIn(repo, "sync", "Updating — fetching, rebasing, aligning submodules…", () => api.changesSyncRun(repo, stash, bundles, fingerprint)),
       stashNow: (repo) => apply("stash", () => api.changesStashPush(repo, "Before update", false)),
@@ -691,6 +701,7 @@ export function ChangesTab({
             <div className="w-full lg:w-80 shrink-0 space-y-3">
               <PushAccessCard
                 repoPath={repoPath}
+                refreshKey={identityRefresh}
                 push={status.push}
                 onChanged={(p) => {
                   // A mode change that lands after a switch to another
@@ -724,6 +735,7 @@ export function ChangesTab({
                 }
                 onPullInside={(s) => void pullInside(repoPath, s)}
                 onUpdateOne={(p) => void runLong("submodules", `Updating ${p}…`, () => api.changesSubmoduleUpdate(repoPath, [p]))}
+                onRecordOne={(p) => void apply(`record:${p}`, () => api.changesRecordPointers(repoPath, [p]))}
                 sectionPaths={sectionPaths}
                 onJumpToSection={jumpToSubmodule}
               />

@@ -268,11 +268,14 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(null);
             case "changes_conflict_view":
               return Promise.resolve(cfg.conflictView);
-            case "changes_record_pointers":
-              // Recording is a commit: HEAD moves, as it does for real.
+            case "changes_record_pointers": {
+              // Recording is a commit: HEAD moves, as it does for real. The
+              // detail is the commit message, naming the paths it recorded.
               window.__SCENARIO__ = { ...window.__SCENARIO__, head_oid: "bbbb2222", ahead: (window.__SCENARIO__.ahead || 0) + 1 };
               window.__RECORDED__ = true;
-              return done("Recorded 1 submodule pointer(s).");
+              const recorded = args.paths ?? ["B"];
+              return done(`Recorded ${recorded.length} submodule pointer(s).`).then((r) => ({ ...r, detail: `Record submodule pointers: ${recorded.join(", ")}` }));
+            }
             case "changes_stage":
               if (cfg.stageRefusal && !args.allowMarkers)
                 return Promise.resolve({ ok: false, headline: cfg.stageRefusal.message, detail: "", refusal: cfg.stageRefusal, status: statusFor(args.repoPath) });
@@ -1427,6 +1430,31 @@ try {
     await page.close();
   }
   {
+    // The card's rows: Record this pointer exactly where the checkout is ahead of the record.
+    const lagging = sub({ path: "lagging", name: "lagging", ahead: 0, behind: 3, state: "moved", actual: "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0", actual_short: "a0a0a0a", summary: "sits 3 commits behind what this repo records; on main" });
+    const page = await open(SCENARIOS.submodules, { submodules: [...SUBMODULES, lagging], subInner: SUB_INNER });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    const rowButtons = (path) =>
+      page.evaluate((p) => {
+        const row = [...document.querySelectorAll("li")].find((r) => r.innerText.includes(p));
+        return row ? [...row.querySelectorAll("button")].map((b) => b.innerText.trim()) : null;
+      }, path);
+    ok("the card's row for a submodule ahead of the record offers Record this pointer", (await rowButtons("trinity"))?.includes("Record this pointer") === true, JSON.stringify(await rowButtons("trinity")));
+    ok("  one behind it offers Update to, not Record", (await rowButtons("lagging"))?.includes("Update to dceaf0b") === true && !(await rowButtons("lagging"))?.includes("Record this pointer"), JSON.stringify(await rowButtons("lagging")));
+    ok("  one at the record offers neither", !(await rowButtons("delivery"))?.some((b) => b.startsWith("Update to") || b === "Record this pointer"), JSON.stringify(await rowButtons("delivery")));
+    const subReads = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodules").length);
+    const readsBefore = await subReads();
+    ok("Record this pointer on trinity", await clickInRow(page, "trinity", { text: "Record this pointer" }));
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_record_pointers"), { timeout: 4000 });
+    const rec = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_record_pointers").at(-1).args);
+    ok("  records that one path, in the repository", rec.repoPath === "/repos/gitswitch" && JSON.stringify(rec.paths) === '["trinity"]', JSON.stringify(rec));
+    await page.waitForFunction(() => document.body.innerText.includes("Recorded 1 submodule pointer(s)."), { timeout: 4000 });
+    ok("  the result card shows the commit it made, by its message", (await text(page)).includes("Record submodule pointers: trinity"));
+    await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "changes_submodules").length > n, { timeout: 4000 }, readsBefore);
+    ok("  and the card re-reads", (await subReads()) > readsBefore, `${readsBefore} → ${await subReads()}`);
+    await page.close();
+  }
+  {
     const page = await open(SCENARIOS.submodules, { submodules: SUBMODULES, subInner: SUB_INNER });
     await page.waitForFunction(() => document.body.innerText.includes("2000+"), { timeout: 4000 });
     await clickInRow(page, "staging", { text: "Show what changed" });
@@ -1482,8 +1510,25 @@ try {
     const trinity = await rowButtons("trinity");
     ok("a submodule behind its own upstream offers Pull inside with the count", trinity?.includes("Pull inside (11)") === true, JSON.stringify(trinity));
     ok("  but not Update to: its checkout is ahead of the record", !trinity?.some((b) => b.startsWith("Update to")));
+    ok("  so it offers Record this pointer instead", trinity?.includes("Record this pointer") === true, JSON.stringify(trinity));
     const lag = await rowButtons("lagging");
     ok("a submodule behind the record offers Update to <recorded>", lag?.includes("Update to dceaf0b") === true, JSON.stringify(lag));
+    ok("  and not Record this pointer: there is nothing ahead to record", !lag?.includes("Record this pointer"), JSON.stringify(lag));
+    const delivery = await rowButtons("delivery");
+    ok("a submodule at the recorded commit offers neither", !delivery?.some((b) => b.startsWith("Update to") || b === "Record this pointer"), JSON.stringify(delivery));
+    const subReads = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodules").length);
+    const readsBefore = await subReads();
+    ok("Record this pointer on trinity", await clickInTr("trinity", "Record this pointer"));
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_record_pointers"), { timeout: 4000 });
+    const rec = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_record_pointers").at(-1).args);
+    ok("  records that one path, in the repository (never inside the submodule)", rec.repoPath === "/repos/gitswitch" && JSON.stringify(rec.paths) === '["trinity"]', JSON.stringify(rec));
+    await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "changes_submodules").length > n, { timeout: 4000 }, readsBefore);
+    ok("  then the table re-reads", (await subReads()) > readsBefore, `${readsBefore} → ${await subReads()}`);
+    await page.evaluate(() => [...document.querySelectorAll('a[role="tab"]')].find((a) => a.innerText.trim().startsWith("Changes")).click());
+    await page.waitForFunction(() => document.body.innerText.includes("Recorded 1 submodule pointer(s)."), { timeout: 4000 });
+    ok("  and the result card on Changes shows the commit it made, by its message", (await text(page)).includes("Record submodule pointers: trinity"));
+    await page.evaluate(() => [...document.querySelectorAll('a[role="tab"]')].find((a) => a.innerText.trim().startsWith("Submodules")).click());
+    await page.waitForFunction(() => document.body.innerText.includes("populated"), { timeout: 4000 });
     ok("Pull inside on trinity", await clickInTr("trinity", "Pull inside"));
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_pull"), { timeout: 4000 });
     const pull = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_pull").at(-1).args);
@@ -2229,6 +2274,31 @@ try {
     await page.close();
   }
 
+  section("Clone page: progress after the main download");
+  {
+    const page = await openClonePage(browser, server, {
+      cloneHang: true,
+      cloneProgress: { phase: "Submodules", percent: 37, done: 3, total: 8, bytes: null, rate: null, detail: "libs/sub" },
+    });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Clone").click());
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules 37%"), { timeout: 4000 });
+    const s = await text(page);
+    ok("while submodules download, the line says which one it is on", s.includes("Submodules 37%") && s.includes("3 of 8") && s.includes("libs/sub"), s.slice(s.indexOf("Submodules"), s.indexOf("Submodules") + 60));
+    ok("  without the GitHub size estimate, which is about the main download", !s.includes("of about"));
+    await page.close();
+  }
+  {
+    const page = await openClonePage(browser, server, {
+      cloneHang: true,
+      cloneProgress: { phase: "Large files", percent: 40, done: 2, total: 5, bytes: "1.0 MiB of 4.0 MiB", rate: null, detail: "media/video/intro.mp4" },
+    });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Clone").click());
+    await page.waitForFunction(() => document.body.innerText.includes("Large files 40%"), { timeout: 4000 });
+    const s = await text(page);
+    ok("while large files download, the line counts them, with the bytes git-lfs reported and the file it is on", s.includes("2 of 5") && s.includes("1.0 MiB of 4.0 MiB") && s.includes("media/video/intro.mp4") && !s.includes("of about"), s.slice(s.indexOf("Large files"), s.indexOf("Large files") + 90));
+    await page.close();
+  }
+
   section("Clone page: Git LFS option");
   const CLONED_LFS = {
     path: "/repos/big-data",
@@ -2253,6 +2323,7 @@ try {
     const s = await text(page);
     ok("while it runs, the banner shows git's phase and percentage", s.includes("Receiving objects 45%"));
     ok("  with how many objects, how much has arrived of the estimate, and the rate", s.includes("556 of 1,234") && s.includes("10.00 MiB of about 1.2 GB") && s.includes("2.00 MiB/s"));
+    ok("  and how long is left at that rate", s.includes("about 10 min left"), s.slice(s.indexOf("2.00 MiB/s"), s.indexOf("2.00 MiB/s") + 40));
     ok("  as a bar", await page.evaluate(() => !!document.querySelector('[aria-label="Clone progress"]')));
     await page.close();
   }

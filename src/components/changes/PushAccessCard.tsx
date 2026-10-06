@@ -22,6 +22,8 @@ interface Props {
   repoPath: string;
   push: PushState;
   onChanged: (p: PushState) => void;
+  /** Bumped by the page's Refresh: the pushing identity is read again. */
+  refreshKey: number;
 }
 
 type Segment = { value: PushMode; label: string; icon: typeof Lock; what: string };
@@ -90,7 +92,7 @@ const OUTCOME_STYLE: Record<JobOutcomeKind, string> = {
  * Who a push from here would authenticate as. Read once per repository (and
  * on Re-check), never polled: it may ask github.com over ssh.
  */
-function PushesAs({ repoPath }: { repoPath: string }) {
+function PushesAs({ repoPath, refreshKey }: { repoPath: string; refreshKey: number }) {
   const [who, setWho] = useState<api.PushIdentity | null>(null);
   const [loading, setLoading] = useState(true);
   const seq = useRef(0);
@@ -113,7 +115,7 @@ function PushesAs({ repoPath }: { repoPath: string }) {
   useEffect(() => {
     read(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [repoPath]);
+  }, [repoPath, refreshKey]);
 
   if (loading && !who) {
     return <p className="text-xs text-zinc-500">Checking which account would push…</p>;
@@ -173,7 +175,7 @@ function PushesAs({ repoPath }: { repoPath: string }) {
   );
 }
 
-export function PushAccessCard({ repoPath, push, onChanged }: Props) {
+export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props) {
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const [pending, setPending] = useState<PushMode | null>(null);
@@ -277,7 +279,7 @@ export function PushAccessCard({ repoPath, push, onChanged }: Props) {
       </div>
 
       <p className="text-xs text-zinc-400 leading-relaxed">{push.reason}</p>
-      <PushesAs repoPath={repoPath} />
+      <PushesAs repoPath={repoPath} refreshKey={refreshKey} />
 
       <div className="flex rounded-lg border border-zinc-700 overflow-hidden w-fit max-w-full" role="radiogroup" aria-label="Push access">
         {SEGMENTS.map((s) => {

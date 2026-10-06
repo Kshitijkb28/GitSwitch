@@ -37,6 +37,9 @@ try {
     await page.setViewport({ width, height: 900 });
     await page.evaluateOnNewDocument((repos, st, d1, subs, stashes, submods) => {
       localStorage.clear();
+      // The Clone page takes its readings only once it has a URL and a folder.
+      localStorage.setItem("gitswitch:sparse.url", JSON.stringify("git@github.com:me/big-data.git"));
+      localStorage.setItem("gitswitch:sparse.parentDir", JSON.stringify("/repos"));
       localStorage.setItem("gitswitch:changes.repo", JSON.stringify("/repos/gitswitch"));
       localStorage.setItem("gitswitch:history.repo", JSON.stringify("/repos/gitswitch"));
       const profiles = [
@@ -53,6 +56,8 @@ try {
           return id;
         },
         invoke: (cmd) => {
+          // Every call, in order: what a page asks when it opens must be asked again by its Refresh.
+          (window.__CALLS__ = window.__CALLS__ || []).push(cmd);
           switch (cmd) {
             case "get_profiles": return Promise.resolve(profiles);
             case "history_list_repos": return Promise.resolve(repos);
@@ -75,6 +80,7 @@ try {
             case "get_current_git_config": return Promise.resolve("[user]\n\tname = Me\n\temail = me@personal.test");
             case "allowed_signers_path": return Promise.resolve("/Users/me/.ssh/allowed_signers");
             case "local_clone_index": return Promise.resolve({ by_path: {}, by_repo: {} });
+            case "clone_destination_status": return Promise.resolve({ path: "/repos/big-data", exists: false, is_repo: false, origin: null, same_repo: false, same_url: false, origin_is_https: false, incomplete: false });
             case "list_remote_repos": return Promise.resolve({ repos: [], sso_hidden_orgs: 0, truncated: false });
             case "list_remote_repos_page": return Promise.resolve({ listing: { account: "a", login: "me", suggested_profile_id: null, repos: [], sso_hidden_orgs: 0, truncated: false }, page: 1, per_page: 10, has_more: false });
             case "history_branches": return Promise.resolve([{ name: "main", is_current: true, is_remote: false, upstream: "origin/main", ahead: 0, behind: 0, tip: "aaa", short_tip: "aaa", last_author: "Me", last_date: "2026-01-01T00:00:00Z", subject: "x" }]);
@@ -84,12 +90,16 @@ try {
         },
       };
     }, REPOS, status, DIFF_TEXT, SUB_STATUSES, STASHES, SUBMODULES);
-    await page.goto(`${server.url}/`, { waitUntil: "networkidle0" });
+    // Start off a page that is not swept, so the first stop (Profiles, at "/") mounts fresh on its click.
+    await page.goto(`${server.url}/profile/new`, { waitUntil: "networkidle0" });
 
     // The Repository page's other tabs are swept as pages of their own.
     const STOPS = PAGES.flatMap((n) => (n === "Repository" ? [n, "tab:History", "tab:Submodules"] : [n]));
     for (const stop of STOPS) {
       const name = stop.replace(/^tab:/, "");
+      // Counted before the click: React runs a page's first effects inside the
+      // click that opened it, so its first readings are already on the list.
+      const callsBefore = await page.evaluate(() => (window.__CALLS__ || []).length);
       const clicked = await page.evaluate((n, isTab) => {
         const a = [...document.querySelectorAll(isTab ? 'a[role="tab"]' : "nav a")].find((x) => x.innerText.trim().startsWith(n));
         if (a) { a.click(); return true; }
@@ -136,6 +146,29 @@ try {
         if (!hasRefresh) {
           bad++;
           console.log(`             no Refresh button on ${name}`);
+        } else {
+          // Refresh must do what a fresh visit does: everything the page asked
+          // the backend when it opened, it asks again — not one reading of several.
+          // (A page that polls while something runs is not running anything here.)
+          // The Clone page asks GitHub about the size 600 ms after it opens.
+          await new Promise((r) => setTimeout(r, 500));
+          const opened = await page.evaluate((from) => (window.__CALLS__ || []).slice(from), callsBefore);
+          const asked = [...new Set(opened)];
+          const mark = await page.evaluate(() => (window.__CALLS__ || []).length);
+          await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Refresh").click());
+          await new Promise((r) => setTimeout(r, 1500));
+          const again = await page.evaluate((from) => (window.__CALLS__ || []).slice(from), mark);
+          const missing = asked.filter((c) => !again.includes(c));
+          if (missing.length) {
+            bad++;
+            console.log(`             Refresh on ${name} did not re-ask: ${missing.join(", ")} (opened with: ${asked.join(", ")})`);
+          } else if (asked.length) {
+            console.log(`             Refresh re-asks all ${asked.length}: ${asked.join(", ")}`);
+          } else if (name !== "Auto Assign") {
+            // Only Auto Assign reads nothing on open (it scans a chosen folder).
+            bad++;
+            console.log(`             ${name} asked nothing on open — Refresh parity not checked`);
+          }
         }
       }
     }

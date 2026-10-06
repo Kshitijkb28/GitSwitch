@@ -4,7 +4,7 @@ import { Button } from "../Button";
 import { Card } from "../Card";
 import * as api from "../../lib/api";
 import type { SubmoduleInfo } from "../../lib/api";
-import { canPullInside, canUpdate, pullInsideTitle, updateTitle } from "../changes/SubmodulesCard";
+import { canPullInside, canRecord, canUpdate, pullInsideTitle, recordTitle, updateTitle } from "../changes/SubmodulesCard";
 
 interface Props {
   /** The repository (never a submodule): this tab is about ITS submodules. */
@@ -21,6 +21,8 @@ interface Props {
   onPullInside: (sub: SubmoduleInfo) => void;
   /** `git submodule update -- <path>`: check out the commit this repository records. */
   onUpdateOne: (path: string) => void;
+  /** One commit in the repository recording where that submodule is checked out now. */
+  onRecordOne: (path: string) => void;
   /** Opens the Update drawer for the repository: the latest below, your work on top, every submodule aligned. */
   onPreview: () => void;
 }
@@ -63,7 +65,7 @@ function stateClass(s: SubmoduleInfo): string {
  * upstream is a stream of pointer bumps, this is where the person's work
  * actually lives.
  */
-export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInside, onOpenHistory, onInitialise, onRecordPointers, onPullInside, onUpdateOne, onPreview }: Props) {
+export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInside, onOpenHistory, onInitialise, onRecordPointers, onPullInside, onUpdateOne, onRecordOne, onPreview }: Props) {
   const [subs, setSubs] = useState<SubmoduleInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -207,6 +209,12 @@ export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInsid
                           <Button size="sm" variant="secondary" disabled={busy} onClick={() => onUpdateOne(s.path)} title={updateTitle(s)} className="px-2">
                             <GitCommitHorizontal size={13} />
                             Update to {s.recorded_short}
+                          </Button>
+                        )}
+                        {canRecord(s) && (
+                          <Button size="sm" variant="secondary" disabled={busy} onClick={() => onRecordOne(s.path)} title={recordTitle(s)} className="px-2">
+                            <GitCommitHorizontal size={13} />
+                            Record this pointer
                           </Button>
                         )}
                         <Button size="sm" variant="ghost" onClick={() => onWorkInside(s.path)} title="Work in this submodule as its own repository" className="px-2">

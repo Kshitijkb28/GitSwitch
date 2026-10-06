@@ -500,6 +500,8 @@ export interface CloneProgress {
   total: number | null;
   bytes: string | null;
   rate: string | null;
+  /** What is being worked on right now: the submodule being fetched, the large file being downloaded. */
+  detail?: string;
 }
 
 export async function cloneProgress(destPath: string): Promise<CloneProgress | null> {
@@ -1699,9 +1701,13 @@ export async function changesConflictView(repoPath: string, path: string): Promi
   return invoke("changes_conflict_view", { repoPath, path });
 }
 
-/** One commit recording every submodule checked out ahead of what the branch records. */
-export async function changesRecordPointers(repoPath: string): Promise<OpResult> {
-  return invoke("changes_record_pointers", { repoPath });
+/**
+ * One commit recording submodule pointers checked out ahead of what the branch
+ * records. `paths`: exactly these submodules — each is refused when it is not
+ * a populated, listed submodule or not strictly ahead; null = every such one.
+ */
+export async function changesRecordPointers(repoPath: string, paths: string[] | null = null): Promise<OpResult> {
+  return invoke("changes_record_pointers", { repoPath, paths });
 }
 
 export type PullMode = "ff-only" | "merge" | "rebase";

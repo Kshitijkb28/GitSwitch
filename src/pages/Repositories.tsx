@@ -332,6 +332,8 @@ export function Repositories() {
           )}
           <RefreshButton
             onClick={() => {
+              // Everything a fresh visit reads, again.
+              api.getProfiles().then(setProfiles).catch(() => setProfiles([]));
               refreshLocal();
               reloadAccounts();
               if (account) load(account, true);

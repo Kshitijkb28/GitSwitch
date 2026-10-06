@@ -441,7 +441,7 @@ impl GitCmd {
 /// process is holding a lock" about a process the app itself had killed.
 /// On Windows `kill()` is `TerminateProcess` on git alone; the Job Object
 /// taken out at spawn has already ended its descendants.
-async fn terminate_tree(child: &mut tokio::process::Child) {
+pub(crate) async fn terminate_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         let group = -(pid as i32);
@@ -449,9 +449,16 @@ async fn terminate_tree(child: &mut tokio::process::Child) {
         unsafe {
             libc::kill(group, libc::SIGTERM);
         }
+        let deadline = std::time::Instant::now() + KILL_GRACE;
         let left_on_its_own = tokio::time::timeout(KILL_GRACE, child.wait()).await.is_ok();
-        // The leader may have gone while a grandchild lingers: insist on the
-        // whole group either way. ESRCH (nobody left) is the good outcome.
+        // The leader going is not the group going: an inner `git clone` is
+        // still removing what it had written when its parent exits, and a
+        // SIGKILL at that moment leaves a half-deleted `.git/modules/<name>`
+        // that makes the whole repository unreadable. The grace is the
+        // group's. ESRCH (nobody left) is the good outcome.
+        while std::time::Instant::now() < deadline && unsafe { libc::kill(group, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         unsafe {
             libc::kill(group, libc::SIGKILL);
         }

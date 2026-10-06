@@ -38,6 +38,14 @@ ok "reports the submodule count" "$(printf '%s' "$OUT" | jqf submodules.listed)"
 ok "  and checks it out (not left empty)" "$([ -f "$SB/clones/withsub/vendor/sub/s.txt" ] && echo yes || echo no)" "yes"
 ok "  sets submodule.active so future ones arrive on pull" "$(git -C "$SB/clones/withsub" config --get submodule.active)" "."
 
+# What the Clone page was shown meanwhile: the submodule named while it was
+# being fetched, then the finished count — and no large-files count, since
+# nothing was asked for.
+TRACE=$(probe_trace)
+ok "  the progress line named the submodule while it was fetched" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;p=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("done") is not None][0];print(p["done"],"of",p["total"],p["detail"])')" "0 of 1 vendor/sub"
+ok "  and the last word on the submodules was all of them done, nothing named" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;p=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules"][-1];print(p["phase"],p["done"],"of",p["total"],p["percent"],p.get("detail"))')" "Submodules 1 of 1 100 None"
+ok "  no large-files count was claimed" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;print([p for p in json.load(sys.stdin) if p["phase"]=="Large files" and p.get("done") is not None])')" "[]"
+
 section "Sparse clone"
 OUT=$(probe sparse_clone "" "$SB/origin.git,$SB/clones,sparse")
 ok "sparse clone succeeds" "$(printf '%s' "$OUT" | jqf path)" "$SB/clones/sparse"

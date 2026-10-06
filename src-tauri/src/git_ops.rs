@@ -1796,7 +1796,7 @@ pub async fn submodule_update(repo_path: &str, paths: Option<Vec<String>>) -> Re
             validate_repo_path(path)?;
         }
     }
-    let report = crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url, paths.as_deref()).await;
+    let report = crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url, paths.as_deref(), None).await;
     let after = snapshot(repo_path).await?;
 
     let headline = format!("{} of {} submodule(s) up to date.", report.downloaded, report.listed);

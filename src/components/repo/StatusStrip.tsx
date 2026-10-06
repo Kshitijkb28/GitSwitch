@@ -27,6 +27,8 @@ export type RepoActions = StripActions & {
   updateOne: (repo: string, sub: string) => Promise<unknown>;
   pullInside: (repo: string, sub: SubmoduleInfo) => Promise<unknown>;
   recordPointers: (repo: string) => Promise<unknown>;
+  /** One commit in `repo` recording where the submodule `sub` is checked out now (a row's "Record this pointer"). */
+  recordOne: (repo: string, sub: string) => Promise<unknown>;
   /** Runs an assessed plan (the Update drawer's "Update now"). */
   update: (repo: string, stash: boolean, bundles: boolean, fingerprint: [string, string][]) => Promise<unknown>;
   /** Stashes the uncommitted changes that collide with the update, so it can run. */

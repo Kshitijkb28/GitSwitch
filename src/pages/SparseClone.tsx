@@ -47,6 +47,29 @@ function profileForFolder(dir: string, profiles: Profile[]): Profile | null {
 
 /** Folder name git will create — mirrors the backend's repo_name_from_url. */
 /** "1.2 GB" from GitHub's kilobytes. */
+/** "10.00 MiB" / "2.00 MiB/s", as git prints them, in bytes. */
+function gitSizeBytes(s: string): number | null {
+  const m = /^\s*([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\b/.exec(s);
+  if (!m) return null;
+  const unit = { B: 1, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3, TiB: 1024 ** 4 }[m[2] as "B" | "KiB" | "MiB" | "GiB" | "TiB"];
+  return parseFloat(m[1]) * unit;
+}
+
+/**
+ * "about 10 min left", from what has arrived, how fast, and how big GitHub
+ * says the repository is — only the main download has that estimate.
+ */
+function timeLeft(bytes: string, rate: string, estimateKb: number): string | null {
+  const have = gitSizeBytes(bytes);
+  const perSec = gitSizeBytes(rate);
+  if (have === null || perSec === null || perSec <= 0) return null;
+  const secs = Math.max(0, estimateKb * 1024 - have) / perSec;
+  if (secs < 60) return "less than a minute left";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `about ${mins} min left`;
+  return `about ${Math.floor(mins / 60)} h ${mins % 60} min left`;
+}
+
 function formatKb(kb: number): string {
   if (kb < 1024) return `${kb} KB`;
   const mb = kb / 1024;
@@ -165,10 +188,17 @@ export function SparseClone() {
   // GitHub shows org-<ID>@github.com links for orgs with an SSH certificate authority.
   const certOrgUrl = /^(?:ssh:\/\/)?org-[^@\s]+@github\.com[:/]/i.test(url.trim());
   const keyInUse = effective?.ssh_key_path ?? null;
-  // Bumped when the user returns to the app: the destination folder may have
-  // been created or deleted, and a certificate may have appeared, meanwhile.
+  // Bumped when the user returns to the app, and by Refresh: the destination
+  // folder may have been created or deleted, a certificate may have
+  // appeared, git-lfs may have been installed, GitHub may answer about the
+  // size now. Every reading this page takes on its own re-runs on it.
   const [recheck, setRecheck] = useState(0);
   useRefreshOnFocus(() => setRecheck((n) => n + 1));
+  // What a fresh visit does, in one go.
+  function reloadAll() {
+    reloadProfiles();
+    setRecheck((n) => n + 1);
+  }
   // git-lfs can be installed while the app is open, so ask again on focus.
   useEffect(() => {
     let stale = false;
@@ -206,18 +236,24 @@ export function SparseClone() {
   const cloning = !!job && !job.done;
 
   // The size is asked for once per URL, a little after typing stops.
+  const sizeUrl = useRef<string | null>(null);
   useEffect(() => {
     const mine = ++sizeSeq.current;
-    setSizeEstimate(null);
+    // A new URL blanks the old answer; a re-ask for the same URL (Refresh,
+    // the window regaining focus) keeps what the page has until GitHub
+    // answers again — an answer that fails does not take away one it gave.
+    const urlChanged = sizeUrl.current !== url;
+    sizeUrl.current = url;
+    if (urlChanged) setSizeEstimate(null);
     if (!/github\.com[:/]/.test(url)) return;
     const id = window.setTimeout(() => {
       api
         .cloneSizeEstimate(url)
-        .then((s) => { if (mine === sizeSeq.current) setSizeEstimate(s); })
+        .then((s) => { if (mine === sizeSeq.current && (s || urlChanged)) setSizeEstimate(s); })
         .catch(() => { /* GitHub would not say; the clone works all the same */ });
     }, 600);
     return () => window.clearTimeout(id);
-  }, [url]);
+  }, [url, recheck]);
 
   // Poll the clone's progress while it runs — the same shape as the LFS poll.
   useEffect(() => {
@@ -422,7 +458,7 @@ export function SparseClone() {
             download only the folders you need.
           </p>
         </div>
-        <RefreshButton onClick={reloadProfiles} title="Re-read the profiles and their folders" />
+        <RefreshButton onClick={reloadAll} title="Re-read the profiles, the destination and what git-lfs and GitHub say" />
       </div>
 
       {fromRepo && (
@@ -459,11 +495,16 @@ export function SparseClone() {
                     {progress.done !== null && progress.total !== null && (
                       <span className="text-zinc-500"> · {progress.done.toLocaleString()} of {progress.total.toLocaleString()}</span>
                     )}
+                    {progress.detail && <span className="text-zinc-500"> · {progress.detail}</span>}
                   </span>
                   <span className="text-zinc-500 tabular-nums">
                     {progress.bytes}
-                    {progress.bytes && sizeEstimate && ` of about ${formatKb(sizeEstimate.kb)}`}
+                    {progress.bytes && sizeEstimate && !progress.detail && ` of about ${formatKb(sizeEstimate.kb)}`}
                     {progress.rate && ` · ${progress.rate}`}
+                    {progress.bytes && progress.rate && sizeEstimate && !progress.detail && (() => {
+                      const left = timeLeft(progress.bytes, progress.rate, sizeEstimate.kb);
+                      return left ? ` · ${left}` : "";
+                    })()}
                   </span>
                 </span>
                 <span className="block h-1.5 mt-1 rounded bg-zinc-700/70 overflow-hidden">

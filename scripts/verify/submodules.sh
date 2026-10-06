@@ -122,6 +122,7 @@ cd "$SB/super_fresh"
 ok "the fixture: nothing populated yet" "$(find mapped moved orphan -mindepth 1 | wc -l | tr -d ' ')" "0"
 ARGS=$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"paths":["moved"]}))' "$SB/super_fresh")
 OUT=$(pinvoke changes_submodule_update "$ARGS")
+TRACE_INIT=$(probe_trace)      # read right after the call that really populated one
 ok "asked for 'moved' only, it reports one of one" "$(printf '%s' "$OUT" | jqf value.headline)" "1 of 1 submodule(s) up to date."
 ok "  moved is checked out at the recorded commit" "$(git -C "$SB/super_fresh/moved" rev-parse HEAD)" "$(git rev-parse HEAD:moved)"
 ok "  mapped was not touched" "$(find mapped -mindepth 1 | wc -l | tr -d ' ')" "0"
@@ -141,6 +142,55 @@ ok "  (git's own update of that path moves it back — which is why the app name
 ARGS=$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"paths":["../escape"]}))' "$SB/super_fresh")
 ok "a path outside the repository is refused" "$(pinvoke changes_submodule_update "$ARGS")" "isn't a path inside this repository"
 cd "$SB/super"
+
+ok "  and initialising from the Changes page reports no clone progress — no clone is running there" "$TRACE_INIT" "[]"
+
+section "Cloning this superproject names each submodule as it arrives"
+mkdir -p "$SB/clones"
+OUT=$(probe clone "" "$SB/super,$SB/clones,fresh,submodules")
+ok "the clone lists the mapped submodules and fetches them" "$(printf '%s' "$OUT" | jqf submodules.listed):$(printf '%s' "$OUT" | jqf submodules.downloaded)" "2:2"
+TRACE=$(probe_trace)
+ok "  each was named while it was the one being fetched, in order" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;e=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")];print([p["done"] for p in e], [p["total"] for p in e], len(set(p["detail"] for p in e)))')" "[0, 1] [2, 2] 2"
+ok "  the last word on the submodules is both done, nothing named" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;p=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules"][-1];print(p["phase"],p["done"],p["total"],p["percent"],"detail" in p)')" "Submodules 2 2 100 False"
+
+section "A submodule download that makes no headway is stopped; one beside it still arrives"
+# A server that accepts the connection and never answers: git waits on it for
+# ever, and the app must not — nor must it give up on a download that is
+# merely slow, so the clock only runs while nothing is reported.
+"$PY" - > "$SB/stuck-port" <<'PYSRV' &
+import socket, sys, time
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(8)
+print(s.getsockname()[1], flush=True)
+while True:
+    c, _ = s.accept(); time.sleep(3600)
+PYSRV
+STUCK_PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SB/stuck-port" ] && break; sleep 0.5; done
+PORT="$(cat "$SB/stuck-port")"
+git config --global protocol.git.allow always          # the sandbox's own config: git:// is refused for submodules otherwise
+git init -q "$SB/super-stuck"; printf 'r\n' > "$SB/super-stuck/README.md"; git -C "$SB/super-stuck" add -A >/dev/null; git -C "$SB/super-stuck" commit -qm init
+( cd "$SB/super-stuck" && git submodule add -q "$SB/mapped.git" mapped 2>/dev/null )
+git -C "$SB/super-stuck" config -f .gitmodules submodule.stuck.path stuck; git -C "$SB/super-stuck" config -f .gitmodules "submodule.stuck.url" "git://127.0.0.1:$PORT/stuck.git"
+git -C "$SB/super-stuck" update-index --add --cacheinfo "160000,$(git -C "$SB/mapped.git" rev-parse HEAD),stuck"
+git -C "$SB/super-stuck" add .gitmodules; git -C "$SB/super-stuck" commit -qm "two submodules, one of them stuck"
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=3 probe clone "" "$SB/super-stuck,$SB/clones,stuckclone,submodules"); T1=$(date +%s)
+ok "the clone comes back with the good submodule, and the stuck one named" "$(printf '%s' "$OUT" | jqf submodules.downloaded):$(printf '%s' "$OUT" | jqf submodules.failed_paths)" "1:[\"stuck\"]"
+ok "  stopped for making no headway, not for taking long" "$(printf '%s' "$OUT" | jqf submodules.error)" "made no progress for 3s and was stopped"
+ok "  within seconds, not after the old three-minute limit" "$([ $((T1-T0)) -lt 60 ] && echo quick || echo "slow: $((T1-T0))s")" "quick"
+ok "  and the page's line named it while it hung" "$(probe_trace | "$PY" -c 'import sys,json;e=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="stuck"];print(len(e)>0)')" "True"
+ok "  the clone is still a repository the app can read" "$(probe status "$SB/clones/stuckclone" | jqf branch):$(git -C "$SB/clones/stuckclone" status --porcelain >/dev/null 2>&1 && echo readable || echo broken)" "main:readable"
+ok "  and nothing half-deleted is left for the stuck one" "$([ -e "$SB/clones/stuckclone/.git/modules/stuck" ] && echo leftover || echo clean)" "clean"
+kill "$STUCK_PID" 2>/dev/null; git config --global --unset protocol.git.allow
+# A download that is quiet because it is checking out (a smudge filter, say) is not a stall.
+git config --global filter.slow.smudge 'sleep 2; cat'; git config --global filter.slow.clean cat
+git init -q --bare "$SB/slow.git"; git clone -q "$SB/slow.git" "$SB/author-slow" 2>/dev/null
+printf '*.f filter=slow\n' > "$SB/author-slow/.gitattributes"; for i in 1 2 3; do printf '%s\n' "$i" > "$SB/author-slow/$i.f"; done
+git -C "$SB/author-slow" add -A >/dev/null; git -C "$SB/author-slow" commit -qm "slow files"; git -C "$SB/author-slow" push -q origin main 2>/dev/null
+git init -q "$SB/super-slow"; printf 'r\n' > "$SB/super-slow/README.md"; git -C "$SB/super-slow" add -A >/dev/null; git -C "$SB/super-slow" commit -qm init
+( cd "$SB/super-slow" && git submodule add -q "$SB/slow.git" slow 2>/dev/null ); git -C "$SB/super-slow" commit -qm "a slow submodule"
+OUT=$(GITSWITCH_STALL_SECS=3 probe clone "" "$SB/super-slow,$SB/clones,slowclone,submodules")
+ok "a six-second silent checkout is not stopped by a three-second stall window: the download had finished" "$(printf '%s' "$OUT" | jqf submodules.downloaded):$(printf '%s' "$OUT" | jqf submodules.failed_paths):$(ls "$SB/clones/slowclone/slow" | grep -c '\.f$')" "1:[]:3"
+git config --global --unset filter.slow.smudge; git config --global --unset filter.slow.clean
 
 section "A submodule path with a space and a non-ASCII character"
 git init -q --bare "$SB/uml.git"

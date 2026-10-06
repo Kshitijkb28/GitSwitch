@@ -163,10 +163,17 @@ ok "  none is a pointer stub" "$(printf '%s' "$OUT" | jqf lfs.pointers_left)" "0
 ok "  the fresh clone's filters had to be set up first" "$(printf '%s' "$OUT" | jqf lfs.configured_now)" "True"
 ok "  the note says what arrived" "$(printf '%s' "$OUT" | jqf lfs.note)" "Downloaded 3 large files"
 ok "  the file holds real bytes" "$(wc -c < "$SB/clones/lfsclone/model.bin" | tr -d ' ')" "4096"
+# What the Clone page was shown meanwhile: the Large files phase opened at
+# none of the stubs and closed at the measured count (a local download of a
+# few KB is over before the first half-second read, so only the ends are certain).
+TRACE=$(probe_trace)
+ok "  the progress line opened the Large files phase at none of the stubs" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;p=[p for p in json.load(sys.stdin) if p["phase"]=="Large files" and p.get("done") is not None][0];print(p["done"],"of",p["total"])')" "0 of"
+ok "  and the last thing recorded was Large files, every stub fetched — the measured count" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;p=json.load(sys.stdin)[-1];print(p["phase"],p["done"]==p["total"],p["percent"])')" "Large files True 100"
 OUT=$(probe clone "" "$SB/remote.git,$SB/clones,nolfs,nosub")
 ok "without the option the stubs stay" "$(printf '%s' "$OUT" | jqf lfs.pointers_left)" "3"
 ok "  and the result points at the Changes page" "$(printf '%s' "$OUT" | jqf lfs.note)" "Changes"
 ok "  the file is still a stub" "$([ "$(wc -c < "$SB/clones/nolfs/model.bin" | tr -d ' ')" -lt 200 ] && echo stub || echo content)" "stub"
+ok "  and without the option no large-files count was ever claimed" "$(probe_trace | "$PY" -c 'import sys,json;print([p for p in json.load(sys.stdin) if p["phase"]=="Large files" and p.get("done") is not None])')" "[]"
 OUT=$(probe sparse_clone "" "$SB/remote.git,$SB/clones,sparse")
 ok "a sparse clone has no LFS report yet (nothing is checked out)" "$(printf '%s' "$OUT" | jqf lfs)" "None"
 OUT=$(probe sparse_set "$SB/clones/sparse" "assets,lfs")

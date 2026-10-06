@@ -16,6 +16,8 @@ interface Props {
   onPullInside: (sub: SubmoduleInfo) => void;
   /** `git submodule update -- <path>`: check out the commit this repository records. */
   onUpdateOne: (path: string) => void;
+  /** One commit in this repository recording where that submodule is checked out now. */
+  onRecordOne: (path: string) => void;
   /** Bumped by the page after any operation, so the list re-reads. */
   refreshKey: number;
   /** Submodules that have their own section in the main column. */
@@ -37,6 +39,16 @@ export const pullInsideTitle = (s: SubmoduleInfo) =>
   `git pull inside ${s.path}: brings ${s.own_branch} up to date with ${s.own_upstream}${s.own_behind > 0 ? ` (${s.own_behind} behind)` : ""}. Nothing in this repository changes until you record the pointer.`;
 export const updateTitle = (s: SubmoduleInfo) =>
   `git submodule update -- ${s.path}: checks out ${s.recorded_short}, the commit this repository records (${s.behind} commit${s.behind === 1 ? "" : "s"} past what is checked out now)`;
+/**
+ * "Record this pointer": the mirror case — the checkout moved past the record
+ * (a commit or a pull inside did that), so the repository can record it. Only
+ * when strictly ahead: equal, behind or diverged checkouts, and ones whose
+ * recorded commit the submodule does not have yet, are the backend's refusals.
+ */
+export const canRecord = (s: SubmoduleInfo) =>
+  s.initialised && s.listed && quiet(s) && s.ahead > 0 && s.behind === 0 && !s.recorded_missing;
+export const recordTitle = (s: SubmoduleInfo) =>
+  `One commit in this repository recording ${s.actual_short} for ${s.path}, ${s.ahead} commit${s.ahead === 1 ? "" : "s"} ahead of the ${s.recorded_short} it records now. Nothing inside ${s.path} changes.`;
 
 /** A submodule is a repo, so its files open in the same diff panel. */
 function chipClass(state: SubmoduleInfo["state"]): string {
@@ -77,6 +89,7 @@ function SubmoduleRow({
   onOpenRepo,
   onPullInside,
   onUpdateOne,
+  onRecordOne,
   hasSection,
   onJumpToSection,
   refreshKey,
@@ -87,6 +100,7 @@ function SubmoduleRow({
   onOpenRepo: (path: string) => void;
   onPullInside: (sub: SubmoduleInfo) => void;
   onUpdateOne: (path: string) => void;
+  onRecordOne: (path: string) => void;
   /** The main column already shows this submodule's files — link there instead of re-reading them. */
   hasSection: boolean;
   onJumpToSection?: (path: string) => void;
@@ -268,6 +282,12 @@ function SubmoduleRow({
               Update to {sub.recorded_short}
             </Button>
           )}
+          {canRecord(sub) && (
+            <Button size="sm" variant="secondary" disabled={busy} onClick={() => onRecordOne(sub.path)} title={recordTitle(sub)} className="px-1.5">
+              <GitCommitHorizontal size={13} />
+              Record this pointer
+            </Button>
+          )}
           {sub.initialised && (
             <Button
               size="sm"
@@ -297,6 +317,7 @@ export function SubmodulesCard({
   onUpdate,
   onPullInside,
   onUpdateOne,
+  onRecordOne,
   refreshKey,
   sectionPaths = [],
   onJumpToSection,
@@ -363,6 +384,7 @@ export function SubmodulesCard({
             onOpenRepo={onOpenRepo}
             onPullInside={onPullInside}
             onUpdateOne={onUpdateOne}
+            onRecordOne={onRecordOne}
             hasSection={sectionPaths.includes(s.path)}
             onJumpToSection={onJumpToSection}
             refreshKey={refreshKey}
