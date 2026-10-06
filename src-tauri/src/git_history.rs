@@ -51,6 +51,9 @@ pub struct HistoryCommit {
     pub touches_submodules: Vec<String>,
     /// It changes nothing but submodule pointers — a bump, not work.
     pub only_submodules: bool,
+    /// No remote-tracking branch has it: it exists only here. Meaningful
+    /// only when the page says there are remote-tracking branches at all.
+    pub unpushed: bool,
     // graph placement
     pub lane: usize,
     pub parent_lanes: Vec<usize>,
@@ -65,6 +68,14 @@ pub struct HistoryPage {
     pub limit: usize,
     pub has_more: bool,
     pub max_lane: usize,
+    /// The repository has at least one remote-tracking branch to compare
+    /// with. Without one nothing here is known to be pushed, and the rows
+    /// carry no mark.
+    pub remote_refs: bool,
+    /// The comparison with the remote-tracking branches failed (a
+    /// remote-tracking ref pointing at a missing object, say): the rows carry
+    /// no mark, and this says why.
+    pub marks_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -564,7 +575,9 @@ fn classify_touches(files: &[String], gitlinks: &[String]) -> (Vec<String>, bool
 /// One page of history for a branch (or every branch when `rev` is "--all").
 /// `authors`: only commits by any of these (emails or names, literal);
 /// `hide_pointer_only`: leave out commits that change nothing but submodule
-/// pointers (the CI bumps a superproject's history fills up with).
+/// pointers (the CI bumps a superproject's history fills up with);
+/// `unpushed_only`: only commits no remote-tracking branch has.
+#[allow(clippy::too_many_arguments)]
 pub fn history_page(
     repo_path: &str,
     rev: &str,
@@ -573,6 +586,7 @@ pub fn history_page(
     search: Option<&str>,
     authors: Option<&[String]>,
     hide_pointer_only: bool,
+    unpushed_only: bool,
 ) -> Result<HistoryPage, AppError> {
     let repo = PathBuf::from(repo_path);
     // Ranges (main..origin/main) are legitimate revisions; only flags are not.
@@ -646,6 +660,14 @@ pub fn history_page(
         count_args.push(rev.to_string());
         log_args.push(rev.to_string());
     }
+    // Only what no remote-tracking branch has: `--not` turns every ref that
+    // `--remotes` adds into an exclusion.
+    if unpushed_only {
+        for args in [&mut count_args, &mut log_args] {
+            args.push("--not".into());
+            args.push("--remotes".into());
+        }
+    }
     // Everything but the gitlinks: a commit that touches only pointers has
     // nothing left and drops out of the list (and the count). Full history
     // with merge simplification keeps every commit that did real work and
@@ -670,9 +692,11 @@ pub fn history_page(
     let log_ref: Vec<&str> = log_args.iter().map(String::as_str).collect();
     // A repo with no commits yet makes `git log` exit non-zero; that's an empty
     // history, not an error worth showing the user.
+    // (With the unpushed filter a failure is a failure: an empty list would
+    // claim everything is pushed.)
     let raw = match git(&repo, &log_ref) {
         Ok(r) => r,
-        Err(_) if total == 0 => String::new(),
+        Err(_) if total == 0 && !unpushed_only => String::new(),
         Err(e) => return Err(e),
     };
     let parsed = parse_log(&raw);
@@ -712,6 +736,7 @@ pub fn history_page(
             active_lanes: row.active.clone(),
             touches_submodules: Vec::new(),
             only_submodules: false,
+            unpushed: false,
         });
     }
     if !gitlinks.is_empty() {
@@ -723,6 +748,25 @@ pub fn history_page(
             }
         }
     }
+    let remote_refs = has_remote_refs(&repo);
+    let mut marks_error = None;
+    if remote_refs {
+        if unpushed_only {
+            for c in commits.iter_mut() {
+                c.unpushed = true;
+            }
+        } else {
+            let hashes: Vec<String> = commits.iter().map(|c| c.hash.clone()).collect();
+            match unpushed_among(&repo, &hashes) {
+                Ok(unpushed) => {
+                    for c in commits.iter_mut() {
+                        c.unpushed = unpushed.contains(&c.hash);
+                    }
+                }
+                Err(e) => marks_error = Some(e),
+            }
+        }
+    }
 
     Ok(HistoryPage {
         has_more: offset + commits.len() < total,
@@ -731,7 +775,34 @@ pub fn history_page(
         limit,
         max_lane,
         commits,
+        remote_refs,
+        marks_error,
     })
+}
+
+/// At least one remote-tracking branch exists — something a commit can have
+/// been pushed to.
+fn has_remote_refs(repo: &Path) -> bool {
+    git(repo, &["for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes/"]).map(|o| !o.trim().is_empty()).unwrap_or(false)
+}
+
+/// Which of these commits no remote-tracking branch has. `--no-walk` lists
+/// only the commits named, while `--not --remotes` still excludes everything
+/// a remote-tracking branch reaches — so the answer costs one walk of the
+/// remote side down to the oldest commit asked about, never a walk of the
+/// whole history. Two hundred at a time, for Windows' argument limit.
+fn unpushed_among(repo: &Path, hashes: &[String]) -> Result<std::collections::HashSet<String>, String> {
+    let mut out = std::collections::HashSet::new();
+    for chunk in hashes.chunks(200) {
+        let mut args: Vec<&str> = vec!["rev-list", "--no-walk=unsorted"];
+        args.extend(chunk.iter().map(String::as_str));
+        args.extend(["--not", "--remotes"]);
+        // A failure (a remote-tracking ref at a missing object, say) is not
+        // "everything is pushed": the caller says it could not tell.
+        let o = git(repo, &args).map_err(|e| e.to_string())?;
+        out.extend(o.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()));
+    }
+    Ok(out)
 }
 
 pub fn commit_detail(repo_path: &str, hash: &str) -> Result<CommitDetail, AppError> {
@@ -817,7 +888,7 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
     .filter(|s| s != branch)
     .collect();
 
-    let page = history_page(repo_path, branch, 0, 400, None, None, false)?;
+    let page = history_page(repo_path, branch, 0, 400, None, None, false, false)?;
     let merges = page.commits.into_iter().filter(|c| c.is_merge).take(50).collect();
 
     Ok(MergeInfo {

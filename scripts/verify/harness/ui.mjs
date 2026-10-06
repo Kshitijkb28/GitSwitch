@@ -54,6 +54,8 @@ async function openPage(browser, server, scenario, opts = {}) {
     lfs: opts.lfs ?? null,
     repos: opts.repos ?? null,
     pushState: opts.pushState ?? null,
+    pushResult: opts.pushResult ?? null,
+    subPushResult: opts.subPushResult ?? null,
     consoleEntries: opts.consoleEntries ?? [],
     lfsListing: opts.lfsListing ?? LFS_LISTING,
     lfsProgress: opts.lfsProgress ?? null,
@@ -231,6 +233,12 @@ async function openPage(browser, server, scenario, opts = {}) {
               if (cfg.pullResult) return Promise.resolve({ ...cfg.pullResult, status: window.__SCENARIO__ });
               return done("Done.");
             case "changes_push":
+              if (cfg.hang) return new Promise(() => {}); // never settles
+              // The refusal is the repository's own; a submodule pushed first succeeds.
+              if (cfg.pushResult && args.repoPath === window.__SCENARIO__.path) return Promise.resolve({ ...cfg.pushResult, status: window.__SCENARIO__ });
+              // A submodule's own push answering with its own refusal.
+              if (cfg.subPushResult && args.repoPath !== window.__SCENARIO__.path) return Promise.resolve({ ...cfg.subPushResult, status: statusFor(args.repoPath) });
+              return done("Done.");
             case "changes_submodule_update":
             case "changes_lfs_pull":
             case "changes_lfs_pull_paths":
@@ -1419,7 +1427,7 @@ try {
     ok("a capped untracked count is shown as a floor", s.includes("2000+ untracked files"));
     ok("a clean submodule says it is up to date", s.includes("up to date with what this repo records"));
     ok("recorded and checked-out commits are both shown", s.includes("dceaf0b") && s.includes("d9b93c5"));
-    ok("uninitialised ones are grouped, not listed 27 times", s.includes("27 not initialised"));
+    ok("uninitialised ones are grouped, not listed 27 times", s.includes("27 not downloaded yet"));
     ok("  and it says git cannot fetch them", s.includes("fetch them"));
     await clickInRow(page, "trinity", { text: "Show what changed" });
     await sleep(300);
@@ -1427,6 +1435,112 @@ try {
     // Chrome's innerText applies CSS text-transform; that heading is uppercased.
     ok("expanding shows the commits it moved through", /commits it moved through/i.test(s2));
     ok("  with subjects and a tail count", s2.includes("Updated") && s2.includes("and 8 more"));
+    await page.close();
+  }
+  {
+    // A push refused for a submodule commit no remote has: one button pushes that submodule first and then this repository; another pushes anyway.
+    const message = "trinity records d9b93c5, a commit none of trinity's remotes has yet — anyone fetching this push could not check it out. Push trinity first, or push anyway.";
+    const refusal = {
+      ok: false,
+      headline: message,
+      detail: "",
+      refusal: { code: "submodules-unpushed", message },
+      unpushed_submodules: [{ path: "trinity", recorded: "d9b93c5".padEnd(40, "0"), recorded_short: "d9b93c5", state: "not-on-remote", branch: "main" }],
+    };
+    const page = await open(SCENARIOS.submodules, { submodules: SUBMODULES, subInner: SUB_INNER, pushResult: refusal });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    await (await button(page, "Push")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Push trinity first"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a push refused for a submodule commit no remote has names the submodule and offers to push it first", s.includes("none of trinity's remotes has yet") && s.includes("Push trinity first"));
+    ok("  and offers to push anyway", s.includes("Push anyway"));
+    await (await button(page, "Push trinity first")).click();
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 3, { timeout: 4000 });
+    const pushes = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").map((c) => c.args));
+    ok("  Push trinity first pushes the submodule, then this repository", pushes.length >= 3 && pushes[1].repoPath === "/repos/gitswitch/trinity" && pushes[2].repoPath === "/repos/gitswitch" && pushes[2].allowUnpushedSubmodules === false, JSON.stringify(pushes));
+    await page.waitForFunction(() => document.body.innerText.includes("Push anyway"), { timeout: 4000 });
+    await (await button(page, "Push anyway")).click();
+    await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "changes_push").length > n, { timeout: 4000 }, pushes.length);
+    const last = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").at(-1).args);
+    ok("  Push anyway sends the override, for this repository", last.repoPath === "/repos/gitswitch" && last.allowUnpushedSubmodules === true, JSON.stringify(last));
+    await page.close();
+  }
+  {
+    // The submodule's own refusal, chained from here, is shown as the submodule's: named, and without the repository's remedies.
+    const message = "trinity records d9b93c5, which none of trinity's remote-tracking branches has — as far as this checkout knows. Anyone fetching this push could not check it out. Push trinity first (or fetch it, if that commit was pushed from elsewhere), or push anyway.";
+    const refusal = { ok: false, headline: message, detail: "", refusal: { code: "submodules-unpushed", message }, unpushed_submodules: [{ path: "trinity", recorded: "d9b93c5".padEnd(40, "0"), recorded_short: "d9b93c5", state: "not-on-remote", branch: "fix" }] };
+    const subRefusal = { ok: false, headline: "This branch tracks `origin/main`, which has another name. Publish it as `origin/fix` instead.", detail: "", refusal: { code: "upstream-name-differs", message: "This branch tracks `origin/main`, which has another name. Publish it as `origin/fix` instead." } };
+    const page = await open(SCENARIOS.submodules, { submodules: SUBMODULES, subInner: SUB_INNER, pushResult: refusal, subPushResult: subRefusal });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    await (await button(page, "Push")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Push trinity first"), { timeout: 4000 }).catch(() => null);
+    await (await button(page, "Push trinity first"))?.click();
+    await page.waitForFunction(() => document.body.innerText.includes("trinity: This branch tracks"), { timeout: 4000 }).catch(() => null);
+    const s = await text(page);
+    ok("a chained submodule push that is refused is shown as the submodule's, by name", s.includes("trinity: This branch tracks `origin/main`"));
+    ok("  and the repository's own remedy for that code is not offered for it", (await button(page, "Publish as")) === null, JSON.stringify(await page.evaluate(() => [...document.querySelectorAll("button")].map((b) => b.innerText.trim()).filter((t) => t.startsWith("Publish")))));
+    await page.close();
+  }
+  {
+    // A detached submodule cannot push: the refusal offers to start a branch in it instead, and the card opens that row's form.
+    const message = "trinity records d9b93c5, which none of trinity's remote-tracking branches has — as far as this checkout knows. Anyone fetching this push could not check it out. Push trinity first (it is detached — start a branch there first), or push anyway.";
+    const refusal = { ok: false, headline: message, detail: "", refusal: { code: "submodules-unpushed", message }, unpushed_submodules: [{ path: "trinity", recorded: "d9b93c5".padEnd(40, "0"), recorded_short: "d9b93c5", state: "not-on-remote", branch: null }] };
+    const detached = sub({ path: "trinity", name: "trinity", own_branch: null, own_upstream: null, own_unpushed: 1, recorded_on_remote: false, summary: "up to date with what this repo records; detached" });
+    const page = await open(SCENARIOS.submodules, { submodules: [detached], subInner: SUB_INNER, pushResult: refusal });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    await (await button(page, "Push")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Start a branch in trinity first"), { timeout: 4000 }).catch(() => null);
+    ok("for a detached submodule the refusal offers a branch there, not a push from it", (await button(page, "Start a branch in trinity first")) !== null && (await button(page, "Push trinity first")) === null);
+    await (await button(page, "Start a branch in trinity first"))?.click();
+    await page.waitForSelector('input[aria-label="Branch name for trinity"]', { timeout: 4000 }).catch(() => null);
+    ok("  which opens that submodule's branch form on the card", (await page.$('input[aria-label="Branch name for trinity"]')) !== null);
+    await page.close();
+  }
+  {
+    // A detached submodule offers a branch at its checkout, named by the person; a recorded commit no remote has is marked on the row.
+    const detached = sub({ path: "trinity", name: "trinity", own_branch: null, own_upstream: null, own_unpushed: 2, recorded_on_remote: false, summary: "up to date with what this repo records; detached" });
+    const page = await open(SCENARIOS.submodules, { submodules: [detached], subInner: SUB_INNER });
+    await page.waitForFunction(() => document.body.innerText.includes("Start a branch here"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a detached submodule's row offers Start a branch here", s.includes("Start a branch here"));
+    ok("  and a recorded commit no remote has is marked on the row", s.includes("recorded commit not pushed"));
+    await (await button(page, "Start a branch here")).click();
+    await page.waitForSelector('input[aria-label="Branch name for trinity"]', { timeout: 4000 });
+    await page.type('input[aria-label="Branch name for trinity"]', "fix/pointer");
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_branch"), { timeout: 4000 });
+    const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_branch").args);
+    ok("  Enter creates the branch at the submodule's checkout and switches to it", call.repoPath === "/repos/gitswitch/trinity" && call.name === "fix/pointer" && call.from === null && call.switchTo === true, JSON.stringify(call));
+    await page.close();
+  }
+  {
+    // Inside a submodule, the Submodules tab is about THAT submodule's own submodules — the only place they can be downloaded from.
+    const page = await open(SCENARIOS.submodules, { submodules: SUBMODULES, subInner: SUB_INNER });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    const tab = (name) =>
+      page.evaluate((n) => {
+        const t = [...document.querySelectorAll('[role="tab"]')].find((b) => b.innerText.trim().startsWith(n));
+        if (!t) return false;
+        t.click();
+        return true;
+      }, name);
+    ok("the Submodules tab opens", await tab("Submodules"));
+    await page.waitForFunction(() => document.body.innerText.includes("Work inside"), { timeout: 4000 }).catch(() => null);
+    const before = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodules").map((c) => c.args.repoPath));
+    ok("  at the repository it reads the repository's submodules", before.length > 0 && before.every((p) => p === "/repos/gitswitch"), JSON.stringify(before));
+    const inside = await page.evaluate(() => {
+      const row = [...document.querySelectorAll("tr")].find((r) => r.innerText.includes("trinity"));
+      const b = row && [...row.querySelectorAll("button")].find((x) => x.innerText.trim() === "Work inside");
+      if (!b) return false;
+      b.click();
+      return true;
+    });
+    ok("  Work inside scopes the page to the submodule", inside);
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 }).catch(() => null);
+    ok("  and the Submodules tab opens again there", await tab("Submodules"));
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules of trinity"), { timeout: 4000 }).catch(() => null);
+    const scoped = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodules").map((c) => c.args.repoPath).at(-1));
+    ok("  where it reads the submodule's own submodules and says whose they are", scoped === "/repos/gitswitch/trinity", JSON.stringify(scoped));
     await page.close();
   }
   {
@@ -2348,6 +2462,20 @@ try {
     const s2 = await text(page);
     ok("the result says what arrived", s2.includes("Downloaded 5 large files"));
     ok("  and the clone was asked to fetch LFS", await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "full_clone" && c.args.withLfs === true)));
+    await page.close();
+  }
+  {
+    // Refresh does what leaving and re-opening the page does: the last clone's result card goes; the form stays.
+    const page = await openClonePage(browser, server, { cloneResult: CLONED_LFS });
+    await clickClone(page);
+    await page.waitForFunction(() => document.body.innerText.includes("Cloned big-data"), { timeout: 4000 });
+    const refresh = await button(page, "Refresh");
+    ok("after the clone the result card is shown, and the page has Refresh", refresh !== null);
+    await refresh.click();
+    await page.waitForFunction(() => !document.body.innerText.includes("Cloned big-data"), { timeout: 4000 });
+    const s = await text(page);
+    ok("Refresh drops the result card, as leaving the page would", !s.includes("Cloned big-data") && !s.includes("Downloaded 5 large files"));
+    ok("  and keeps the form", await page.evaluate(() => [...document.querySelectorAll("input")].some((i) => i.value.includes("big-data"))));
     await page.close();
   }
   {

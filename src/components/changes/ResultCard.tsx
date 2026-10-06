@@ -11,6 +11,8 @@ type Props = {
   onRecordPointers?: () => void;
   /** Rendered after the guidance: e.g. "Open in Changes" / "Open in History". */
   extraAction?: { label: string; onClick: () => void; primary?: boolean };
+  /** Several at once (a push refused for more than one submodule); wins over `extraAction`. */
+  extraActions?: { label: string; onClick: () => void; primary?: boolean }[];
 };
 
 /** Undo/drop counts for a tree or stash outcome, in one sentence. */
@@ -26,7 +28,8 @@ function treeSentence(t: NonNullable<OpResult["tree"]>): string | null {
 }
 
 /** The outcome of the last operation: headline, detail, advice, undo lines. */
-export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAction }: Props) {
+export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAction, extraActions }: Props) {
+  const actions = extraActions ?? (extraAction ? [extraAction] : []);
   const tree = result.tree;
   const stash = result.stash;
   const treeLine = tree ? treeSentence(tree) : null;
@@ -45,11 +48,13 @@ export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAct
           {result.advice?.guidance && result.advice.guidance !== result.detail && (
             <p className="text-xs text-zinc-300 break-words">{result.advice.guidance}</p>
           )}
-          {extraAction && (
-            <div>
-              <Button size="sm" variant={extraAction.primary ? "primary" : "secondary"} onClick={extraAction.onClick} disabled={busy}>
-                {extraAction.label}
-              </Button>
+          {actions.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {actions.map((a) => (
+                <Button key={a.label} size="sm" variant={a.primary ? "primary" : "secondary"} onClick={a.onClick} disabled={busy}>
+                  {a.label}
+                </Button>
+              ))}
             </div>
           )}
           {result.pull?.recovery && (

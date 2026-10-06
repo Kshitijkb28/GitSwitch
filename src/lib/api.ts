@@ -172,6 +172,8 @@ export interface HistoryCommit {
   touches_submodules: string[];
   /** Changes nothing but submodule pointers: a bump, not work. */
   only_submodules: boolean;
+  /** No remote-tracking branch has it: it exists only here (meaningful when the page has `remote_refs`). */
+  unpushed: boolean;
   lane: number;
   parent_lanes: number[];
   active_lanes: number[];
@@ -184,6 +186,10 @@ export interface HistoryPage {
   limit: number;
   has_more: boolean;
   max_lane: number;
+  /** At least one remote-tracking branch exists; without one nothing here is known to be pushed. */
+  remote_refs: boolean;
+  /** The comparison with the remote-tracking branches failed: no row is marked, and this says why. */
+  marks_error?: string | null;
 }
 
 export interface FileChange {
@@ -305,7 +311,8 @@ export async function historyPage(
   limit: number,
   search?: string | null,
   authors?: string[] | null,
-  hidePointerOnly = false
+  hidePointerOnly = false,
+  unpushedOnly = false
 ): Promise<HistoryPage> {
   return invoke("history_page", {
     repoPath,
@@ -315,6 +322,7 @@ export async function historyPage(
     search: search ?? null,
     authors: authors ?? null,
     hidePointerOnly,
+    unpushedOnly,
   });
 }
 
@@ -1051,6 +1059,14 @@ export interface SubmoduleInfo {
   operation: string | null;
   conflicted: number;
   upstream_remote: string | null;
+  /**
+   * The recorded commit is on one of the submodule's remote-tracking branches,
+   * so a clone of this repository can get it. `null` when that cannot be known
+   * here (not initialised, the commit missing, or no remote-tracking branch).
+   */
+  recorded_on_remote: boolean | null;
+  /** Commits at its checkout that no remote-tracking branch has; `null` without one to compare with. */
+  own_unpushed: number | null;
 }
 
 export interface LfsStatus {
@@ -1235,6 +1251,28 @@ export interface OpResult {
   sync?: SyncOutcome;
   tree?: TreeOutcome;
   stash?: StashOutcome;
+  /** Submodules a push would leave a clone unable to check out, or could not check. */
+  unpushed_submodules?: SubmodulePush[];
+  /**
+   * Set by the page on a result that belongs to a submodule it ran an operation
+   * in (its path), not to the repository on screen: actions keyed on the
+   * result's codes are not offered for it.
+   */
+  inside?: string;
+}
+
+/**
+ * A submodule whose recorded commit a push advertises while none of the
+ * submodule's remotes has it (`not-on-remote`), or where that could not be
+ * checked (`not-here`: the commit is not in its checkout; `not-populated`).
+ */
+export interface SubmodulePush {
+  path: string;
+  recorded: string;
+  recorded_short: string;
+  state: "not-on-remote" | "not-here" | "not-populated";
+  /** Its checked-out branch; null when detached, where a push from it needs a branch first. */
+  branch: string | null;
 }
 
 // --- Tree management: branches, undo, reset, revert, cherry-pick, conflicts ----
@@ -1540,6 +1578,10 @@ export interface SyncSubPlan {
   own_commits: SyncCommitRef[];
   /** It has submodules of its own; the update does not go inside them. */
   has_nested: boolean;
+  /** Upstream moved it to another address; the update re-points it there (git submodule sync). */
+  url_change: { from: string; to: string } | null;
+  /** The remote its branch's upstream lives on. */
+  remote: string | null;
 }
 
 export interface SyncSuperPlan {
@@ -1750,8 +1792,9 @@ export async function changesCommit(
   return invoke("changes_commit", { repoPath, message, amend });
 }
 
-export async function changesPush(repoPath: string, setUpstream: boolean): Promise<OpResult> {
-  return invoke("changes_push", { repoPath, setUpstream });
+/** `allowUnpushedSubmodules`: push although a submodule's recorded commit is on none of that submodule's remotes. */
+export async function changesPush(repoPath: string, setUpstream: boolean, allowUnpushedSubmodules = false): Promise<OpResult> {
+  return invoke("changes_push", { repoPath, setUpstream, allowUnpushedSubmodules });
 }
 
 /** `withLfs` also downloads LFS content — a plain pull leaves pointer stubs. `autostash` lets a rebase pull run on a dirty tree. */

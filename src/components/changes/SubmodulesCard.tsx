@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, useRef } from "react";
-import { Box, Download, Loader2, FolderOpen, GitCommitHorizontal, AlertTriangle, CornerDownRight } from "lucide-react";
+import { Box, Download, Loader2, FolderOpen, GitCommitHorizontal, GitBranch, AlertTriangle, CornerDownRight } from "lucide-react";
 import { Button } from "../Button";
 import { ChangesList } from "./ChangesList";
 import { DiffPanel } from "./DiffPanel";
@@ -18,6 +18,10 @@ interface Props {
   onUpdateOne: (path: string) => void;
   /** One commit in this repository recording where that submodule is checked out now. */
   onRecordOne: (path: string) => void;
+  /** A branch at a detached submodule's checkout, named by the person. */
+  onStartBranch: (path: string, name: string) => void;
+  /** "<nonce>:<path>" — opens that submodule's branch form (a push that needs one). */
+  openBranchFormFor?: string | null;
   /** Bumped by the page after any operation, so the list re-reads. */
   refreshKey: number;
   /** Submodules that have their own section in the main column. */
@@ -81,6 +85,56 @@ function chipLabel(state: SubmoduleInfo["state"]): string {
   }
 }
 
+/** Detached and populated: a branch at its checkout is what lets it keep and push its commits. */
+export const canStartBranch = (s: SubmoduleInfo) => s.initialised && s.gitdir_valid && !s.own_branch && !!s.actual;
+
+export function startBranchTitle(s: SubmoduleInfo): string {
+  const n = s.own_unpushed ?? 0;
+  return n > 0
+    ? `Detached: ${n} commit${n === 1 ? "" : "s"} here ${n === 1 ? "is" : "are"} on no branch and no remote. A branch keeps them and lets you push them.`
+    : "Detached: a branch here lets you commit and push";
+}
+
+/** The recorded commit is on none of the submodule's remotes: a clone of this repository could not check it out. */
+export const recordedUnpushed = (s: SubmoduleInfo) => s.recorded_on_remote === false;
+
+export function recordedUnpushedTitle(s: SubmoduleInfo): string {
+  return `This repository records ${s.recorded_short} for ${s.path}, which none of ${s.path}'s remote-tracking branches has — as far as this checkout knows. A clone could not check it out: push ${s.path} first (or fetch it, if that commit was pushed from elsewhere).`;
+}
+
+/** Asks for the branch's name; Enter or Create submits it, Escape cancels. */
+export function StartBranchForm({ path, busy, onSubmit, onCancel }: { path: string; busy: boolean; onSubmit: (name: string) => void; onCancel: () => void }) {
+  const [name, setName] = useState("");
+  const ready = name.trim().length > 0 && !busy;
+  return (
+    <form
+      className="flex items-center gap-1.5 flex-wrap"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (ready) onSubmit(name.trim());
+      }}
+    >
+      <input
+        autoFocus
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") onCancel();
+        }}
+        placeholder="branch name"
+        aria-label={`Branch name for ${path}`}
+        className="h-7 w-40 rounded bg-zinc-900 border border-zinc-700 px-2 text-xs text-zinc-200 font-mono focus:outline-none focus:border-zinc-500"
+      />
+      <Button size="sm" variant="primary" type="submit" disabled={!ready} className="px-2">
+        Create branch
+      </Button>
+      <Button size="sm" variant="ghost" type="button" onClick={onCancel} className="px-2">
+        Cancel
+      </Button>
+    </form>
+  );
+}
+
 /** One submodule, expandable to show what moved and what changed inside it. */
 function SubmoduleRow({
   repoPath,
@@ -90,6 +144,8 @@ function SubmoduleRow({
   onPullInside,
   onUpdateOne,
   onRecordOne,
+  onStartBranch,
+  openBranchFormFor,
   hasSection,
   onJumpToSection,
   refreshKey,
@@ -101,6 +157,10 @@ function SubmoduleRow({
   onPullInside: (sub: SubmoduleInfo) => void;
   onUpdateOne: (path: string) => void;
   onRecordOne: (path: string) => void;
+  /** A branch at a detached submodule's checkout. */
+  onStartBranch: (path: string, name: string) => void;
+  /** "<nonce>:<path>" — the page asks this row to open its branch form. */
+  openBranchFormFor?: string | null;
   /** The main column already shows this submodule's files — link there instead of re-reading them. */
   hasSection: boolean;
   onJumpToSection?: (path: string) => void;
@@ -111,6 +171,14 @@ function SubmoduleRow({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [diffFor, setDiffFor] = useState<ChangeEntry | null>(null);
+  const [branching, setBranching] = useState(false);
+  // Asked by the page (a push refused for this detached submodule): open the
+  // form; the input's focus brings the row into view.
+  useEffect(() => {
+    const path = openBranchFormFor?.split(":").slice(1).join(":");
+    if (path === sub.path && canStartBranch(sub)) setBranching(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openBranchFormFor]);
 
   const absolute = `${repoPath.replace(/\/+$/, "")}/${sub.path}`;
   const hasInnerChanges = sub.dirty_tracked > 0 || sub.dirty_untracked > 0;
@@ -166,6 +234,11 @@ function SubmoduleRow({
             >
               {chipLabel(sub.state)}
             </span>
+            {recordedUnpushed(sub) && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded shrink-0 bg-amber-500/15 text-amber-300" title={recordedUnpushedTitle(sub)}>
+                recorded commit not pushed
+              </span>
+            )}
             {sub.initialised && (
               <span
                 className="text-[10px] font-mono px-1.5 py-0.5 rounded shrink-0 bg-zinc-900/60 text-zinc-400"
@@ -288,6 +361,23 @@ function SubmoduleRow({
               Record this pointer
             </Button>
           )}
+          {canStartBranch(sub) && !branching && (
+            <Button size="sm" variant={(sub.own_unpushed ?? 0) > 0 ? "secondary" : "ghost"} disabled={busy} onClick={() => setBranching(true)} title={startBranchTitle(sub)} className="px-1.5">
+              <GitBranch size={13} />
+              Start a branch here
+            </Button>
+          )}
+          {canStartBranch(sub) && branching && (
+            <StartBranchForm
+              path={sub.path}
+              busy={busy}
+              onSubmit={(name) => {
+                setBranching(false);
+                onStartBranch(sub.path, name);
+              }}
+              onCancel={() => setBranching(false)}
+            />
+          )}
           {sub.initialised && (
             <Button
               size="sm"
@@ -318,6 +408,8 @@ export function SubmodulesCard({
   onPullInside,
   onUpdateOne,
   onRecordOne,
+  onStartBranch,
+  openBranchFormFor,
   refreshKey,
   sectionPaths = [],
   onJumpToSection,
@@ -367,7 +459,7 @@ export function SubmodulesCard({
             title="git submodule update --init for the never-initialised ones only — populated submodules are left exactly as they are"
           >
             <Download size={13} />
-            Initialise missing ({fetchable})
+            Download missing ({fetchable})
           </Button>
         )}
       </div>
@@ -377,7 +469,7 @@ export function SubmodulesCard({
       <ul className="max-h-96 overflow-y-auto divide-y divide-zinc-800/70">
         {present.map((s) => (
           <SubmoduleRow
-            key={s.path}
+            key={`${repoPath}/${s.path}`}
             repoPath={repoPath}
             sub={s}
             busy={busy}
@@ -385,6 +477,8 @@ export function SubmodulesCard({
             onPullInside={onPullInside}
             onUpdateOne={onUpdateOne}
             onRecordOne={onRecordOne}
+            onStartBranch={onStartBranch}
+            openBranchFormFor={openBranchFormFor}
             hasSection={sectionPaths.includes(s.path)}
             onJumpToSection={onJumpToSection}
             refreshKey={refreshKey}
@@ -398,11 +492,11 @@ export function SubmodulesCard({
             <AlertTriangle size={13} className="shrink-0 mt-0.5 text-zinc-500" />
             <div className="min-w-0 flex-1">
               <p className="text-xs text-zinc-400 leading-relaxed">
-                {missing.length} not initialised
+                {missing.length} not downloaded yet
                 {fetchable > 0 && unfetchable > 0
-                  ? ` — ${fetchable} can be fetched with Initialise missing, ${unfetchable} have no entry in .gitmodules so git can't fetch them`
+                  ? ` — ${fetchable} can be fetched with Download missing, ${unfetchable} have no entry in .gitmodules so git can't fetch them`
                   : fetchable > 0
-                    ? " — Initialise missing will fetch them"
+                    ? " — Download missing fetches them (git submodule update --init)"
                     : " — none of them have an entry in .gitmodules, so git can't fetch them"}
                 .
               </p>
@@ -416,7 +510,7 @@ export function SubmodulesCard({
                 <ul className="mt-1 max-h-40 overflow-y-auto space-y-0.5">
                   {missing.map((s) => (
                     <li
-                      key={s.path}
+                      key={`${repoPath}/${s.path}`}
                       className="text-xs font-mono text-zinc-500 truncate"
                       title={s.summary}
                     >

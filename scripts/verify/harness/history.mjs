@@ -315,6 +315,31 @@ try {
     await page.close();
   }
   {
+    // Which commits are pushed: a row no remote-tracking branch has carries a mark, and a toggle lists only those.
+    const local = { ...HISTORY_PAGE, commits: [{ ...HISTORY_PAGE.commits[0], refs: ["HEAD -> main"], unpushed: true }, ...HISTORY_PAGE.commits.slice(1)] };
+    const page = await openHistoryPage(browser, server, { historyPage: local });
+    await page.waitForFunction(() => document.body.innerText.includes("not pushed"), { timeout: 4000 });
+    const marked = await page.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.includes("not pushed")).map((b) => b.innerText.replace(/\s+/g, " ")));
+    ok("a commit no remote has carries a 'not pushed' mark on its row, and only that row", marked.length === 1 && marked[0].includes("Tidy the settings page"), JSON.stringify(marked));
+    const box = await page.$('input[aria-label="Only commits not pushed yet"]');
+    ok("  the list offers to show only such commits", box !== null);
+    await box.evaluate((el) => el.click());
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "history_page").some((c) => c.args.unpushedOnly === true), { timeout: 4000 });
+    const only = await lastCall(page, "history_page");
+    ok("  which re-reads the page from the start with only what no remote has", only && only.args.unpushedOnly === true && only.args.offset === 0, JSON.stringify(only && only.args));
+    ok("  and the summary line says so", (await text(page)).includes("not pushed yet"));
+    await page.close();
+  }
+  {
+    // No remote-tracking branch at all: nothing is known to be pushed, and no row is marked.
+    const none = { ...HISTORY_PAGE, remote_refs: false, commits: HISTORY_PAGE.commits.map((c) => ({ ...c, unpushed: true })) };
+    const page = await openHistoryPage(browser, server, { historyPage: none });
+    await page.waitForFunction(() => document.body.innerText.includes("No remote-tracking branch here"), { timeout: 4000 });
+    const marked = await page.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.includes("not pushed")).length);
+    ok("without a remote-tracking branch the page says nothing is known to be pushed, and marks no row", marked === 0);
+    await page.close();
+  }
+  {
     // A repository without submodules, opened with the toggle left on from another one.
     const page = await open({ persist: { "history.hidePointerOnly": true } });
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_page"), { timeout: 4000 });

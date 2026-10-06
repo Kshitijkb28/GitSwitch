@@ -148,6 +148,8 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
   // CI bumps fill a superproject's history; this hides commits that move
   // nothing but submodule pointers.
   const [hidePointerOnly, setHidePointerOnly] = usePersistedState("history.hidePointerOnly", false);
+  // What a push would send: the commits no remote-tracking branch has.
+  const [onlyUnpushed, setOnlyUnpushed] = usePersistedState("history.onlyUnpushed", false);
   const [authors, setAuthors] = useState<api.AuthorCount[]>([]);
   const authorsSeq = useRef(0);
   const [branches, setBranches] = useState<api.BranchInfo[]>([]);
@@ -405,11 +407,11 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
     }
     const seq = ++pageSeq.current;
     setLoadingPage(true);
-    api.historyPage(repo, rev, offset, PAGE_SIZE, appliedSearch || null, effectiveAuthors, hasSubmodules && hidePointerOnly)
+    api.historyPage(repo, rev, offset, PAGE_SIZE, appliedSearch || null, effectiveAuthors, hasSubmodules && hidePointerOnly, onlyUnpushed)
       .then((p) => { if (pageSeq.current === seq) { setPage(p); setError(null); } })
       .catch((e) => { if (pageSeq.current === seq) { setError(String(e)); setPage(null); } })
       .finally(() => { if (pageSeq.current === seq) setLoadingPage(false); });
-  }, [repo, rev, offset, appliedSearch, reloadKey, authorsKey, hidePointerOnly, hasSubmodules, awaitingMe]);
+  }, [repo, rev, offset, appliedSearch, reloadKey, authorsKey, hidePointerOnly, hasSubmodules, awaitingMe, onlyUnpushed]);
 
   // Who commits here — read once per repository and revision, never polled.
   useEffect(() => {
@@ -765,6 +767,30 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                 </label>
               )}
 
+              <label className="flex items-start gap-2.5 mb-3 cursor-pointer select-none" title="Commits no remote-tracking branch has yet — any remote counts">
+                <Checkbox
+                  checked={onlyUnpushed}
+                  onChange={(v) => { setOnlyUnpushed(v); setOffset(0); }}
+                  className="mt-0.5"
+                  aria-label="Only commits not pushed yet"
+                />
+                <span className="text-xs text-zinc-300">
+                  Only commits not pushed yet
+                  <span className="text-zinc-500"> — the ones no remote-tracking branch has</span>
+                </span>
+              </label>
+
+              {page && !page.remote_refs && (
+                <p className="text-xs text-amber-300/90 mb-2 break-words">
+                  No remote-tracking branch here: nothing is known to be pushed, so the rows carry no mark.
+                </p>
+              )}
+              {page?.marks_error && (
+                <p className="text-xs text-amber-300/90 mb-2 break-words">
+                  Could not tell which commits a remote-tracking branch has, so the rows carry no mark: {page.marks_error}
+                </p>
+              )}
+
               {account && (
                 <label className="flex items-start gap-2.5 mb-3 cursor-pointer select-none">
                   <Checkbox
@@ -787,6 +813,7 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                 <p className="text-xs text-zinc-500">
                   {rev === "--all" ? "All branches" : rev}
                   {author ? ` · by ${authorName}` : onlyMine && accountEmail ? " · this account only" : ""}
+                  {onlyUnpushed ? " · not pushed yet" : ""}
                   {page && (
                     <>
                       {" · "}
@@ -812,7 +839,8 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
               {page && page.commits.length === 0 && !loadingPage && (
                 <p className="text-sm text-zinc-500 py-6 text-center">
                   No commits{appliedSearch ? ` matching “${appliedSearch}”` : ""}
-                  {author ? ` by ${authorName}` : onlyMine ? " authored by this account" : ""}.
+                  {author ? ` by ${authorName}` : onlyMine ? " authored by this account" : ""}
+                  {onlyUnpushed ? " left that no remote-tracking branch has" : ""}.
                 </p>
               )}
 
@@ -838,6 +866,14 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                         title={`Changes nothing but the pointer of ${c.touches_submodules.join(", ")}`}
                       >
                         submodule bump: {c.touches_submodules.join(", ")}
+                      </span>
+                    )}
+                    {c.unpushed && page?.remote_refs && (
+                      <span
+                        className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 shrink-0"
+                        title="No remote-tracking branch has this commit: as far as this checkout knows, it exists only here"
+                      >
+                        not pushed
                       </span>
                     )}
                     <span className="hidden xl:flex items-center gap-1 shrink-0 max-w-[26%] overflow-hidden">

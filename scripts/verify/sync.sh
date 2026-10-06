@@ -385,10 +385,28 @@ ok "  it succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
 ok "  B's folder is still empty" "$(ls -A "$SB/local/B" | wc -l | tr -d ' ')" "0"
 ok "  and the branch records upstream's B pointer" "$(git -C "$SB/local" rev-parse HEAD:B)" "$(git -C "$SB/local" rev-parse origin/main:B)"
 restore
+# A dead address in the submodule's own config while .gitmodules still declares the live one
+# (upstream moved nothing): the person's own setting is not overridden — blocked, with the way out named.
 git -C "$SB/local/A" remote set-url origin "$SB/does-not-exist.git"
+OUT=$(probe sync_plan "$SB/local")
+ok "a submodule whose own address is dead is blocked, naming the address .gitmodules declares and git submodule sync as the way out" "$(printf '%s' "$OUT" | jqf blockers)" "it fetches from $SB/does-not-exist.git while .gitmodules declares $SB/A.git; \`git submodule sync\` re-points it"
+ok "  and does not call it a move by upstream" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);a=[s for s in d['submodules'] if s['path']=='A'][0];print(a['url_change'], any('upstream moved it' in n for n in a['notes']))")" "None False"
+restore
+# A mirror of A chosen here, while upstream's declaration never changed: noted, left alone.
+git clone -q --bare "$SB/A.git" "$SB/A-mirror.git" 2>/dev/null
+git -C "$SB/local/A" remote set-url origin "$SB/A-mirror.git"
+OUT=$(probe sync_plan "$SB/local")
+ok "a mirror chosen here is not 'upstream moved it': the plan notes the difference and leaves it" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);a=[s for s in d['submodules'] if s['path']=='A'][0];print(a['url_change'], [n for n in a['notes'] if 'while .gitmodules declares' in n])")" "True:None ['it fetches from $SB/A-mirror.git while .gitmodules declares $SB/A.git; upstream did not move it, so the update leaves that as it is']"
+OUT=$(probe sync_run "$SB/local")
+ok "  and the run leaves the mirror in place" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$SB/local/A" remote get-url origin)" "True:$SB/A-mirror.git"
+rm -rf "$SB/A-mirror.git"
+restore
+# Unreachable at the declared address too: that is the blocker.
+mv "$SB/A.git" "$SB/A.git.away"
 OUT=$(probe sync_plan "$SB/local")
 ok "a submodule whose remote cannot be fetched, with a moving pointer, is blocked" "$(printf '%s' "$OUT" | jqf blockers)" "is not available here and fetching failed"
 ok "  the plan still assessed B" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([x['action'] for x in d['submodules'] if x['path']=='B'])")" "['fast-forward']"
+mv "$SB/A.git.away" "$SB/A.git"
 restore
 # Upstream records a commit of A that was never pushed to A's remote.
 printf 'secret\n' > "$SB/upstream/A/unpushed.txt"; git -C "$SB/upstream/A" add -A >/dev/null; git -C "$SB/upstream/A" commit -qm "A: never pushed"
@@ -1476,5 +1494,25 @@ probe sync_plan "$W/local" >/dev/null
 OUT=$(probe sync_run "$W/local")
 ok "the update finishes; seal s2's pointer is upstream's twin of s2" "$(printf '%s' "$OUT" | jqf ok):$(subjects "$W/local" origin/main..HEAD)" "True:unrelated|seal s1|"
 ok "  and that commit is named as already upstream, not as resolved into nothing" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours was dropped because upstream already contained it: seal s2"
+
+section "A submodule whose address changed upstream is fetched from the new one, and the update re-points it"
+mini pu A
+W="$SB/pu"
+# Upstream moves A to another address: a copy of its repository with a commit only that copy has.
+git clone -q --bare "$W/A.git" "$W/A-moved.git" 2>/dev/null
+git clone -q "$W/A-moved.git" "$W/author-A2" 2>/dev/null; printf 'moved\n' > "$W/author-A2/moved.txt"; git -C "$W/author-A2" add -A >/dev/null; git -C "$W/author-A2" commit -qm "A: only at the new address"; git -C "$W/author-A2" push -q origin main 2>/dev/null
+git -C "$W/upstream" config -f .gitmodules submodule.A.url "$W/A-moved.git"; git -C "$W/upstream" submodule sync -q -- A 2>/dev/null
+git -C "$W/upstream/A" pull -q --ff-only origin main 2>/dev/null
+git -C "$W/upstream" add .gitmodules A >/dev/null; git -C "$W/upstream" commit -qm "super: move A to its new address"; git -C "$W/upstream" push -q origin main 2>/dev/null
+OUT=$(probe sync_plan "$W/local")
+ok "the preview sees the move and fetched the new commit from there — no fetch-failed blocker" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);s=[s for s in d['submodules'] if s['path']=='A'][0];print(d['can_run'], s['action'], s['remedy'], s['url_change']['to'].endswith('/A-moved.git'), s['url_change']['from'].endswith('/A.git'))")" "True fast-forward None True True"
+ok "  and says what the update will do about it" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);s=[s for s in d['submodules'] if s['path']=='A'][0];print([n for n in s['notes'] if 'upstream moved it' in n][0])")" "upstream moved it: it now lives at $W/A-moved.git (it fetched from $W/A.git until now); the update re-points it there, as \`git submodule sync\` does, before aligning it"
+ok "  the preview changed no address" "$(git -C "$W/local/A" remote get-url origin)" "$W/A.git"
+ok "  what it fetched from the new address is parked, and the remote-tracking branch is left alone" "$(git -C "$W/local/A" for-each-ref --format='%(refname)' refs/gitswitch-moved/ | head -1):$(git -C "$W/local/A" rev-parse origin/main)" "refs/gitswitch-moved/origin/main:$(git -C "$W/author-A" rev-parse HEAD)"
+OUT=$(probe sync_run "$W/local")
+ok "the update finishes with A at upstream's commit" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/local/A" rev-parse HEAD)" "True:$(git -C "$W/local" rev-parse HEAD:A)"
+ok "  A fetches from the new address now, in its own config and the superproject's" "$(git -C "$W/local/A" remote get-url origin):$(git -C "$W/local" config submodule.A.url)" "$W/A-moved.git:$W/A-moved.git"
+ok "  its remote-tracking branch comes from there, and the parking is cleared" "$(git -C "$W/local/A" rev-parse origin/main):$(git -C "$W/local/A" for-each-ref refs/gitswitch-moved/ | wc -l | tr -d ' ')" "$(git -C "$W/local" rev-parse HEAD:A):0"
+ok "  and the result says so" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin)['sync'];print([s['note'] for s in d['submodules'] if s['path']=='A'][0])")" "fast-forwarded to $(git -C "$W/local" rev-parse --short=7 HEAD:A); now fetches from $W/A-moved.git"
 
 verify_result

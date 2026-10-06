@@ -194,9 +194,14 @@ export function SparseClone() {
   // size now. Every reading this page takes on its own re-runs on it.
   const [recheck, setRecheck] = useState(0);
   useRefreshOnFocus(() => setRecheck((n) => n + 1));
-  // What a fresh visit does, in one go.
+  // What a fresh visit does, in one go: every reading taken again, and the
+  // last clone's result card gone — a fresh visit starts without one, and
+  // Refresh must not keep what leaving the page would have dropped.
   function reloadAll() {
     reloadProfiles();
+    setCloned(null);
+    setSparseLfs(null);
+    setFromRepo(null);
     setRecheck((n) => n + 1);
   }
   // git-lfs can be installed while the app is open, so ask again on focus.

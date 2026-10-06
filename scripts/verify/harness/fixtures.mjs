@@ -690,6 +690,8 @@ export function sub(over = {}) {
     operation: null,
     conflicted: 0,
     upstream_remote: "origin",
+    recorded_on_remote: true,
+    own_unpushed: 0,
     ...over,
   };
 }

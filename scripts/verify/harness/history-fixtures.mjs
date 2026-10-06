@@ -33,6 +33,7 @@ function commit(hash, subject, over = {}) {
     is_merge: false,
     touches_submodules: [],
     only_submodules: false,
+    unpushed: false,
     lane: 0,
     parent_lanes: [0],
     active_lanes: [0],
@@ -59,6 +60,7 @@ export const HISTORY_PAGE_BUMP = {
   limit: 50,
   has_more: false,
   max_lane: 0,
+  remote_refs: true,
 };
 
 export const HISTORY_PAGE = {
@@ -72,6 +74,7 @@ export const HISTORY_PAGE = {
   limit: 50,
   has_more: false,
   max_lane: 0,
+  remote_refs: true,
 };
 
 function branch(name, over = {}) {

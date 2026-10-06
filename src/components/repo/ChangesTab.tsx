@@ -23,6 +23,7 @@ import { DiscardConfirmModal } from "../changes/DiscardConfirmModal";
 import { ResetConfirmModal } from "../changes/ResetConfirmModal";
 import { DiscardAllModal } from "../changes/DiscardAllModal";
 import { usePersistedState } from "../../lib/persist";
+import { canonicalJoin } from "../../lib/paths";
 import { useRefreshOnFocus } from "../../lib/focus";
 import { elapsedLabel, runJob, useGitJob, clearJob, type GitJobKind } from "../../lib/gitJobs";
 import * as api from "../../lib/api";
@@ -450,6 +451,7 @@ export function ChangesTab({
       pullInside,
       recordPointers: (repo) => apply("record", () => api.changesRecordPointers(repo)),
       recordOne: (repo, sub) => apply(`record:${sub}`, () => api.changesRecordPointers(repo, [sub])),
+      startBranch: (repo, sub, name) => startBranch(repo, sub, name),
       update: (repo, stash, bundles, fingerprint) =>
         runLongIn(repo, "sync", "Updating — fetching, rebasing, aligning submodules…", () => api.changesSyncRun(repo, stash, bundles, fingerprint)),
       stashNow: (repo) => apply("stash", () => api.changesStashPush(repo, "Before update", false)),
@@ -500,7 +502,64 @@ export function ChangesTab({
         ? status
         : subStatuses.find((s) => s.status.path === branchesFor)?.status ?? null;
 
-  const refusalCode = result?.refusal?.code;
+  // A branch at a detached submodule's checkout: the result is the
+  // submodule's, so it updates that row's status, not the repository's.
+  const startBranch = (repo: string, sub: string, name: string) => {
+    const inside = canonicalJoin(repo, sub);
+    return apply(`branch:${sub}`, () => api.changesCreateBranch(inside, name, null, true), inside);
+  };
+
+  // A result that belongs to a submodule (a push chained from here) carries
+  // its codes for the submodule, not for this repository: no action keyed on
+  // them is offered for it.
+  const refusalCode = result?.inside ? undefined : result?.refusal?.code;
+  // The submodule whose branch form the card should open (a nonce, then the path).
+  const [branchFormFor, setBranchFormFor] = useState<string | null>(null);
+  // A push refused because a submodule's recorded commit is on no remote of
+  // its own: one button per submodule pushes it first and then this
+  // repository — or, for a detached submodule, opens its branch form, since a
+  // push from it needs a branch; pushing anyway is the person's call.
+  const subPushActions =
+    refusalCode === "submodules-unpushed" && status
+      ? [
+          ...(result?.unpushed_submodules ?? [])
+            .filter((s) => s.state === "not-on-remote")
+            .map((s) =>
+              s.branch === null
+                ? {
+                    label: `Start a branch in ${s.path} first`,
+                    primary: true,
+                    onClick: () => setBranchFormFor(`${Date.now()}:${s.path}`),
+                  }
+                : {
+                    label: `Push ${s.path} first`,
+                    primary: true,
+                    onClick: () =>
+                      runLong("push", `Pushing ${s.path}, then this repository…`, async () => {
+                        const inside = canonicalJoin(repoPath, s.path);
+                        // Its upstream as of now, not as of the page's last read.
+                        const st = await api.changesRepoStatus(inside).catch(() => null);
+                        const r = await api.changesPush(inside, !st?.upstream);
+                        // The submodule's own refusal, named for it everywhere
+                        // it is read (card and toast); its status is not this
+                        // repository's.
+                        if (!r.ok) {
+                          return {
+                            ...r,
+                            inside,
+                            headline: `${s.path}: ${r.headline}`,
+                            refusal: r.refusal ? { ...r.refusal, message: `${s.path}: ${r.refusal.message}` } : undefined,
+                            advice: r.advice ? { ...r.advice, headline: `${s.path}: ${r.advice.headline}` } : undefined,
+                            status: undefined,
+                          };
+                        }
+                        return api.changesPush(repoPath, !status.upstream);
+                      }),
+                  }
+            ),
+          { label: "Push anyway", onClick: () => runLong("push", "Pushing…", () => api.changesPush(repoPath, !status.upstream, true)) },
+        ]
+      : undefined;
   const historyAction =
     refusalCode === "already-pushed" || refusalCode === "would-drop-pushed"
       ? {
@@ -639,6 +698,7 @@ export function ChangesTab({
               }}
               onRecordPointers={() => apply("record", () => api.changesRecordPointers(repoPath))}
               extraAction={markersAction ?? syncHandOff ?? movedAction ?? historyAction ?? publishAction}
+              extraActions={subPushActions}
             />
           )}
 
@@ -736,6 +796,8 @@ export function ChangesTab({
                 onPullInside={(s) => void pullInside(repoPath, s)}
                 onUpdateOne={(p) => void runLong("submodules", `Updating ${p}…`, () => api.changesSubmoduleUpdate(repoPath, [p]))}
                 onRecordOne={(p) => void apply(`record:${p}`, () => api.changesRecordPointers(repoPath, [p]))}
+                onStartBranch={(p, name) => void startBranch(repoPath, p, name)}
+                openBranchFormFor={branchFormFor}
                 sectionPaths={sectionPaths}
                 onJumpToSection={jumpToSubmodule}
               />

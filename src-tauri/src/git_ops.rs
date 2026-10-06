@@ -626,6 +626,21 @@ pub struct PushOutcome {
     pub remote: String,
 }
 
+/// A submodule whose recorded commit this push advertises while no remote of
+/// the submodule has it — what `git push --recurse-submodules=check` looks
+/// for — or where that could not be checked. `state`: not-on-remote |
+/// not-here (the commit is not in the submodule's checkout) | not-populated.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct SubmodulePush {
+    pub path: String,
+    pub recorded: String,
+    pub recorded_short: String,
+    pub state: String,
+    /// Its checked-out branch; `None` when detached, where a push from it
+    /// needs a branch first.
+    pub branch: Option<String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct PullOutcome {
     pub mode: String,
@@ -675,6 +690,10 @@ pub struct OpResult {
     pub tree: Option<crate::tree::TreeOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stash: Option<crate::stash::StashOutcome>,
+    /// Submodules a push would leave a clone unable to check out (their
+    /// recorded commit is on no remote of theirs), or could not check.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unpushed_submodules: Vec<SubmodulePush>,
 }
 
 impl OpResult {
@@ -694,6 +713,7 @@ impl OpResult {
             sync: None,
             tree: None,
             stash: None,
+            unpushed_submodules: Vec::new(),
         }
     }
 
@@ -1433,7 +1453,102 @@ pub fn resolve_push_target(i: &PushInputs) -> Result<PushTarget, Refusal> {
     Ok(PushTarget { remote, remote_ref: own, set_upstream: true })
 }
 
-pub async fn push(repo_path: &str, set_upstream: bool) -> Result<OpResult, AppError> {
+/// Every submodule pointer the commits being pushed set — `since..HEAD` for
+/// the remote's current tip, every commit no remote-tracking branch of that
+/// remote has for a first publish — and whether the commit each points at is
+/// on a remote-tracking branch of the remote a clone would fetch it from. A
+/// clone may check out any of the pushed commits, so an intermediate pointer
+/// counts as much as HEAD's (`git push --recurse-submodules=check` walks the
+/// same commits). Read with -z, so a path with non-ASCII bytes is itself.
+pub(crate) async fn submodules_needing_push(repo_path: &str, remote: &str, since: Option<&str>) -> Vec<SubmodulePush> {
+    let repo = std::path::Path::new(repo_path);
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        "-z".into(),
+        "--raw".into(),
+        "--no-abbrev".into(),
+        "--no-renames".into(),
+        "--ignore-submodules=none".into(),
+        "--diff-filter=AMT".into(),
+        "--format=".into(),
+    ];
+    match since {
+        Some(base) => args.push(format!("{}..HEAD", base)),
+        None => args.extend(["HEAD".to_string(), "--not".to_string(), format!("--remotes={}", remote)]),
+    }
+    let Ok(out) = GitCmd::at(repo_path).args(args.iter().map(String::as_str)).run().await else { return Vec::new() };
+    if !out.ok() {
+        return Vec::new();
+    }
+    // `:<srcmode> <dstmode> <src> <dst> <status>\0<path>\0`, per change.
+    let toks: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+    let mut pointers: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        if t.first() == Some(&b':') {
+            let header = String::from_utf8_lossy(t).to_string();
+            let f: Vec<&str> = header.split(' ').collect();
+            if f.len() >= 5 && f[1] == "160000" {
+                if let Some(p) = toks.get(i + 1) {
+                    pointers.insert((String::from_utf8_lossy(p).to_string(), f[3].to_string()));
+                }
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    if pointers.is_empty() {
+        return Vec::new();
+    }
+    let declared = crate::submodules::parse_gitmodules(&crate::submodules::gitmodules_listing(repo).await);
+    let super_url = GitCmd::at(repo_path)
+        .args(["config", "--get", &format!("remote.{}.url", remote)])
+        .ok_text()
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut out_list = Vec::new();
+    for (path, recorded) in pointers {
+        let sub = repo.join(&path);
+        let populated = sub.join(".git").exists() && GitCmd::at(&sub).args(["rev-parse", "--git-dir"]).ok_text().await.is_some();
+        let branch = if populated {
+            GitCmd::at(&sub).args(["symbolic-ref", "-q", "--short", "HEAD"]).ok_text().await.map(|b| b.trim().to_string()).filter(|b| !b.is_empty())
+        } else {
+            None
+        };
+        let state = if !populated {
+            "not-populated"
+        } else if !GitCmd::at(&sub).args(["cat-file", "-e", &format!("{}^{{commit}}", recorded)]).run().await.map(|o| o.ok()).unwrap_or(false) {
+            "not-here"
+        } else {
+            let which = crate::submodules::clone_remote(&sub, declared.get(&path).and_then(|m| m.url.as_deref()), super_url.as_deref()).await;
+            if crate::submodules::on_remote(&sub, &recorded, which.as_deref()).await {
+                continue;
+            }
+            "not-on-remote"
+        };
+        out_list.push(SubmodulePush { recorded_short: recorded.chars().take(7).collect(), recorded, path, state: state.into(), branch });
+    }
+    out_list
+}
+
+/// One sentence per submodule the push check could not clear, for a push
+/// that went ahead. "Has" means a remote-tracking branch here has it: what
+/// this checkout knows, which a fetch may update.
+fn submodule_push_notes(checks: &[SubmodulePush]) -> Vec<String> {
+    checks
+        .iter()
+        .map(|s| match s.state.as_str() {
+            "not-on-remote" => format!("Pushed anyway: {} records {}, which none of its remote-tracking branches has here — push {} too.", s.path, s.recorded_short, s.path),
+            "not-here" => format!("{} records {}, a commit its checkout here does not have, so whether a remote has it could not be checked.", s.path, s.recorded_short),
+            _ => format!("{} is not initialised here, so whether a remote has {} could not be checked.", s.path, s.recorded_short),
+        })
+        .collect()
+}
+
+pub async fn push(repo_path: &str, set_upstream: bool, allow_unpushed_submodules: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Push, &StatusFacts::from(&before)) {
         return Ok(OpResult::refused(r, before));
@@ -1467,6 +1582,41 @@ pub async fn push(repo_path: &str, set_upstream: bool) -> Result<OpResult, AppEr
     let PushTarget { remote, remote_ref, set_upstream: needs_upstream } = target;
     crate::git_exec::validate_remote_name(&remote)?;
     crate::git_exec::validate_branch_name(&branch)?;
+    // What this push advertises: every submodule pointer the remote's tip does
+    // not already record must point at a commit some remote of the submodule
+    // has, or a clone of the pushed branch cannot check it out — the check
+    // `git push --recurse-submodules=check` makes. Refused with the
+    // submodules named; pushing anyway is the person's call.
+    let remote_tip = GitCmd::at(repo_path)
+        .args(["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{}/{}^{{commit}}", remote, remote_ref.trim_start_matches("refs/heads/"))])
+        .ok_text()
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let sub_checks = submodules_needing_push(repo_path, &remote, remote_tip.as_deref()).await;
+    let unpushed: Vec<&SubmodulePush> = sub_checks.iter().filter(|s| s.state == "not-on-remote").collect();
+    if !unpushed.is_empty() && !allow_unpushed_submodules {
+        let msg = if unpushed.len() == 1 {
+            let s = unpushed[0];
+            let how = if s.state == "not-on-remote" && s.branch.is_none() {
+                "(it is detached — start a branch there first)"
+            } else {
+                "(or fetch it, if that commit was pushed from elsewhere)"
+            };
+            format!(
+                "{} records {}, which none of {}'s remote-tracking branches has — as far as this checkout knows. Anyone fetching this push could not check it out. Push {} first {}, or push anyway.",
+                s.path, s.recorded_short, s.path, s.path, how
+            )
+        } else {
+            format!(
+                "{} record commits that none of their remote-tracking branches has — as far as this checkout knows. Anyone fetching this push could not check them out. Push them first (or fetch them, if those commits were pushed from elsewhere), or push anyway.",
+                unpushed.iter().map(|s| format!("{} ({})", s.path, s.recorded_short)).collect::<Vec<_>>().join(", ")
+            )
+        };
+        let mut r = OpResult::refused(refuse("submodules-unpushed", msg), before);
+        r.unpushed_submodules = sub_checks;
+        return Ok(r);
+    }
     let args = build_push_args(&remote, &branch, &remote_ref, needs_upstream);
     let out = GitCmd::at(repo_path)
         .args(args)
@@ -1500,15 +1650,20 @@ pub async fn push(repo_path: &str, set_upstream: bool) -> Result<OpResult, AppEr
     } else {
         format!("Pushed to {}.", remote)
     };
-    let detail = outcome
+    let mut detail = outcome
         .refs
         .iter()
         .map(|r| format!("{} {}", r.to, r.summary))
         .collect::<Vec<_>>()
         .join(", ");
+    let notes = submodule_push_notes(&sub_checks);
+    if !notes.is_empty() {
+        detail = format!("{} {}", detail, notes.join(" ")).trim().to_string();
+    }
 
     Ok(OpResult {
         push: Some(outcome),
+        unpushed_submodules: sub_checks,
         ..OpResult::done(headline, detail, after)
     })
 }

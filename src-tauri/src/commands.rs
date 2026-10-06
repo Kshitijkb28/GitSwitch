@@ -458,6 +458,9 @@ pub async fn history_branches(repo_path: String) -> Result<Vec<BranchInfo>, AppE
 
 /// Paginated: git log is fast, but a 100k-commit repo would still choke the UI
 /// if we handed it everything at once.
+// The page's filters are the IPC arguments, one each; a struct would change
+// the contract every frontend call site and harness fixture is written to.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn history_page(
     repo_path: String,
@@ -467,6 +470,7 @@ pub async fn history_page(
     search: Option<String>,
     authors: Option<Vec<String>>,
     hide_pointer_only: Option<bool>,
+    unpushed_only: Option<bool>,
 ) -> Result<HistoryPage, AppError> {
     tokio::task::spawn_blocking(move || {
         git_history::history_page(
@@ -477,6 +481,7 @@ pub async fn history_page(
             search.as_deref(),
             authors.as_deref(),
             hide_pointer_only.unwrap_or(false),
+            unpushed_only.unwrap_or(false),
         )
     })
     .await
@@ -699,8 +704,11 @@ pub async fn changes_commit(
 }
 
 #[tauri::command]
-pub async fn changes_push(repo_path: String, set_upstream: bool) -> Result<OpResult, AppError> {
-    git_ops::push(&repo_path, set_upstream).await
+/// `allow_unpushed_submodules`: push although a submodule's recorded commit is
+/// on none of that submodule's remotes — the person's call, after the refusal
+/// named it.
+pub async fn changes_push(repo_path: String, set_upstream: bool, allow_unpushed_submodules: Option<bool>) -> Result<OpResult, AppError> {
+    git_ops::push(&repo_path, set_upstream, allow_unpushed_submodules.unwrap_or(false)).await
 }
 
 /// `mode` is one of "ff-only", "merge", "rebase" — chosen by the user, never

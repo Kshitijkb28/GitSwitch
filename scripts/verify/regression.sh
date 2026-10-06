@@ -246,4 +246,20 @@ ok "  on the right branch" "$(printf '%s' "$OUT" | jqf branch)" "main"
 OUT=$(probe status "$SB/clones/sparse")
 ok "status works on a sparse checkout too" "$(printf '%s' "$OUT" | jqf name)" "sparse"
 
+section "History marks what no remote-tracking branch has, and can list only that"
+UP="$SB/unpushed"; git init -q --bare "$UP.git"; git clone -q "$UP.git" "$UP" 2>/dev/null
+for n in 1 2; do printf '%s\n' "$n" > "$UP/f$n.txt"; git -C "$UP" add -A >/dev/null; git -C "$UP" commit -qm "pushed $n"; done
+git -C "$UP" push -q -u origin main 2>/dev/null
+for n in 3 4; do printf '%s\n' "$n" > "$UP/f$n.txt"; git -C "$UP" add -A >/dev/null; git -C "$UP" commit -qm "local $n"; done
+hp() { pinvoke history_page "{\"repoPath\":\"$1\",\"rev\":\"$2\",\"offset\":0,\"limit\":50,\"search\":null,\"authors\":null,\"hidePointerOnly\":false,\"unpushedOnly\":$3}"; }
+ok "each row says whether a remote-tracking branch has it" "$(hp "$UP" HEAD false | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(d["remote_refs"], [(c["subject"],c["unpushed"]) for c in d["commits"]])')" "True [('local 4', True), ('local 3', True), ('pushed 2', False), ('pushed 1', False)]"
+ok "  the filter lists only those, with their count" "$(hp "$UP" HEAD true | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(d["total"], [c["subject"] for c in d["commits"]], all(c["unpushed"] for c in d["commits"]))')" "2 ['local 4', 'local 3'] True"
+# Pushed to any remote counts: the commit exists somewhere else than here.
+git init -q --bare "$UP-other.git"; git -C "$UP" remote add other "$UP-other.git"; git -C "$UP" push -q other main 2>/dev/null
+ok "  a push to any remote counts" "$(hp "$UP" HEAD true | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(d["total"])')" "0"
+git -C "$UP" switch -q -c topic 2>/dev/null; printf 't\n' > "$UP/t.txt"; git -C "$UP" add -A >/dev/null; git -C "$UP" commit -qm "topic only"
+ok "  across all branches too" "$(hp "$UP" --all true | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(d["total"], [c["subject"] for c in d["commits"]])')" "1 ['topic only']"
+NR="$SB/noremote"; git init -q "$NR"; printf 'x\n' > "$NR/x.txt"; git -C "$NR" add -A >/dev/null; git -C "$NR" commit -qm "alone"
+ok "without a remote-tracking branch nothing is marked, and the page says there is none to compare with" "$(hp "$NR" HEAD false | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(d["remote_refs"], [c["unpushed"] for c in d["commits"]])')" "False [False]"
+
 verify_result

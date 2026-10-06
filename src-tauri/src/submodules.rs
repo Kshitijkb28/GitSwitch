@@ -87,9 +87,67 @@ pub struct SubmoduleInfo {
     pub conflicted: usize,
     /// The remote its branch's upstream lives on ("origin" for origin/main).
     pub upstream_remote: Option<String>,
+    /// The commit the superproject records is on a remote-tracking branch of
+    /// the remote a clone would fetch it from (the one whose address
+    /// .gitmodules declares; origin when that cannot be told; any remote when
+    /// there is no origin) — as far as this checkout knows. `None` when that
+    /// cannot be known here: not initialised, the commit missing, or no such
+    /// remote-tracking branch to compare with.
+    #[serde(default)]
+    pub recorded_on_remote: Option<bool>,
+    /// Commits at its checkout that no remote-tracking branch of that remote
+    /// has; `None` when it has none to compare with.
+    #[serde(default)]
+    pub own_unpushed: Option<usize>,
 }
 
 const MAX_MOVED: usize = 10;
+
+/// The same address, give or take a trailing slash or a `.git`.
+fn norm_url(u: &str) -> String {
+    let t = u.trim().trim_end_matches('/');
+    t.strip_suffix(".git").unwrap_or(t).to_string()
+}
+
+/// The submodule remote a clone of the superproject would fetch from: the one
+/// whose address is what .gitmodules declares (resolved against the
+/// superproject's own remote address), else "origin" when it exists, else
+/// none — in which case every remote-tracking branch counts.
+pub(crate) async fn clone_remote(sub_dir: &Path, declared: Option<&str>, super_url: Option<&str>) -> Option<String> {
+    let listing = GitCmd::at(sub_dir).args(["config", "--get-regexp", r"^remote\..*\.url$"]).ok_text().await.unwrap_or_default();
+    let remotes: Vec<(String, String)> = listing
+        .lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            let name = k.strip_prefix("remote.")?.strip_suffix(".url")?;
+            Some((name.to_string(), v.trim().to_string()))
+        })
+        .collect();
+    if let Some(d) = declared {
+        let want = norm_url(&crate::sync::resolve_submodule_url(super_url, d));
+        if let Some((n, _)) = remotes.iter().find(|(_, u)| norm_url(u) == want) {
+            return Some(n.clone());
+        }
+    }
+    remotes.iter().find(|(n, _)| n == "origin").map(|(n, _)| n.clone())
+}
+
+/// `refs/remotes/<remote>/` — or every remote-tracking branch when no remote is named.
+pub(crate) fn remote_scope(remote: Option<&str>) -> String {
+    match remote {
+        Some(r) => format!("refs/remotes/{}/", r),
+        None => "refs/remotes/".to_string(),
+    }
+}
+
+/// A remote-tracking branch of that remote has the commit (which must exist here).
+pub(crate) async fn on_remote(sub_dir: &Path, oid: &str, remote: Option<&str>) -> bool {
+    GitCmd::at(sub_dir)
+        .args(["for-each-ref", "--count=1", "--format=%(refname)", &format!("--contains={}", oid), &remote_scope(remote)])
+        .ok_text()
+        .await
+        .is_some_and(|s| !s.trim().is_empty())
+}
 
 /// Parse `git ls-files -s -z`, keeping only gitlinks.
 ///
@@ -139,7 +197,7 @@ pub async fn has_gitlinks(repo: &Path) -> bool {
 
 /// `.gitmodules` as `parse_gitmodules` reads it. Absent is normal (every
 /// gitlink is then unmapped) and comes back empty.
-async fn gitmodules_listing(repo: &Path) -> Vec<u8> {
+pub(crate) async fn gitmodules_listing(repo: &Path) -> Vec<u8> {
     match GitCmd::at(repo)
         .args(["config", "-f", ".gitmodules", "--get-regexp", "-z", r"\.(path|url|branch)$"])
         .run()
@@ -254,7 +312,7 @@ pub fn summarise(
                 .to_string()
         }
         "not-initialised" => {
-            return "not initialised — Update submodules will fetch it".to_string()
+            return "not downloaded yet — Download fetches it (git submodule update --init)".to_string()
         }
         _ => {}
     }
@@ -392,6 +450,18 @@ pub async fn list_submodules(repo_path: &str) -> Result<Vec<SubmoduleInfo>, AppE
     }
 
     let cfg = parse_gitmodules(&gitmodules_listing(&repo).await);
+    // The superproject's own address, against which a relative .gitmodules
+    // address resolves: origin's, or the first remote's.
+    let super_url = match GitCmd::at(&repo).args(["config", "--get", "remote.origin.url"]).ok_text().await.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(u) => Some(u),
+        None => {
+            let first = GitCmd::at(&repo).args(["remote"]).ok_text().await.unwrap_or_default().lines().next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            match first {
+                Some(r) => GitCmd::at(&repo).args(["config", "--get", &format!("remote.{}.url", r)]).ok_text().await.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                None => None,
+            }
+        }
+    };
 
     let mut out = Vec::with_capacity(gitlinks.len());
     for (recorded, path) in gitlinks {
@@ -431,6 +501,8 @@ pub async fn list_submodules(repo_path: &str) -> Result<Vec<SubmoduleInfo>, AppE
             operation: None,
             conflicted: 0,
             upstream_remote: None,
+            recorded_on_remote: None,
+            own_unpushed: None,
         };
 
         if initialised {
@@ -445,6 +517,32 @@ pub async fn list_submodules(repo_path: &str) -> Result<Vec<SubmoduleInfo>, AppE
                 .await
                 .filter(|s| !s.is_empty());
             info.actual_short = info.actual.as_deref().map(short);
+            if info.gitdir_valid {
+                // Against the remote-tracking branches of the remote a clone
+                // would fetch from: with none, nothing here is known to be
+                // pushed and the row says nothing of it.
+                let which = clone_remote(&sub_dir, module.and_then(|m| m.url.as_deref()), super_url.as_deref()).await;
+                let scope = remote_scope(which.as_deref());
+                let remote_refs = GitCmd::at(&sub_dir)
+                    .args(["for-each-ref", "--count=1", "--format=%(refname)", &scope])
+                    .ok_text()
+                    .await
+                    .is_some_and(|s| !s.trim().is_empty());
+                if remote_refs {
+                    if info.actual.is_some() {
+                        let not = match &which {
+                            Some(r) => format!("--remotes={}", r),
+                            None => "--remotes".to_string(),
+                        };
+                        info.own_unpushed = GitCmd::at(&sub_dir).args(["rev-list", "--count", "HEAD", "--not", &not]).ok_text().await.and_then(|n| n.trim().parse().ok());
+                    }
+                    let present = info.actual.as_deref() == Some(info.recorded.as_str())
+                        || GitCmd::at(&sub_dir).args(["cat-file", "-e", &format!("{}^{{commit}}", info.recorded)]).run().await.map(|o| o.ok()).unwrap_or(false);
+                    if present {
+                        info.recorded_on_remote = Some(on_remote(&sub_dir, &info.recorded, which.as_deref()).await);
+                    }
+                }
+            }
 
             let own = read_own_state(&sub_dir).await;
             info.upstream_remote = own.upstream.as_deref().and_then(|u| u.split('/').next()).map(|s| s.to_string());
@@ -672,7 +770,8 @@ mod tests {
     #[test]
     fn a_listed_but_missing_submodule_points_at_the_fix() {
         let msg = summarise("not-initialised", true, 0, 0, false, 0, 0, false, None, None, 0, 0);
-        assert!(msg.contains("Update submodules"));
+        assert!(msg.contains("Download fetches it"));
+        assert!(msg.contains("git submodule update --init"));
     }
 
     #[test]

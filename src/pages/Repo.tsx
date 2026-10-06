@@ -329,15 +329,18 @@ export function Repo() {
    * job slot, the result card, the toasts) on the repository itself — so the
    * scope goes back to it first — and everything re-reads when it is done.
    */
-  const runOnRepo = (op: (a: RepoActions) => Promise<unknown>) => {
+  // An operation on the scoped repository — the repository, or a submodule
+  // inside it whose own submodules the tab shows: the scope stays where it is.
+  const runHere = (op: (a: RepoActions) => Promise<unknown>) => {
     const a = actionsRef.current;
     if (!a) return;
-    sel.setSub("");
     void op(a).finally(() => {
       setReloadKey((k) => k + 1);
       actionsRef.current?.refresh();
     });
   };
+  // A submodule path relative to the scoped repository, as a scope of the repository.
+  const scoped = (p: string) => (sel.sub ? `${sel.sub}/${p}` : p);
   // Arriving on a tab re-reads the repository, as opening the old page did:
   // the terminal drawer or an operation on another tab may have moved HEAD.
   const firstTab = useRef(true);
@@ -569,21 +572,25 @@ export function Repo() {
         onRepoChanged={() => actionsRef.current?.refresh()}
         hasSubmodules={gitlinks > 0}
       />
+      {/* The scoped repository's submodules: the repository's, or — inside a
+          submodule — that submodule's own, which only it can download. */}
       <SubmodulesTab
-        repoPath={sel.path}
+        repoPath={sel.effectivePath}
+        scope={sel.sub}
         visible={tab === "submodules"}
         busy={busy}
         refreshKey={reloadKey}
-        onWorkInside={workInside}
+        onWorkInside={(p) => workInside(scoped(p))}
         onOpenHistory={(p) => {
-          sel.setSub(p);
+          sel.setSub(scoped(p));
           go("history");
         }}
-        onInitialise={(paths) => runOnRepo((a) => a.initialise(sel.path, paths))}
-        onRecordPointers={() => runOnRepo((a) => a.recordPointers(sel.path))}
-        onPullInside={(s) => runOnRepo((a) => a.pullInside(sel.path, s))}
-        onUpdateOne={(p) => runOnRepo((a) => a.updateOne(sel.path, p))}
-        onRecordOne={(p) => runOnRepo((a) => a.recordOne(sel.path, p))}
+        onInitialise={(paths) => runHere((a) => a.initialise(sel.effectivePath, paths))}
+        onRecordPointers={() => runHere((a) => a.recordPointers(sel.effectivePath))}
+        onPullInside={(s) => runHere((a) => a.pullInside(sel.effectivePath, s))}
+        onUpdateOne={(p) => runHere((a) => a.updateOne(sel.effectivePath, p))}
+        onRecordOne={(p) => runHere((a) => a.recordOne(sel.effectivePath, p))}
+        onStartBranch={(p, name) => runHere((a) => a.startBranch(sel.effectivePath, p, name))}
         onPreview={() => {
           // The whole repository is what updates; the drawer is opened for it
           // in the same step, so the scope change does not close it.

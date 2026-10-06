@@ -1,14 +1,28 @@
 import { useCallback, useEffect, useState } from "react";
-import { Box, Download, FolderOpen, GitGraph, Loader2, AlertTriangle, GitCommitHorizontal, ArrowDownUp } from "lucide-react";
+import { Box, Download, FolderOpen, GitGraph, GitBranch, Loader2, AlertTriangle, GitCommitHorizontal, ArrowDownUp } from "lucide-react";
 import { Button } from "../Button";
 import { Card } from "../Card";
 import * as api from "../../lib/api";
 import type { SubmoduleInfo } from "../../lib/api";
-import { canPullInside, canRecord, canUpdate, pullInsideTitle, recordTitle, updateTitle } from "../changes/SubmodulesCard";
+import {
+  StartBranchForm,
+  canPullInside,
+  canRecord,
+  canStartBranch,
+  canUpdate,
+  pullInsideTitle,
+  recordTitle,
+  recordedUnpushed,
+  recordedUnpushedTitle,
+  startBranchTitle,
+  updateTitle,
+} from "../changes/SubmodulesCard";
 
 interface Props {
-  /** The repository (never a submodule): this tab is about ITS submodules. */
+  /** The scoped repository — the repository, or a submodule inside it: this tab is about ITS submodules. */
   repoPath: string;
+  /** The scope relative to the repository ("" for the repository itself), for the heading. */
+  scope: string;
   visible: boolean;
   busy: boolean;
   /** Bumped by the page after any operation, so the table re-reads. */
@@ -23,6 +37,8 @@ interface Props {
   onUpdateOne: (path: string) => void;
   /** One commit in the repository recording where that submodule is checked out now. */
   onRecordOne: (path: string) => void;
+  /** A branch at a detached submodule's checkout, named by the person. */
+  onStartBranch: (path: string, name: string) => void;
   /** Opens the Update drawer for the repository: the latest below, your work on top, every submodule aligned. */
   onPreview: () => void;
 }
@@ -65,7 +81,12 @@ function stateClass(s: SubmoduleInfo): string {
  * upstream is a stream of pointer bumps, this is where the person's work
  * actually lives.
  */
-export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInside, onOpenHistory, onInitialise, onRecordPointers, onPullInside, onUpdateOne, onRecordOne, onPreview }: Props) {
+export function SubmodulesTab({ repoPath, scope, visible, busy, refreshKey, onWorkInside, onOpenHistory, onInitialise, onRecordPointers, onPullInside, onUpdateOne, onRecordOne, onStartBranch, onPreview }: Props) {
+  // The row whose branch is being named — never one of another repository's.
+  const [branchingFor, setBranchingFor] = useState<string | null>(null);
+  useEffect(() => {
+    setBranchingFor(null);
+  }, [repoPath]);
   const [subs, setSubs] = useState<SubmoduleInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -105,17 +126,22 @@ export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInsid
         </p>
       ) : subs.length === 0 && !error ? (
         <Card>
-          <p className="text-sm text-zinc-400">This repository has no submodules.</p>
+          <p className="text-sm text-zinc-400">{scope ? scope : "This repository"} has no submodules.</p>
         </Card>
       ) : (
         <>
           {error && <p className="text-sm text-red-400 break-words">{error}</p>}
+          {scope && (
+            <p className="text-xs text-zinc-500">
+              Submodules of <span className="font-mono text-zinc-300">{scope}</span> — downloaded, recorded and pulled from here; Update works on the repository as a whole.
+            </p>
+          )}
           <div className="flex items-center gap-2 flex-wrap text-xs text-zinc-500">
             <Box size={14} className="text-zinc-400" />
             <span>
               {present.length} populated
               {moved.length > 0 && <> · <span className="text-sky-300">{moved.length} moved</span></>}
-              {missing.length > 0 && <> · {missing.length} not initialised</>}
+              {missing.length > 0 && <> · {missing.length} not downloaded yet</>}
               {unfetchable.length > 0 && <> · <span className="text-red-300">{unfetchable.length} unfetchable</span></>}
             </span>
             <span className="ml-auto flex items-center gap-2">
@@ -137,10 +163,10 @@ export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInsid
                   variant="secondary"
                   disabled={busy}
                   onClick={() => onInitialise(missing.map((s) => s.path))}
-                  title={`git submodule update --init for the ${missing.length} never-initialised submodule(s) only — populated ones are left alone`}
+                  title={`git submodule update --init for the ${missing.length} submodule(s) not downloaded yet — populated ones are left alone`}
                 >
                   <Download size={13} />
-                  Initialise missing ({missing.length})
+                  Download missing ({missing.length})
                 </Button>
               )}
             </span>
@@ -163,6 +189,11 @@ export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInsid
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-mono text-xs text-zinc-200 break-all">{s.path}</span>
                         <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${stateClass(s)}`}>{stateLabel(s)}</span>
+                        {recordedUnpushed(s) && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded shrink-0 bg-amber-500/15 text-amber-300" title={recordedUnpushedTitle(s)}>
+                            recorded commit not pushed
+                          </span>
+                        )}
                       </div>
                       <p className="text-xs text-zinc-500 mt-0.5 leading-relaxed">{s.summary}</p>
                       <p className="lg:hidden text-xs font-mono text-zinc-500 mt-0.5">
@@ -217,6 +248,23 @@ export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInsid
                             Record this pointer
                           </Button>
                         )}
+                        {canStartBranch(s) && branchingFor !== s.path && (
+                          <Button size="sm" variant={(s.own_unpushed ?? 0) > 0 ? "secondary" : "ghost"} disabled={busy} onClick={() => setBranchingFor(s.path)} title={startBranchTitle(s)} className="px-2">
+                            <GitBranch size={13} />
+                            Start a branch here
+                          </Button>
+                        )}
+                        {canStartBranch(s) && branchingFor === s.path && (
+                          <StartBranchForm
+                            path={s.path}
+                            busy={busy}
+                            onSubmit={(name) => {
+                              setBranchingFor(null);
+                              onStartBranch(s.path, name);
+                            }}
+                            onCancel={() => setBranchingFor(null)}
+                          />
+                        )}
                         <Button size="sm" variant="ghost" onClick={() => onWorkInside(s.path)} title="Work in this submodule as its own repository" className="px-2">
                           <FolderOpen size={13} />
                           Work inside
@@ -241,9 +289,9 @@ export function SubmodulesTab({ repoPath, visible, busy, refreshKey, onWorkInsid
                     </td>
                     <td className="px-3 py-2 text-right whitespace-nowrap">
                       {s.listed && (
-                        <Button size="sm" variant="ghost" disabled={busy} onClick={() => onInitialise([s.path])} className="px-2" title="git submodule update --init for this one submodule">
+                        <Button size="sm" variant="secondary" disabled={busy} onClick={() => onInitialise([s.path])} className="px-2" title="git submodule update --init for this one submodule: downloads it at the commit this repository records">
                           <Download size={13} />
-                          Initialise
+                          Download
                         </Button>
                       )}
                     </td>

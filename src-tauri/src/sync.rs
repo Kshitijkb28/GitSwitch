@@ -94,6 +94,21 @@ pub struct SuperFacts {
     pub identity_email: String,
     #[serde(default)]
     pub profile_email: Option<String>,
+    /// Submodules upstream's tree adds that its .gitmodules declares: the run
+    /// downloads them after the rebase, as `git submodule update --init` would.
+    #[serde(default)]
+    pub new_submodules: Vec<String>,
+    /// Gitlinks upstream adds without a .gitmodules entry: nothing can fetch them.
+    #[serde(default)]
+    pub new_unmapped: Vec<String>,
+}
+
+/// A submodule's address as upstream's `.gitmodules` now declares it (`to`),
+/// when that is not the one it fetches from (`from`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UrlChange {
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -145,6 +160,15 @@ pub struct SubFacts {
     pub operation: Option<String>,
     pub fetch_error: Option<String>,
     pub has_nested: bool,
+    /// Upstream's .gitmodules declares another address for it than the one it
+    /// fetches from, and that declaration changed since we parted: it was
+    /// fetched from the new one, and the run re-points it.
+    #[serde(default)]
+    pub url_change: Option<UrlChange>,
+    /// It fetches from another address than .gitmodules declares, by this
+    /// checkout's own choice (upstream did not move it): left as it is.
+    #[serde(default)]
+    pub url_differs: Option<UrlChange>,
     /// Commits inside it that the update brings in (`head..target`) and that
     /// are its own (`target..head`), each capped at MAX_LISTED.
     #[serde(default)]
@@ -216,6 +240,13 @@ pub struct SubPlan {
     /// It has submodules of its own; the update does not go inside them.
     #[serde(default)]
     pub has_nested: bool,
+    /// Upstream moved it to another address (shown with any token masked);
+    /// the update re-points it there before aligning it.
+    #[serde(default)]
+    pub url_change: Option<UrlChange>,
+    /// The remote its branch's upstream lives on.
+    #[serde(default)]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -257,6 +288,12 @@ pub struct SuperPlan {
     pub more_own_dropped: usize,
     #[serde(default)]
     pub unlisted_dropped: Vec<String>,
+    /// Submodules upstream added that the run downloads after the rebase, and
+    /// gitlinks it added without a .gitmodules entry (which nothing can fetch).
+    #[serde(default)]
+    pub new_submodules: Vec<String>,
+    #[serde(default)]
+    pub new_unmapped: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -335,6 +372,22 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
             if s.own_merges == 1 { "commit itself is" } else { "commits themselves are" }
         ));
     }
+    if !s.new_submodules.is_empty() {
+        notes.push(format!(
+            "upstream added {}: {} — downloaded after the rebase, at the commit it records (git submodule update --init).",
+            plural(s.new_submodules.len(), "submodule", "submodules"),
+            s.new_submodules.join(", ")
+        ));
+    }
+    if !s.new_unmapped.is_empty() {
+        notes.push(format!(
+            "upstream added {} without an entry in .gitmodules: {} — git cannot fetch {}, so {} empty.",
+            plural(s.new_unmapped.len(), "submodule", "submodules"),
+            s.new_unmapped.join(", "),
+            if s.new_unmapped.len() == 1 { "it" } else { "them" },
+            if s.new_unmapped.len() == 1 { "it stays" } else { "they stay" }
+        ));
+    }
 
     let mut subs = Vec::new();
     for f in &facts.submodules {
@@ -359,7 +412,22 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
             incoming_commits: f.incoming_commits.clone(),
             own_commits: f.own_commits.clone(),
             has_nested: f.has_nested,
+            url_change: f.url_change.as_ref().map(|u| UrlChange { from: crate::repo_scan::mask_token(&u.from), to: crate::repo_scan::mask_token(&u.to) }),
+            remote: f.remote.clone(),
         };
+        if let Some(u) = &p.url_change {
+            p.notes.push(format!(
+                "upstream moved it: it now lives at {} (it fetched from {} until now); the update re-points it there, as `git submodule sync` does, before aligning it",
+                u.to, u.from
+            ));
+        }
+        if let Some(u) = &f.url_differs {
+            p.notes.push(format!(
+                "it fetches from {} while .gitmodules declares {}; upstream did not move it, so the update leaves that as it is",
+                crate::repo_scan::mask_token(&u.from),
+                crate::repo_scan::mask_token(&u.to)
+            ));
+        }
         let block = |p: &mut SubPlan, code: &str, why: String| {
             p.action = "blocked".into();
             p.remedy = Some(code.into());
@@ -401,9 +469,13 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
         } else if f.target.is_none() {
             block(&mut p, "removed-upstream", "upstream removed this submodule; decide by hand what to do with your copy".into());
         } else if !f.target_present {
+            let stale = match &f.url_differs {
+                Some(u) => format!(" — it fetches from {} while .gitmodules declares {}; `git submodule sync` re-points it", crate::repo_scan::mask_token(&u.from), crate::repo_scan::mask_token(&u.to)),
+                None => String::new(),
+            };
             block(&mut p, if f.fetch_error.is_some() { "fetch-failed" } else { "unreachable" }, match &f.fetch_error {
-                Some(e) => format!("the commit upstream records ({}) is not available here and fetching failed: {}", short(f.target.as_deref().unwrap_or("")), e),
-                None => format!("the commit upstream records ({}) is not reachable from its remote's branches", short(f.target.as_deref().unwrap_or(""))),
+                Some(e) => format!("the commit upstream records ({}) is not available here and fetching failed: {}{}", short(f.target.as_deref().unwrap_or("")), e, stale),
+                None => format!("the commit upstream records ({}) is not reachable from its remote's branches{}", short(f.target.as_deref().unwrap_or("")), stale),
             });
         } else if !same_oid(&head, &f.recorded) && pointer_moves {
             block(&mut p, "record-pointers", format!(
@@ -605,6 +677,8 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
             more_own: s.ahead.saturating_sub(s.own_commits.len()),
             more_own_dropped: s.unlisted_already_upstream.len(),
             unlisted_dropped: s.unlisted_already_upstream.clone(),
+            new_submodules: s.new_submodules.clone(),
+            new_unmapped: s.new_unmapped.clone(),
         },
         submodules: subs,
         skipped: facts.skipped.clone(),
@@ -647,6 +721,17 @@ pub struct SubState {
     /// checkout, and where that branch stood before — so an abort puts it back.
     #[serde(default)]
     pub reattached: Option<(String, String)>,
+    /// The address upstream's .gitmodules now declares for it, when that is
+    /// not the one it fetched from; `url_synced` once the run re-pointed it.
+    #[serde(default)]
+    pub url_change: Option<UrlChange>,
+    #[serde(default)]
+    pub url_synced: bool,
+    #[serde(default)]
+    pub url_note: Option<String>,
+    /// The remote its branch's upstream lives on ("origin" when unknown).
+    #[serde(default)]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1212,6 +1297,99 @@ async fn dirty_sets(repo: &Path) -> (Vec<String>, Vec<String>) {
     (tracked, untracked)
 }
 
+/// A `.gitmodules` URL as git resolves it: `./x` and `../x` are relative to
+/// the superproject's remote — each `../` drops one path component of it (or
+/// what follows the colon of a `host:path` address) — and anything else is
+/// itself. Without a remote address a relative one is returned as written.
+pub(crate) fn resolve_submodule_url(base: Option<&str>, url: &str) -> String {
+    if !(url.starts_with("./") || url.starts_with("../")) {
+        return url.to_string();
+    }
+    let Some(base) = base else { return url.to_string() };
+    let mut remote = base.trim_end_matches(['/', '\\']).to_string();
+    let mut rest = url;
+    let mut colon = false;
+    loop {
+        if let Some(r) = rest.strip_prefix("../") {
+            rest = r;
+            if let Some(i) = remote.rfind(['/', '\\']) {
+                remote.truncate(i);
+            } else if let Some(i) = remote.rfind(':') {
+                remote.truncate(i);
+                colon = true;
+            } else {
+                remote = ".".into();
+            }
+        } else if let Some(r) = rest.strip_prefix("./") {
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    let mut out = format!("{}{}{}", remote, if colon { ":" } else { "/" }, rest);
+    while out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+/// What `.gitmodules` at `rev` declares as the address of submodule `name`.
+async fn declared_url(repo: &Path, rev: &str, name: &str) -> Option<String> {
+    g(repo)
+        .args(["config", "--blob", &format!("{}:.gitmodules", rev), "--get", &format!("submodule.{}.url", name)])
+        .ok_text()
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Drops what a preview parked under refs/gitswitch-moved/ for this remote.
+async fn clear_parked(sub: &Path, remote: &str) {
+    let refs = g(sub).args(["for-each-ref", "--format=%(refname)", &format!("refs/gitswitch-moved/{}/", remote)]).ok_text().await.unwrap_or_default();
+    for r in refs.lines().map(str::trim).filter(|r| !r.is_empty()) {
+        let _ = g(sub).args(["update-ref", "-d", r]).run().await;
+    }
+}
+
+/// Among `added` (paths upstream's tree adds), the gitlinks — split into the
+/// ones upstream's .gitmodules declares and the ones it does not.
+async fn new_gitlinks(repo: &Path, upstream_ref: &str, added: &BTreeSet<String>) -> (Vec<String>, Vec<String>) {
+    if added.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut args: Vec<String> = vec!["ls-tree".into(), "-z".into(), upstream_ref.to_string(), "--".into()];
+    args.extend(added.iter().cloned());
+    let Ok(out) = g(repo).top_flag("--literal-pathspecs").args(args.iter().map(String::as_str)).run().await else {
+        return (Vec::new(), Vec::new());
+    };
+    let gitlinks: Vec<String> = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter_map(|rec| {
+            let rec = String::from_utf8_lossy(rec);
+            let (meta, path) = rec.split_once('\t')?;
+            meta.starts_with("160000 ").then(|| path.to_string())
+        })
+        .collect();
+    if gitlinks.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let declared: BTreeSet<String> = g(repo)
+        .args(["config", "--blob", &format!("{}:.gitmodules", upstream_ref), "--get-regexp", r"^submodule\..*\.path$"])
+        .ok_text()
+        .await
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once(' ').map(|(_, v)| v.trim().to_string()))
+        .collect();
+    gitlinks.into_iter().partition(|p| declared.contains(p))
+}
+
+/// The same address, give or take a trailing slash.
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
 async fn fetch_remote(repo: &Path, remote: &str, extra: &[&str]) -> Result<(), String> {
     let mut args = vec!["fetch", "--quiet", "--no-recurse-submodules", "--", remote];
     args.extend_from_slice(extra);
@@ -1245,21 +1423,67 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
     let subs_listed = crate::submodules::list_submodules(repo_path).await?;
     let mut fetch_errors: BTreeMap<String, String> = BTreeMap::new();
     if fetch {
-        let mut jobs: Vec<(String, PathBuf, String)> = vec![(String::new(), repo.clone(), remote.clone())];
-        for s in subs_listed.iter().filter(|s| s.listed && s.initialised && s.gitdir_valid) {
-            jobs.push((s.path.clone(), repo.join(&s.path), s.upstream_remote.clone().unwrap_or_else(|| "origin".into())));
+        if let Err(e) = fetch_remote(&repo, &remote, &[]).await {
+            return Err(AppError::Command(format!("Fetching {} failed: {}", remote, e)));
         }
+    }
+    // Where upstream now says each submodule lives. One whose address changed
+    // in upstream's .gitmodules is fetched from the new one, parked under
+    // refs/gitswitch-moved/ so a preview leaves its remote-tracking branches
+    // alone; the run re-points it (git submodule sync), fetches for real and
+    // clears the parking.
+    let super_url = g(&repo).args(["config", "--get", &format!("remote.{}.url", remote)]).ok_text().await.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let base_for_urls = g(&repo).args(["merge-base", "HEAD", &upstream_ref]).ok_text().await.map(|s| s.trim().to_string()).unwrap_or_default();
+    let mut url_changes: BTreeMap<String, UrlChange> = BTreeMap::new();
+    let mut url_differs: BTreeMap<String, UrlChange> = BTreeMap::new();
+    for s in subs_listed.iter().filter(|s| s.listed && s.initialised && s.gitdir_valid) {
+        let Some(name) = s.name.as_deref() else { continue };
+        let sub_remote = s.upstream_remote.clone().unwrap_or_else(|| "origin".into());
+        let Some(declared) = declared_url(&repo, &upstream_ref, name).await else { continue };
+        let Some(configured) = g(&repo.join(&s.path)).args(["config", "--get", &format!("remote.{}.url", sub_remote)]).ok_text().await.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else { continue };
+        let to = resolve_submodule_url(super_url.as_deref(), &declared);
+        if same_url(&to, &configured) {
+            continue;
+        }
+        // Upstream moved it only when its declaration differs from where we
+        // parted; otherwise the address here is this checkout's own choice (a
+        // mirror, ssh for https), which the update leaves alone.
+        let base_declared = if base_for_urls.is_empty() { None } else { declared_url(&repo, &base_for_urls, name).await.map(|d| resolve_submodule_url(super_url.as_deref(), &d)) };
+        let moved = match &base_declared {
+            Some(b) => !same_url(b, &to),
+            None => true,
+        };
+        if moved {
+            url_changes.insert(s.path.clone(), UrlChange { from: configured, to });
+        } else {
+            url_differs.insert(s.path.clone(), UrlChange { from: configured, to });
+        }
+    }
+    if fetch {
+        let jobs: Vec<(String, PathBuf, String, Option<String>)> = subs_listed
+            .iter()
+            .filter(|s| s.listed && s.initialised && s.gitdir_valid)
+            .map(|s| (s.path.clone(), repo.join(&s.path), s.upstream_remote.clone().unwrap_or_else(|| "origin".into()), url_changes.get(&s.path).map(|u| u.to.clone())))
+            .collect();
         for batch in jobs.chunks(FETCH_FANOUT) {
             let tasks: Vec<_> = batch
                 .iter()
                 .cloned()
-                .map(|(path, dir, rem)| tokio::spawn(async move { (path, fetch_remote(&dir, &rem, &[]).await) }))
+                .map(|(path, dir, rem, moved_to)| {
+                    tokio::spawn(async move {
+                        let r = match moved_to {
+                            Some(url) => {
+                                let spec = format!("+refs/heads/*:refs/gitswitch-moved/{}/*", rem);
+                                fetch_remote(&dir, &url, &[spec.as_str()]).await
+                            }
+                            None => fetch_remote(&dir, &rem, &[]).await,
+                        };
+                        (path, r)
+                    })
+                })
                 .collect();
             for t in tasks {
                 if let Ok((path, Err(e))) = t.await {
-                    if path.is_empty() {
-                        return Err(AppError::Command(format!("Fetching {} failed: {}", remote, e)));
-                    }
                     fetch_errors.insert(path, e);
                 }
             }
@@ -1330,6 +1554,9 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
     // --no-renames: a file upstream renamed is an addition at its new path
     // all the same, and an untracked file sitting there is in its way.
     let upstream_added = name_only(&repo, &["diff", "--name-only", "--diff-filter=A", "--no-renames", "--ignore-submodules=none", &format!("HEAD...{}", upstream_ref)]).await;
+    // Submodules upstream added: the run downloads the ones its .gitmodules
+    // declares; one without an entry cannot be fetched by anything.
+    let (new_submodules, new_unmapped) = new_gitlinks(&repo, &upstream_ref, &upstream_added).await;
     let mine_changed = name_only(&repo, &["log", "--name-only", "--format=", "--ignore-submodules=none", &format!("{}..HEAD", upstream_ref)]).await;
     let (dirty_tracked, untracked) = dirty_sets(&repo).await;
     let file_overlap: Vec<String> = mine_changed.intersection(&upstream_changed).cloned().collect();
@@ -1417,6 +1644,8 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
             operation: s.operation.clone(),
             fetch_error: fetch_errors.get(&s.path).cloned(),
             has_nested: sub.join(".gitmodules").exists(),
+            url_change: url_changes.get(&s.path).cloned(),
+            url_differs: url_differs.get(&s.path).cloned(),
             incoming_commits: Vec::new(),
             own_commits: Vec::new(),
             own_total: 0,
@@ -1503,7 +1732,8 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
                     },
                 };
                 if let Some(tip) = tip {
-                    f.tip_ahead_of_target = !same_oid(&tip, t) && is_ancestor(&sub, t, &tip).await;
+                    // Not for a moved submodule: its remote-tracking tip is the old address's.
+                    f.tip_ahead_of_target = f.url_change.is_none() && !same_oid(&tip, t) && is_ancestor(&sub, t, &tip).await;
                 }
             }
         }
@@ -1577,6 +1807,8 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
             identity_mismatch: false,
             identity_email: String::new(),
             profile_email: None,
+            new_submodules,
+            new_unmapped,
         },
         submodules,
         skipped,
@@ -2113,6 +2345,34 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
         }
         let path = st.subs[i].path.clone();
         let sub = repo.join(&path);
+        if let Some(u) = st.subs[i].url_change.clone().filter(|_| st.subs[i].url_note.is_none()) {
+            let to = crate::repo_scan::mask_token(&u.to);
+            let remote = st.subs[i].remote.clone().unwrap_or_else(|| "origin".into());
+            let dead = st.plan.submodules.iter().find(|p| p.path == path).and_then(|p| p.fetch_error.clone());
+            if let Some(e) = dead {
+                // The new address did not answer at preview time: the working
+                // one stays, and the result says so.
+                st.subs[i].url_note = Some(format!("not re-pointed at {}: fetching from there failed at preview time ({}); it still fetches from {}", to, e, crate::repo_scan::mask_token(&u.from)));
+            } else {
+                // .gitmodules is the rebased branch's now: `git submodule sync`
+                // points the submodule (and the superproject's record of it) at
+                // the address it declares; then its branches are fetched from
+                // there. The note names the address actually left in place.
+                let synced = g(repo).args(["submodule", "sync", "--", &path]).timeout(LOCAL_TIMEOUT).run().await.map(|o| o.ok()).unwrap_or(false);
+                st.subs[i].url_synced = synced;
+                let now = g(&sub).args(["config", "--get", &format!("remote.{}.url", remote)]).ok_text().await.map(|t| crate::repo_scan::mask_token(t.trim())).unwrap_or_default();
+                st.subs[i].url_note = Some(if !synced {
+                    format!("could not be re-pointed at {} (git submodule sync failed)", to)
+                } else {
+                    match fetch_remote(&sub, &remote, &[]).await {
+                        Ok(()) => format!("now fetches from {}", now),
+                        Err(e) => format!("re-pointed at {}, but fetching from there failed: {}", now, e),
+                    }
+                });
+                clear_parked(&sub, &remote).await;
+            }
+            write_state_at(state_file, st)?;
+        }
         let Some(recorded) = gitlink_at(repo, "HEAD", &path).await else { continue };
         let Some(head) = oid(&sub, "HEAD").await else { continue };
         st.subs[i].target = recorded.clone();
@@ -2183,6 +2443,47 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
         st.subs[i].aligned = true;
         st.subs[i].head_after = Some(new_head);
         st.subs[i].note = format!("your commits rebased onto {}; the superproject does not record them yet", short(&recorded));
+    }
+    // Submodules upstream added: downloaded at the commit the rebased branch
+    // records, as `git submodule update --init` would — one at a time, so one
+    // that fails does not stop the next; each is named in the result. An
+    // abort never undoes a download (there was nothing there before).
+    let fresh: Vec<String> = st.plan.superproject.new_submodules.iter().filter(|p| !st.subs.iter().any(|s| &s.path == *p)).cloned().collect();
+    for path in fresh {
+        let sub = repo.join(&path);
+        let recorded = gitlink_at(repo, "HEAD", &path).await.unwrap_or_default();
+        let (ok, note) = if sub.join(".git").exists() {
+            (true, "new upstream; already downloaded".to_string())
+        } else if recorded.is_empty() {
+            (false, "new upstream; the rebased branch does not record it after all".to_string())
+        } else {
+            let url = g(repo).args(["config", "--get", &format!("remote.{}.url", st.plan.superproject.remote)]).ok_text().await.unwrap_or_default();
+            let report = crate::sparse::update_submodules(repo, None, None, url.trim(), Some(std::slice::from_ref(&path)), None).await;
+            match (&report.error, report.downloaded) {
+                (None, n) if n > 0 => (true, format!("new upstream; downloaded at {}", short(&recorded))),
+                (None, _) => (false, "new upstream; could not be downloaded — Download it from the Submodules tab".to_string()),
+                (Some(e), _) => (false, format!("new upstream; could not be downloaded: {} — Download it from the Submodules tab", e.trim())),
+            }
+        };
+        st.subs.push(SubState {
+            path: path.clone(),
+            branch_before: None,
+            reattach_to: None,
+            head_before: String::new(),
+            backup: None,
+            target: recorded.clone(),
+            rebased: false,
+            head_after: oid(&sub, "HEAD").await,
+            aligned: ok,
+            note,
+            stash_before: None,
+            reattached: None,
+            url_change: None,
+            url_synced: false,
+            url_note: None,
+            remote: None,
+        });
+        write_state_at(state_file, st)?;
     }
     st.phase = "done".into();
     write_state_at(state_file, st)
@@ -2373,6 +2674,10 @@ fn outcome_action(s: &SubState, planned: Option<&str>, phase: &str) -> String {
         "left-as-moved"
     } else if s.note.starts_with("could not be aligned") {
         "could-not-align"
+    } else if s.note.starts_with("new upstream; downloaded") || s.note.starts_with("new upstream; already downloaded") {
+        "downloaded"
+    } else if s.note.starts_with("new upstream") {
+        "could-not-download"
     } else if s.rebased {
         "rebased"
     } else if s.note.starts_with("fast-forwarded") {
@@ -2702,7 +3007,11 @@ async fn build_outcome(repo: &Path, st: &SyncState) -> SyncOutcome {
             head_after: head_now,
             recorded_after: recorded,
             ok,
-            note: s.note.clone(),
+            note: match &s.url_note {
+                Some(u) if s.note.is_empty() => u.clone(),
+                Some(u) => format!("{}; {}", s.note, u),
+                None => s.note.clone(),
+            },
         });
     }
     SyncOutcome {
@@ -2817,6 +3126,12 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
                 note: String::new(),
                 stash_before: None,
                 reattached: None,
+                // Unmasked, from the facts: the state compares it with the
+                // configuration when an abort puts the address back.
+                url_change: facts.submodules.iter().find(|f| f.path == p.path).and_then(|f| f.url_change.clone()),
+                url_synced: false,
+                url_note: None,
+                remote: p.remote.clone(),
             })
             .collect(),
         needs_user: None,
@@ -3030,7 +3345,8 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
     // moved for that reason alone.)
     if st.plan.superproject.behind > 0 && oid(&repo, "HEAD").await.as_deref() == Some(st.head_before.as_str()) {
         // What the update had already moved goes back too, as Abort would.
-        let notes = put_back_submodules(&repo, &mut st).await;
+        let mut notes = put_back_submodules(&repo, &mut st).await;
+        notes.extend(put_back_urls(&repo, &mut st).await);
         st.phase = "aborted".into();
         let mut r = finish(repo_path, &st, &state_file).await?;
         if !notes.is_empty() {
@@ -3111,11 +3427,42 @@ async fn published(repo: &Path, commit: &str) -> bool {
 /// progress is aborted, a finished rebase or a fast-forward undone, a branch
 /// moved to re-attach a detached checkout restored — only when clean, never
 /// at the cost of uncommitted work. Returns one note per submodule touched.
+/// A submodule the update re-pointed is pointed back. With the superproject
+/// at its pre-update commit, `.gitmodules` declares the address it had and
+/// `git submodule sync` restores it; when the superproject could not go back
+/// (uncommitted changes), the address stays, and the note says so.
+async fn put_back_urls(repo: &Path, st: &mut SyncState) -> Vec<String> {
+    let mut notes = Vec::new();
+    for s in st.subs.iter_mut() {
+        let Some(u) = s.url_change.clone().filter(|_| s.url_synced) else { continue };
+        let sub = repo.join(&s.path);
+        let remote = s.remote.clone().unwrap_or_else(|| "origin".into());
+        let ok = g(repo).args(["submodule", "sync", "--", &s.path]).timeout(LOCAL_TIMEOUT).run().await.map(|o| o.ok()).unwrap_or(false);
+        clear_parked(&sub, &remote).await;
+        let now = g(&sub).args(["config", "--get", &format!("remote.{}.url", remote)]).ok_text().await.map(|t| t.trim().to_string()).unwrap_or_default();
+        let (from, now_shown) = (crate::repo_scan::mask_token(&u.from), crate::repo_scan::mask_token(&now));
+        if ok && same_url(&now, &u.from) {
+            s.url_synced = false;
+            s.url_note = Some(format!("fetches from {} again", from));
+            notes.push(format!("{}: its address was put back to {}", s.path, from));
+        } else {
+            s.url_note = Some(format!("still points at {}", now_shown));
+            notes.push(format!("{}: still points at {}; `git submodule sync -- {}` puts it back once .gitmodules declares {} again", s.path, now_shown, s.path, from));
+        }
+    }
+    notes
+}
+
 async fn put_back_submodules(repo: &Path, st: &mut SyncState) -> Vec<String> {
     let mut notes: Vec<String> = Vec::new();
     let handed_over = st.handed_over.clone();
     for s in st.subs.iter_mut() {
         let sub = repo.join(&s.path);
+        // Downloaded by the update because upstream added it: there was nothing
+        // there before, and nothing is taken away.
+        if s.head_before.is_empty() {
+            continue;
+        }
         if rebase_in_progress(&sub).await {
             let _ = g(&sub).args(["rebase", "--abort"]).timeout(LOCAL_TIMEOUT).run().await;
         }
@@ -3222,6 +3569,8 @@ pub async fn sync_abort(repo_path: &str) -> Result<OpResult, AppError> {
             notes.push(format!("the superproject was left as rebased because it has uncommitted changes; its pre-update tip is branch {}", st.backup.clone().unwrap_or_default()));
         }
     }
+    // After the superproject, whose .gitmodules decides where they point.
+    notes.extend(put_back_urls(&repo, &mut st).await);
     st.phase = "aborted".into();
     st.needs_user = None;
     let mut r = finish(repo_path, &st, &state_file).await?;
@@ -3354,6 +3703,21 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn gitmodules_urls_resolve_the_way_git_resolves_them() {
+        let r = |base: Option<&str>, url: &str| resolve_submodule_url(base, url);
+        assert_eq!(r(Some("git@github.com:org/repo.git"), "https://x.test/y.git"), "https://x.test/y.git");
+        assert_eq!(r(Some("git@github.com:org/repo.git"), "../lib.git"), "git@github.com:org/lib.git");
+        assert_eq!(r(Some("git@github.com:repo.git"), "../lib.git"), "git@github.com:lib.git");
+        assert_eq!(r(Some("https://github.com/org/repo.git/"), "../lib.git"), "https://github.com/org/lib.git");
+        assert_eq!(r(Some("https://github.com/org/repo.git"), "../../other/lib.git"), "https://github.com/other/lib.git");
+        assert_eq!(r(Some("https://github.com/org/repo.git"), "./lib"), "https://github.com/org/repo.git/lib");
+        assert_eq!(r(Some("/srv/git/repo.git"), "../lib.git"), "/srv/git/lib.git");
+        assert_eq!(r(None, "../lib.git"), "../lib.git");
+        assert!(same_url("https://x.test/y.git/", "https://x.test/y.git"));
+        assert!(!same_url("https://x.test/y.git", "https://x.test/y"));
+    }
+
     fn sub(path: &str) -> SubFacts {
         SubFacts {
             path: path.into(),
@@ -3839,6 +4203,10 @@ mod tests {
             note: note.into(),
             stash_before: None,
             reattached: None,
+            url_change: None,
+            url_synced: false,
+            url_note: None,
+            remote: None,
         };
         assert_eq!(outcome_action(&st("fast-forwarded to abc1234", false), Some("fast-forward"), "done"), "fast-forwarded");
         assert_eq!(outcome_action(&st("rebased (conflicts resolved by you)", true), Some("rebase"), "done"), "rebased");

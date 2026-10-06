@@ -29,6 +29,8 @@ export type RepoActions = StripActions & {
   recordPointers: (repo: string) => Promise<unknown>;
   /** One commit in `repo` recording where the submodule `sub` is checked out now (a row's "Record this pointer"). */
   recordOne: (repo: string, sub: string) => Promise<unknown>;
+  /** A branch at a detached submodule's checkout, so its commits can be kept and pushed. */
+  startBranch: (repo: string, sub: string, name: string) => Promise<unknown>;
   /** Runs an assessed plan (the Update drawer's "Update now"). */
   update: (repo: string, stash: boolean, bundles: boolean, fingerprint: [string, string][]) => Promise<unknown>;
   /** Stashes the uncommitted changes that collide with the update, so it can run. */

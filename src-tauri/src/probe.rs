@@ -161,7 +161,7 @@ pub(crate) mod tests {
             "changes_unstage" => forward!(c::changes_unstage, args, repo_path, paths),
             "changes_discard" => forward!(c::changes_discard, args, repo_path, paths),
             "changes_commit" => forward!(c::changes_commit, args, repo_path, message, amend),
-            "changes_push" => forward!(c::changes_push, args, repo_path, set_upstream),
+            "changes_push" => forward!(c::changes_push, args, repo_path, set_upstream, allow_unpushed_submodules),
             "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash),
             "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path, paths),
             "changes_lfs_pull" => forward!(c::changes_lfs_pull, args, repo_path),
@@ -210,7 +210,7 @@ pub(crate) mod tests {
             "changes_stash_restore_file" => forward!(c::changes_stash_restore_file, args, repo_path, index, path, oid),
             // History page
             "history_branches" => forward!(c::history_branches, args, repo_path),
-            "history_page" => forward!(c::history_page, args, repo_path, rev, offset, limit, search, authors, hide_pointer_only),
+            "history_page" => forward!(c::history_page, args, repo_path, rev, offset, limit, search, authors, hide_pointer_only, unpushed_only),
             "history_commit_detail" => forward!(c::history_commit_detail, args, repo_path, hash),
             "history_branch_merges" => forward!(c::history_branch_merges, args, repo_path, branch),
             "history_fetch" => forward!(c::history_fetch, args, repo_path),
@@ -285,7 +285,7 @@ pub(crate) mod tests {
                 let amend = a.get(1).map(|s| s == "amend").unwrap_or(false);
                 show(git_ops::commit(&repo(), first, amend).await)
             }
-            "push" => show(git_ops::push(&repo(), first == "upstream").await),
+            "push" => show(git_ops::push(&repo(), first == "upstream", false).await),
             // PROBE_ARGS: "<mode>[,lfs][,autostash]"
             "pull" => {
                 let with_lfs = a.iter().skip(1).any(|s| s == "lfs");
@@ -454,7 +454,7 @@ pub(crate) mod tests {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),
             },
-            "hpage" => match crate::git_history::history_page(&repo(), "HEAD", 0, 20, None, None, a.iter().any(|s| s == "hide-pointer-only")) {
+            "hpage" => match crate::git_history::history_page(&repo(), "HEAD", 0, 20, None, None, a.iter().any(|s| s == "hide-pointer-only"), a.iter().any(|s| s == "unpushed-only")) {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),
             },
