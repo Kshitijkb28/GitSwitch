@@ -210,7 +210,7 @@ pub(crate) mod tests {
             "changes_stash_restore_file" => forward!(c::changes_stash_restore_file, args, repo_path, index, path, oid),
             // History page
             "history_branches" => forward!(c::history_branches, args, repo_path),
-            "history_page" => forward!(c::history_page, args, repo_path, rev, offset, limit, search, author),
+            "history_page" => forward!(c::history_page, args, repo_path, rev, offset, limit, search, authors, hide_pointer_only),
             "history_commit_detail" => forward!(c::history_commit_detail, args, repo_path, hash),
             "history_branch_merges" => forward!(c::history_branch_merges, args, repo_path, branch),
             "history_fetch" => forward!(c::history_fetch, args, repo_path),
@@ -453,7 +453,7 @@ pub(crate) mod tests {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),
             },
-            "hpage" => match crate::git_history::history_page(&repo(), "HEAD", 0, 20, None, None) {
+            "hpage" => match crate::git_history::history_page(&repo(), "HEAD", 0, 20, None, None, a.iter().any(|s| s == "hide-pointer-only")) {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),
             },

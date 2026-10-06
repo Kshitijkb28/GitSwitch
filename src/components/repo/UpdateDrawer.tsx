@@ -27,7 +27,11 @@ export function UpdateDrawer({ repoPath, status, busy, onClose, onRun, onRemedy 
   const [bundles, setBundles] = usePersistedState("changes.syncBundles", false);
   const st = useUpdatePlan(repoPath);
   const blocked = whyNoPreview(status);
-  const upstream = status.upstream ?? "upstream";
+  // git spells an upstream "remotes/origin/main" when a local branch shares
+  // its short name; the words here use the plain name, the command line git's
+  // own unambiguous one.
+  const rawUpstream = status.upstream ?? "upstream";
+  const upstream = rawUpstream.replace(/^(refs\/)?remotes\//, "");
   const [replanWhenFresh, setReplanWhenFresh] = useState(false);
   const statusRef = useRef(status);
   statusRef.current = status;
@@ -35,7 +39,7 @@ export function UpdateDrawer({ repoPath, status, busy, onClose, onRun, onRemedy 
   // Opening without a plan assesses once (a fetch); a refused run re-assesses too.
   useEffect(() => {
     if (blocked || st.assessing) return;
-    if (!st.plan || st.moved) void assess(repoPath, statusRef.current, stash, true);
+    if (!st.plan || (st.moved && !st.movedPlanned)) void assess(repoPath, statusRef.current, stash, true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repoPath, st.moved]);
 
@@ -48,15 +52,23 @@ export function UpdateDrawer({ repoPath, status, busy, onClose, onRun, onRemedy 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [replanWhenFresh, status.head_oid, status.stash_count, status.untracked_count]);
 
+  // Closing (or running) means the new plan was read. Said by the person's
+  // own act, not by the drawer going away: the page takes it down for a
+  // moment whenever the repository is being re-read, and the note that
+  // upstream moved must still be there when it comes back.
+  const close = () => {
+    clearMoved(repoPath);
+    onClose();
+  };
+  const closeRef = useRef(close);
+  closeRef.current = close;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") closeRef.current();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-  // Closing (or running) means the new plan was read.
-  useEffect(() => () => clearMoved(repoPath), [repoPath]);
+  }, []);
 
   const onStash = (v: boolean) => {
     setStash(v);
@@ -69,16 +81,20 @@ export function UpdateDrawer({ repoPath, status, busy, onClose, onRun, onRemedy 
       onStash(true);
       return;
     }
+    // These take the drawer down: that is a close, and the "upstream moved
+    // while you were reading" note is over with it.
+    if (code === "open" || code === "untracked-in-the-way" || code === "choose-branch") clearMoved(repoPath);
     await onRemedy(code, sub);
     if (code === "record-pointers" || code === "reinit" || code === "stash-collides") setReplanWhenFresh(true);
   };
 
   const plan = st.plan;
-  const canRun = !!plan && plan.can_run && !busy && !st.assessing;
+  // A plan kept from earlier is not runnable while the repository itself says no.
+  const canRun = !!plan && plan.can_run && !busy && !st.assessing && blocked === null;
 
   return (
     <div className="fixed inset-0 z-40 flex justify-end">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-[1px]" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-[1px]" onClick={close} />
       <div
         role="dialog"
         aria-label="Update"
@@ -97,7 +113,7 @@ export function UpdateDrawer({ repoPath, status, busy, onClose, onRun, onRemedy 
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={close}
             aria-label="Close"
             className="p-1 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer shrink-0"
           >
@@ -134,12 +150,14 @@ export function UpdateDrawer({ repoPath, status, busy, onClose, onRun, onRemedy 
             <details className="text-xs text-zinc-500">
               <summary className="cursor-pointer select-none hover:text-zinc-400">What git will run</summary>
               <ol className="mt-1 space-y-0.5 list-decimal list-inside font-mono">
-                <li>git fetch {upstream.split("/")[0]}</li>
+                <li>git fetch {plan.superproject.remote || upstream.split("/")[0]}</li>
                 <li>git branch gitswitch-before-sync-&lt;time&gt; (a backup of where you are)</li>
-                <li>
-                  git rebase {stash ? "--autostash " : ""}
-                  {upstream} — your commits on top of what came in
-                </li>
+                {plan.superproject.behind > 0 && (
+                  <li>
+                    git rebase {plan.superproject.will_stash ? "--autostash " : ""}
+                    {rawUpstream} — your commits on top of what came in
+                  </li>
+                )}
                 {plan.submodules.some((s) => s.action === "rebase") && (
                   <li>in each submodule that carries your commits: git rebase onto the commit the superproject records</li>
                 )}
@@ -167,7 +185,10 @@ export function UpdateDrawer({ repoPath, status, busy, onClose, onRun, onRemedy 
               variant="primary"
               disabled={!canRun}
               title={plan.can_run ? "Runs exactly the plan above" : "Clear the blockers above first"}
-              onClick={() => onRun(stash, bundles, plan.fingerprint)}
+              onClick={() => {
+                clearMoved(repoPath);
+                onRun(stash, bundles, plan.fingerprint);
+              }}
               className="min-w-[8rem]"
             >
               <Play size={13} />

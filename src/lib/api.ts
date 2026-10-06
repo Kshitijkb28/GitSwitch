@@ -166,6 +166,12 @@ export interface HistoryCommit {
   subject: string;
   refs: string[];
   is_merge: boolean;
+  /** The author date, stable across rebases; `date` is the committer date. */
+  author_date: string;
+  /** Submodule pointers this commit moves. */
+  touches_submodules: string[];
+  /** Changes nothing but submodule pointers: a bump, not work. */
+  only_submodules: boolean;
   lane: number;
   parent_lanes: number[];
   active_lanes: number[];
@@ -298,7 +304,8 @@ export async function historyPage(
   offset: number,
   limit: number,
   search?: string | null,
-  author?: string | null
+  authors?: string[] | null,
+  hidePointerOnly = false
 ): Promise<HistoryPage> {
   return invoke("history_page", {
     repoPath,
@@ -306,7 +313,8 @@ export async function historyPage(
     offset,
     limit,
     search: search ?? null,
-    author: author ?? null,
+    authors: authors ?? null,
+    hidePointerOnly,
   });
 }
 
@@ -813,6 +821,11 @@ export interface SyncSummary {
   /** For a submodule's own status: its path in the superproject and the commit it is rebased onto. */
   sub_path: string | null;
   sub_target: string | null;
+  /**
+   * The pause is a submodule pointer the update could not place itself, still
+   * unmerged here: stage it in this repository ("Mark resolved" on its row).
+   */
+  handed_over?: boolean;
 }
 
 export interface SyncNeedsUser {
@@ -1490,6 +1503,8 @@ export interface SyncCommitRef {
   only_pointers: boolean;
   /** Upstream already carries this change: the rebase drops it. */
   already_upstream: boolean;
+  /** In an outcome: left out because nothing of it remained once its conflict was resolved. */
+  resolved_away?: boolean;
 }
 
 export interface SyncSubPlan {
@@ -1511,7 +1526,8 @@ export interface SyncSubPlan {
   fetch_error: string | null;
   notes: string[];
   /**
-   * When blocked, a stable code for the remedy: reinit | finish-operation |
+   * When blocked, a stable code for the remedy (also: untracked-inside |
+   * commit-first): reinit | finish-operation |
    * resolve-conflicts | removed-upstream | fetch-failed | unreachable |
    * record-pointers | squash-own | stash-inside. Buttons key on this, never
    * on the sentence.
@@ -1527,6 +1543,8 @@ export interface SyncSubPlan {
 export interface SyncSuperPlan {
   branch: string;
   upstream: string;
+  /** The remote the update fetches from. */
+  remote?: string;
   head: string;
   upstream_oid: string;
   ahead: number;
@@ -1548,6 +1566,8 @@ export interface SyncSuperPlan {
   /** Commits beyond the 30 listed on each side. */
   more_incoming: number;
   more_own: number;
+  /** Of the commits beyond the listed ones, how many upstream already has (they are dropped too). */
+  more_own_dropped?: number;
 }
 
 export interface SyncSkipped {
@@ -1565,6 +1585,8 @@ export interface SyncPlan {
   submodules: SyncSubPlan[];
   skipped: SyncSkipped[];
   /** Oids the run re-checks: ["", upstream] then [path, target] per submodule. */
+  /** The superproject HEAD the plan was made for; a plan for another HEAD is stale. */
+  head_oid?: string | null;
   fingerprint: [string, string][];
   summary: string;
 }
@@ -1606,6 +1628,8 @@ export interface SyncOutcome {
   head_after: string;
   incoming: number;
   own_kept: SyncCommitRef[];
+  /** How many commits of yours are on top — all of them; `own_kept` lists the newest. */
+  own_kept_total?: number;
   own_dropped: SyncCommitRef[];
   stashed: boolean;
   /** An autostash entry git could not re-apply is still in `git stash list`. */
@@ -1666,6 +1690,8 @@ export interface ConflictView {
   truncated: boolean;
   sides: Sides;
   total_lines: number;
+  /** The file is larger than what was read: a count of zero does not mean resolved. */
+  partial?: boolean;
 }
 
 /** A conflicted file split into what each side wants, for the resolution view. */

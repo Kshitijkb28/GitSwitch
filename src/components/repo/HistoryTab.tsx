@@ -23,6 +23,7 @@ import { CommitDetailPanel } from "../history/CommitDetailPanel";
 import { usePersistedState } from "../../lib/persist";
 import { useGitJob } from "../../lib/gitJobs";
 import * as api from "../../lib/api";
+import { formatWhen } from "../../lib/time";
 
 /** Refusals the detail panel answers inline (a note, a re-asked question) — it stays open for these. */
 const PANEL_HANDLES = new Set(["would-drop-pushed", "merge-commit-needs-mainline"]);
@@ -100,12 +101,37 @@ interface Props {
   /** The account filter's profile id ("" = all) and that profile's email, for "only mine". */
   account: string;
   accountEmail: string;
+  /** The accounts have been read: until then `accountEmail` is empty for a reason that will pass. */
+  accountsReady: boolean;
   visible: boolean;
   /** Bumped by the page when the repository moved (a fetch, a pull, any operation). */
   reloadKey: number;
   onOpenChanges: () => void;
   /** This tab moved the repository (a fetch, a detach, a reset…): the strip must re-read it. */
   onRepoChanged: () => void;
+  /** The repository has submodules: pointer-only commits can be hidden. */
+  hasSubmodules: boolean;
+}
+
+/** The most `--author` patterns one history read is given (the Windows command line has a limit). */
+const MAX_AUTHOR_FILTER = 200;
+/** How many people the backend lists at most: a list that long may be cut short. */
+const AUTHORS_LISTED = 300;
+
+/**
+ * What a person is filtered by. An address is matched whole by the backend
+ * (it wraps it in its angle brackets). A commit with no address, or with one
+ * that is not an address (`jdoe <jdoe>`, an import), is matched by its whole
+ * identity, anchored at both ends — a bare name would also mean everyone
+ * whose name or address merely contains it.
+ */
+function personKey(a: api.AuthorCount): string {
+  return a.email.includes("@") ? a.email : `${a.name} <${a.email}>`;
+}
+
+/** A bot or a CI identity, by the names and addresses they use. */
+function isBot(a: api.AuthorCount): boolean {
+  return /\[bot\]/i.test(a.name) || /^(github|github actions)$/i.test(a.name.trim()) || /\[bot\]|noreply@github\.com|^actions@|^ci@|dependabot|renovate|github-actions/i.test(a.email);
 }
 
 /**
@@ -113,12 +139,15 @@ interface Props {
  * History page, minus its picker, Fetch and Check GitHub, which now sit above
  * the tabs.
  */
-export function HistoryTab({ repo, account, accountEmail, visible, reloadKey: outerReload, onOpenChanges, onRepoChanged }: Props) {
+export function HistoryTab({ repo, account, accountEmail, accountsReady, visible, reloadKey: outerReload, onOpenChanges, onRepoChanged, hasSubmodules }: Props) {
   const toast = useToast();
   const [onlyMine, setOnlyMine] = usePersistedState("history.onlyMine", false);
   // The people filter: an author email, "" for everyone. It beats "only this
   // account" when both are set, since it is the more specific choice.
   const [author, setAuthor] = usePersistedState("history.author", "");
+  // CI bumps fill a superproject's history; this hides commits that move
+  // nothing but submodule pointers.
+  const [hidePointerOnly, setHidePointerOnly] = usePersistedState("history.hidePointerOnly", false);
   const [authors, setAuthors] = useState<api.AuthorCount[]>([]);
   const authorsSeq = useRef(0);
   const [branches, setBranches] = useState<api.BranchInfo[]>([]);
@@ -210,7 +239,6 @@ export function HistoryTab({ repo, account, accountEmail, visible, reloadKey: ou
     loadSync(repo, rev);
     loadMergeInfo(repo, rev);
     setReloadKey((k) => k + 1);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [outerReload]);
 
   const loadBranches = useCallback(async (path: string) => {
@@ -338,16 +366,50 @@ export function HistoryTab({ repo, account, accountEmail, visible, reloadKey: ou
     loadBranches(repo);
   }, [repo, loadBranches]);
 
-  const effectiveAuthor = author || (onlyMine && accountEmail ? accountEmail : null);
+  // The people filter resolves to a list of emails: one person, "me", or
+  // everyone who is not a bot. Null means everyone.
+  const people = authors.filter((a) => !isBot(a));
+  const bots = authors.length - people.length;
+  const mine = accountEmail ? authors.find((a) => a.email.toLowerCase() === accountEmail.toLowerCase()) : undefined;
+  // How "me" is asked for: an address as it is (the backend matches it whole);
+  // an account "address" without an @ (an import's `sam <sam>`) by the whole
+  // identity when that person is in the list, else by the address in its
+  // brackets — a bare word would also mean everyone whose name or address
+  // contains it.
+  const meFilter: string[] | null = !accountEmail ? null : accountEmail.includes("@") ? [accountEmail] : mine ? [personKey(mine)] : [`<${accountEmail}>`];
+  // "People only" is the list of everyone who is not a bot, so it is offered
+  // only while there is a bot to leave out and the list is one git can be
+  // handed whole — cut short, it would hide people instead of bots.
+  const peopleOffered = bots > 0 && people.length > 0 && people.length <= MAX_AUTHOR_FILTER && authors.length < AUTHORS_LISTED;
+  const effectiveAuthors: string[] | null =
+    author === "me"
+      ? meFilter
+      : author === "people"
+        ? peopleOffered
+          ? people.map(personKey)
+          : null
+        : author
+          ? [author]
+          : onlyMine
+            ? meFilter
+            : null;
+  const authorsKey = JSON.stringify(effectiveAuthors);
+  // "Just me" before the accounts are read would be everyone's commits under
+  // that label; the page waits (and says it is loading) until they are.
+  const awaitingMe = !accountsReady && (author === "me" || (!author && onlyMine && !!account));
   useEffect(() => {
     if (!repo) return;
+    if (awaitingMe) {
+      setLoadingPage(true);
+      return;
+    }
     const seq = ++pageSeq.current;
     setLoadingPage(true);
-    api.historyPage(repo, rev, offset, PAGE_SIZE, appliedSearch || null, effectiveAuthor)
+    api.historyPage(repo, rev, offset, PAGE_SIZE, appliedSearch || null, effectiveAuthors, hasSubmodules && hidePointerOnly)
       .then((p) => { if (pageSeq.current === seq) { setPage(p); setError(null); } })
       .catch((e) => { if (pageSeq.current === seq) { setError(String(e)); setPage(null); } })
       .finally(() => { if (pageSeq.current === seq) setLoadingPage(false); });
-  }, [repo, rev, offset, appliedSearch, reloadKey, effectiveAuthor]);
+  }, [repo, rev, offset, appliedSearch, reloadKey, authorsKey, hidePointerOnly, hasSubmodules, awaitingMe]);
 
   // Who commits here — read once per repository and revision, never polled.
   useEffect(() => {
@@ -357,11 +419,18 @@ export function HistoryTab({ repo, account, accountEmail, visible, reloadKey: ou
       .then((list) => { if (authorsSeq.current === seq) setAuthors(list); })
       .catch(() => { if (authorsSeq.current === seq) setAuthors([]); });
   }, [repo, rev, reloadKey]);
-  // A person who is not in this revision's list is no filter at all.
+  // A person who is not in this revision's list is no filter at all — and so
+  // is a preset that does not apply here (kept from another repository).
+  const iCommitHere = !!mine;
   useEffect(() => {
-    if (author && authors.length && !authors.some((a) => a.email === author)) setAuthor("");
-  }, [authors, author, setAuthor]);
-  const authorName = authors.find((a) => a.email === author)?.name ?? author;
+    if (!author || !authors.length) return;
+    // "Just me" cannot be judged before the accounts are read: the people
+    // usually arrive first, and the preset would be thrown away on every visit.
+    if (author === "me" && !accountsReady) return;
+    const stale = author === "me" ? !iCommitHere : author === "people" ? !peopleOffered : !authors.some((a) => personKey(a) === author);
+    if (stale) setAuthor("");
+  }, [authors, author, iCommitHere, peopleOffered, setAuthor, accountsReady]);
+  const authorName = author === "me" ? "me" : author === "people" ? "people only" : (authors.find((a) => personKey(a) === author)?.name ?? author);
 
   useEffect(() => {
     loadSync(repo, rev);
@@ -372,7 +441,6 @@ export function HistoryTab({ repo, account, accountEmail, visible, reloadKey: ou
   useEffect(() => {
     if (!repo || !autoFetch) return;
     doFetch(repo, true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repo, autoFetch]);
 
   async function selectBranch(name: string) {
@@ -665,17 +733,36 @@ export function HistoryTab({ repo, account, accountEmail, visible, reloadKey: ou
                       optionIcon={<UserRound size={14} />}
                       options={[
                         { value: "", label: `Everyone · ${authors.reduce((n, a) => n + a.commits, 0).toLocaleString()}` },
+                        ...(mine ? [{ value: "me", label: `Just me · ${mine.commits.toLocaleString()}` }] : []),
+                        ...(peopleOffered
+                          ? [{ value: "people", label: `People only (hide bots and CI) · ${people.reduce((n, a) => n + a.commits, 0).toLocaleString()}` }]
+                          : []),
                         ...authors.map((a) => ({
-                          value: a.email,
-                          label: `${a.name} · ${a.commits.toLocaleString()}`,
+                          value: personKey(a),
+                          label: `${a.name}${isBot(a) ? " (bot)" : ""} · ${a.commits.toLocaleString()}`,
                         })),
                       ]}
                     />
                   </div>
-                  {author && (
+                  {author && author !== "me" && author !== "people" && (
                     <span className="text-[11px] text-zinc-600 font-mono truncate max-w-[16rem]">{author}</span>
                   )}
                 </div>
+              )}
+
+              {hasSubmodules && (
+                <label className="flex items-start gap-2.5 mb-3 cursor-pointer select-none" title="A commit that changes nothing but submodule pointers — the bumps a CI makes — is left out of the list and the count">
+                  <Checkbox
+                    checked={hidePointerOnly}
+                    onChange={(v) => { setHidePointerOnly(v); setOffset(0); }}
+                    className="mt-0.5"
+                    aria-label="Hide pointer-only commits"
+                  />
+                  <span className="text-xs text-zinc-300">
+                    Hide pointer-only commits
+                    <span className="text-zinc-500"> — the ones that only move a submodule pointer</span>
+                  </span>
+                </label>
               )}
 
               {account && (
@@ -745,6 +832,14 @@ export function HistoryTab({ repo, account, accountEmail, visible, reloadKey: ou
                     <span className="text-sm text-zinc-200 truncate min-w-0 flex-1">
                       {c.subject}
                     </span>
+                    {c.only_submodules && (
+                      <span
+                        className="hidden sm:inline text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-500 shrink-0 truncate max-w-[12rem]"
+                        title={`Changes nothing but the pointer of ${c.touches_submodules.join(", ")}`}
+                      >
+                        submodule bump: {c.touches_submodules.join(", ")}
+                      </span>
+                    )}
                     <span className="hidden xl:flex items-center gap-1 shrink-0 max-w-[26%] overflow-hidden">
                       {c.refs.slice(0, 2).map((r) => (
                         <Badge key={r} variant="default">{r}</Badge>
@@ -753,8 +848,11 @@ export function HistoryTab({ repo, account, accountEmail, visible, reloadKey: ou
                     <span className="hidden md:inline text-xs text-zinc-500 truncate min-w-0 max-w-[18%]">
                       {c.author_name}
                     </span>
-                    <span className="hidden sm:inline text-xs text-zinc-600 shrink-0 tabular-nums" title={c.date}>
-                      {c.date.replace("T", " ").slice(0, 16)}
+                    <span
+                      className="hidden sm:inline text-xs text-zinc-600 shrink-0 tabular-nums"
+                      title={`${formatWhen(c.author_date || c.date).title}${c.author_date && c.author_date !== c.date ? ` · committed ${c.date}` : ""}`}
+                    >
+                      {formatWhen(c.author_date || c.date).text}
                     </span>
                   </button>
                 ))}
@@ -842,7 +940,7 @@ function TipCard({
             {tip.subject}
           </p>
           <p className="text-[11px] text-zinc-600 truncate mt-0.5">
-            {tip.author} · {tip.date.replace("T", " ").slice(0, 16)}
+            {tip.author} · <span title={formatWhen(tip.date).title}>{formatWhen(tip.date).text}</span>
           </p>
         </>
       ) : (

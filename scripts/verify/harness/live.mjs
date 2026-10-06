@@ -867,7 +867,9 @@ try {
     await openChanges();
     ok("Preview update", await click(page, "Preview update"));
     ok("  the plan warns that both sides changed c.txt", await waitText(page, "Both sides changed c.txt"));
-    ok("  and names who did what", (await text(page)).includes("theirs c again (live)") && (await text(page)).includes("Live"));
+    const author = git(WORK, "log", "-1", "--format=%an", "HEAD");
+    const drawerTxt = await page.evaluate(() => document.querySelector('[role="dialog"][aria-label="Update"]')?.innerText ?? "");
+    ok("  and names who did what, in the drawer", drawerTxt.includes("theirs c again (live)") && drawerTxt.includes("mine c again (live)") && author.length > 0 && drawerTxt.includes(author), `author "${author}"`);
     ok("Update now", await click(page, "Update now"));
     ok("  the update pauses on the conflict", await waitText(page, "Update paused: conflicts to resolve."));
     ok("  git: the rebase is stopped on c.txt", exists(`${WORK}/.git/rebase-merge`) && git(WORK, "diff", "--name-only", "--diff-filter=U") === "c.txt");

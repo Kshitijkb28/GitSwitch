@@ -86,6 +86,113 @@ ok "  marks the current one" "$(printf '%s' "$OUT" | python3 -c "import sys,json
 OUT=$(probe hpage "$R")
 ok "returns a page of commits" "$(printf '%s' "$OUT" | jqf total)" "5"
 ok "  with graph lanes assigned" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print('lane' if 'lane' in d['commits'][0] else 'missing')")" "lane"
+ok "  and the author date beside the committer date" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);c=d['commits'][0];print(c['author_date'][:4].isdigit() and c['date'][:4].isdigit())")" "True"
+OUT=$(probe hpage "$SB/clones/withsub")
+ok "a commit that adds a submodule says which pointer it touches" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print([c['touches_submodules'] for c in d['commits'] if 'vendor/sub' in c['touches_submodules']][:1])")" "[['vendor/sub']]"
+ok "  but is not a pointer-only bump: it adds .gitmodules too" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print([c['only_submodules'] for c in d['commits'] if 'vendor/sub' in c['touches_submodules']][:1])")" "[False]"
+git -C "$SB/clones/withsub/vendor/sub" commit -q --allow-empty -m "sub: bump"; git -C "$SB/clones/withsub" add vendor/sub; git -C "$SB/clones/withsub" commit -qm "ci: bump vendor/sub"
+OUT=$(probe hpage "$SB/clones/withsub")
+ok "a commit that only moves the pointer is a bump" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);c=d['commits'][0];print(c['subject'],c['only_submodules'],c['touches_submodules'])")" "ci: bump vendor/sub True ['vendor/sub']"
+OUT=$(probe hpage "$SB/clones/withsub" "hide-pointer-only")
+ok "  and hiding pointer-only commits leaves it out of the list and the count" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print(any(c['subject']=='ci: bump vendor/sub' for c in d['commits']), d['total'])")" "False $(( $(git -C "$SB/clones/withsub" rev-list --count HEAD) - 1 ))"
+# The author's date and the committer's are two facts, each read from its own field.
+AD="$SB/dates"; git init -q -b main "$AD"
+GIT_AUTHOR_DATE="2020-01-02T03:04:05+00:00" GIT_COMMITTER_DATE="2021-06-07T08:09:10+00:00" git -C "$AD" commit -q --allow-empty -m "two dates"
+OUT=$(probe hpage "$AD")
+ok "the author date and the committer date are told apart" "$(printf '%s' "$OUT" | python3 -c "import sys,json;c=json.load(sys.stdin)['commits'][0];print(c['author_date'][:10],c['date'][:10])")" "2020-01-02 2021-06-07"
+# People: an address matches whole and as written; several are any of them.
+for who in "me@x.test" "xme@x.test" "someone@x.testing" "1+me@x.test" "ci[bot]@x.test"; do git -C "$AD" -c user.name="N" -c user.email="$who" commit -q --allow-empty -m "by $who"; done
+by() { local ARGS="{\"repoPath\":\"$AD\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":50,\"search\":null,\"authors\":$1,\"hidePointerOnly\":false}"; pinvoke history_page "$ARGS" | python3 -c "import sys,json;d=json.load(sys.stdin)['value'];print(d['total'], sorted(c['subject'] for c in d['commits']))"; }
+ONE=$(by '["me@x.test"]'); PLUS=$(by '["1+me@x.test"]'); BOT=$(by '["ci[bot]@x.test"]'); TWO=$(by '["me@x.test","someone@x.testing"]'); NONE=$(by '[]')
+ok "one address matches its own commits, not a longer one ending the same" "$ONE" "1 ['by me@x.test']"
+ok "  a plus in an address is literal" "$PLUS" "1 ['by 1+me@x.test']"
+ok "  and so are brackets" "$BOT" "1 ['by ci[bot]@x.test']"
+ok "  several addresses are any of them" "$TWO" "2 ['by me@x.test', 'by someone@x.testing']"
+ok "  and an empty list is everyone" "$NONE" "6 ["
+# A path that was an ordinary folder before it became a submodule: hiding the
+# pointer must not hide the commits that worked on the files it used to hold.
+H="$SB/hist"; git init -q -b main "$H"; git init -q -b main "$SB/hsub"; git -C "$SB/hsub" commit -q --allow-empty -m s1
+mkdir -p "$H/vendor/lib"; printf 'c\n' > "$H/vendor/lib/code.c"; git -C "$H" add -A >/dev/null; git -C "$H" commit -qm "add vendored lib"
+printf 'c2\n' >> "$H/vendor/lib/code.c"; git -C "$H" commit -qam "work inside the vendored folder"
+git -C "$H" rm -q -r vendor/lib; git -C "$H" commit -qm "remove the vendored folder"
+( cd "$H" && git submodule add -q "$SB/hsub" vendor/lib 2>/dev/null ); git -C "$H" commit -qm "vendor/lib becomes a submodule"
+git -C "$H/vendor/lib" commit -q --allow-empty -m s2; git -C "$H" add vendor/lib; git -C "$H" commit -qm "bump vendor/lib"
+OUT=$(probe hpage "$H" "hide-pointer-only")
+ok "hiding pointer-only commits hides the bump" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print(any(c['subject']=='bump vendor/lib' for c in d['commits']))")" "False"
+ok "  and nothing that touched files there while it was a folder" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print(sorted(c['subject'] for c in d['commits']))")" "['add vendored lib', 'remove the vendored folder', 'vendor/lib becomes a submodule', 'work inside the vendored folder']"
+ok "  the count is of those rows" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['total'],len(d['commits']))")" "4 4"
+# A pointer change is a bump whatever the ignore setting says; a merge never is; a name is read as it is.
+git -C "$H" config -f .gitmodules submodule.vendor/lib.ignore all; git -C "$H" commit -qam "ignore = all"
+git -C "$H/vendor/lib" commit -q --allow-empty -m s3
+git -C "$H" update-index --cacheinfo "160000,$(git -C "$H/vendor/lib" rev-parse HEAD),vendor/lib"; git -C "$H" commit -qm "bump again"
+( cd "$H" && git submodule add -q "$SB/hsub" "módulo" 2>/dev/null ); git -C "$H" commit -qm "add módulo"
+git -C "$H/módulo" commit -q --allow-empty -m s4; git -C "$H" add "módulo"; git -C "$H" commit -qm "bump módulo"
+git -C "$H" switch -q -c side; printf 's\n' > "$H/side.txt"; git -C "$H" add side.txt; git -C "$H" commit -qm "side work"
+git -C "$H" switch -q main; printf 'm\n' > "$H/main.txt"; git -C "$H" add main.txt; git -C "$H" commit -qm "main work"; git -C "$H" merge -q --no-ff -m "merge side" side
+OUT=$(probe hpage "$H")
+ok "a bump of a submodule git is told to ignore is still a bump" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print([(c['only_submodules'],c['touches_submodules']) for c in d['commits'] if c['subject']=='bump again'])")" "[(True, ['vendor/lib'])]"
+ok "  a path with a non-ASCII name is recognised" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print([c['only_submodules'] for c in d['commits'] if c['subject'].startswith('bump m')], [len(c['touches_submodules']) for c in d['commits'] if c['subject'].startswith('bump m')])")" "[True] [1]"
+ok "  a merge is never one" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print([(c['only_submodules'],c['touches_submodules']) for c in d['commits'] if c['is_merge']])")" "[(False, [])]"
+# One person under two addresses: the total, the rows and the people list agree.
+MM="$SB/mailmap"; git init -q -b main "$MM"
+for i in 1 2 3; do git -C "$MM" -c user.name=Old -c user.email=old@corp.test commit -q --allow-empty -m "old $i"; done
+for i in 1 2; do git -C "$MM" -c user.name=Me -c user.email=me@new.test commit -q --allow-empty -m "new $i"; done
+printf 'Me <me@new.test> <old@corp.test>\n' > "$MM/.mailmap"; git -C "$MM" add .mailmap; git -C "$MM" -c user.name=Me -c user.email=me@new.test commit -qm "mailmap"
+OUT=$(pinvoke history_page "{\"repoPath\":\"$MM\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":4,\"search\":null,\"authors\":[\"me@new.test\"],\"hidePointerOnly\":false}")
+ok "with a .mailmap, one person's total counts every address of theirs" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin)['value'];print(d['total'],len(d['commits']),d['has_more'])")" "6 4 True"
+ok "  the rows carry the mapped name and address" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin)['value'];print(sorted(set((c['author_name'],c['author_email']) for c in d['commits'])))")" "[('Me', 'me@new.test')]"
+PEOPLE=$(pinvoke history_authors "{\"repoPath\":\"$MM\",\"rev\":\"HEAD\"}")
+ok "  and the people list says the same number" "$(printf '%s' "$PEOPLE" | python3 -c "import sys,json;d=json.load(sys.stdin)['value'];print([(a['email'],a['commits']) for a in d])")" "[('me@new.test', 6)]"
+OUT=$(pinvoke history_page "{\"repoPath\":\"$MM\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":4,\"search\":null,\"authors\":[\"old@corp.test\"],\"hidePointerOnly\":false}")
+ok "  the old address alone matches nothing, and says so" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin)['value'];print(d['total'],len(d['commits']),d['has_more'])")" "0 0 False"
+# The same with log.mailmap switched off here: the total and the rows are still the mapped person's.
+git -C "$MM" config log.mailmap false
+OUT=$(pinvoke history_page "{\"repoPath\":\"$MM\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":4,\"search\":null,\"authors\":[\"me@new.test\"],\"hidePointerOnly\":false}")
+ok "  with log.mailmap=false in the repository, the total and the rows do not change" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin)['value'];print(d['total'],len(d['commits']),d['has_more'],sorted(set(c['author_email'] for c in d['commits'])))")" "6 4 True ['me@new.test']"
+git -C "$MM" config --unset log.mailmap
+# People whose commits carry no address, or one that is not an address: picked by their whole identity.
+NA="$SB/noaddr"; git init -q -b main "$NA"
+who() { GIT_AUTHOR_NAME="$1" GIT_AUTHOR_EMAIL="$2" git -C "$NA" commit -q --allow-empty -m "$3"; }
+who "Sam" "" "sam 1"; who "Sam" "" "sam 2"; who "Samantha Lee" "samantha@x.test" "samantha"; who "Other" "osama@x.test" "other"; who "jdoe" "jdoe" "imported"
+who "Uncle Sam" "" "uncle sam"; who "bjdoe" "jdoe" "another import"; who "A.B [bot]" "" "a bot without an address"
+PEOPLE=$(pinvoke history_authors "{\"repoPath\":\"$NA\",\"rev\":\"HEAD\"}")
+ok "a person without an address is listed with none" "$(printf '%s' "$PEOPLE" | python3 -c "import sys,json;d=json.load(sys.stdin)['value'];print(sorted((a['name'],a['email'],a['commits']) for a in d))")" "('Sam', '', 2)"
+whole() { local ARGS="{\"repoPath\":\"$NA\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":50,\"search\":null,\"authors\":$1,\"hidePointerOnly\":false}"; pinvoke history_page "$ARGS" | python3 -c "import sys,json;d=json.load(sys.stdin)['value'];print(d['total'], sorted(c['subject'] for c in d['commits']))"; }
+SAM=$(whole '["Sam <>"]'); JD=$(whole '["jdoe <jdoe>"]')
+ok "  picked by the whole identity, it is only theirs — not everyone whose name or address contains or ends with it" "$SAM" "2 ['sam 1', 'sam 2']"
+ok "  and so is an address that is not an address" "$JD" "1 ['imported']"
+ok "  dots and brackets in such an identity are read as themselves" "$(whole '["A.B [bot] <>"]')" "1 ['a bot without an address']"
+ok "  an address in its brackets alone is that address, under any name" "$(whole '["<jdoe>"]')" "2 ['another import', 'imported']"
+search() { local ARGS="{\"repoPath\":\"$NA\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":50,\"search\":\"$1\",\"authors\":[],\"hidePointerOnly\":false}"; pinvoke history_page "$ARGS" | python3 -c "import sys,json;d=json.load(sys.stdin)['value'];print(d['total'], sorted(c['subject'] for c in d['commits']))"; }
+ok "  a search is still the text itself: a dot is a dot" "$(search 'sam .')" "0 []"
+ok "    and the text is found whatever its case" "$(search 'SAM 1')" "1 ['sam 1']"
+# Signed commits, with git told to show signatures in every log: the names read are still only names.
+if command -v ssh-keygen >/dev/null 2>&1; then
+  SG="$SB/signed"; mkdir -p "$SG/keys"; ssh-keygen -q -t ed25519 -N "" -C sig@x.test -f "$SG/keys/id" >/dev/null 2>&1
+  printf 'sig@x.test %s\n' "$(cat "$SG/keys/id.pub")" > "$SG/keys/allowed"
+  git init -q -b main "$SG/sub"; git -C "$SG/sub" commit -q --allow-empty -m s1
+  git init -q -b main "$SG/repo"
+  for k in gpg.format=ssh "user.signingkey=$SG/keys/id.pub" commit.gpgsign=true "gpg.ssh.allowedSignersFile=$SG/keys/allowed" user.email=sig@x.test; do git -C "$SG/repo" config "${k%%=*}" "${k#*=}"; done
+  printf 'r\n' > "$SG/repo/r.txt"; git -C "$SG/repo" add r.txt
+  if git -C "$SG/repo" commit -qm "base" 2>/dev/null; then
+    ( cd "$SG/repo" && git submodule add -q "$SG/sub" libs/sub 2>/dev/null ); git -C "$SG/repo" commit -qm "add sub"
+    for n in 1 2; do git -C "$SG/repo/libs/sub" commit -q --allow-empty -m "s$((n+1))"; git -C "$SG/repo" add libs/sub; git -C "$SG/repo" commit -qm "BUMP $n"; done
+    printf 'r2\n' >> "$SG/repo/r.txt"; git -C "$SG/repo" commit -qam "file change"
+    ok "the commits are signed, and git verifies them" "$(git -C "$SG/repo" log --format=%G? | tr -d '\n')" "GGGGG"
+    git -C "$SG/repo" config log.showSignature true
+    ok "  a plain log now carries the signature check" "$(git -C "$SG/repo" log -1 --format=%s | grep -c 'signature' || true)" "1"
+    OUT=$(probe hpage "$SG/repo")
+    ok "with log.showSignature on, a signed pointer bump is still read as one" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print([(c['subject'],c['only_submodules'],c['touches_submodules']) for c in d['commits'] if c['subject'].startswith('BUMP')])")" "[('BUMP 2', True, ['libs/sub']), ('BUMP 1', True, ['libs/sub'])]"
+    ok "  and the rows are the commits, nothing of the check among them" "$(printf '%s' "$OUT" | python3 -c "import sys,json;d=json.load(sys.stdin);print([c['subject'] for c in d['commits']])")" "['file change', 'BUMP 2', 'BUMP 1', 'add sub', 'base']"
+    SGH="$(git -C "$SG/repo" rev-parse HEAD)"
+    DET=$(pinvoke history_commit_detail "{\"repoPath\":\"$SG/repo\",\"hash\":\"$SGH\"}")
+    ok "  a commit's own page reads its hash and files, not the check" "$(printf '%s' "$DET" | python3 -c "import sys,json;d=json.load(sys.stdin)['value'];print(d['hash']=='$SGH',d['subject'],[f['path'] for f in d['files']])")" "True file change ['r.txt']"
+  else
+    printf '  SKIPPED: this git cannot sign with an ssh key, so the signature section has nothing to read\n'
+  fi
+else
+  printf '  SKIPPED: no ssh-keygen here, so the signature section has nothing to sign with\n'
+fi
 OUT=$(probe sync "$R" "main")
 ok "sync reports ahead/behind against the upstream" "$(printf '%s' "$OUT" | jqf upstream)" "origin/main"
 git -C "$SB/clones/withsub/vendor/sub" fetch -q origin 2>/dev/null

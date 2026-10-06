@@ -182,6 +182,112 @@ ok "  the on-top check is measured, and passes" "$(printf '%s' "$OUT" | jqf sync
 ok "  so the result is the preview" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 2 commits of yours on top of 3 incoming."
 ok "  the other two are on top" "$(subjects "$SB/local" origin/main..HEAD)" "local unrelated|seal work|"
 
+section "A drop the preview did not foresee is still told apart from a loss"
+restore
+# Two commits of mine on one file: the first makes the change upstream also
+# made, the second another one. The preview cannot foresee the first (once the
+# second exists the file no longer equals upstream's); git finds it empty when
+# it replays it and leaves it out, saying so.
+printf 'shared line 1\nshared line 2 (upstream)\nshared line 3\n' > "$SB/local/shared.txt"; git -C "$SB/local" add shared.txt; git -C "$SB/local" commit -qm "same as upstream"
+printf 'shared line 1\nshared line 2 (upstream)\nshared line 3\nshared line 4 (mine)\n' > "$SB/local/shared.txt"; git -C "$SB/local" add shared.txt; git -C "$SB/local" commit -qm "my line 4"
+OUT=$(probe sync_plan "$SB/local")
+ok "the plan does not foresee the drop" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([c['already_upstream'] for c in d['superproject']['own_commits'] if c['subject']=='same as upstream'])")" "[False]"
+OUT=$(probe sync_run "$SB/local")
+ok "the update succeeds all the same" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  the on-top check passes: git itself said the change was already upstream" "$(printf '%s' "$OUT" | jqf sync.verified.own_on_top)" "True"
+ok "  the dropped commit is named" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours was dropped because upstream already contained it: same as upstream"
+ok "  and the result says the preview did not show it" "$(printf '%s' "$OUT" | jqf detail)" "Not in the preview: git left out 1 commit of yours whose changes upstream already had"
+ok "  so it does not claim to be as previewed" "$(printf '%s' "$OUT" | jqf detail | grep -c 'As previewed' || true)" "0"
+ok "  the other three are on top" "$(subjects "$SB/local" origin/main..HEAD)" "my line 4|local unrelated|seal work|"
+
+section "A commit thrown away by hand is a failed check, by name"
+restore
+printf 'shared line 1\nshared line 2 (mine)\nshared line 3\n' > "$SB/local/shared.txt"; git -C "$SB/local" add shared.txt; git -C "$SB/local" commit -qm "my shared edit"
+probe sync_plan "$SB/local" >/dev/null
+OUT=$(probe sync_run "$SB/local")
+ok "paused on shared.txt" "$(printf '%s' "$OUT" | jqf sync.needs_user.paths)" "shared.txt"
+git -C "$SB/local" rebase --skip >/dev/null 2>&1      # in a terminal: the commit being replayed is discarded
+ok "  the rebase went on without it and finished" "$([ -d "$SB/local/.git/rebase-merge" ] && echo stopped || echo finished)" "finished"
+OUT=$(probe sync_continue "$SB/local")
+ok "the result is not a success" "$(printf '%s' "$OUT" | jqf ok)" "False"
+ok "  the headline says a check failed" "$(printf '%s' "$OUT" | jqf headline)" "Update finished, but a check did not pass"
+ok "  the on-top check is the one" "$(printf '%s' "$OUT" | jqf sync.verified.own_on_top)" "False"
+ok "  the missing commit is named, with where its original is" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours is missing after the replay and not found upstream: my shared edit. The originals are on the backup branch"
+ok "  it is not called already upstream" "$(printf '%s' "$OUT" | jqf detail | grep -c 'already contained' || true)" "0"
+ok "  the backup branch still holds it" "$(git -C "$SB/local" log --format=%s -1 "$(git -C "$SB/local" for-each-ref --format='%(refname:short)' 'refs/heads/gitswitch-before-sync-*' | head -1)")" "my shared edit"
+
+section "A submodule only my commits added is not called removed"
+restore
+( cd "$SB/local" && git submodule add -q "$SB/orphan.git" lib 2>/dev/null )
+OUT=$(probe sync_plan "$SB/local")
+ok "added but not committed yet: said so, with its own code" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=[s for s in d['submodules'] if s['path']=='lib'][0];print(x['action'],x['remedy'],'|',x['reason'])")" "blocked commit-first | it was added here but is not committed yet"
+git -C "$SB/local" commit -qm "add lib"
+OUT=$(probe sync_plan "$SB/local")
+ok "committed: lib is no blocker, and the reason is the true one" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=[s for s in d['submodules'] if s['path']=='lib'][0];print(x['action'],'|',x['reason'])")" "none | added by your commits; upstream does not have it"
+ok "  the update can run" "$(printf '%s' "$OUT" | jqf can_run)" "True"
+git -C "$SB/local/lib" commit -q --allow-empty -m "lib: moved on"
+ok "  its checkout moved off what my commit records: blocked, as any submodule would be" "$(probe sync_plan "$SB/local" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=[s for s in d['submodules'] if s['path']=='lib'][0];print(x['action'],x['remedy'])")" "blocked record-pointers"
+git -C "$SB/local/lib" reset -q --hard HEAD~1
+LIB0="$(head_of "$SB/local/lib")"
+OUT=$(probe sync_run "$SB/local")
+ok "the update succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  my commit adding it is on top" "$(git -C "$SB/local" log --format=%s -1)" "add lib"
+ok "  it records the same commit and the checkout did not move" "$(git -C "$SB/local" rev-parse HEAD:lib):$(head_of "$SB/local/lib")" "$LIB0:$LIB0"
+ok "  nothing is out of line" "$(git -C "$SB/local" submodule status 2>/dev/null | grep -c '^[+-]' || true)" "0"
+
+section "An untracked file inside a submodule, in the way of what comes in, is a blocker"
+restore
+printf 'mine\n' > "$SB/local/B/b2.txt"      # upstream's B adds b2.txt
+OUT=$(probe sync_plan "$SB/local")
+ok "B is blocked by name" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);b=[s for s in d['submodules'] if s['path']=='B'][0];print(b['action'],b['remedy'])")" "blocked untracked-inside"
+ok "  the sentence names the file" "$(printf '%s' "$OUT" | jqf blockers)" "B: untracked file inside it would be overwritten by the commits it will be moved onto: b2.txt"
+ok "  running anyway is refused, so nothing is left half-done" "$(probe sync_run "$SB/local" | jqf refusal.code)" "sync-blocked"
+ok "  B did not move" "$(git -C "$SB/local" submodule status 2>/dev/null | grep -c '^[+-]' || true)" "0"
+rm "$SB/local/B/b2.txt"
+ok "  with the file out of the way the update can run" "$(probe sync_plan "$SB/local" | jqf can_run)" "True"
+
+section "A stash entry named autostash from an earlier rebase is not this run's"
+restore
+git -C "$SB/local" stash store -m autostash "$(git -C "$SB/local" stash create)"      # what a failed re-apply leaves behind
+git -C "$SB/local" checkout -q -- README.md; git -C "$SB/local/A" checkout -q -- A.txt
+ok "the old entry is there and the tree is clean" "$(git -C "$SB/local" stash list --format=%gs):$(git -C "$SB/local" status --porcelain --untracked-files=no --ignore-submodules=all | wc -l | tr -d ' ')" "autostash:0"
+OUT=$(probe sync_run "$SB/local")
+ok "the update does not mistake it for its own" "$(printf '%s' "$OUT" | jqf headline)" "Updated: 2 commits of yours on top of 3 new commits"
+ok "  no stash is reported left behind" "$(printf '%s' "$OUT" | jqf sync.stash_left)" "False"
+ok "  and the entry is still theirs to drop" "$(git -C "$SB/local" stash list | wc -l | tr -d ' ')" "1"
+
+section "Abort puts a re-attached branch back where it stood"
+restore
+git -C "$SB/local/A" checkout -q -- A.txt; git -C "$SB/local/A" checkout -q --detach       # clean and detached; main inside A still at my commit
+printf 'shared line 1\nshared line 2 (mine)\nshared line 3\n' > "$SB/local/shared.txt"; git -C "$SB/local" add shared.txt; git -C "$SB/local" commit -qm "my shared edit"
+probe sync_plan "$SB/local" >/dev/null
+OUT=$(probe sync_run "$SB/local")
+ok "paused on the file" "$(printf '%s' "$OUT" | jqf sync.needs_user.paths)" "shared.txt"
+ok "  after A was rebased and re-attached to main" "$(on_branch "$SB/local/A")" "main"
+ok "  which moved main inside A onto the rebased commits" "$([ "$(git -C "$SB/local/A" rev-parse main)" != "$A_HEAD0" ] && echo moved || echo still)" "moved"
+ok "  the submodule the run has not reached yet is not given a verb" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([s['action'] for s in d['sync']['submodules'] if s['path']=='B'])")" "['pending']"
+OUT=$(probe sync_abort "$SB/local")
+ok "abort detaches A where it was" "$(on_branch "$SB/local/A"):$(head_of "$SB/local/A")" "DETACHED:$A_HEAD0"
+ok "  and puts main inside it back where it stood" "$(git -C "$SB/local/A" rev-parse main)" "$A_HEAD0"
+ok "  the outcome calls A put back, and B untouched" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "[('A', 'put-back'), ('B', 'unchanged')]"
+
+section "An update aborted in a terminal still puts back what it had moved"
+restore
+git -C "$SB/local/A" checkout -q -- A.txt
+printf 'shared line 1\nshared line 2 (mine)\nshared line 3\n' > "$SB/local/shared.txt"; git -C "$SB/local" add shared.txt; git -C "$SB/local" commit -qm "my shared edit"
+SUPER1="$(head_of "$SB/local")"
+probe sync_plan "$SB/local" >/dev/null
+OUT=$(probe sync_run "$SB/local")
+ok "paused on the file, with A already rebased" "$(printf '%s' "$OUT" | jqf sync.needs_user.paths):$([ "$(head_of "$SB/local/A")" != "$A_HEAD0" ] && echo rebased || echo not)" 'shared.txt"]:rebased'
+git -C "$SB/local" rebase --abort >/dev/null 2>&1        # in a terminal
+OUT=$(probe sync_continue "$SB/local")
+ok "Continue update sees it was aborted" "$(printf '%s' "$OUT" | jqf headline)" "Update aborted."
+ok "  and puts A back, saying so" "$(printf '%s' "$OUT" | jqf detail)" "A: put back at $(printf '%s' "$A_HEAD0" | cut -c1-7)"
+ok "  A is where it was" "$(head_of "$SB/local/A"):$(on_branch "$SB/local/A")" "$A_HEAD0:main"
+ok "  the superproject is where it was" "$(head_of "$SB/local")" "$SUPER1"
+ok "  nothing is paused any more" "$(probe sync_abort "$SB/local" | jqf refusal.code)" "no-sync"
+ok "  and the next preview is not blocked by leftovers" "$(probe sync_plan "$SB/local" | jqf can_run)" "True"
+
 section "Blocked states are named, never guessed"
 restore
 git -C "$SB/local/A" commit -q --allow-empty -m "A: extra, unrecorded"
@@ -305,7 +411,8 @@ git -C "$SB/local" reset -q --hard HEAD~1            # drop "local unrelated" so
 git -C "$SB/local/A" checkout -q -- A.txt
 printf 'A v1\nline2 (mine)\nline3\n' > "$SB/local/A/A.txt"; git -C "$SB/local/A" commit -qam "A: my edit of A.txt"
 git -C "$SB/local" add A >/dev/null; git -C "$SB/local" commit -q --amend --no-edit
-probe sync_plan "$SB/local" >/dev/null
+OUT=$(probe sync_plan "$SB/local")
+ok "the plan counts A's own commits, not the pointer commits" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([s['reason'] for s in d['submodules'] if s['path']=='A'][0])")" "your 2 commits are rebased onto"
 OUT=$(probe sync_run "$SB/local")
 ok "the sync pauses inside A" "$(printf '%s' "$OUT" | jqf headline)" "Update paused inside A."
 ok "  saying where to resolve" "$(printf '%s' "$OUT" | jqf sync.needs_user.hint)" "Open it as its own repository"
@@ -313,7 +420,7 @@ ok "  A has the conflict" "$(git -C "$SB/local/A" status --porcelain | grep -c '
 T=$(git -C "$SB/local" rev-parse origin/main:A)
 ok "  inside A, theirs is named after upstream's record" "$(probe status "$SB/local/A" | jqf operation.sides.theirs)" "origin/main's A ($(printf '%s' "$T" | cut -c1-7))"
 ok "  A's status knows the update, its path and its target" "$(probe status "$SB/local/A" | jqf sync.sub_path):$(probe status "$SB/local/A" | jqf sync.sub_target)" "A:$T"
-ok "  the superproject counts A's unresolved file" "$(probe status "$SB/local" | jqf sync.unresolved)" "1"
+ok "  the superproject counts A's unresolved file — a conflict inside it, not a pointer to stage" "$(probe status "$SB/local" | jqf sync.unresolved):$(probe status "$SB/local" | jqf sync.handed_over)" "1:False"
 OUT=$(probe sync_continue "$SB/local")
 ok "  continuing before resolving is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "unmerged-paths"
 printf 'A v1\nline2 (both)\nline3\n' > "$SB/local/A/A.txt"; git -C "$SB/local/A" add A.txt
@@ -368,5 +475,817 @@ git -C "$SB/local3" config user.email wrong@example.test
 OUT=$(probe sync_plan "$SB/local3")
 ok "with nothing of mine to replay and only fast-forwards, it is not" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | jqf superproject.ahead)" "True:0"
 git -C "$SB/local3" config --unset user.email
+
+# --- worlds of their own -------------------------------------------------------
+# A bare superproject and bare submodules seeded by an author, then `local`
+# and `upstream` clones with every submodule on main.
+mini() {
+  local D="$SB/$1"; shift; mkdir -p "$D"
+  git init -q --bare "$D/super.git"
+  for s in "$@"; do
+    git init -q --bare "$D/$s.git"; git clone -q "$D/$s.git" "$D/author-$s" 2>/dev/null
+    printf '%s v1\nline2\nline3\n' "$s" > "$D/author-$s/$s.txt"
+    git -C "$D/author-$s" add -A >/dev/null; git -C "$D/author-$s" commit -qm "$s: initial"; git -C "$D/author-$s" push -q origin main 2>/dev/null
+  done
+  git clone -q "$D/super.git" "$D/author" 2>/dev/null
+  printf 'readme\n' > "$D/author/README.md"; git -C "$D/author" add -A >/dev/null; git -C "$D/author" commit -qm "super: initial"
+  for s in "$@"; do ( cd "$D/author" && git submodule add -q "$D/$s.git" "$s" 2>/dev/null && git config -f .gitmodules "submodule.$s.branch" main ); done
+  if [ "$#" -gt 0 ]; then git -C "$D/author" add -A >/dev/null; git -C "$D/author" commit -qm "super: add submodules"; fi
+  git -C "$D/author" push -q origin main 2>/dev/null
+  for c in local upstream; do
+    git clone -q --recurse-submodules "$D/super.git" "$D/$c" 2>/dev/null
+    for s in "$@"; do git -C "$D/$c/$s" checkout -q main; done
+  done
+}
+
+section "Abort puts back a submodule the update only fast-forwarded"
+mini ab B C
+W="$SB/ab"
+# Upstream: B moves forward; C's history is rewritten, so my C (still what my
+# branch records) has diverged from what upstream records.
+printf 'b2\n' > "$W/upstream/B/b2.txt"; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: upstream 1"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+printf 'C v1, rewritten\nline2\nline3\n' > "$W/upstream/C/C.txt"; git -C "$W/upstream/C" commit -q --amend -am "C: initial, rewritten"; git -C "$W/upstream/C" push -q -f origin main 2>/dev/null
+git -C "$W/upstream" add B C >/dev/null; git -C "$W/upstream" commit -qm "super: bump B, rewrite C"; git -C "$W/upstream" push -q origin main 2>/dev/null
+B0="$(head_of "$W/local/B")"; C0="$(head_of "$W/local/C")"; S0="$(head_of "$W/local")"
+OUT=$(probe sync_plan "$W/local")
+ok "the plan: B fast-forwards, C is rebased after the superproject" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action'],s['predicted_gitlink_conflict']) for s in d['submodules']])")" "[('B', 'fast-forward', False), ('C', 'rebase', False)]"
+OUT=$(probe sync_run "$W/local")
+ok "the update pauses inside C" "$(printf '%s' "$OUT" | jqf headline)" "Update paused inside C."
+ok "  after B was fast-forwarded" "$([ "$(head_of "$W/local/B")" != "$B0" ] && echo moved || echo still)" "moved"
+OUT=$(probe sync_abort "$W/local")
+ok "abort says so" "$(printf '%s' "$OUT" | jqf headline)" "Update aborted."
+ok "  and names B, which it put back too" "$(printf '%s' "$OUT" | jqf detail)" "B: put back at $(printf '%s' "$B0" | cut -c1-7)"
+ok "  B is back where it was" "$(head_of "$W/local/B")" "$B0"
+ok "  C is back where it was" "$(head_of "$W/local/C"):$(git -C "$W/local/C" status --porcelain | grep -c '^UU' || true)" "$C0:0"
+ok "  the superproject is back where it was" "$(head_of "$W/local")" "$S0"
+ok "  no submodule is left off its recorded commit" "$(git -C "$W/local" submodule status 2>/dev/null | grep -c '^[+-]' || true)" "0"
+ok "  the outcome calls both put back" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "[('B', 'put-back'), ('C', 'put-back')]"
+ok "  and the next preview is not blocked by what the abort left" "$(probe sync_plan "$W/local" | jqf can_run)" "True"
+
+section "A pointer handed over waits to be staged: the count says so, and Continue is refused until it is"
+mini ho
+W="$SB/ho"
+git init -q --bare "$W/X.git"; git clone -q "$W/X.git" "$W/author-X" 2>/dev/null
+printf 'x1\n' > "$W/author-X/x.txt"; git -C "$W/author-X" add -A >/dev/null; git -C "$W/author-X" commit -qm "X: one"
+printf 'x2\n' >> "$W/author-X/x.txt"; git -C "$W/author-X" commit -qam "X: two"; git -C "$W/author-X" push -q origin main 2>/dev/null
+X1="$(git -C "$W/author-X" rev-parse HEAD~1)"
+# Both sides add X: upstream at its tip, I at the commit before.
+( cd "$W/upstream" && git submodule add -q "$W/X.git" X 2>/dev/null ); git -C "$W/upstream" commit -qm "super: add X"; git -C "$W/upstream" push -q origin main 2>/dev/null
+( cd "$W/local" && git submodule add -q "$W/X.git" X 2>/dev/null ); git -C "$W/local/X" checkout -q "$X1"; git -C "$W/local" add X; git -C "$W/local" commit -qm "add X here"
+OUT=$(probe sync_plan "$W/local")
+ok "the preview says the update will pause on X, not that it moves it" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['predicted_gitlink_conflict'],'|',x['reason'])")" "none True | added by your commits at"
+OUT=$(probe sync_run "$W/local")
+ok "the update hands X over" "$(printf '%s' "$OUT" | jqf sync.needs_user.where_)" "submodule:X"
+CV=$(pinvoke changes_conflict_view "{\"repoPath\":\"$W/local\",\"path\":\"X\"}")
+ok "  a pointer has no sides to show: the conflict view says what decides it" "$(printf '%s' "$CV" | jqf error)" "X is a submodule, not a file"
+ok "  saying it has to be staged" "$(printf '%s' "$OUT" | jqf sync.needs_user.hint)" "decide by hand, stage it, then Continue update"
+ok "  the status counts the pointer still to stage, and says it is a hand-over" "$(probe status "$W/local" | jqf sync.unresolved):$(probe status "$W/local" | jqf sync.handed_over)" "1:True"
+OUT=$(probe sync_continue "$W/local")
+ok "  Continue before staging is refused, not repeated" "$(printf '%s' "$OUT" | jqf refusal.code)" "unmerged-paths"
+ok "    naming what to do" "$(printf '%s' "$OUT" | jqf refusal.message)" "X is still unmerged here. Put it where you want it and stage it"
+git -C "$W/local" add X
+ok "  staged, nothing is left" "$(probe status "$W/local" | jqf sync.unresolved):$(probe status "$W/local" | jqf sync.handed_over)" "0:False"
+OUT=$(probe sync_continue "$W/local")
+ok "then Continue finishes" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  with my commit on top, recording where I put X" "$(git -C "$W/local" log --format=%s -1):$(git -C "$W/local" rev-parse HEAD:X)" "add X here:$X1"
+
+section "A pointer bump of mine that upstream has moved past is foreseen as dropped"
+mini sp A
+W="$SB/sp"
+for n in one two three; do printf '%s\n' "$n" >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: $n"; done; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+ONE="$(git -C "$W/upstream/A" rev-parse HEAD~2)"; THREE="$(git -C "$W/upstream/A" rev-parse HEAD)"
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: bump A to three"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" merge -q --ff-only "$ONE"      # my A stops at one
+git -C "$W/local" add A >/dev/null; git -C "$W/local" commit -qm "bump A to one"
+OUT=$(probe sync_plan "$W/local")
+ok "the preview marks my bump as one upstream already has" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(c['subject'],c['only_pointers'],c['already_upstream']) for c in d['superproject']['own_commits']])")" "[('bump A to one', True, True)]"
+ok "  and A as a plain fast-forward" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([s['action'] for s in d['submodules']])")" "['fast-forward']"
+OUT=$(probe sync_run "$W/local")
+ok "the update succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  naming the bump it left out" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours was dropped because upstream already contained it: bump A to one"
+ok "  exactly as previewed" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 0 commits of yours on top of 1 incoming."
+ok "  A is at upstream's commit and nothing is out of line" "$(head_of "$W/local/A"):$(git -C "$W/local" submodule status 2>/dev/null | grep -c '^[+-]' || true)" "$THREE:0"
+
+section "Two pointer commits of mine block only when upstream moved the pointer too"
+mini sq A
+W="$SB/sq"
+printf 'u\n' > "$W/upstream/up.txt"; git -C "$W/upstream" add -A >/dev/null; git -C "$W/upstream" commit -qm "super: unrelated"; git -C "$W/upstream" push -q origin main 2>/dev/null
+for n in one two; do printf '%s\n' "$n" >> "$W/local/A/A.txt"; git -C "$W/local/A" commit -qam "A: my $n"; git -C "$W/local" add A >/dev/null; git -C "$W/local" commit -qm "bump A to $n"; done
+OUT=$(probe sync_plan "$W/local")
+ok "upstream left the pointer alone: nothing to squash" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['action'],s['remedy']) for s in d['submodules']])")" "True:[('none', None)]"
+OUT=$(probe sync_run "$W/local")
+ok "the update replays both without a stop" "$(printf '%s' "$OUT" | jqf headline)" "Updated: 2 commits of yours on top of 1 new commit"
+ok "  as previewed" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 2 commits of yours on top of 1 incoming."
+ok "  both on top, in order" "$(subjects "$W/local" origin/main..HEAD)" "bump A to two|bump A to one|"
+ok "  the branch records where A is" "$(git -C "$W/local" rev-parse HEAD:A)" "$(head_of "$W/local/A")"
+
+section "Level with upstream, a submodule is aligned and the branch is not touched"
+mini lv B
+W="$SB/lv"
+printf 'b2\n' > "$W/upstream/B/b2.txt"; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: upstream 1"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+B1="$(head_of "$W/upstream/B")"
+git -C "$W/upstream" add B >/dev/null; git -C "$W/upstream" commit -qm "super: bump B"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null       # the branch records B's new commit; B's checkout has not followed
+# (each file by name: `add -A` would also record B where its checkout still is)
+git -C "$W/local" switch -q -c side; printf 's\n' > "$W/local/side.txt"; git -C "$W/local" add side.txt; git -C "$W/local" commit -qm "side work"
+git -C "$W/local" switch -q main; printf 'm\n' > "$W/local/main.txt"; git -C "$W/local" add main.txt; git -C "$W/local" commit -qm "main work"; git -C "$W/local" merge -q --no-ff -m "merge side" side
+printf 'edited\n' >> "$W/local/README.md"
+S0="$(head_of "$W/local")"
+OUT=$(probe sync_plan "$W/local" "nostash")
+ok "only the submodule needs moving" "$(printf '%s' "$OUT" | jqf summary)" "Only submodules need aligning."
+ok "  so my edits need no stash and nothing blocks" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | jqf superproject.will_stash)" "True:False"
+OUT=$(probe sync_run "$W/local" "nostash")
+ok "the update says what it did" "$(printf '%s' "$OUT" | jqf headline)" "Submodules aligned: B. Your branch was already level with origin/main."
+ok "  B is at the recorded commit" "$(head_of "$W/local/B")" "$B1"
+ok "  the branch was not rewritten: same tip, my merge still a merge" "$(head_of "$W/local"):$(git -C "$W/local" rev-list --count --merges origin/main..HEAD)" "$S0:1"
+ok "  my edit is still there" "$(git -C "$W/local" status --porcelain -- README.md)" " M README.md"
+
+# A file with a few lines both sides can change in different places.
+seed_file() {  # seed_file <world>: F.txt in the superproject, on both clones
+  local D="$SB/$1"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do printf 'line %s\n' "$i"; done > "$D/upstream/F.txt"
+  git -C "$D/upstream" add F.txt; git -C "$D/upstream" commit -qm "super: F.txt"; git -C "$D/upstream" push -q origin main 2>/dev/null
+  git -C "$D/local" pull -q --ff-only 2>/dev/null
+}
+edit_line() { sed -i.bak "s/^line $2\$/line $2 $3/" "$1"; rm -f "$1.bak"; }   # edit_line <file> <n> <suffix>
+
+section "A commit of mine that moves a pointer back while upstream moved it forward is handed over, not undone"
+mini rw A
+W="$SB/rw"
+for n in one two; do printf '%s\n' "$n" >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: $n"; done; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+ONE="$(git -C "$W/upstream/A" rev-parse HEAD~1)"; TWO="$(head_of "$W/upstream/A")"
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A at two"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null; git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" merge -q --ff-only "$TWO"
+printf 'three\n' >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: three"; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+THREE="$(head_of "$W/upstream/A")"
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A to three"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local/A" reset -q --hard "$ONE"; git -C "$W/local" add A; git -C "$W/local" commit -qm "pin A back to one"
+cp -R "$W/local" "$W/local2"
+OUT=$(probe sync_plan "$W/local")
+ok "the preview says the update will pause on the pointer" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['predicted_gitlink_conflict'],'|',x['reason'])")" "none True | your commit moves its pointer back to $(printf '%s' "$ONE" | cut -c1-7) while upstream moved it forward to $(printf '%s' "$THREE" | cut -c1-7)"
+OUT=$(probe sync_run "$W/local")
+ok "the update pauses and hands A over" "$(printf '%s' "$OUT" | jqf sync.needs_user.where_)" "submodule:A"
+ok "  saying which is which" "$(printf '%s' "$OUT" | jqf sync.needs_user.hint)" "Your commit records A at $(printf '%s' "$ONE" | cut -c1-7), behind the $(printf '%s' "$THREE" | cut -c1-7) upstream moved it to"
+ok "  A was not moved forward over what my commit says" "$(head_of "$W/local/A")" "$ONE"
+ok "  the status calls it a hand-over with one pointer to stage" "$(probe status "$W/local" | jqf sync.handed_over):$(probe status "$W/local" | jqf sync.unresolved)" "True:1"
+git -C "$W/local" add A        # leave it where I pinned it
+OUT=$(probe sync_continue "$W/local")
+ok "kept as I pinned it: the update finishes with my commit on top" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/local" log --format=%s -1)" "True:pin A back to one"
+ok "  recording my pointer, with A there" "$(git -C "$W/local" rev-parse HEAD:A):$(head_of "$W/local/A")" "$ONE:$ONE"
+ok "  as the preview said" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 1 commit of yours on top of 1 incoming."
+# The other choice, on a copy: take upstream's pointer — my commit then has nothing left to say.
+probe sync_run "$W/local2" >/dev/null
+git -C "$W/local2/A" merge -q --ff-only "$THREE"; git -C "$W/local2" add A
+OUT=$(probe sync_continue "$W/local2")
+ok "taking upstream's pointer instead: the update finishes" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/local2" rev-parse HEAD:A)" "True:$THREE"
+ok "  and the commit that was left with nothing is named, not passed over" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours was left out: nothing of it remained once its conflict was resolved — pin A back to one."
+ok "  without claiming the result is as previewed" "$(printf '%s' "$OUT" | jqf detail | grep -c 'As previewed' || true)" "0"
+
+section "A pointer change that is staged and not committed blocks the update"
+mini sg A
+W="$SB/sg"
+printf 'one\n' >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: one"; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A at one"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null; git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" merge -q --ff-only origin/main
+printf 'u\n' > "$W/upstream/up.txt"; git -C "$W/upstream" add up.txt; git -C "$W/upstream" commit -qm "super: unrelated"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local/A" reset -q --hard HEAD~1; git -C "$W/local" add A       # staged, not committed
+OUT=$(probe sync_plan "$W/local")
+ok "the staged pointer is a blocker with its own sentence" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'],'|',x['reason'])")" "blocked commit-first | its pointer is staged at"
+ok "  it is not called something my commits did" "$(printf '%s' "$OUT" | jqf blockers | grep -c 'your commits put' || true)" "0"
+git -C "$W/local" restore --staged A; git -C "$W/local/A" merge -q --ff-only origin/main
+ok "  unstaged and back in place, the update can run" "$(probe sync_plan "$W/local" | jqf can_run)" "True"
+
+section "Untracked files in the way are found whatever git calls the change and however many there are"
+mini rn B
+W="$SB/rn"
+git -C "$W/upstream/B" mv B.txt NOTES.txt; git -C "$W/upstream/B" commit -qm "B: rename"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+git -C "$W/upstream" add B >/dev/null; git -C "$W/upstream" commit -qm "super: bump B"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'mine\n' > "$W/local/B/NOTES.txt"
+OUT=$(probe sync_plan "$W/local")
+ok "a file upstream renamed onto an untracked one of mine is a blocker" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'])"):$(printf '%s' "$OUT" | jqf blockers)" "blocked untracked-inside:"
+ok "  naming it" "$(printf '%s' "$OUT" | jqf blockers)" "NOTES.txt"
+rm "$W/local/B/NOTES.txt"
+printf 'z\n' > "$W/upstream/B/zz-new.txt"; git -C "$W/upstream/B" add zz-new.txt; git -C "$W/upstream/B" commit -qm "B: zz-new"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+git -C "$W/upstream" add B >/dev/null; git -C "$W/upstream" commit -qm "super: bump B again"; git -C "$W/upstream" push -q origin main 2>/dev/null
+mkdir -p "$W/local/B/out"; i=0; while [ $i -lt 2010 ]; do : > "$W/local/B/out/f$i"; i=$((i+1)); done
+printf 'mine\n' > "$W/local/B/zz-new.txt"
+OUT=$(probe sync_plan "$W/local")
+ok "with more untracked files than a status lists, the one in the way is still found" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'])"):$(printf '%s' "$OUT" | jqf blockers)" "blocked untracked-inside:"
+ok "  by name" "$(printf '%s' "$OUT" | jqf blockers)" "zz-new.txt"
+
+section "Level with upstream, a submodule's rebase finished in a terminal is carried on, not called an abort"
+mini lt B C
+W="$SB/lt"
+printf 'b2\n' > "$W/upstream/B/b2.txt"; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: upstream 1"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+printf 'C v1, rewritten\nline2\nline3\n' > "$W/upstream/C/C.txt"; git -C "$W/upstream/C" commit -q --amend -am "C: initial, rewritten"; git -C "$W/upstream/C" push -q -f origin main 2>/dev/null
+git -C "$W/upstream" add B C >/dev/null; git -C "$W/upstream" commit -qm "super: bump B, rewrite C"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null          # the branch is level; B and C have not followed
+S0="$(head_of "$W/local")"
+OUT=$(probe sync_run "$W/local")
+ok "the update pauses inside C with the branch untouched" "$(printf '%s' "$OUT" | jqf headline):$([ "$(head_of "$W/local")" = "$S0" ] && echo same)" "Update paused inside C.:same"
+printf 'C v1, both\nline2\nline3\n' > "$W/local/C/C.txt"; git -C "$W/local/C" add C.txt; GIT_EDITOR=true git -C "$W/local/C" rebase --continue >/dev/null 2>&1      # in a terminal
+OUT=$(probe sync_continue "$W/local")
+ok "Continue update carries on" "$(printf '%s' "$OUT" | jqf headline)" "Submodules aligned: B, C."
+ok "  it is not called aborted, and nothing is left paused" "$(printf '%s' "$OUT" | jqf sync.phase):$(probe status "$W/local" | jqf sync)" "done:None"
+ok "  every submodule matches what the branch records, or sits on top of it" "$(printf '%s' "$OUT" | jqf sync.verified.submodules_aligned)" "True"
+
+section "More commits of mine than the preview lists are all counted, and a clean replay is not called a loss"
+mini big
+W="$SB/big"; seed_file big
+edit_line "$W/local/F.txt" 5 "(mine)"; git -C "$W/local" commit -qam "my edit of l5"
+i=1; while [ $i -le 34 ]; do printf '%s\n' "$i" > "$W/local/f$i.txt"; git -C "$W/local" add "f$i.txt"; git -C "$W/local" commit -qm "c$i"; i=$((i+1)); done
+edit_line "$W/upstream/F.txt" 8 "(upstream)"; git -C "$W/upstream" commit -qam "super: l8"; git -C "$W/upstream" push -q origin main 2>/dev/null
+OUT=$(probe sync_plan "$W/local")
+ok "35 commits of mine, 30 of them listed" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin)['superproject'];print(d['ahead'],len(d['own_commits']),d['more_own'])")" "35 30 5"
+OUT=$(probe sync_run "$W/local")
+ok "the update succeeds" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf sync.verified.own_on_top)" "True:True"
+ok "  and counts all of them" "$(printf '%s' "$OUT" | jqf headline)" "Updated: 35 commits of yours on top of 1 new commit"
+ok "  as previewed" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 35 commits of yours on top of 1 incoming."
+ok "  git agrees" "$(git -C "$W/local" rev-list --count origin/main..HEAD)" "35"
+
+section "A lost commit is not excused by another with the same subject"
+mini dup
+W="$SB/dup"
+printf 'readme (upstream)\n' > "$W/upstream/README.md"; git -C "$W/upstream" commit -qam "super: readme"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'a\n' > "$W/local/a.txt"; git -C "$W/local" add a.txt; git -C "$W/local" commit -qm "wip"
+printf 'readme (mine)\n' > "$W/local/README.md"; git -C "$W/local" commit -qam "wip"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "paused on the README" "$(printf '%s' "$OUT" | jqf sync.needs_user.paths)" "README.md"
+git -C "$W/local" rebase --skip >/dev/null 2>&1
+OUT=$(probe sync_continue "$W/local")
+ok "one of two commits called wip is gone: a failed check" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf sync.verified.own_on_top)" "False:False"
+ok "  named as missing" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours is missing after the replay and not found upstream: wip."
+
+section "A commit resolved into nothing is named, not passed over"
+mini tu
+W="$SB/tu"
+printf 'readme (upstream)\n' > "$W/upstream/README.md"; git -C "$W/upstream" commit -qam "super: readme"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'a\n' > "$W/local/a.txt"; git -C "$W/local" add a.txt; git -C "$W/local" commit -qm "add a"
+printf 'readme (mine)\n' > "$W/local/README.md"; git -C "$W/local" commit -qam "edit readme"
+probe sync_plan "$W/local" >/dev/null
+probe sync_run "$W/local" >/dev/null
+probe tree_resolve_side "$W/local" "theirs,README.md" >/dev/null        # Take theirs: upstream's version
+OUT=$(probe sync_continue "$W/local")
+ok "the update finishes" "$(printf '%s' "$OUT" | jqf headline)" "Updated: 1 commit of yours on top of 1 new commit"
+ok "  naming the commit that was left with nothing" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours was left out: nothing of it remained once its conflict was resolved — edit readme."
+ok "  and not claiming the result is as previewed" "$(printf '%s' "$OUT" | jqf detail | grep -c 'As previewed' || true)" "0"
+
+section "A drop git made while the rebase was finished in a terminal is still told apart from a loss"
+mini tc
+W="$SB/tc"; seed_file tc
+printf 'readme (upstream)\n' > "$W/upstream/README.md"; edit_line "$W/upstream/F.txt" 2 "CHANGED"; edit_line "$W/upstream/F.txt" 6 "(upstream)"
+git -C "$W/upstream" commit -qam "super: big"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'readme (mine)\n' > "$W/local/README.md"; git -C "$W/local" commit -qam "X: readme"
+edit_line "$W/local/F.txt" 2 "CHANGED"; git -C "$W/local" commit -qam "A: change l2"
+edit_line "$W/local/F.txt" 11 "(mine)"; git -C "$W/local" commit -qam "B: change l11"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "paused on the README" "$(printf '%s' "$OUT" | jqf sync.needs_user.paths)" "README.md"
+printf 'readme (mine)\n' > "$W/local/README.md"; git -C "$W/local" add README.md; GIT_EDITOR=true git -C "$W/local" rebase --continue >/dev/null 2>&1       # in a terminal
+OUT=$(probe sync_continue "$W/local")
+ok "the update is a success: what git left out was already upstream" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf sync.verified.own_on_top)" "True:True"
+ok "  and it is named" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours was dropped because upstream already contained it: A: change l2"
+ok "  the other two are on top" "$(subjects "$W/local" origin/main..HEAD)" "B: change l11|X: readme|"
+
+section "Abort calls a submodule put back when aborting its rebase already did that"
+mini ae C
+W="$SB/ae"
+printf 'C v1\nline2 (upstream)\nline3\n' > "$W/upstream/C/C.txt"; git -C "$W/upstream/C" commit -qam "C: upstream edit"; git -C "$W/upstream/C" push -q origin main 2>/dev/null
+git -C "$W/upstream" add C >/dev/null; git -C "$W/upstream" commit -qm "super: bump C"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'C v1\nline2 (mine)\nline3\n' > "$W/local/C/C.txt"; printf 'o\n' > "$W/local/C/other.txt"; git -C "$W/local/C" add -A >/dev/null; git -C "$W/local/C" commit -qm "C: my edit"
+git -C "$W/local" add C >/dev/null; git -C "$W/local" commit -qm "seal C"
+printf 'still editing\n' >> "$W/local/C/other.txt"
+C0="$(head_of "$W/local/C")"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "paused inside C" "$(printf '%s' "$OUT" | jqf headline)" "Update paused inside C."
+OUT=$(probe sync_abort "$W/local")
+ok "abort calls C put back: it is exactly where it was, my edit and all" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])"):$(head_of "$W/local/C"):$(git -C "$W/local/C" status --porcelain)" "[('C', 'put-back')]:$C0: M other.txt"
+ok "  and does not say it was left as moved" "$(printf '%s' "$OUT" | jqf detail | grep -c 'left as moved' || true)" "0"
+
+section "A preview that upstream has moved past is refused when run, not carried out on a different plan"
+mini fp
+W="$SB/fp"
+printf 'u1\n' > "$W/upstream/u1.txt"; git -C "$W/upstream" add u1.txt; git -C "$W/upstream" commit -qm "super: u1"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'm\n' > "$W/local/m.txt"; git -C "$W/local" add m.txt; git -C "$W/local" commit -qm "mine"
+S0="$(head_of "$W/local")"
+FP="$(probe sync_plan "$W/local" | "$PY" -c "import sys,json;print(json.dumps(json.load(sys.stdin)['fingerprint']))")"
+printf 'u2\n' > "$W/upstream/u2.txt"; git -C "$W/upstream" add u2.txt; git -C "$W/upstream" commit -qm "super: u2"; git -C "$W/upstream" push -q origin main 2>/dev/null      # after the preview
+ARGS="{\"repoPath\":\"$W/local\",\"stash\":true,\"bundles\":false,\"fingerprint\":$FP}"
+OUT=$(pinvoke changes_sync_run "$ARGS")
+ok "the run fetches, sees upstream moved, and refuses" "$(printf '%s' "$OUT" | jqf value.refusal.code)" "assess-again"
+ok "  nothing was touched: same commit, no backup branch, nothing paused" "$(head_of "$W/local"):$(git -C "$W/local" for-each-ref 'refs/heads/gitswitch-before-sync-*' | wc -l | tr -d ' '):$([ -e "$W/local/.git/gitswitch-sync.json" ] && echo state || echo none)" "$S0:0:none"
+FP="$(probe sync_plan "$W/local" | "$PY" -c "import sys,json;print(json.dumps(json.load(sys.stdin)['fingerprint']))")"
+ARGS="{\"repoPath\":\"$W/local\",\"stash\":true,\"bundles\":false,\"fingerprint\":$FP}"
+OUT=$(pinvoke changes_sync_run "$ARGS")
+ok "previewed again, the same run goes through" "$(printf '%s' "$OUT" | jqf value.ok):$(printf '%s' "$OUT" | jqf value.headline)" "True:Updated: 1 commit of yours on top of 2 new commits"
+
+section "My commit that added a submodule is already upstream, then I bumped it: handed over, never re-written without a backup"
+mini tz
+W="$SB/tz"
+git init -q --bare "$W/X.git"; git clone -q "$W/X.git" "$W/author-X" 2>/dev/null
+printf 'x1\n' > "$W/author-X/x.txt"; git -C "$W/author-X" add -A >/dev/null; git -C "$W/author-X" commit -qm "X: one"
+printf 'x2\n' >> "$W/author-X/x.txt"; git -C "$W/author-X" commit -qam "X: two"; git -C "$W/author-X" push -q origin main 2>/dev/null
+X1="$(git -C "$W/author-X" rev-parse HEAD~1)"; X2="$(head_of "$W/author-X")"
+# The same patch on both sides (a PR of mine that was merged by rebase), then each side moves X its own way.
+for c in upstream local; do ( cd "$W/$c" && git submodule add -q "$W/X.git" X 2>/dev/null ); git -C "$W/$c/X" checkout -q "$X1"; git -C "$W/$c" add X; done
+git -C "$W/upstream" commit -qm "add X (#7)"; git -C "$W/local" commit -qm "add X"
+git -C "$W/upstream/X" checkout -q "$X2"; git -C "$W/upstream" add X; git -C "$W/upstream" commit -qm "move X to two"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'mine\n' > "$W/local/X/mine.txt"; git -C "$W/local/X" add mine.txt; git -C "$W/local/X" commit -qm "X: my work"; XM="$(head_of "$W/local/X")"
+git -C "$W/local" add X; git -C "$W/local" commit -qm "bump X to my work"
+OUT=$(probe sync_plan "$W/local")
+ok "the preview says the update will pause on X" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['predicted_gitlink_conflict'])")" "none True"
+OUT=$(probe sync_run "$W/local")
+ok "and it does: X is handed over" "$(printf '%s' "$OUT" | jqf sync.needs_user.where_)" "submodule:X"
+ok "  saying what each side records" "$(printf '%s' "$OUT" | jqf sync.needs_user.hint)" "your commit records it at $(printf '%s' "$XM" | cut -c1-7) and upstream at $(printf '%s' "$X2" | cut -c1-7)"
+ok "  my commit inside X was not re-written" "$(head_of "$W/local/X")" "$XM"
+ok "  and X is not called rebased" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "[('X', 'unchanged')]"
+git -C "$W/local" add X       # keep where my commit put it
+OUT=$(probe sync_continue "$W/local")
+ok "kept as I put it: the update finishes with my bump on top" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/local" log --format=%s -1):$(git -C "$W/local" rev-parse HEAD:X)" "True:bump X to my work:$XM"
+ok "  and the add that upstream already had is named as left out" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours was dropped because upstream already contained it: add X"
+
+section "A commit of mine that moved a pointer back is already upstream: the submodule simply moves forward, as previewed"
+mini ty A
+W="$SB/ty"
+for n in one two; do printf '%s\n' "$n" >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: $n"; done; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+ONE="$(git -C "$W/upstream/A" rev-parse HEAD~1)"; TWO="$(head_of "$W/upstream/A")"
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A at two"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null; git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" merge -q --ff-only "$TWO"
+# The same pin on both sides, then upstream moves on.
+git -C "$W/local/A" reset -q --hard "$ONE"; git -C "$W/local" add A; git -C "$W/local" commit -qm "pin A back to one"
+git -C "$W/upstream/A" checkout -q "$ONE"; git -C "$W/upstream" add A; git -C "$W/upstream" commit -qm "pin A back to one (#12)"
+git -C "$W/upstream/A" checkout -q main; printf 'three\n' >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: three"; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+THREE="$(head_of "$W/upstream/A")"
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A to three"; git -C "$W/upstream" push -q origin main 2>/dev/null
+OUT=$(probe sync_plan "$W/local")
+ok "the preview does not promise a pause that will not come" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['predicted_gitlink_conflict'])")" "fast-forward False"
+OUT=$(probe sync_run "$W/local")
+ok "the update finishes without pausing, A moved forward" "$(printf '%s' "$OUT" | jqf ok):$(head_of "$W/local/A")" "True:$THREE"
+ok "  as previewed" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 0 commits of yours on top of 2 incoming."
+
+section "A submodule git is told to ignore in diffs: my pointer commit is still mine, not called already upstream"
+for world in tj tk; do
+  mini $world A
+  W="$SB/$world"
+  for n in one two; do printf '%s\n' "$n" >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: $n"; done; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+  ONE="$(git -C "$W/upstream/A" rev-parse HEAD~1)"; TWO="$(head_of "$W/upstream/A")"
+  if [ "$world" = tj ]; then git -C "$W/upstream" config -f .gitmodules submodule.A.ignore all; git -C "$W/upstream" add .gitmodules; fi
+  git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A at two"; git -C "$W/upstream" push -q origin main 2>/dev/null
+  git -C "$W/local" pull -q --ff-only 2>/dev/null; git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" merge -q --ff-only "$TWO"
+  [ "$world" = tk ] && git -C "$W/local" config diff.ignoreSubmodules all
+  git -C "$W/local/A" reset -q --hard "$ONE"; git -C "$W/local" add A; git -C "$W/local" commit -qm "pin A back to one"
+  printf 'u\n' > "$W/upstream/up.txt"; git -C "$W/upstream" add up.txt; git -C "$W/upstream" commit -qm "super: unrelated"; git -C "$W/upstream" push -q origin main 2>/dev/null
+  OUT=$(probe sync_plan "$W/local")
+  ok "($world) my pin is previewed as kept" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(c['subject'],c['already_upstream']) for c in d['superproject']['own_commits']])")" "[('pin A back to one', False)]"
+  ok "($world)   and A is not said to move forward" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],'|',x['reason'])")" "none | your commits put its pointer at $(printf '%s' "$ONE" | cut -c1-7)"
+  OUT=$(probe sync_run "$W/local")
+  ok "($world) the update keeps it" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/local" log --format=%s -1):$(head_of "$W/local/A")" "True:pin A back to one:$ONE"
+  ok "($world)   as previewed" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 1 commit of yours on top of 1 incoming."
+done
+
+section "Files in the way are found by their real names, whatever characters they hold"
+mini t1 B
+W="$SB/t1"
+printf 'c\n' > "$W/upstream/B/café.txt"; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: café"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+printf 'naive\n' > "$W/upstream/naïve.txt"; git -C "$W/upstream" add -A >/dev/null; git -C "$W/upstream" commit -qm "super: bump B, add naïve"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'mine\n' > "$W/local/B/café.txt"
+OUT=$(probe sync_plan "$W/local")
+ok "an untracked café.txt inside B blocks the update that brings one" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'])")" "blocked untracked-inside"
+ok "  by its name, unquoted" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;sys.stdout.reconfigure(encoding='utf-8');print(' '.join(json.load(sys.stdin)['blockers']))")" "overwritten by the commits it will be moved onto: café.txt;"
+rm "$W/local/B/café.txt"; printf 'mine\n' > "$W/local/naïve.txt"
+OUT=$(probe sync_plan "$W/local")
+ok "the same in the repository itself" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | jqf blockers)" "False:"
+ok "  by its name" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;sys.stdout.reconfigure(encoding='utf-8');print(' '.join(json.load(sys.stdin)['blockers']))")" "Untracked file would be overwritten by incoming commits: naïve.txt."
+rm "$W/local/naïve.txt"
+# An edit of mine to a file upstream changed as well: the overlap is seen under its real name too.
+printf 'naive, upstream again\n' > "$W/upstream/naïve.txt"; git -C "$W/upstream" commit -qam "super: naïve again"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null; git -C "$W/local" reset -q --hard HEAD~1; git -C "$W/local" submodule update -q 2>/dev/null
+printf 'naive, mine\n' > "$W/local/naïve.txt"
+OUT=$(probe sync_plan "$W/local")
+ok "an uncommitted edit that collides with what comes in is named too" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;sys.stdout.reconfigure(encoding='utf-8');print(' '.join(json.load(sys.stdin)['blockers']))")" "Your uncommitted changes to naïve.txt collide with incoming commits"
+
+section "An untracked file where a folder has to come is in the way; a clone where a submodule comes is not"
+mini tg B
+W="$SB/tg"
+mkdir -p "$W/upstream/B/docs"; printf 'g\n' > "$W/upstream/B/docs/guide.md"; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: docs"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+mkdir -p "$W/upstream/conf"; printf 'a\n' > "$W/upstream/conf/app.yml"; git -C "$W/upstream" add -A >/dev/null; git -C "$W/upstream" commit -qm "super: bump B, add conf"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'a file, not a folder\n' > "$W/local/B/docs"
+OUT=$(probe sync_plan "$W/local")
+ok "a file named docs inside B, where docs/guide.md has to come, blocks" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'],'|',x['reason'])")" "blocked untracked-inside | untracked file inside it would be overwritten by the commits it will be moved onto: docs;"
+rm "$W/local/B/docs"; printf 'a file, not a folder\n' > "$W/local/conf"
+OUT=$(probe sync_plan "$W/local")
+ok "the same in the repository itself" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | jqf blockers)" "False:"
+ok "  naming the file" "$(printf '%s' "$OUT" | jqf blockers)" "conf"
+rm "$W/local/conf"
+# A folder of that name with other files in it is no obstacle: the new file arrives beside them.
+mkdir -p "$W/local/conf" "$W/local/B/docs"; printf 'mine\n' > "$W/local/conf/other.yml"; printf 'mine\n' > "$W/local/B/docs/other.md"
+OUT=$(probe sync_plan "$W/local")
+ok "untracked neighbours in the same folder are not in the way" "$(printf '%s' "$OUT" | jqf can_run)" "True"
+OUT=$(probe sync_run "$W/local")
+ok "  and the update goes through beside them" "$(printf '%s' "$OUT" | jqf ok):$(cat "$W/local/conf/other.yml"):$(cat "$W/local/B/docs/other.md"):$(cat "$W/local/conf/app.yml")" "True:mine:mine:a"
+# Upstream adds a submodule where I already have a clone of it by hand.
+git init -q --bare "$W/sdk.git"; git clone -q "$W/sdk.git" "$W/author-sdk" 2>/dev/null
+printf 's\n' > "$W/author-sdk/s.txt"; git -C "$W/author-sdk" add -A >/dev/null; git -C "$W/author-sdk" commit -qm "sdk: one"; git -C "$W/author-sdk" push -q origin main 2>/dev/null
+( cd "$W/upstream" && git submodule add -q "$W/sdk.git" sdk 2>/dev/null ); git -C "$W/upstream" commit -qm "super: add sdk"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git clone -q "$W/sdk.git" "$W/local/sdk" 2>/dev/null; printf 'kept\n' > "$W/local/sdk/notes.txt"
+OUT=$(probe sync_plan "$W/local")
+ok "a clone of mine where upstream adds a submodule does not block" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | jqf blockers)" "True:[]"
+OUT=$(probe sync_run "$W/local")
+ok "  the update takes it as that submodule's checkout, my file in it untouched" "$(git -C "$W/local" rev-parse HEAD:sdk):$(cat "$W/local/sdk/notes.txt")" "$(head_of "$W/author-sdk"):kept"
+ok "  and the checks pass: a clone that became a submodule is not an untracked file that vanished" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf sync.verified.untracked_unchanged)" "True:True"
+
+section "A folder my commits turned into a submodule is one I added, not a pointer upstream is said to record"
+mini tf
+W="$SB/tf"
+mkdir -p "$W/upstream/lib"; printf 'vendored\n' > "$W/upstream/lib/v.txt"; git -C "$W/upstream" add -A >/dev/null; git -C "$W/upstream" commit -qm "super: vendored lib"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null
+git init -q --bare "$W/L.git"; git clone -q "$W/L.git" "$W/author-L" 2>/dev/null
+printf 'l\n' > "$W/author-L/l.txt"; git -C "$W/author-L" add -A >/dev/null; git -C "$W/author-L" commit -qm "L: one"; git -C "$W/author-L" push -q origin main 2>/dev/null
+cp -R "$W/local" "$W/local2"
+git -C "$W/local" rm -rq lib; git -C "$W/local" commit -qm "drop vendored lib"
+( cd "$W/local" && git submodule add -q "$W/L.git" lib 2>/dev/null ); git -C "$W/local" commit -qm "lib as a submodule"
+printf 'u\n' > "$W/upstream/up.txt"; git -C "$W/upstream" add up.txt; git -C "$W/upstream" commit -qm "super: unrelated"; git -C "$W/upstream" push -q origin main 2>/dev/null
+OUT=$(probe sync_plan "$W/local")
+ok "the preview calls it mine, and can run" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],'|',x['reason'])")" "True:none | added by your commits; upstream does not have it"
+OUT=$(probe sync_run "$W/local")
+ok "  and the update keeps both commits on top" "$(printf '%s' "$OUT" | jqf ok):$(subjects "$W/local" origin/main..HEAD)" "True:lib as a submodule|drop vendored lib|"
+# Staged and not committed yet, on a copy: said as what it is.
+git -C "$W/local2" rm -rq lib; ( cd "$W/local2" && git submodule add -q "$W/L.git" lib 2>/dev/null )
+OUT=$(probe sync_plan "$W/local2")
+ok "staged and not committed: the reason is that, not a folder's id shown as a pointer" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['remedy'],'|',x['reason'])")" "commit-first | it was added here but is not committed yet"
+
+section "A lost commit is not excused by a namesake that was replayed onto changed surroundings"
+for world in lw lx; do
+  mini $world
+  W="$SB/$world"; seed_file $world
+  printf 'readme (upstream)\n' > "$W/upstream/README.md"; edit_line "$W/upstream/F.txt" 4 "(upstream)"
+  git -C "$W/upstream" commit -qam "super: readme and line 4"; git -C "$W/upstream" push -q origin main 2>/dev/null
+  # Two commits with one subject. In lw they are written a day apart, in lx in the same second.
+  D1="2026-01-05T10:00:00"; D2="2026-01-06T10:00:00"; [ "$world" = lx ] && D2="$D1"
+  printf 'readme (mine)\n' > "$W/local/README.md"; GIT_AUTHOR_DATE="$D1" git -C "$W/local" commit -qam "wip"
+  edit_line "$W/local/F.txt" 2 "(mine)"; GIT_AUTHOR_DATE="$D2" git -C "$W/local" commit -qam "wip"
+  probe sync_plan "$W/local" >/dev/null
+  OUT=$(probe sync_run "$W/local")
+  ok "($world) paused on the README" "$(printf '%s' "$OUT" | jqf sync.needs_user.paths)" "README.md"
+  git -C "$W/local" rebase --skip >/dev/null 2>&1      # in a terminal: the README commit is thrown away
+  OUT=$(probe sync_continue "$W/local")
+  ok "($world) one wip is on top, the other is gone: a failed check" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf sync.verified.own_on_top):$(subjects "$W/local" origin/main..HEAD):$(sed -n 2p "$W/local/F.txt")" "False:False:wip|:line 2 (mine)"
+  ok "($world)   named as missing, not as already upstream" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours is missing after the replay and not found upstream: wip."
+  ok "($world)   and nothing is called dropped-because-upstream-had-it" "$(printf '%s' "$OUT" | jqf detail | grep -c 'already contained' || true)" "0"
+done
+
+section "Resolved into nothing is measured when the update continues, so a namesake keeps its own copy"
+mini rn2
+W="$SB/rn2"; seed_file rn2
+printf 'readme (upstream)\n' > "$W/upstream/README.md"; edit_line "$W/upstream/F.txt" 4 "(upstream)"
+git -C "$W/upstream" commit -qam "super: readme and line 4"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'readme (mine)\n' > "$W/local/README.md"; git -C "$W/local" commit -qam "wip"; GONE="$(head_of "$W/local")"
+edit_line "$W/local/F.txt" 2 "(mine)"; git -C "$W/local" commit -qam "wip"
+probe sync_plan "$W/local" >/dev/null
+probe sync_run "$W/local" >/dev/null
+probe tree_resolve_side "$W/local" "theirs,README.md" >/dev/null        # upstream's README: my first wip has nothing left
+OUT=$(probe sync_continue "$W/local")
+ok "the update finishes with the other wip on top" "$(printf '%s' "$OUT" | jqf ok):$(subjects "$W/local" origin/main..HEAD):$(sed -n 2p "$W/local/F.txt")" "True:wip|:line 2 (mine)"
+ok "  one left out, said as resolved into nothing" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours was left out: nothing of it remained once its conflict was resolved — wip."
+ok "  and marked so for the card" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(c['subject'],c['resolved_away'],c['already_upstream']) for c in d['sync']['own_dropped']])")" "[('wip', True, False)]"
+ok "  the one named is the README commit, not its namesake" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([c['oid'] for c in d['sync']['own_dropped']])")" "['$GONE']"
+
+section "A commit with no subject at all is replayed and counted like any other"
+mini es
+W="$SB/es"; seed_file es
+edit_line "$W/upstream/F.txt" 4 "(upstream)"; edit_line "$W/upstream/F.txt" 9 "(upstream)"
+git -C "$W/upstream" commit -qam "super: lines 4 and 9"; git -C "$W/upstream" push -q origin main 2>/dev/null
+# Each of mine lands next to a line upstream changed: replayed cleanly, but not as the same patch.
+edit_line "$W/local/F.txt" 2 "(mine)"; git -C "$W/local" commit -q --allow-empty-message -am ""
+printf 'b\n' > "$W/local/b.txt"; git -C "$W/local" add b.txt; git -C "$W/local" commit -qm "add b"
+edit_line "$W/local/F.txt" 11 "(mine)"; git -C "$W/local" commit -q --allow-empty-message -am ""
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "the update finishes: three of mine on top" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf headline)" "True:Updated: 3 commits of yours on top of 1 new commit"
+ok "  none called dropped" "$(printf '%s' "$OUT" | jqf sync.own_dropped)" "[]"
+ok "  as previewed" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 3 commits of yours on top of 1 incoming."
+
+section "Abort puts back a handed-over submodule I had moved as the hand-over said"
+mini hb A
+W="$SB/hb"
+for n in one two; do printf '%s\n' "$n" >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: $n"; done; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+ONE="$(git -C "$W/upstream/A" rev-parse HEAD~1)"; TWO="$(head_of "$W/upstream/A")"
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A at two"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null; git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" merge -q --ff-only "$TWO"
+printf 'three\n' >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: three"; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+THREE="$(head_of "$W/upstream/A")"
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A to three"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local/A" reset -q --hard "$ONE"; git -C "$W/local" add A; git -C "$W/local" commit -qm "pin A back to one"
+S0="$(head_of "$W/local")"
+cp -R "$W/local" "$W/local2"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "the update hands A over" "$(printf '%s' "$OUT" | jqf sync.needs_user.where_)" "submodule:A"
+git -C "$W/local/A" merge -q --ff-only "$THREE"       # "move it to upstream's" — then I change my mind
+OUT=$(probe sync_abort "$W/local")
+ok "abort puts A back where it stood, and says so" "$(printf '%s' "$OUT" | jqf headline):$(printf '%s' "$OUT" | jqf detail)" "Update aborted.:A: put back at $(printf '%s' "$ONE" | cut -c1-7)"
+ok "  A and the branch are where they were" "$(head_of "$W/local/A"):$(on_branch "$W/local/A"):$(head_of "$W/local")" "$ONE:main:$S0"
+ok "  nothing is off its recorded commit" "$(git -C "$W/local" submodule status 2>/dev/null | grep -c '^[+-]' || true)" "0"
+ok "  the outcome calls A put back" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "[('A', 'put-back')]"
+# On a copy: I put A on a new commit of my own instead. Abort must not move a branch off work nothing else holds.
+probe sync_plan "$W/local2" >/dev/null; probe sync_run "$W/local2" >/dev/null
+printf 'new work\n' >> "$W/local2/A/A.txt"; git -C "$W/local2/A" commit -qam "A: new work of mine"; MINE="$(head_of "$W/local2/A")"
+OUT=$(probe sync_abort "$W/local2")
+ok "a commit of mine made there meanwhile is not walked off: A is left, and named" "$(printf '%s' "$OUT" | jqf detail):$(head_of "$W/local2/A")" "A: left at $(printf '%s' "$MINE" | cut -c1-7), where you put it; $(printf '%s' "$MINE" | cut -c1-7) holds commits nothing else has, and it stood at $(printf '%s' "$ONE" | cut -c1-7) before the update:$MINE"
+ok "  the outcome says left as moved" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "[('A', 'left-as-moved')]"
+
+section "The branch reset by hand while a submodule's rebase was paused: Continue sees an abort and puts back the rest"
+mini ar B C
+W="$SB/ar"
+printf 'b2\n' > "$W/upstream/B/b2.txt"; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: upstream 1"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+printf 'C v1, rewritten\nline2\nline3\n' > "$W/upstream/C/C.txt"; git -C "$W/upstream/C" commit -q --amend -am "C: initial, rewritten"; git -C "$W/upstream/C" push -q -f origin main 2>/dev/null
+git -C "$W/upstream" add B C >/dev/null; git -C "$W/upstream" commit -qm "super: bump B, rewrite C"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'mine\n' > "$W/local/mine.txt"; git -C "$W/local" add mine.txt; git -C "$W/local" commit -qm "my own commit"
+B0="$(head_of "$W/local/B")"; C0="$(head_of "$W/local/C")"; S0="$(head_of "$W/local")"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "the update pauses inside C, the branch already replayed" "$(printf '%s' "$OUT" | jqf headline):$([ "$(head_of "$W/local")" != "$S0" ] && echo replayed || echo still)" "Update paused inside C.:replayed"
+BK="$(git -C "$W/local" branch --list 'gitswitch-before-sync-*' --format='%(refname:short)' | head -1)"
+git -C "$W/local/C" rebase --abort >/dev/null 2>&1; git -C "$W/local" reset -q --hard "$BK"      # in a terminal
+OUT=$(probe sync_continue "$W/local")
+ok "Continue update sees it was undone by hand" "$(printf '%s' "$OUT" | jqf headline)" "Update aborted."
+ok "  and puts B back too, saying so" "$(printf '%s' "$OUT" | jqf detail)" "B: put back at $(printf '%s' "$B0" | cut -c1-7)"
+ok "  B, C and the branch are where they were" "$(head_of "$W/local/B"):$(head_of "$W/local/C"):$(head_of "$W/local")" "$B0:$C0:$S0"
+ok "  nothing is off its recorded commit" "$(git -C "$W/local" submodule status 2>/dev/null | grep -c '^[+-]' || true)" "0"
+
+section "My pointer already contains upstream's, but git cannot see that from the base: recorded as mine, no pause, nothing re-written"
+mini cu A
+W="$SB/cu"
+# Upstream re-writes A's history; I rebuild my work on top of the new line and record it.
+printf 'A v1, rewritten\nline2\nline3\n' > "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -q --amend -am "A: initial, rewritten"; git -C "$W/upstream/A" push -q -f origin main 2>/dev/null
+NEWA="$(head_of "$W/upstream/A")"
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A rewritten"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" reset -q --hard "$NEWA"
+printf 'mine\n' > "$W/local/A/mine.txt"; git -C "$W/local/A" add mine.txt; git -C "$W/local/A" commit -qm "A: my work on the new line"; MINE="$(head_of "$W/local/A")"
+git -C "$W/local" add A; git -C "$W/local" commit -qm "bump A to my work"
+OUT=$(probe sync_plan "$W/local")
+ok "the preview says my pointer is kept" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],'|',x['reason'])")" "none | already contains $(printf '%s' "$NEWA" | cut -c1-7); your commit's pointer will be kept"
+OUT=$(probe sync_run "$W/local")
+ok "the update finishes without a pause" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf sync.phase)" "True:done"
+ok "  recording my commit, which A still sits on, un-rewritten" "$(git -C "$W/local" rev-parse HEAD:A):$(head_of "$W/local/A")" "$MINE:$MINE"
+ok "  as previewed" "$(printf '%s' "$OUT" | jqf detail)" "As previewed: 1 commit of yours on top of 1 incoming."
+
+section "A commit whose message starts with '#' keeps its message when its conflict is resolved and the update continues"
+mini hs
+W="$SB/hs"; seed_file hs
+edit_line "$W/upstream/F.txt" 3 "(upstream)"; git -C "$W/upstream" commit -qam "super: line 3"; git -C "$W/upstream" push -q origin main 2>/dev/null
+edit_line "$W/local/F.txt" 3 "(mine)"; printf '#123 fix line 3\n\nBody of the fix.\n# a body line that looks like a comment\n' > "$W/msg"; git -C "$W/local" commit -q -a -F "$W/msg" --cleanup=verbatim
+edit_line "$W/local/F.txt" 9 "(mine)"; git -C "$W/local" commit -qam "mine: line 9"
+cp -R "$W/local" "$W/local2"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "the update pauses on F.txt" "$(printf '%s' "$OUT" | jqf sync.needs_user.paths)" "F.txt"
+probe tree_resolve_side "$W/local" "mine,F.txt" >/dev/null
+OUT=$(probe sync_continue "$W/local")
+ok "Continue finishes with both commits on top, as previewed" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf headline):$(printf '%s' "$OUT" | jqf detail)" "True:Updated: 2 commits of yours on top of 1 new commit from origin/main.:As previewed: 2 commits of yours on top of 1 incoming."
+ok "  the message is kept letter for letter, '#' lines and all" "$(git -C "$W/local" log -1 --format=%B HEAD~1 | tr '\n' '|')" "#123 fix line 3||Body of the fix.|# a body line that looks like a comment|"
+ok "  and nothing is called dropped" "$(printf '%s' "$OUT" | jqf sync.own_dropped)" "[]"
+# The same with nothing but a '#' line: left to git, that is an empty message and a dead end.
+printf '#123 only a subject\n' > "$W/msg2"
+git -C "$W/local2" reset -q --hard HEAD~2; edit_line "$W/local2/F.txt" 3 "(mine)"; git -C "$W/local2" commit -q -a -F "$W/msg2" --cleanup=verbatim
+edit_line "$W/local2/F.txt" 9 "(mine)"; git -C "$W/local2" commit -qam "mine: line 9"
+probe sync_plan "$W/local2" >/dev/null; probe sync_run "$W/local2" >/dev/null
+probe tree_resolve_side "$W/local2" "mine,F.txt" >/dev/null
+OUT=$(probe sync_continue "$W/local2")
+ok "a message that is only a '#' line is kept too, and the update finishes" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/local2" log --format=%s origin/main..HEAD | tr '\n' '|')" "True:mine: line 9|#123 only a subject|"
+ok "  with the author and time of the original" "$(git -C "$W/local2" log -1 --format='%an %aI' HEAD~1)" "$(git -C "$W/local2" log -1 --format='%an %aI' "$(git -C "$W/local2" branch --list 'gitswitch-before-sync-*' --format='%(refname:short)' | head -1)~1")"
+
+section "Abort never walks a submodule's branch off a commit nothing else holds"
+mini st A
+W="$SB/st"
+for n in one two; do printf '%s\n' "$n" >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: $n"; done; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+ONE="$(git -C "$W/upstream/A" rev-parse HEAD~1)"; TWO="$(head_of "$W/upstream/A")"
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A at two"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null; git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" merge -q --ff-only "$TWO"
+printf 'three\n' >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: three"; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+THREE="$(head_of "$W/upstream/A")"
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A to three"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local/A" reset -q --hard "$ONE"; git -C "$W/local" add A; git -C "$W/local" commit -qm "pin A back to one"
+probe sync_plan "$W/local" >/dev/null; probe sync_run "$W/local" >/dev/null
+# In a terminal: a commit on A's branch, then the checkout moved to upstream's (published) commit.
+printf 'x\n' >> "$W/local/A/A.txt"; git -C "$W/local/A" commit -qam "A: X, mine alone"; X="$(head_of "$W/local/A")"
+git -C "$W/local/A" checkout -q "$THREE"; git -C "$W/local" add A
+OUT=$(probe sync_abort "$W/local")
+ok "the checkout sits on a published commit, but the branch holds X: A is left, saying why" "$(printf '%s' "$OUT" | jqf detail)" "A: left at $(printf '%s' "$THREE" | cut -c1-7), where you put it; $(printf '%s' "$X" | cut -c1-7) holds commits nothing else has, and it stood at $(printf '%s' "$ONE" | cut -c1-7) before the update"
+ok "  the branch still holds X" "$(git -C "$W/local/A" rev-parse main):$(git -C "$W/local/A" branch -a --contains "$X" | tr -d ' *\n')" "$X:main"
+ok "  and the outcome says left as moved" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "[('A', 'left-as-moved')]"
+
+section "Abort leaves a submodule the update rebased when a commit was added to it since"
+mini sx B C
+W="$SB/sx"
+printf 'b2\n' > "$W/upstream/B/b2.txt"; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: upstream 1"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+printf 'C v1, rewritten\nline2\nline3\n' > "$W/upstream/C/C.txt"; git -C "$W/upstream/C" commit -q --amend -am "C: initial, rewritten"; git -C "$W/upstream/C" push -q -f origin main 2>/dev/null
+git -C "$W/upstream" add B C >/dev/null; git -C "$W/upstream" commit -qm "super: bump B, rewrite C"; git -C "$W/upstream" push -q origin main 2>/dev/null
+# My own work in B, so B is rebased at its pointer stop; C pauses afterwards.
+printf 'mine\n' > "$W/local/B/mine.txt"; git -C "$W/local/B" add mine.txt; git -C "$W/local/B" commit -qm "B: mine"; git -C "$W/local" add B; git -C "$W/local" commit -qm "seal B"
+B0="$(head_of "$W/local/B")"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "the update pauses inside C, with B rebased" "$(printf '%s' "$OUT" | jqf headline):$([ "$(head_of "$W/local/B")" != "$B0" ] && echo rebased || echo not)" "Update paused inside C.:rebased"
+printf 'more\n' > "$W/local/B/more.txt"; git -C "$W/local/B" add more.txt; git -C "$W/local/B" commit -qm "B: more, during the pause"; BX="$(head_of "$W/local/B")"
+OUT=$(probe sync_abort "$W/local")
+ok "abort leaves B where it is and says what it holds" "$(printf '%s' "$OUT" | jqf detail)" "B: left as moved: $(printf '%s' "$BX" | cut -c1-7) holds commits made since the update, which nothing else has; it stood at $(printf '%s' "$B0" | cut -c1-7) before the update"
+ok "  B still holds that commit" "$(head_of "$W/local/B")" "$BX"
+ok "  C is back where it was" "$(git -C "$W/local/C" status --porcelain | grep -c '^UU' || true):$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "0:[('B', 'left-as-moved'), ('C', 'put-back')]"
+
+section "A rename of mine is not foreseen as dropped because upstream has the new name"
+mini fr
+W="$SB/fr"
+for i in 1 2 3 4 5 6 7 8 9 10; do printf 'line %s\n' "$i"; done > "$W/upstream/old.txt"; git -C "$W/upstream" add old.txt; git -C "$W/upstream" commit -qm "super: old.txt"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null
+cp "$W/upstream/old.txt" "$W/upstream/new.txt"; git -C "$W/upstream" add new.txt; git -C "$W/upstream" commit -qm "super: copy to new.txt"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" mv old.txt new.txt; git -C "$W/local" commit -qm "rename old.txt to new.txt"
+OUT=$(probe sync_plan "$W/local")
+ok "the preview keeps my rename" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(c['subject'],c['already_upstream']) for c in d['superproject']['own_commits']])")" "[('rename old.txt to new.txt', False)]"
+OUT=$(probe sync_run "$W/local")
+ok "the update keeps it too, and says so once" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf detail):$(printf '%s' "$OUT" | jqf sync.own_dropped)" "True:As previewed: 1 commit of yours on top of 1 incoming.:[]"
+ok "  old.txt is gone, as my commit said" "$([ -e "$W/local/old.txt" ] && echo present || echo gone)" "gone"
+# A file whose name is pathspec magic to git: compared as a name, not read as magic.
+mini fc
+W="$SB/fc"
+printf 'note 1\n' > "$W/upstream/:notes"; git -C "$W/upstream" add -- ":(literal):notes"; git -C "$W/upstream" commit -qm "super: notes"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null
+printf 'my note\n' >> "$W/local/:notes"; git -C "$W/local" commit -qam "edit my notes"
+printf 'u\n' > "$W/upstream/up.txt"; git -C "$W/upstream" add up.txt; git -C "$W/upstream" commit -qm "super: unrelated"; git -C "$W/upstream" push -q origin main 2>/dev/null
+OUT=$(probe sync_plan "$W/local")
+ok "a commit to a file called :notes is previewed as kept" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(c['subject'],c['already_upstream']) for c in d['superproject']['own_commits']])")" "[('edit my notes', False)]"
+OUT=$(probe sync_run "$W/local")
+ok "  and kept" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf detail)" "True:As previewed: 1 commit of yours on top of 1 incoming."
+
+section "A clone of mine where upstream adds a submodule is adopted only when it sits on the recorded commit"
+mini ad
+W="$SB/ad"
+git init -q --bare "$W/sdk.git"; git clone -q "$W/sdk.git" "$W/author-sdk" 2>/dev/null
+printf 's\n' > "$W/author-sdk/s.txt"; git -C "$W/author-sdk" add -A >/dev/null; git -C "$W/author-sdk" commit -qm "sdk: one"; git -C "$W/author-sdk" push -q origin main 2>/dev/null
+S1="$(head_of "$W/author-sdk")"
+printf 's2\n' >> "$W/author-sdk/s.txt"; git -C "$W/author-sdk" commit -qam "sdk: two"; git -C "$W/author-sdk" push -q origin main 2>/dev/null
+( cd "$W/upstream" && git submodule add -q "$W/sdk.git" sdk 2>/dev/null ); git -C "$W/upstream" commit -qm "super: add sdk"; git -C "$W/upstream" push -q origin main 2>/dev/null
+cp -R "$W/local" "$W/local2"; cp -R "$W/local" "$W/local3"
+git clone -q "$W/sdk.git" "$W/local/sdk" 2>/dev/null; git -C "$W/local/sdk" reset -q --hard "$S1"
+OUT=$(probe sync_plan "$W/local")
+ok "a clone at another commit is in the way, and said so" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | jqf blockers)" "False:"
+ok "  by name" "$(printf '%s' "$OUT" | jqf blockers)" "Untracked file would be overwritten by incoming commits: sdk/."
+git init -q "$W/local2/sdk"; printf 'unrelated\n' > "$W/local2/sdk/u.txt"
+OUT=$(probe sync_plan "$W/local2")
+ok "an unrelated repository there is in the way too" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | jqf blockers)" "False:"
+git clone -q "$W/sdk.git" "$W/local3/sdk" 2>/dev/null
+OUT=$(probe sync_plan "$W/local3")
+ok "a clone on the recorded commit is not" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | jqf blockers)" "True:[]"
+OUT=$(probe sync_run "$W/local3")
+ok "  and the update adopts it, every check passing" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf sync.verified.untracked_unchanged):$(git -C "$W/local3" rev-parse HEAD:sdk):$(head_of "$W/local3/sdk")" "True:True:$(head_of "$W/author-sdk"):$(head_of "$W/author-sdk")"
+
+section "A pointer commit of mine that is already upstream keeps nothing when upstream then moved the pointer back"
+mini tb A
+W="$SB/tb"
+for n in one two; do printf '%s\n' "$n" >> "$W/upstream/A/A.txt"; git -C "$W/upstream/A" commit -qam "A: $n"; done; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+ONE="$(git -C "$W/upstream/A" rev-parse HEAD~1)"; TWO="$(head_of "$W/upstream/A")"
+git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" merge -q --ff-only "$TWO"; git -C "$W/local" add A; git -C "$W/local" commit -qm "bump A to two"
+git -C "$W/upstream/A" checkout -q "$TWO"; git -C "$W/upstream" add A; git -C "$W/upstream" commit -qm "bump A to two (#12)"        # the same patch, merged by rebase
+git -C "$W/upstream/A" checkout -q "$ONE"; git -C "$W/upstream" add A; git -C "$W/upstream" commit -qm "back A off to one"; git -C "$W/upstream" push -q origin main 2>/dev/null
+OUT=$(probe sync_plan "$W/local")
+ok "my bump is foreseen as already upstream" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(c['subject'],c['already_upstream']) for c in d['superproject']['own_commits']])")" "[('bump A to two', True)]"
+ok "  and A is not promised to be kept: the checkout will sit ahead of what the branch records" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],'|',x['reason'])")" "ahead | your commits sit on top of $(printf '%s' "$ONE" | cut -c1-7) already; the superproject does not record them yet"
+OUT=$(probe sync_run "$W/local")
+ok "the run does what the preview said" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/local" rev-parse HEAD:A):$(head_of "$W/local/A"):$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "True:$ONE:$TWO:[('A', 'left-ahead')]"
+
+section "Files in the way are compared the way the disk compares them"
+mini ic B
+W="$SB/ic"
+mkdir -p "$W/upstream/B/docs"; printf 'g\n' > "$W/upstream/B/docs/guide.md"; printf 'r\n' > "$W/upstream/B/readme.md"; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: docs"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+git -C "$W/upstream" add B >/dev/null; git -C "$W/upstream" commit -qm "super: bump B"; git -C "$W/upstream" push -q origin main 2>/dev/null
+if [ "$(git -C "$W/local/B" config --type=bool core.ignorecase)" = "true" ]; then
+  printf 'a file\n' > "$W/local/B/Docs"
+  OUT=$(probe sync_plan "$W/local")
+  ok "on a case-insensitive disk, a file called Docs is in the way of docs/guide.md" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'],'|',x['reason'])")" "blocked untracked-inside | untracked file inside it would be overwritten by the commits it will be moved onto: Docs;"
+  rm "$W/local/B/Docs"; printf 'mine\n' > "$W/local/B/README.MD"
+  OUT=$(probe sync_plan "$W/local")
+  ok "  and README.MD of readme.md" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'],'|',x['reason'])")" "blocked untracked-inside | untracked file inside it would be overwritten by the commits it will be moved onto: README.MD;"
+  rm "$W/local/B/README.MD"
+else
+  printf '  (case-sensitive disk here: the Docs/docs checks need a case-insensitive one)\n'
+fi
+# An untracked repository sitting where a folder of incoming files goes: in the way when it already holds one of them, not otherwise.
+git init -q "$W/local/B/docs"; printf 'mine\n' > "$W/local/B/docs/other.md"
+OUT=$(probe sync_plan "$W/local")
+ok "an untracked repository at docs/ without guide.md is not in the way" "$(printf '%s' "$OUT" | jqf can_run)" "True"
+printf 'mine\n' > "$W/local/B/docs/guide.md"
+OUT=$(probe sync_plan "$W/local")
+ok "  holding guide.md, it is — named by the file git would refuse to overwrite" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'],'|',x['reason'])")" "blocked untracked-inside | untracked file inside it would be overwritten by the commits it will be moved onto: docs/guide.md;"
+
+section "Files in the way are compared the way the disk compares them (every alphabet)"
+mini ic2 B
+W="$SB/ic2"
+mkdir -p "$W/upstream/B/émile"; printf 'n\n' > "$W/upstream/B/émile/n.txt"; printf 'a\n' > "$W/upstream/B/Ärger.txt"; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: accents"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+mkdir -p "$W/upstream/émile"; printf 'n\n' > "$W/upstream/émile/n.txt"; git -C "$W/upstream" add -A >/dev/null; git -C "$W/upstream" commit -qm "super: bump B, add émile"; git -C "$W/upstream" push -q origin main 2>/dev/null
+if [ "$(git -C "$W/local/B" config --type=bool core.ignorecase)" = "true" ]; then
+  printf 'a file\n' > "$W/local/B/ÉMILE"
+  OUT=$(probe sync_plan "$W/local")
+  ok "on a case-insensitive disk, a file called ÉMILE is in the way of émile/n.txt" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;sys.stdout.reconfigure(encoding='utf-8');d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'],'|',x['reason'])")" "blocked untracked-inside | untracked file inside it would be overwritten by the commits it will be moved onto: ÉMILE;"
+  rm "$W/local/B/ÉMILE"; printf 'mine\n' > "$W/local/B/ärger.txt"
+  OUT=$(probe sync_plan "$W/local")
+  ok "  and ärger.txt of Ärger.txt" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;sys.stdout.reconfigure(encoding='utf-8');d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'],'|',x['reason'])")" "blocked untracked-inside | untracked file inside it would be overwritten by the commits it will be moved onto: ärger.txt;"
+  rm "$W/local/B/ärger.txt"
+  mkdir -p "$W/local/ÉMILE"; printf 'mine\n' > "$W/local/ÉMILE/N.TXT"
+  OUT=$(probe sync_plan "$W/local")
+  ok "  in the repository itself, ÉMILE/N.TXT is in the way of émile/n.txt" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;sys.stdout.reconfigure(encoding='utf-8');print(' '.join(json.load(sys.stdin)['blockers']))")" "Untracked file would be overwritten by incoming commits: ÉMILE/N.TXT."
+  rm -r "$W/local/ÉMILE"
+  # The disk decides, not a setting: with core.ignorecase unset the disk still folds.
+  git -C "$W/local/B" config --unset core.ignorecase; printf 'mine\n' > "$W/local/B/ÄRGER.TXT"
+  OUT=$(probe sync_plan "$W/local")
+  ok "  with core.ignorecase unset the answer is the disk's, still" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;sys.stdout.reconfigure(encoding='utf-8');d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'],'|',x['reason'])")" "blocked untracked-inside | untracked file inside it would be overwritten by the commits it will be moved onto: ÄRGER.TXT;"
+  rm "$W/local/B/ÄRGER.TXT"; git -C "$W/local/B" config core.ignorecase true
+else
+  printf '  (case-sensitive disk here: the folded-name checks need a case-insensitive one)\n'
+fi
+# An ignored file at an incoming path is not in the way: git overwrites it.
+EXCL="$(git -C "$W/local/B" rev-parse --path-format=absolute --git-path info/exclude)"; mkdir -p "$(dirname "$EXCL")"
+printf 'ignored\n' > "$W/local/B/Ärger.txt"; printf 'Ärger.txt\n' > "$EXCL"
+OUT=$(probe sync_plan "$W/local")
+ok "an ignored file at an incoming path is not in the way" "$(printf '%s' "$OUT" | jqf can_run)" "True"
+rm "$W/local/B/Ärger.txt"; : > "$EXCL"
+# An empty untracked folder where a file comes is not in the way either; one with a file in it is.
+mkdir -p "$W/local/B/Ärger.txt"
+OUT=$(probe sync_plan "$W/local")
+ok "an empty untracked folder where a file comes is not in the way" "$(printf '%s' "$OUT" | jqf can_run)" "True"
+printf 'x\n' > "$W/local/B/Ärger.txt/x"
+OUT=$(probe sync_plan "$W/local")
+ok "  one with a file in it is, named as a folder" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;sys.stdout.reconfigure(encoding='utf-8');d=json.load(sys.stdin);x=d['submodules'][0];print(x['action'],x['remedy'],'|',x['reason'])")" "blocked untracked-inside | untracked file inside it would be overwritten by the commits it will be moved onto: Ärger.txt/;"
+rm -r "$W/local/B/Ärger.txt"
+# Many files in the way: the sentence names ten and counts the rest.
+mkdir -p "$W/upstream/B/gen"; for i in $(seq 1 30); do printf '%s\n' "$i" > "$W/upstream/B/gen/f$i.txt"; done; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: gen"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+git -C "$W/upstream" add B >/dev/null; git -C "$W/upstream" commit -qm "super: bump B"; git -C "$W/upstream" push -q origin main 2>/dev/null
+mkdir -p "$W/local/B/gen"; for i in $(seq 1 30); do printf 'mine\n' > "$W/local/B/gen/f$i.txt"; done
+OUT=$(probe sync_plan "$W/local")
+ok "thirty files in the way: ten are named and the rest counted" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];r=x['reason'];print(x['remedy'], r.count('gen/f'), 'and 20 more' in r)")" "untracked-inside 10 True"
+for i in $(seq 31 60); do printf 'mine\n' > "$W/local/B/gen/f$i.txt"; done
+for i in $(seq 31 60); do printf '%s\n' "$i" > "$W/upstream/B/gen/f$i.txt"; done; git -C "$W/upstream/B" add -A >/dev/null; git -C "$W/upstream/B" commit -qm "B: more gen"; git -C "$W/upstream/B" push -q origin main 2>/dev/null
+git -C "$W/upstream" add B >/dev/null; git -C "$W/upstream" commit -qm "super: bump B again"; git -C "$W/upstream" push -q origin main 2>/dev/null
+OUT=$(probe sync_plan "$W/local")
+ok "sixty in the way: the count stops looking at fifty and says so" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);x=d['submodules'][0];r=x['reason'];print(x['remedy'], r.count('gen/f'), 'and at least 40 more' in r)")" "untracked-inside 10 True"
+rm -r "$W/local/B/gen"
+# Thousands of ignored files on disk that upstream starts tracking: not in the way, and not slow to say so.
+mini ig
+W="$SB/ig"
+mkdir -p "$W/upstream/gen"; "$PY" -c "
+import sys
+for i in range(2000):
+    open('%s/gen/f%d.txt' % (sys.argv[1], i), 'w').write('%d\n' % i)
+" "$W/upstream"; git -C "$W/upstream" add -A >/dev/null; git -C "$W/upstream" commit -qm "super: track gen"; git -C "$W/upstream" push -q origin main 2>/dev/null
+mkdir -p "$W/local/gen"; "$PY" -c "
+import sys
+for i in range(2000):
+    open('%s/gen/f%d.txt' % (sys.argv[1], i), 'w').write('mine\n')
+" "$W/local"; printf 'gen/\n' > "$W/local/.git/info/exclude"
+T0=$(date +%s); OUT=$(probe sync_plan "$W/local"); T1=$(date +%s)
+ok "two thousand ignored files where upstream's come are not in the way (git overwrites ignored files)" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | jqf blockers)" "True:[]"
+ok "  and the preview took seconds, not minutes" "$([ $((T1-T0)) -lt 25 ] && echo quick || echo "slow: $((T1-T0))s")" "quick"
+# On macOS a name may be spelled decomposed on disk and composed in the tree; with core.precomposeunicode off, git sees two names — the disk sees one.
+if [ "$(uname)" = Darwin ]; then
+  mini nf
+  W="$SB/nf"
+  printf 'c\n' > "$W/upstream/café.txt"; git -C "$W/upstream" add -A >/dev/null; git -C "$W/upstream" commit -qm "super: café"; git -C "$W/upstream" push -q origin main 2>/dev/null
+  git -C "$W/local" config core.precomposeunicode false
+  printf 'mine\n' > "$W/local/$(printf 'cafe\314\201.txt')"
+  OUT=$(probe sync_plan "$W/local")
+  ok "a decomposed café.txt on disk is in the way of the composed one, whatever git's normalisation setting" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | "$PY" -c "import sys,json;sys.stdout.reconfigure(encoding='utf-8');print(' '.join(json.load(sys.stdin)['blockers']))")" "False:Untracked file would be overwritten by incoming commits: cafe"
+fi
+
+section "A stop committed by the app before git refused the continue is not committed twice, nor called left out"
+mini uc
+W="$SB/uc"; seed_file uc
+printf 'notes\n' > "$W/upstream/notes.txt"; git -C "$W/upstream" add notes.txt; git -C "$W/upstream" commit -qm "super: notes"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only 2>/dev/null
+edit_line "$W/upstream/F.txt" 3 "(upstream)"; git -C "$W/upstream" commit -qam "super: line 3"; git -C "$W/upstream" push -q origin main 2>/dev/null
+edit_line "$W/local/F.txt" 3 "(mine)"; git -C "$W/local" commit -qam "#7 fix line 3"
+edit_line "$W/local/F.txt" 9 "(mine)"; git -C "$W/local" commit -qam "mine: line 9"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "the update pauses on F.txt" "$(printf '%s' "$OUT" | jqf sync.needs_user.paths)" "F.txt"
+probe tree_resolve_side "$W/local" "mine,F.txt" >/dev/null
+printf 'edited during the pause\n' >> "$W/local/notes.txt"          # an unstaged edit to another tracked file
+OUT=$(probe sync_continue "$W/local")
+ok "Continue is refused by git for the unstaged edit, and nothing was committed" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/local" log --format=%s -1):$([ -e "$(git -C "$W/local" rev-parse --path-format=absolute --git-path MERGE_MSG)" ] && echo open || echo closed)" "False:super: line 3:open"
+git -C "$W/local" checkout -q -- notes.txt
+OUT=$(probe sync_continue "$W/local")
+ok "discarded, the next Continue finishes with both commits on top, once each" "$(printf '%s' "$OUT" | jqf ok):$(subjects "$W/local" origin/main..HEAD)" "True:mine: line 9|#7 fix line 3|"
+ok "  as previewed, nothing left out" "$(printf '%s' "$OUT" | jqf detail):$(printf '%s' "$OUT" | jqf sync.own_dropped)" "As previewed: 2 commits of yours on top of 1 incoming.:[]"
+# The other way round, on a copy: the person commits the stop in a terminal, then presses Continue.
+mini uc2
+W="$SB/uc2"; seed_file uc2
+edit_line "$W/upstream/F.txt" 3 "(upstream)"; git -C "$W/upstream" commit -qam "super: line 3"; git -C "$W/upstream" push -q origin main 2>/dev/null
+edit_line "$W/local/F.txt" 3 "(mine)"; git -C "$W/local" commit -qam "fix line 3"
+edit_line "$W/local/F.txt" 9 "(mine)"; git -C "$W/local" commit -qam "mine: line 9"
+probe sync_plan "$W/local" >/dev/null; probe sync_run "$W/local" >/dev/null
+probe tree_resolve_side "$W/local" "mine,F.txt" >/dev/null
+GIT_EDITOR=true git -C "$W/local" commit -q --no-verify -C "$(cat "$(git -C "$W/local" rev-parse --path-format=absolute --git-path rebase-merge/stopped-sha)")"     # in a terminal
+OUT=$(probe sync_continue "$W/local")
+ok "a stop committed by hand is carried on, not called resolved into nothing" "$(printf '%s' "$OUT" | jqf ok):$(subjects "$W/local" origin/main..HEAD):$(printf '%s' "$OUT" | jqf sync.own_dropped)" "True:mine: line 9|fix line 3|:[]"
 
 verify_result

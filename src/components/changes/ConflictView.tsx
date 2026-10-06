@@ -64,11 +64,16 @@ export function ConflictView({ repoPath, path }: Props) {
         mine = <span className="text-zinc-200">{view.sides.mine}</span> · theirs = <span className="text-zinc-200">{view.sides.theirs}</span>
         <span className="text-zinc-600">
           {" "}
-          · {view.marker_count} conflict{view.marker_count === 1 ? "" : "s"} left in the file
+          · {view.marker_count} conflict{view.marker_count === 1 ? "" : "s"} {view.partial ? "in the part of the file that was read" : "left in the file"}
         </span>
       </p>
-      {view.marker_count === 0 && (
+      {view.marker_count === 0 && !view.partial && (
         <p className="text-emerald-300/90">No conflict markers remain — the file reads as resolved. Mark it resolved on the list.</p>
+      )}
+      {view.partial && (
+        <p className="text-amber-400/90">
+          This file is larger than what is read here, so it cannot be called resolved from this view — open it in your editor to check the rest.
+        </p>
       )}
       {view.hunks.map((h, i) => (
         <div key={h.line} className="rounded-lg border border-zinc-800 overflow-hidden">

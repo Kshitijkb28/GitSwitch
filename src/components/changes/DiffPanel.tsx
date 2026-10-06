@@ -87,7 +87,8 @@ export function DiffView({
  */
 export function DiffPanel({ repoPath, entry, onClose, onOpenPath }: Props) {
   // A conflicted file is shown by its sides, not as a diff against the index.
-  const conflicted = entry.kind === "conflicted";
+  // A conflicted gitlink has no sides to split: it keeps the pointer diff.
+  const conflicted = entry.kind === "conflicted" && !entry.is_submodule;
   const hasStaged = entry.staged !== "." && entry.kind !== "untracked";
   const hasUnstaged = entry.unstaged !== "." || entry.kind === "untracked";
   const [side, setSide] = useState<"staged" | "unstaged">(

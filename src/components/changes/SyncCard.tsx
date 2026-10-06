@@ -41,6 +41,9 @@ export function SyncPausedCard({ sync, status, busy, onContinue, onAbort, onOpen
   const where = sync.needs_user?.where_ ?? "";
   const inSub = where.startsWith("submodule");
   const subPath = inSub ? (where.split(":")[1] ?? "") : "";
+  // A pointer the update could not place itself: nothing to resolve inside
+  // the submodule — its row here has to be staged.
+  const handedOver = inSub && !!sync.handed_over;
   // The backend counts what is still unmerged where the pause is. An older
   // answer has no count: fall back to this repository's own conflicts.
   const unresolved =
@@ -56,7 +59,9 @@ export function SyncPausedCard({ sync, status, busy, onContinue, onAbort, onOpen
         <AlertTriangle size={16} className="text-amber-400 shrink-0" />
         <div className="min-w-0 flex-1 space-y-1">
           <p className="text-sm text-amber-100">
-            Update paused{inSub ? ` inside ${subPath || "a submodule"}` : ""}.
+            {handedOver
+              ? `Update paused: the pointer of ${subPath} needs staging.`
+              : `Update paused${inSub ? ` inside ${subPath || "a submodule"}` : ""}.`}
           </p>
           <p className="text-xs text-amber-200/70 break-words">
             {sync.needs_user?.hint ?? "Continue when you are ready, or abort to put everything back."}
@@ -68,8 +73,14 @@ export function SyncPausedCard({ sync, status, busy, onContinue, onAbort, onOpen
             </p>
           )}
         </div>
-        {!inSub && hereConflicts && status.conflicted_count > 0 && (
-          <Button size="sm" variant="secondary" disabled={busy} onClick={() => onHandOff(where)} title="Scrolls to the conflicted files on this tab">
+        {(!inSub || handedOver) && hereConflicts && status.conflicted_count > 0 && (
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={busy}
+            onClick={() => onHandOff("superproject")}
+            title={handedOver ? `Scrolls to ${subPath} in the conflicts on this tab, where it can be marked resolved` : "Scrolls to the conflicted files on this tab"}
+          >
             Go to the conflicts
           </Button>
         )}
@@ -82,7 +93,13 @@ export function SyncPausedCard({ sync, status, busy, onContinue, onAbort, onOpen
           size="sm"
           variant="primary"
           disabled={busy || hereConflicts}
-          title={hereConflicts ? `Resolve and stage every conflicted file first (${unresolved} left)` : "Resumes where it stopped"}
+          title={
+            handedOver
+              ? `Stage ${subPath} on this tab first — "Mark resolved" on its row — once it is where you want it`
+              : hereConflicts
+                ? `Resolve and stage every conflicted file first (${unresolved} left)`
+                : "Resumes where it stopped"
+          }
           onClick={onContinue}
         >
           <Play size={13} />
@@ -118,9 +135,35 @@ const CHECKS: [keyof SyncOutcome["verified"], string][] = [
   ["no_conflicts_left", "no conflicts remain"],
 ];
 
+/** The backend's outcome code, in words. */
+function outcomeLabel(action: string): string {
+  switch (action) {
+    case "fast-forwarded":
+      return "fast-forwarded";
+    case "could-not-fast-forward":
+      return "could not fast-forward";
+    case "left-ahead":
+      return "left ahead";
+    case "put-back":
+      return "put back";
+    case "left-as-moved":
+      return "left as the update moved it";
+    case "pending":
+      return "not reached yet";
+    default:
+      return action;
+  }
+}
+
 /** What a finished (or paused, or aborted) update did, repository by repository. */
 export function SyncOutcomeView({ outcome, busy, onRecordPointers }: OutcomeProps) {
   const failed = CHECKS.filter(([k]) => !outcome.verified[k]);
+  // Three different things, never one word for all of them: upstream had
+  // it, its conflict was resolved into nothing, or it is simply not there.
+  const away = outcome.own_dropped.filter((c) => c.resolved_away);
+  const had = outcome.own_dropped.filter((c) => !c.resolved_away && c.already_upstream);
+  const lost = outcome.own_dropped.filter((c) => !c.resolved_away && !c.already_upstream);
+  const names = (cs: typeof had) => cs.map((c) => c.subject || "(no subject)").join("; ");
   return (
     <div className="space-y-2 text-xs">
       <div className="overflow-x-auto">
@@ -139,8 +182,9 @@ export function SyncOutcomeView({ outcome, busy, onRecordPointers }: OutcomeProp
                 {short(outcome.head_before)} → {short(outcome.head_after)}
               </td>
               <td className="py-1 text-zinc-300">
-                {outcome.incoming} incoming, {outcome.own_kept.length} of yours kept
-                {outcome.own_dropped.length > 0 && `, ${outcome.own_dropped.length} dropped`}
+                {outcome.incoming} incoming, {outcome.own_kept_total ?? outcome.own_kept.length} of yours kept
+                {had.length + away.length > 0 && `, ${had.length + away.length} left out`}
+                {lost.length > 0 && `, ${lost.length} missing`}
                 {outcome.stashed && " · uncommitted changes stashed and re-applied"}
               </td>
             </tr>
@@ -151,7 +195,7 @@ export function SyncOutcomeView({ outcome, busy, onRecordPointers }: OutcomeProp
                   {short(s.head_before)} → {short(s.head_after)}
                 </td>
                 <td className={`py-1 ${s.ok ? "text-zinc-300" : "text-red-300"}`}>
-                  {s.action}
+                  {outcomeLabel(s.action)}
                   {s.note && <span className="text-zinc-500"> — {s.note}</span>}
                 </td>
               </tr>
@@ -160,10 +204,21 @@ export function SyncOutcomeView({ outcome, busy, onRecordPointers }: OutcomeProp
         </table>
       </div>
 
-      {outcome.own_dropped.length > 0 && (
+      {had.length > 0 && (
         <p className="text-zinc-400 break-words">
-          Dropped because upstream already had them:{" "}
-          {outcome.own_dropped.map((c) => c.subject).join("; ")}.
+          Left out because upstream already had {had.length === 1 ? "it" : "them"}: {names(had)}.
+        </p>
+      )}
+      {away.length > 0 && (
+        <p className="text-zinc-400 break-words">
+          Left out because nothing of {away.length === 1 ? "it" : "them"} remained once {away.length === 1 ? "its conflict was" : "their conflicts were"}{" "}
+          resolved: {names(away)}.
+        </p>
+      )}
+      {lost.length > 0 && (
+        <p className="text-red-300 break-words">
+          Missing after the replay and not found upstream: {names(lost)}. The {lost.length === 1 ? "original is" : "originals are"} on the backup
+          branch — see Backups.
         </p>
       )}
 

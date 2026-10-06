@@ -98,6 +98,14 @@ pub fn inherited_git_env_to_strip() -> Vec<String> {
     names
 }
 
+/// A `-c` that every command of the `log` family gets, whoever runs it: with
+/// `log.showSignature` set in someone's config, git writes each commit's
+/// signature check into the very output the app parses (`stash list` and
+/// `reflog` are `log` underneath). An explicit `--show-signature` still wins.
+pub fn parse_safe_cfg(subcommand: &str) -> Option<&'static str> {
+    matches!(subcommand, "log" | "show" | "whatchanged" | "reflog" | "stash").then_some("log.showSignature=false")
+}
+
 pub struct GitCmd {
     repo: Option<PathBuf>,
     program: Option<PathBuf>,
@@ -226,8 +234,11 @@ impl GitCmd {
 
     /// Run, returning the exit code and both streams. Only a failure to *spawn*
     /// or a timeout is an `Err`; a non-zero exit is for the caller to read.
-    pub async fn run(self) -> Result<GitOutput, AppError> {
+    pub async fn run(mut self) -> Result<GitOutput, AppError> {
         let sub = self.subcommand();
+        if let Some(kv) = parse_safe_cfg(&sub) {
+            self = self.cfg_raw(kv);
+        }
         let program = self.program.clone().unwrap_or_else(|| PathBuf::from("git"));
         // The argv is assembled straight onto the child below and never exists
         // as a list, so the Activity tab's copy is built here alongside it.
@@ -302,16 +313,25 @@ impl GitCmd {
             }
         };
 
-        if let Some(data) = self.stdin {
-            use tokio::io::AsyncWriteExt;
-            if let Some(mut pipe) = child.stdin.take() {
-                pipe.write_all(&data)
-                    .await
-                    .map_err(|e| AppError::Command(format!("Failed to send input to git: {}", e)))?;
+        // Its input is written by a task of its own, alongside the drain
+        // below. A command that answers while it reads (`cat-file --batch`,
+        // `check-attr --stdin`) fills its output pipe long before it has
+        // taken all of its input; writing everything first would leave it
+        // blocked on a full pipe nobody reads, and us blocked on a pipe it no
+        // longer reads from — for good, since that write sat outside the
+        // timeout.
+        let writer = match (self.stdin, child.stdin.take()) {
+            (Some(data), Some(mut pipe)) => Some(tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                // A child that exits without reading the rest closes the pipe
+                // on us: its exit status tells that story, not this error.
+                let _ = pipe.write_all(&data).await;
+                let _ = pipe.shutdown().await;
                 // Dropping the handle closes the pipe, which git waits for.
                 drop(pipe);
-            }
-        }
+            })),
+            _ => None,
+        };
 
         // On Windows the child's descendants are reached through a Job Object;
         // on unix through the process group set up above.
@@ -350,6 +370,9 @@ impl GitCmd {
                     j.terminate();
                 }
                 terminate_tree(&mut child).await;
+                if let Some(w) = &writer {
+                    w.abort();
+                }
                 // The pipes close as the tree dies; a short cap in case a
                 // process outside both the group and the job holds one open.
                 let (o, e) = tokio::time::timeout(Duration::from_secs(2), drain)
@@ -377,7 +400,7 @@ impl GitCmd {
         if self.log_output {
             crate::cmdlog::record(&where_, argv, code, started.elapsed(), &String::from_utf8_lossy(&stdout), &stderr);
         } else {
-            crate::cmdlog::record(&where_, argv, code, started.elapsed(), "(output not logged: it is a credential)", &stderr);
+            crate::cmdlog::record(&where_, argv, code, started.elapsed(), "(output not logged)", &stderr);
         }
         Ok(GitOutput { code, stdout, stderr })
     }
@@ -562,6 +585,55 @@ mod tests {
     /// background — after the app has already reported a timeout — and the next
     /// look says everything is present. A `!shell` alias reproduces that tree
     /// with no network and no git-lfs needed.
+    /// A command that answers while it reads — here an alias that echoes its
+    /// input — given more than a pipe holds in both directions. Written
+    /// first and read afterwards, neither side could ever move again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn input_is_written_while_output_is_read() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-stdin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        match crate::spawn::command("git").arg("init").arg("-q").arg(&dir).output() {
+            Ok(o) if o.status.success() => {}
+            _ => return,
+        }
+        let big = vec![b'x'; 8 * 1024 * 1024];
+        let out = GitCmd::at(&dir)
+            .cfg("alias.echo", "!cat")
+            .args(["echo"])
+            .stdin_bytes(big.clone())
+            .private_output()
+            .timeout(Duration::from_secs(60))
+            .run()
+            .await
+            .expect("it must finish, not wait on a full pipe");
+        assert!(out.ok(), "{}", out.stderr);
+        assert_eq!(out.stdout.len(), big.len());
+        // A child that stops reading early is an exit status, not an error from the write.
+        let out = GitCmd::at(&dir)
+            .cfg("alias.deaf", "!true")
+            .args(["deaf"])
+            .stdin_bytes(big)
+            .private_output()
+            .timeout(Duration::from_secs(60))
+            .run()
+            .await
+            .expect("an unread input is not a failure to run");
+        assert!(out.ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_family_commands_never_print_signature_checks() {
+        for sub in ["log", "show", "stash", "reflog", "whatchanged"] {
+            assert_eq!(parse_safe_cfg(sub), Some("log.showSignature=false"), "{}", sub);
+        }
+        for sub in ["status", "rebase", "fetch", "cat-file", "commit"] {
+            assert_eq!(parse_safe_cfg(sub), None, "{}", sub);
+        }
+    }
+
     #[tokio::test]
     async fn a_timed_out_command_takes_its_grandchildren_with_it() {
         let dir = std::env::temp_dir().join(format!("gitswitch-pgroup-{}", std::process::id()));

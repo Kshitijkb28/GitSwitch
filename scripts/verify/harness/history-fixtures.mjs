@@ -27,9 +27,12 @@ function commit(hash, subject, over = {}) {
     author_name: "Me",
     author_email: "me@personal.test",
     date: "2026-09-20T10:00:00+02:00",
+    author_date: "2026-09-20T09:30:00+02:00",
     subject,
     refs: [],
     is_merge: false,
+    touches_submodules: [],
+    only_submodules: false,
     lane: 0,
     parent_lanes: [0],
     active_lanes: [0],
@@ -39,9 +42,24 @@ function commit(hash, subject, over = {}) {
 
 /** Who commits here, as `git shortlog -sne` orders them. */
 export const AUTHORS = [
-  { name: "Me", email: "me@example.test", commits: 2 },
+  // The address of the account the repository belongs to, so "Just me" applies.
+  { name: "Me", email: "me@personal.test", commits: 2 },
   { name: "Other Person", email: "other@example.test", commits: 1 },
+  { name: "github-actions[bot]", email: "41898282+github-actions[bot]@users.noreply.github.com", commits: 5 },
 ];
+
+/** A superproject's page: one real commit and one CI bump of a submodule pointer. */
+export const HISTORY_PAGE_BUMP = {
+  commits: [
+    commit(C1, "ci: bump trinity submodule to d9b93c5", { parents: [C2], refs: ["HEAD -> main", "origin/main"], author_name: "github-actions[bot]", touches_submodules: ["trinity"], only_submodules: true }),
+    commit(C2, "Teach the clone page about LFS", { parents: [C3] }),
+  ],
+  total: 2,
+  offset: 0,
+  limit: 50,
+  has_more: false,
+  max_lane: 0,
+};
 
 export const HISTORY_PAGE = {
   commits: [

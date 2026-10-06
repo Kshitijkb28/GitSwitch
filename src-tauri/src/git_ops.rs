@@ -452,11 +452,27 @@ pub fn within_repo(repo_path: &str, path: &str) -> Result<PathBuf, AppError> {
 /// executable bit, or a bundle / launcher type by extension. Such a path is
 /// revealed in the file manager, never opened.
 pub fn opens_by_running(path: &std::path::Path) -> bool {
-    const LAUNCHERS: &[&str] = &["app", "command", "tool", "pkg", "dmg", "scpt", "workflow", "exe", "bat", "cmd", "ps1", "msi", "jar", "sh", "bash", "zsh", "fish", "desktop", "run"];
+    // What "open" runs everywhere: bundles, installers, shell scripts, launchers.
+    const LAUNCHERS: &[&str] = &[
+        "app", "command", "tool", "terminal", "pkg", "dmg", "scpt", "workflow", "action", "exe", "bat", "cmd", "ps1", "msi", "jar", "sh", "bash",
+        "zsh", "fish", "ksh", "csh", "desktop", "run", "appimage",
+    ];
+    // What Windows runs on a double-click — the script host, the shell, the
+    // registry editor, the Python launcher. There is no execute bit to ask.
+    #[cfg(windows)]
+    const PLATFORM: &[&str] = &[
+        "js", "jse", "vbs", "vbe", "wsf", "wsh", "hta", "scr", "pif", "com", "lnk", "msc", "cpl", "reg", "inf", "scf", "py", "pyw", "psm1", "psd1",
+        "msp", "mst", "application", "gadget", "iso", "vhd", "vhdx", "appref-ms", "settingcontent-ms", "library-ms",
+    ];
+    #[cfg(not(windows))]
+    const PLATFORM: &[&str] = &[];
     let by_ext = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| LAUNCHERS.contains(&e.to_ascii_lowercase().as_str()))
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            LAUNCHERS.contains(&e.as_str()) || PLATFORM.contains(&e.as_str())
+        })
         .unwrap_or(false);
     if by_ext {
         return true;
@@ -476,6 +492,37 @@ pub fn opens_by_running(path: &std::path::Path) -> bool {
         false
     }
 }
+
+/// A canonical path the way the operating system's "open" wants it. On
+/// Windows `canonicalize` gives the verbatim form (`\\?\C:\…`), which the
+/// shell does not take; the prefix is dropped for it.
+pub fn shell_path(p: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p.to_path_buf()
+}
+
+/// Up to `max` bytes of a file, and whether there was more. The marker guard
+/// and the conflict view never need a whole file to decide.
+pub(crate) fn read_head(path: &std::path::Path, max: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)?.take(max as u64 + 1).read_to_end(&mut buf)?;
+    let more = buf.len() > max;
+    buf.truncate(max);
+    Ok((buf, more))
+}
+
+/// How much of a file the marker guard reads.
+pub(crate) const MARKER_SCAN_MAX: usize = 16 * 1024 * 1024;
 
 pub fn validate_repo_path(p: &str) -> Result<(), AppError> {
     let bad = p.is_empty()
@@ -707,60 +754,203 @@ pub(crate) fn advice_ctx<'a>(status: &'a RepoStatus) -> AdviceCtx<'a> {
 
 // --- Staging -------------------------------------------------------------
 
-/// Lines (1-based) that open a complete conflict group: seven `<` at the
-/// start, closed later by seven `>`. The marker size git writes by default;
-/// a repository with `conflict-marker-size` set is the "anyway" button's case.
-pub fn conflict_marker_lines(text: &str) -> Vec<usize> {
-    let is_marker = |line: &str, c: char| {
-        let m: String = std::iter::repeat_n(c, 7).collect();
-        line == m || line.starts_with(&(m + " "))
-    };
+/// Lines (1-based) that still carry a conflict marker: every `<<<<<<<` that
+/// opens a hunk, finished or not, and a `>>>>>>>` with no hunk open — the
+/// shapes a half-done edit leaves behind. A bare `=======` on its own is not
+/// one (a Markdown heading underline looks exactly like it). `size` is the
+/// width git wrote: 7 unless the `conflict-marker-size` attribute says so.
+/// The same rule draws the conflict view, so the two never disagree.
+pub fn conflict_marker_lines(text: &str, size: usize) -> Vec<usize> {
     let mut lines = Vec::new();
-    let mut open: Option<usize> = None;
+    let mut open = false;
     for (i, line) in text.lines().enumerate() {
-        if is_marker(line, '<') {
-            open = Some(i + 1);
-        } else if is_marker(line, '>') {
-            if let Some(o) = open.take() {
-                lines.push(o);
+        match crate::git_status::marker_kind(line, size) {
+            Some('<') => {
+                open = true;
+                lines.push(i + 1);
             }
+            Some('>') => {
+                if !open {
+                    lines.push(i + 1);
+                }
+                open = false;
+            }
+            _ => {}
         }
     }
     lines
 }
 
+/// The marker width git writes for each path: 7, or what the
+/// `conflict-marker-size` attribute sets for it. One `check-attr` for all,
+/// the paths on its standard input so their number does not matter.
+pub(crate) async fn marker_sizes(repo: &std::path::Path, paths: &[String]) -> std::collections::BTreeMap<String, usize> {
+    let mut sizes = std::collections::BTreeMap::new();
+    if paths.is_empty() {
+        return sizes;
+    }
+    let mut stdin: Vec<u8> = Vec::new();
+    for p in paths {
+        stdin.extend_from_slice(p.as_bytes());
+        stdin.push(0);
+    }
+    let Ok(out) = GitCmd::at(repo).args(["check-attr", "--stdin", "-z", "conflict-marker-size"]).stdin_bytes(stdin).run().await else { return sizes };
+    if !out.ok() {
+        return sizes;
+    }
+    let fields: Vec<String> = out.stdout.split(|b| *b == 0).map(|p| String::from_utf8_lossy(p).to_string()).collect();
+    for rec in fields.chunks(3) {
+        if let [path, _attr, value] = rec {
+            if let Ok(n) = value.trim().parse::<usize>() {
+                if (3..=200).contains(&n) {
+                    sizes.insert(path.clone(), n);
+                }
+            }
+        }
+    }
+    sizes
+}
+
+pub(crate) fn marker_size_for(sizes: &std::collections::BTreeMap<String, usize>, path: &str) -> usize {
+    sizes.get(path).copied().unwrap_or(7)
+}
+
 /// The refusal for a file that still carries conflict markers.
 pub(crate) fn markers_refusal(path: &str, lines: &[usize]) -> Refusal {
+    let shown: Vec<String> = lines.iter().take(12).map(|n| n.to_string()).collect();
+    let more = lines.len().saturating_sub(shown.len());
     refuse(
         "conflict-markers",
         format!(
-            "{} still contains conflict markers (line{} {}). Finish the edit, or Keep mine / Take theirs.",
+            "{} still contains conflict markers (line{} {}{}). Finish the edit, or Keep mine / Take theirs.",
             path,
             if lines.len() == 1 { "" } else { "s" },
-            lines.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ")
+            shown.join(", "),
+            if more > 0 { format!(" and {} more", more) } else { String::new() }
         ),
     )
 }
 
-/// The first staged text file that still carries conflict markers, read from
-/// the index — what `rebase --continue` or a commit would record.
-pub(crate) async fn staged_marker_offence(repo: &std::path::Path) -> Option<(String, Vec<usize>)> {
-    let out = GitCmd::at(repo).args(["diff", "--cached", "--name-only", "-z", "--diff-filter=AM"]).run().await.ok()?;
-    if !out.ok() {
-        return None;
-    }
-    let names: Vec<String> = out.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| String::from_utf8_lossy(p).to_string()).collect();
-    for name in names {
-        let Ok(blob) = GitCmd::at(repo).args(["show", &format!(":{}", name)]).run().await else { continue };
-        if !blob.ok() || blob.stdout.iter().take(8000).any(|b| *b == 0) {
+/// What one read of staged blobs may hold, and what the whole check may read.
+const MARKER_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const MARKER_SCAN_TOTAL: usize = 256 * 1024 * 1024;
+
+/// `git diff --cached --raw -z` records: the path and blob of every regular
+/// file the index adds or changes. Gitlinks and symlinks have no lines.
+fn parse_raw_blobs(raw: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut it = raw.split(|b| *b == 0).filter(|t| !t.is_empty());
+    while let Some(meta) = it.next() {
+        if meta.first() != Some(&b':') {
             continue;
         }
-        let lines = conflict_marker_lines(&String::from_utf8_lossy(&blob.stdout));
+        let Some(path) = it.next() else { break };
+        let meta = String::from_utf8_lossy(meta);
+        let f: Vec<&str> = meta.split(' ').collect();
+        // ":<mode before> <mode after> <blob before> <blob after> <status>"
+        if f.len() >= 5 && f[1].starts_with("100") {
+            out.push((String::from_utf8_lossy(path).to_string(), f[3].to_string()));
+        }
+    }
+    out
+}
+
+/// `git cat-file --batch` output for the blobs asked for, in order: a header
+/// "<oid> blob <size>", the bytes, a newline — or "<oid> missing".
+fn first_marker_offence(batch_out: &[u8], batch: &[(String, String)], sizes: &std::collections::BTreeMap<String, usize>) -> Option<(String, Vec<usize>)> {
+    let mut rest = batch_out;
+    for (path, _) in batch {
+        let nl = rest.iter().position(|b| *b == b'\n')?;
+        let header = String::from_utf8_lossy(&rest[..nl]).to_string();
+        rest = &rest[nl + 1..];
+        let mut f = header.split(' ');
+        let (_, kind, size) = (f.next(), f.next(), f.next());
+        if kind != Some("blob") {
+            continue; // missing, or not a file's content
+        }
+        let size: usize = size?.parse().ok()?;
+        if rest.len() < size {
+            return None;
+        }
+        let content = &rest[..size];
+        rest = &rest[(size + 1).min(rest.len())..];
+        if content.iter().take(8000).any(|b| *b == 0) {
+            continue;
+        }
+        let lines = conflict_marker_lines(&String::from_utf8_lossy(content), marker_size_for(sizes, path));
         if !lines.is_empty() {
-            return Some((name, lines));
+            return Some((path.clone(), lines));
         }
     }
     None
+}
+
+/// The first staged text file that still carries conflict markers, read from
+/// the index — what `rebase --continue` or a commit would record. The diff
+/// names the staged blobs itself (no rename pairing, so a file moved while it
+/// was edited is still seen); they are read a batch at a time through
+/// `cat-file`, and judged by the same rule as "Mark resolved" and the
+/// conflict view. Nothing here depends on the person's colour, grep or diff
+/// settings, or on what an attribute calls binary.
+pub(crate) async fn staged_marker_offence(repo: &std::path::Path) -> Option<(String, Vec<usize>)> {
+    let out = GitCmd::at(repo)
+        .args(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames", "--no-color", "--diff-filter=AMT"])
+        .run()
+        .await
+        .ok()?;
+    if !out.ok() {
+        return None;
+    }
+    let staged = parse_raw_blobs(&out.stdout);
+    if staged.is_empty() {
+        return None;
+    }
+    let paths: Vec<String> = staged.iter().map(|(p, _)| p.clone()).collect();
+    let sizes = marker_sizes(repo, &paths).await;
+    // How large each blob is, before any of them is read.
+    let ids = |list: &[(String, String)]| -> Vec<u8> { list.iter().flat_map(|(_, oid)| format!("{}\n", oid).into_bytes()).collect() };
+    let check = GitCmd::at(repo).args(["cat-file", "--batch-check"]).stdin_bytes(ids(&staged)).run().await.ok()?;
+    if !check.ok() {
+        return None;
+    }
+    let blob_sizes: Vec<Option<usize>> = String::from_utf8_lossy(&check.stdout)
+        .lines()
+        .map(|l| {
+            let mut f = l.split(' ');
+            match (f.next(), f.next(), f.next()) {
+                (_, Some("blob"), Some(n)) => n.parse().ok(),
+                _ => None,
+            }
+        })
+        .collect();
+    let mut budget = MARKER_SCAN_TOTAL;
+    let mut batch: Vec<(String, String)> = Vec::new();
+    let mut batch_bytes = 0usize;
+    for (i, entry) in staged.iter().enumerate() {
+        let Some(size) = blob_sizes.get(i).copied().flatten() else { continue };
+        if size == 0 || size > MARKER_SCAN_MAX {
+            continue;
+        }
+        if size > budget {
+            break;
+        }
+        budget -= size;
+        batch_bytes += size;
+        batch.push(entry.clone());
+        if batch_bytes >= MARKER_BATCH_BYTES {
+            let read = GitCmd::at(repo).args(["cat-file", "--batch"]).stdin_bytes(ids(&batch)).private_output().run().await.ok()?;
+            if let Some(hit) = first_marker_offence(&read.stdout, &batch, &sizes) {
+                return Some(hit);
+            }
+            batch.clear();
+            batch_bytes = 0;
+        }
+    }
+    if batch.is_empty() {
+        return None;
+    }
+    let read = GitCmd::at(repo).args(["cat-file", "--batch"]).stdin_bytes(ids(&batch)).private_output().run().await.ok()?;
+    first_marker_offence(&read.stdout, &batch, &sizes)
 }
 
 pub async fn stage(repo_path: &str, paths: Vec<String>, allow_markers: bool) -> Result<OpResult, AppError> {
@@ -776,13 +966,14 @@ pub async fn stage(repo_path: &str, paths: Vec<String>, allow_markers: bool) -> 
         .collect();
     // "Mark resolved" on a file whose markers are still in it would stage the
     // markers as the resolution. Refuse by name; the page offers "anyway".
-    if !allow_markers {
+    if !allow_markers && !conflicted_before.is_empty() {
+        let sizes = marker_sizes(std::path::Path::new(repo_path), &conflicted_before).await;
         for p in &conflicted_before {
-            let Ok(bytes) = std::fs::read(std::path::Path::new(repo_path).join(p)) else { continue };
+            let Ok((bytes, _)) = read_head(&std::path::Path::new(repo_path).join(p), MARKER_SCAN_MAX) else { continue };
             if bytes.iter().take(8000).any(|b| *b == 0) {
                 continue;
             }
-            let lines = conflict_marker_lines(&String::from_utf8_lossy(&bytes));
+            let lines = conflict_marker_lines(&String::from_utf8_lossy(&bytes), marker_size_for(&sizes, p));
             if !lines.is_empty() {
                 return Ok(OpResult::refused(markers_refusal(p, &lines), before));
             }
@@ -2118,6 +2309,69 @@ async fn staged_is_empty(repo_path: &str) -> bool {
 /// --continue`, `revert --continue`, `am --continue`, or the commit that
 /// concludes a merge. A pick that became empty after the resolution is
 /// skipped (git would refuse to continue it) and the result says so.
+/// A rebase paused on a plain `pick` whose conflict is resolved and staged:
+/// commit it here, as the commit it replays — its message letter for letter,
+/// its author and date — so `rebase --continue` has nothing left to commit.
+/// Left to git, the continue runs the message through the "editor" with
+/// cleanup=strip: every line starting with '#' goes. A subject like "#123 fix
+/// the parser" vanishes, and a message that is only such a line becomes an
+/// empty one git refuses, with no way on but Abort. Nothing staged (git skips
+/// the commit, and the caller measures that itself), or a stop that is not a
+/// plain pick (an edit or a fixup of somebody's own interactive rebase): left
+/// to git. Hooks are skipped, as git's own rebase skips them. Returns whether
+/// a commit was made.
+pub(crate) async fn commit_resolved_pick(repo: &std::path::Path) -> bool {
+    let Some(stopped) = git_file(repo, "rebase-merge/stopped-sha").await.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else { return false };
+    // The last line of `done` is the command the rebase stopped on.
+    let Some(done) = git_file(repo, "rebase-merge/done").await else { return false };
+    let last = done.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    if !(last.starts_with("pick ") || last.starts_with("p ")) || git_file(repo, "rebase-merge/amend").await.is_some() {
+        return false;
+    }
+    // Options of that rebase a plain commit would not honour (dates, signing):
+    // git's own continue then, as before.
+    for opt in ["rebase-merge/cdate_is_adate", "rebase-merge/ignore_date", "rebase-merge/gpg_sign_opt"] {
+        if git_file(repo, opt).await.is_some() {
+            return false;
+        }
+    }
+    let signoff = git_file(repo, "rebase-merge/signoff").await.is_some();
+    // The stop must still be open — not committed already, by an earlier try
+    // or by hand — and the continue must not be about to refuse: git refuses
+    // it for unstaged edits to tracked files, and a commit made before that
+    // refusal would be committed a second time on the retry.
+    if !stop_is_open(repo).await {
+        return false;
+    }
+    let unstaged = GitCmd::at(repo).pinned().args(["diff", "--quiet", "--ignore-submodules", "--"]).run().await.map(|o| o.code != 0).unwrap_or(true);
+    if unstaged {
+        return false;
+    }
+    let staged = GitCmd::at(repo).pinned().args(["diff", "--cached", "--quiet", "--ignore-submodules=none", "HEAD", "--"]).run().await.map(|o| o.code == 1).unwrap_or(false);
+    if !staged {
+        return false;
+    }
+    let mut args = vec!["commit", "--quiet", "--no-verify", "--cleanup=verbatim", "--allow-empty-message"];
+    if signoff {
+        args.push("--signoff");
+    }
+    args.extend(["-C", stopped.as_str()]);
+    GitCmd::at(repo).pinned().args(args).timeout(NET_TIMEOUT).run().await.map(|o| o.ok()).unwrap_or(false)
+}
+
+/// The pick a rebase stopped on has not been committed yet: git writes the
+/// message it would commit with to MERGE_MSG at the stop, and the commit —
+/// by `rebase --continue`, by the app, or by hand — removes it.
+pub(crate) async fn stop_is_open(repo: &std::path::Path) -> bool {
+    git_file(repo, "MERGE_MSG").await.is_some()
+}
+
+/// A file of the repository's git directory, read whole; `None` when it is not there.
+async fn git_file(repo: &std::path::Path, name: &str) -> Option<String> {
+    let p = GitCmd::at(repo).args(["rev-parse", "--path-format=absolute", "--git-path", name]).ok_text().await?;
+    std::fs::read_to_string(p.trim()).ok()
+}
+
 pub async fn continue_op(repo_path: &str, allow_markers: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Continue, &StatusFacts::from(&before)) {
@@ -2135,9 +2389,19 @@ pub async fn continue_op(repo_path: &str, allow_markers: bool) -> Result<OpResul
     let mut args: Vec<String> = cmd.split_whitespace().skip(1).map(|s| s.to_string()).collect();
     let mut skipped = false;
     let picks = matches!(op.kind.as_str(), "rebase" | "rebase-interactive" | "cherry-pick" | "revert");
-    if picks && staged_is_empty(repo_path).await {
+    // A rebase stop that was committed already (by hand, or by the app on a
+    // try git then refused) has nothing left to skip or to commit.
+    // (Only the merge backend writes a stop this way; the apply backend has no
+    // MERGE_MSG at all, and keeps the old behaviour.)
+    let committed_already = op.kind.starts_with("rebase")
+        && git_file(std::path::Path::new(repo_path), "rebase-merge/stopped-sha").await.is_some()
+        && !stop_is_open(std::path::Path::new(repo_path)).await;
+    if picks && !committed_already && staged_is_empty(repo_path).await {
         args = vec![args[0].clone(), "--skip".into()];
         skipped = true;
+    } else if op.kind.starts_with("rebase") && !committed_already {
+        // The resolved commit keeps its message, whatever it starts with.
+        commit_resolved_pick(std::path::Path::new(repo_path)).await;
     }
     let out = GitCmd::at(repo_path)
         .pinned()
@@ -2721,6 +2985,67 @@ mod tests {
     }
 
     #[test]
+    fn staged_blobs_are_read_from_the_raw_diff_and_the_batch() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let z = "0".repeat(40);
+        // Two files, a gitlink and a symlink: only the files have lines.
+        let raw = format!(
+            ":100644 100644 {z} {a} M\0src/one.txt\0:000000 100755 {z} {b} A\0with space.sh\0:160000 160000 {z} {a} M\0sub\0:000000 120000 {z} {b} A\0link\0"
+        );
+        let staged = parse_raw_blobs(raw.as_bytes());
+        assert_eq!(staged, vec![("src/one.txt".to_string(), a.clone()), ("with space.sh".to_string(), b.clone())]);
+        // A path that stops being a symlink and becomes a file has lines to read; the reverse has none.
+        let types = format!(":120000 100644 {z} {a} T\0was-a-link\0:100644 120000 {z} {b} T\0now-a-link\0");
+        assert_eq!(parse_raw_blobs(types.as_bytes()), vec![("was-a-link".to_string(), a.clone())]);
+        // The batch: a clean file, a missing object, then one with a marker — at a width its attribute sets.
+        let clean = "fine\n";
+        let marked = "x\n<<<<< HEAD\ny\n";
+        let list = vec![("clean.txt".to_string(), a.clone()), ("gone.txt".to_string(), z.clone()), ("narrow.txt".to_string(), b.clone())];
+        let out = format!("{a} blob {}\n{clean}\n{z} missing\n{b} blob {}\n{marked}\n", clean.len(), marked.len());
+        let mut sizes = std::collections::BTreeMap::new();
+        assert_eq!(first_marker_offence(out.as_bytes(), &list, &sizes), None, "five is not a marker at the default width");
+        sizes.insert("narrow.txt".to_string(), 5);
+        assert_eq!(first_marker_offence(out.as_bytes(), &list, &sizes), Some(("narrow.txt".to_string(), vec![2])));
+        // A bare CRLF marker is one; a binary blob is skipped; a cut-off batch is no answer.
+        let crlf = "<<<<<<<\r\nmine\r\n=======\r\n";
+        let bin = "\0\0<<<<<<< HEAD\n";
+        let list = vec![("bin.dat".to_string(), a.clone()), ("crlf.txt".to_string(), b.clone())];
+        let out = format!("{a} blob {}\n{bin}\n{b} blob {}\n{crlf}\n", bin.len(), crlf.len());
+        assert_eq!(first_marker_offence(out.as_bytes(), &list, &std::collections::BTreeMap::new()), Some(("crlf.txt".to_string(), vec![1])));
+        assert_eq!(first_marker_offence(&out.as_bytes()[..60], &list, &std::collections::BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn windows_double_click_types_count_as_programs_only_there() {
+        let p = std::path::Path::new("tools/run.js");
+        assert_eq!(opens_by_running(p), cfg!(windows));
+        assert!(opens_by_running(std::path::Path::new("Build.app")), "a bundle is a program even as a directory");
+        assert!(opens_by_running(std::path::Path::new("setup.Command")));
+        assert!(!opens_by_running(std::path::Path::new("README.md")));
+        // What "open" runs on every platform, in any case.
+        for name in ["a.terminal", "a.action", "a.ksh", "a.csh", "a.AppImage", "A.APP"] {
+            assert!(opens_by_running(std::path::Path::new(name)), "{name}");
+        }
+        // What Windows runs on a double-click, and nothing else does.
+        for name in ["a.vbs", "a.hta", "a.lnk", "a.reg", "a.py", "a.scr", "a.appref-ms", "A.JS"] {
+            assert_eq!(opens_by_running(std::path::Path::new(name)), cfg!(windows), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_path_goes_to_the_shell_without_the_verbatim_prefix() {
+        // An ordinary path is handed over as it is, on every platform.
+        assert_eq!(shell_path(std::path::Path::new("/repos/r/a.txt")), PathBuf::from("/repos/r/a.txt"));
+        #[cfg(windows)]
+        {
+            assert_eq!(shell_path(std::path::Path::new(r"\\?\C:\r\a.txt")), PathBuf::from(r"C:\r\a.txt"));
+            assert_eq!(shell_path(std::path::Path::new(r"\\?\UNC\srv\share\a.txt")), PathBuf::from(r"\\srv\share\a.txt"));
+            assert_eq!(shell_path(std::path::Path::new(r"C:\r\a.txt")), PathBuf::from(r"C:\r\a.txt"));
+        }
+    }
+
+    #[test]
     fn programs_are_revealed_never_opened() {
         let dir = std::env::temp_dir().join(format!("gitswitch-open-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2742,14 +3067,19 @@ mod tests {
     }
 
     #[test]
-    fn conflict_markers_are_found_by_complete_group_only() {
+    fn conflict_markers_are_found_by_opener_and_orphan_close() {
         let text = "a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> theirs\nb\n<<<<<<< ours\nunfinished\n";
-        assert_eq!(conflict_marker_lines(text), vec![2]);
-        assert!(conflict_marker_lines("=======\n<<<<<<<<\nnot markers\n").is_empty());
-        assert!(conflict_marker_lines("clean\n").is_empty());
+        assert_eq!(conflict_marker_lines(text, 7), vec![2, 8], "a half-done hunk is still a marker");
+        assert!(conflict_marker_lines("=======\n<<<<<<<<\nnot markers\n", 7).is_empty(), "a bare separator is a heading; eight is not a marker");
+        assert_eq!(conflict_marker_lines(">>>>>>> left over\n", 7), vec![1], "an orphan close is a leftover");
+        assert_eq!(conflict_marker_lines("<<<<<<<<<< HEAD\nx\n>>>>>>>>>> theirs\n", 10), vec![1], "the width follows conflict-marker-size");
+        assert!(conflict_marker_lines("<<<<<<<<<< HEAD\n", 7).is_empty());
+        assert!(conflict_marker_lines("clean\n", 7).is_empty());
         let r = markers_refusal("shared.txt", &[3, 12]);
         assert_eq!(r.code, "conflict-markers");
         assert!(r.message.contains("shared.txt still contains conflict markers (lines 3, 12)"));
+        let many: Vec<usize> = (1..=20).collect();
+        assert!(markers_refusal("big.txt", &many).message.contains("12 and 8 more"), "{}", markers_refusal("big.txt", &many).message);
         let bisect = StatusFacts {
             operation: Some("bisect".into()),
             abort_command: Some("git bisect reset".into()),

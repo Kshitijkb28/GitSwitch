@@ -8,7 +8,8 @@ import { CommitBox } from "../changes/CommitBox";
 import { DiffPanel } from "../changes/DiffPanel";
 import { TidyUpStrip } from "./TidyUpStrip";
 import type { RepoActions } from "./StatusStrip";
-import { BranchesModal, type RunOptions } from "../changes/BranchesModal";
+import { BranchesModal } from "../changes/BranchesModal";
+import type { ApplyOptions, MarkersRetry } from "../changes/SubmoduleSection";
 import { PushAccessCard } from "../changes/PushAccessCard";
 import { SubmodulesCard } from "../changes/SubmodulesCard";
 import { SubmoduleSection, needsSection, sectionId } from "../changes/SubmoduleSection";
@@ -47,7 +48,8 @@ interface Props {
   onActions: (a: RepoActions) => void;
   onOpenHistory: () => void;
   /** A run was refused because upstream moved: the drawer re-plans. */
-  onAssessAgain: () => void;
+  /** A run on `repo` was refused because upstream moved: re-plan it (and show the drawer if it is the one on screen). */
+  onAssessAgain: (repo: string) => void;
   /** A paused update's hand-off: where the conflicts are (needs_user.where_). */
   onGoToConflicts: (where: string) => void;
   /** Opens the Update drawer. */
@@ -100,8 +102,13 @@ export function ChangesTab({
   const [discardAllOpen, setDiscardAllOpen] = useState(false);
   const [tick, setTick] = useState(0);
   const [subRefresh, setSubRefresh] = useState(0);
-  /** The last operation a "conflict-markers" refusal can be retried from, markers allowed. */
-  const [lastOp, setLastOp] = useState<{ kind: "stage"; paths: string[] } | { kind: "continue" } | { kind: "update-continue" } | null>(null);
+  /**
+   * The retry a "conflict-markers" refusal offers — the very operation that was
+   * refused, run again with markers allowed. Set by the call that was refused
+   * and cleared by every other result, so it can never pair with a different
+   * operation or a different repository.
+   */
+  const [markersRetry, setMarkersRetry] = useState<MarkersRetry | null>(null);
 
   const job = useGitJob(repoPath);
   const seq = useRef(0);
@@ -159,6 +166,8 @@ export function ChangesTab({
     setSubStatuses([]);
     setOpenSubs({});
     setResult(null);
+    // A retry belongs to the repository its refusal came from.
+    setMarkersRetry(null);
     setAmend(false);
     loadStatus(repoPath);
   }, [repoPath, loadStatus]);
@@ -229,6 +238,8 @@ export function ChangesTab({
   // jobs are remembered per repository, so returning to one does not replay
   // a result that was already dismissed.
   const seenJob = useRef<Record<string, number>>({});
+  /** The current "Continue update", for the job effect below (declared further down). */
+  const continueUpdateRef = useRef<(allow: boolean) => unknown>(() => undefined);
   useEffect(() => {
     if (!job || job.running || seenJob.current[repoPath] === job.startedAt) return;
     seenJob.current[repoPath] = job.startedAt;
@@ -240,11 +251,21 @@ export function ChangesTab({
     }
     if (job.result?.refusal?.code === "assess-again") {
       // The drawer re-plans and says why; a result card would only repeat it.
+      // Said here as well as where the run was started: the person may have
+      // been on another repository when it was refused, and this is the
+      // moment it is on screen again. The job is spent once it has been said.
+      onAssessAgain(repoPath);
+      clearJob(repoPath);
       loadStatus(repoPath);
       return;
     }
     if (job.result) {
       setResult(job.result);
+      // A paused update's Continue that was refused for markers while the
+      // person was elsewhere: the retry comes back with its refusal.
+      if (job.kind === "sync" && job.result.refusal?.code === "conflict-markers") {
+        setMarkersRetry({ label: "Continue update anyway", run: () => void continueUpdateRef.current(true) });
+      }
       // The result carries the status git had after the operation, so a
       // second full status read on top of it would be wasted work.
       if (job.result.status) setStatus(job.result.status);
@@ -276,7 +297,7 @@ export function ChangesTab({
    * caller named in `opts.quietRefusal` is a question it answers itself (a
    * confirm step), so it gets neither a toast nor a result card.
    */
-  const apply = async (key: string, fn: () => Promise<OpResult>, target?: string, opts?: RunOptions) => {
+  const apply = async (key: string, fn: () => Promise<OpResult>, target?: string, opts?: ApplyOptions) => {
     const forRepo = repoPath;
     setBusy(key);
     setError(null);
@@ -286,7 +307,10 @@ export function ChangesTab({
       // Still looking at the repository this ran in? Only then is the view
       // updated; the toast below says what happened either way.
       const stillHere = repoRef.current === forRepo;
-      if (!quiet && stillHere) setResult(r);
+      if (!quiet && stillHere) {
+        setResult(r);
+        setMarkersRetry(!r.ok && r.refusal?.code === "conflict-markers" && opts?.markers ? opts.markers : null);
+      }
       if (r.status && stillHere) {
         const s = r.status;
         if (target && target !== forRepo) {
@@ -322,22 +346,34 @@ export function ChangesTab({
    * moved to another repository is shown when they come back, not over the
    * one they are looking at.
    */
-  const runLongIn = (repo: string, kind: GitJobKind, label: string, fn: () => Promise<OpResult>) => {
+  const runLongIn = (repo: string, kind: GitJobKind, label: string, fn: () => Promise<OpResult>, markers?: MarkersRetry) => {
     setResult(null);
     setError(null);
+    setMarkersRetry(null);
     return runJob(repo, kind, label, fn).then((r) => {
       if (!r) return;
+      if (repoRef.current === repo) setMarkersRetry(!r.ok && r.refusal?.code === "conflict-markers" && markers ? markers : null);
       if (r.ok) toast.success(r.headline);
-      else if (r.refusal?.code === "assess-again") onAssessAgain();
+      else if (r.refusal?.code === "assess-again") onAssessAgain(repo);
       // A pause is a hand-off, not a failure.
       else if (r.sync && r.sync.phase === "needs-user") toast.info(r.headline);
-      else toast.error(r.refusal?.message ?? r.advice?.headline ?? "That didn't work");
+      // Finished with a check that did not pass: its own headline says which.
+      else toast.error(r.refusal?.message ?? r.advice?.headline ?? (r.sync ? r.headline : "That didn't work"));
     });
   };
   /** Opens a file in the system's default application, or reveals it. */
   const openPath = (path: string, reveal: boolean) =>
     void api.changesOpenPath(repoPath, path, reveal).catch((e) => toast.error(String(e)));
-  const runLong = (kind: GitJobKind, label: string, fn: () => Promise<OpResult>) => runLongIn(repoPath, kind, label, fn);
+  const runLong = (kind: GitJobKind, label: string, fn: () => Promise<OpResult>, markers?: MarkersRetry) => runLongIn(repoPath, kind, label, fn, markers);
+  // The three operations the marker guard can refuse, each carrying its own
+  // "…anyway" — the same call with markers allowed, on the same repository.
+  const stagePaths = (paths: string[], allow: boolean) =>
+    apply("stage", () => api.changesStage(repoPath, paths, allow), undefined, allow ? undefined : { markers: { label: "Mark resolved anyway", run: () => void stagePaths(paths, true) } });
+  const continueOp = (allow: boolean) =>
+    apply("continue", () => api.changesContinue(repoPath, allow), undefined, allow ? undefined : { markers: { label: "Continue anyway", run: () => void continueOp(true) } });
+  const continueUpdate = (allow: boolean) =>
+    runLong("sync", "Continuing the update…", () => api.changesSyncContinue(repoPath, allow), allow ? undefined : { label: "Continue update anyway", run: () => void continueUpdate(true) });
+  continueUpdateRef.current = continueUpdate;
 
   /**
    * `git pull` inside one submodule, on its own branch, with the page's pull
@@ -423,19 +459,9 @@ export function ChangesTab({
     : null;
   const movedAction = result?.pull && (result.pull.submodules_moved ?? 0) > 0 ? { label: "Update…", onClick: onPreview, primary: true } : null;
   // A file staged with its conflict markers still in it: the refusal names
-  // the lines, and whoever meant it (a marker-size setting, a file that really
-  // contains "<<<<<<<") says so once.
-  const markersAction =
-    result?.refusal?.code === "conflict-markers" && lastOp
-      ? {
-          label: lastOp.kind === "stage" ? "Mark resolved anyway" : lastOp.kind === "continue" ? "Continue anyway" : "Continue update anyway",
-          onClick: () => {
-            if (lastOp.kind === "stage") void apply("stage", () => api.changesStage(repoPath, lastOp.paths, true));
-            else if (lastOp.kind === "continue") void apply("continue", () => api.changesContinue(repoPath, true));
-            else void runLong("sync", "Continuing the update…", () => api.changesSyncContinue(repoPath, true));
-          },
-        }
-      : null;
+  // the lines, and whoever meant it (a file that really contains "<<<<<<<")
+  // says so once.
+  const markersAction = result?.refusal?.code === "conflict-markers" && markersRetry ? { label: markersRetry.label, onClick: markersRetry.run } : null;
 
   // The entries the discard confirmation describes: the parent's, or the submodule's.
   const confirmEntries = confirmDiscard?.target
@@ -528,10 +554,7 @@ export function ChangesTab({
               sync={status.sync}
               status={status}
               busy={anyBusy}
-              onContinue={() => {
-                setLastOp({ kind: "update-continue" });
-                void runLong("sync", "Continuing the update…", () => api.changesSyncContinue(repoPath));
-              }}
+              onContinue={() => void continueUpdate(false)}
               onAbort={() => runLong("sync", "Aborting the update…", () => api.changesSyncAbort(repoPath))}
               onOpenRoot={() => status.sync && openRepo(status.sync.root)}
               onHandOff={onGoToConflicts}
@@ -553,10 +576,7 @@ export function ChangesTab({
                     size="sm"
                     variant="primary"
                     disabled={anyBusy || status.conflicted_count > 0}
-                    onClick={() => {
-                      setLastOp({ kind: "continue" });
-                      void apply("continue", () => api.changesContinue(repoPath));
-                    }}
+                    onClick={() => void continueOp(false)}
                     title={
                       status.conflicted_count > 0
                         ? "Resolve and stage every conflicted file first"
@@ -621,10 +641,7 @@ export function ChangesTab({
                 status={status}
                 busy={anyBusy}
                 onOpen={setDiffFor}
-                onStage={(paths) => {
-                  setLastOp({ kind: "stage", paths });
-                  void apply("stage", () => api.changesStage(repoPath, paths));
-                }}
+                onStage={(paths) => void stagePaths(paths, false)}
                 onUnstage={(paths) => apply("unstage", () => api.changesUnstage(repoPath, paths))}
                 onDiscard={(paths, variant) => setConfirmDiscard({ paths, variant })}
                 onResolveSide={(paths, side) =>

@@ -465,7 +465,8 @@ pub async fn history_page(
     offset: usize,
     limit: usize,
     search: Option<String>,
-    author: Option<String>,
+    authors: Option<Vec<String>>,
+    hide_pointer_only: Option<bool>,
 ) -> Result<HistoryPage, AppError> {
     tokio::task::spawn_blocking(move || {
         git_history::history_page(
@@ -474,7 +475,8 @@ pub async fn history_page(
             offset,
             limit,
             search.as_deref(),
-            author.as_deref(),
+            authors.as_deref(),
+            hide_pointer_only.unwrap_or(false),
         )
     })
     .await
@@ -843,7 +845,7 @@ pub async fn changes_sync_abort(repo_path: String) -> Result<OpResult, AppError>
 /// granted to the JavaScript side.
 #[tauri::command]
 pub async fn changes_open_path(repo_path: String, path: String, reveal: bool) -> Result<(), AppError> {
-    let full = git_ops::within_repo(&repo_path, &path)?;
+    let full = git_ops::shell_path(&git_ops::within_repo(&repo_path, &path)?);
     if !reveal && git_ops::opens_by_running(&full) {
         // The system "open" would run it, not show it.
         return Err(AppError::Command(format!("{} is a program, not a text file — Reveal it instead of opening it.", path)));

@@ -2,6 +2,7 @@ use crate::error::AppError;
 use crate::profiles;
 use crate::repo_scan;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Unit separator — safe inside git format strings, never appears in messages.
@@ -38,10 +39,18 @@ pub struct HistoryCommit {
     pub parents: Vec<String>,
     pub author_name: String,
     pub author_email: String,
+    /// The committer date — what the graph is ordered by.
     pub date: String,
     pub subject: String,
     pub refs: Vec<String>,
     pub is_merge: bool,
+    /// The author date: stable across the rebases an update performs, so a
+    /// row keeps its time when its id changes. Shown; `date` sits in the title.
+    pub author_date: String,
+    /// Submodule pointers this commit moves.
+    pub touches_submodules: Vec<String>,
+    /// It changes nothing but submodule pointers — a bump, not work.
+    pub only_submodules: bool,
     // graph placement
     pub lane: usize,
     pub parent_lanes: Vec<usize>,
@@ -151,9 +160,15 @@ pub(crate) fn is_remote_head(full_ref: &str) -> bool {
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, AppError> {
     let started = std::time::Instant::now();
+    // Signature checks must never land in output that is parsed.
+    let safe: Vec<&str> = match args.first().and_then(|sub| crate::git_exec::parse_safe_cfg(sub)) {
+        Some(kv) => vec!["-c", kv],
+        None => Vec::new(),
+    };
     let out = crate::spawn::command("git")
         .arg("-C")
         .arg(repo)
+        .args(&safe)
         .args(args)
         .output()
         .map_err(|e| AppError::Command(format!("failed to run git: {}", e)))?;
@@ -162,6 +177,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, AppError> {
         ["git", "-C", &repo.to_string_lossy()]
             .iter()
             .map(|a| a.to_string())
+            .chain(safe.iter().map(|a| a.to_string()))
             .chain(args.iter().map(|a| a.to_string()))
             .collect(),
         out.status.code().unwrap_or(-1),
@@ -389,8 +405,8 @@ fn parse_log(raw: &str) -> Vec<(String, Vec<String>, Vec<String>)> {
     // (hash, parents, remaining fields)
     raw.lines()
         .filter_map(|line| {
-            let f: Vec<&str> = line.splitn(8, US).collect();
-            if f.len() < 8 {
+            let f: Vec<&str> = line.splitn(9, US).collect();
+            if f.len() < 9 {
                 return None;
             }
             let parents = f[2]
@@ -443,14 +459,120 @@ pub fn authors(repo_path: &str, rev: &str) -> Result<Vec<AuthorCount>, AppError>
     Ok(list)
 }
 
+/// Every gitlink path in the index — the submodules, mapped or not.
+fn gitlink_paths(repo: &Path) -> Vec<String> {
+    git(repo, &["ls-files", "-s", "-z"])
+        .map(|out| {
+            out.split('\0')
+                .filter(|rec| rec.starts_with("160000 "))
+                .filter_map(|rec| rec.split_once('\t').map(|(_, p)| p.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The files each listed commit touches — one git call for the page, so a
+/// commit can be told apart from a submodule-pointer bump.
+fn files_per_commit(repo: &Path, hashes: &[String]) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    if hashes.is_empty() {
+        return out;
+    }
+    // -z: names as they are (no quoting of non-ASCII paths). Gitlink changes
+    // are listed whatever `submodule.<name>.ignore` or `diff.ignoreSubmodules`
+    // says, and a merge lists nothing — its combined diff is not what it
+    // "changed".
+    // --no-show-signature: with `log.showSignature` set, the verification
+    // text would land among the names.
+    let mut args: Vec<&str> = vec!["show", "--no-show-signature", "--name-only", "-z", "--format=%x1e%H", "--no-renames", "--ignore-submodules=none", "--no-diff-merges"];
+    args.extend(hashes.iter().map(String::as_str));
+    let Ok(text) = git(repo, &args) else { return out };
+    out.extend(parse_name_only(&text));
+    out
+}
+
+/// `--name-only -z --format=%x1e%H` output, from `show` or `log`: one record
+/// per commit — the hash and a NUL, then, when it touches anything, a
+/// newline and its files, each ended by a NUL.
+pub(crate) fn parse_name_only(text: &str) -> BTreeMap<String, Vec<String>> {
+    let mut out = BTreeMap::new();
+    for chunk in text.split('\x1e') {
+        let mut fields = chunk.split('\0');
+        let Some(hash) = fields.next().map(str::trim).filter(|h| !h.is_empty()) else { continue };
+        let files = fields.map(|f| f.strip_prefix('\n').unwrap_or(f)).filter(|f| !f.is_empty()).map(String::from).collect();
+        out.insert(hash.to_string(), files);
+    }
+    out
+}
+
+/// A pathspec that leaves out exactly this path — the gitlink entry — and
+/// nothing under it. A plain or literal pathspec is a prefix match: it would
+/// also hide every commit that touched files there while the path was still
+/// an ordinary folder, earlier in history or on another branch. A pattern
+/// with a wildcard is matched against the whole path instead, so one
+/// character is written as a one-character class (or escaped, when there is
+/// no plain one to use).
+/// `s` as a basic regular expression that matches exactly that text. Only
+/// the characters that mean something in a BRE are escaped; "+", "?", "(",
+/// "{" and "|" are literal there already.
+fn bre_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '.' | '*' | '[' | '^' | '$') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn exact_exclude(path: &str) -> String {
+    let mut out = String::from(":(exclude,glob)");
+    let mut classed = false;
+    let any_plain = path.chars().any(|c| c.is_ascii_alphanumeric());
+    for (i, c) in path.chars().enumerate() {
+        match c {
+            '\\' | '*' | '?' | '[' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if !classed && c.is_ascii_alphanumeric() => {
+                out.push('[');
+                out.push(c);
+                out.push(']');
+                classed = true;
+            }
+            c if !any_plain && i == 0 => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Which of a commit's files are submodule pointers, and whether that is all
+/// it changes. A commit that touches nothing (a merge, an empty commit) is
+/// not a bump: it would otherwise vanish behind the "pointer-only" toggle.
+fn classify_touches(files: &[String], gitlinks: &[String]) -> (Vec<String>, bool) {
+    let touched: Vec<String> = files.iter().filter(|p| gitlinks.contains(p)).cloned().collect();
+    let only = !files.is_empty() && touched.len() == files.len();
+    (touched, only)
+}
+
 /// One page of history for a branch (or every branch when `rev` is "--all").
+/// `authors`: only commits by any of these (emails or names, literal);
+/// `hide_pointer_only`: leave out commits that change nothing but submodule
+/// pointers (the CI bumps a superproject's history fills up with).
 pub fn history_page(
     repo_path: &str,
     rev: &str,
     offset: usize,
     limit: usize,
     search: Option<&str>,
-    author: Option<&str>,
+    authors: Option<&[String]>,
+    hide_pointer_only: bool,
 ) -> Result<HistoryPage, AppError> {
     let repo = PathBuf::from(repo_path);
     // Ranges (main..origin/main) are legitimate revisions; only flags are not.
@@ -458,13 +580,24 @@ pub fn history_page(
         return Err(AppError::Config(format!("Invalid revision: {}", rev)));
     }
     let fmt = format!(
-        "%H{US}%h{US}%P{US}%an{US}%ae{US}%cI{US}%D{US}%s",
+        "%H{US}%h{US}%P{US}%aN{US}%aE{US}%cI{US}%D{US}%s{US}%aI",
         US = US
     );
+    let gitlinks = gitlink_paths(&repo);
 
-    let mut count_args: Vec<String> = vec!["rev-list".into(), "--count".into()];
+    // Counting an author filter has to be done by `log`: it matches authors
+    // through .mailmap, as the People list (shortlog) and the rows do, and
+    // `rev-list` cannot — the two would disagree on the total.
+    let by_author = authors.is_some_and(|a| a.iter().any(|s| !s.trim().is_empty()));
+    // --use-mailmap on the command line: the people list is always mapped,
+    // and `log.mailmap=false` in someone's config must not make the rows and
+    // the count disagree with it.
+    let mut count_args: Vec<String> =
+        if by_author { vec!["log".into(), "--use-mailmap".into(), "--no-show-signature".into(), "--format=%x2e".into()] } else { vec!["rev-list".into(), "--count".into()] };
     let mut log_args: Vec<String> = vec![
         "log".into(),
+        "--use-mailmap".into(),
+        "--no-show-signature".into(),
         format!("--skip={}", offset),
         format!("-n{}", limit),
         "--date-order".into(),
@@ -475,13 +608,29 @@ pub fn history_page(
     // `1234+user@users.noreply.github.com` must match literally.
     let mut limits: Vec<String> = Vec::new();
     if let Some(q) = search.filter(|s| !s.trim().is_empty()) {
-        limits.push(format!("--grep={}", q.trim()));
+        limits.push(format!("--grep={}", bre_literal(q.trim())));
     }
-    if let Some(a) = author.filter(|s| !s.trim().is_empty()) {
-        limits.push(format!("--author={}", a.trim()));
+    // Several --author patterns are ORed by git; capped so the argument list
+    // stays well under Windows' limit. Every pattern is the text itself (a
+    // "+" or "[bot]" in an address is literal): an address is wrapped in its
+    // angle brackets so me@x.test does not also match someone@x.testing; a
+    // whole identity ("Sam <>", for a commit without an address) is anchored
+    // at both ends, so it does not also mean "Uncle Sam <>".
+    for a in authors.unwrap_or(&[]).iter().map(|s| s.trim()).filter(|s| !s.is_empty()).take(200) {
+        if a.starts_with('<') && a.ends_with('>') {
+            // An address in its brackets, whatever the name before it.
+            limits.push(format!("--author={}", bre_literal(a)));
+        } else if a.contains('<') {
+            limits.push(format!("--author=^{}$", bre_literal(a)));
+        } else if a.contains('@') {
+            limits.push(format!("--author=<{}>", bre_literal(a)));
+        } else {
+            limits.push(format!("--author={}", bre_literal(a)));
+        }
     }
     if !limits.is_empty() {
-        for a in ["--fixed-strings".to_string(), "--regexp-ignore-case".to_string()] {
+        // Basic regular expressions by name, whatever grep.patternType says.
+        for a in ["--basic-regexp".to_string(), "--regexp-ignore-case".to_string()] {
             count_args.push(a.clone());
             log_args.push(a);
         }
@@ -497,13 +646,26 @@ pub fn history_page(
         count_args.push(rev.to_string());
         log_args.push(rev.to_string());
     }
+    // Everything but the gitlinks: a commit that touches only pointers has
+    // nothing left and drops out of the list (and the count). Full history
+    // with merge simplification keeps every commit that did real work and
+    // rewrites parents past the hidden ones, so the graph stays connected
+    // instead of running lanes off to commits that are not shown.
+    if hide_pointer_only && !gitlinks.is_empty() {
+        for args in [&mut count_args, &mut log_args] {
+            args.push("--full-history".into());
+            args.push("--simplify-merges".into());
+            args.push("--".into());
+            args.push(".".into());
+            for p in &gitlinks {
+                args.push(exact_exclude(p));
+            }
+        }
+    }
 
     let count_ref: Vec<&str> = count_args.iter().map(String::as_str).collect();
-    let total: usize = git(&repo, &count_ref)
-        .unwrap_or_default()
-        .trim()
-        .parse()
-        .unwrap_or(0);
+    let counted = git(&repo, &count_ref).unwrap_or_default();
+    let total: usize = if by_author { counted.lines().filter(|l| l.trim() == ".").count() } else { counted.trim().parse().unwrap_or(0) };
 
     let log_ref: Vec<&str> = log_args.iter().map(String::as_str).collect();
     // A repo with no commits yet makes `git log` exit non-zero; that's an empty
@@ -541,13 +703,25 @@ pub fn history_page(
             author_email: f[4].clone(),
             date: f[5].clone(),
             subject: f[7].clone(),
+            author_date: f[8].clone(),
             refs,
             hash,
             parents,
             lane: row.lane,
             parent_lanes: row.parent_lanes.clone(),
             active_lanes: row.active.clone(),
+            touches_submodules: Vec::new(),
+            only_submodules: false,
         });
+    }
+    if !gitlinks.is_empty() {
+        let hashes: Vec<String> = commits.iter().map(|c| c.hash.clone()).collect();
+        let files = files_per_commit(&repo, &hashes);
+        for c in commits.iter_mut() {
+            if let Some(f) = files.get(&c.hash) {
+                (c.touches_submodules, c.only_submodules) = classify_touches(f, &gitlinks);
+            }
+        }
     }
 
     Ok(HistoryPage {
@@ -643,7 +817,7 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
     .filter(|s| s != branch)
     .collect();
 
-    let page = history_page(repo_path, branch, 0, 400, None, None)?;
+    let page = history_page(repo_path, branch, 0, 400, None, None, false)?;
     let merges = page.commits.into_iter().filter(|c| c.is_merge).take(50).collect();
 
     Ok(MergeInfo {
@@ -779,6 +953,50 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_line_needs_all_nine_fields_and_keeps_the_author_date_last() {
+        let line = ["h1", "h", "p1 p2", "Ann", "ann@x", "2026-10-05T10:00:00+02:00", "HEAD -> main", "fix: it", "2026-10-01T09:00:00+02:00"].join("\x1f");
+        let parsed = parse_log(&line);
+        assert_eq!(parsed.len(), 1);
+        let (hash, parents, f) = &parsed[0];
+        assert_eq!(hash, "h1");
+        assert_eq!(parents, &["p1", "p2"]);
+        assert_eq!(f[7], "fix: it");
+        assert_eq!(f[8], "2026-10-01T09:00:00+02:00", "the author date rides last");
+        // The old eight-field shape is not silently accepted as a commit.
+        let eight = ["h1", "h", "", "Ann", "ann@x", "2026-10-05T10:00:00+02:00", "", "fix: it"].join("\x1f");
+        assert!(parse_log(&eight).is_empty());
+    }
+
+    #[test]
+    fn name_only_records_are_split_per_commit_and_a_bump_is_told_from_work() {
+        // The bytes git writes with -z: hash, NUL, then (when there are files) a newline and each name with its NUL.
+        let text = "\x1eaaa\0\ntrinity\0\x1ebbb\0\nsrc/main.rs\0trinity\0\x1eccc\0\x1eddd\0\nm\u{f3}dulo file.txt\0";
+        let files = parse_name_only(text);
+        assert_eq!(files["ddd"], vec!["m\u{f3}dulo file.txt".to_string()], "a name is taken as it is, spaces and all");
+        assert_eq!(files["aaa"], vec!["trinity".to_string()]);
+        assert_eq!(files["bbb"], vec!["src/main.rs".to_string(), "trinity".to_string()]);
+        assert!(files["ccc"].is_empty(), "a merge lists no files");
+        let gitlinks = vec!["trinity".to_string(), "vendor/sub".to_string()];
+        assert_eq!(classify_touches(&files["aaa"], &gitlinks), (vec!["trinity".to_string()], true));
+        assert_eq!(classify_touches(&files["bbb"], &gitlinks), (vec!["trinity".to_string()], false));
+        assert_eq!(classify_touches(&files["ccc"], &gitlinks), (vec![], false), "nothing touched is not a bump");
+        assert_eq!(classify_touches(&["README.md".to_string()], &gitlinks), (vec![], false));
+    }
+
+    #[test]
+    fn hiding_a_pointer_leaves_out_that_entry_and_nothing_under_it() {
+        // One character becomes a class, so git matches the whole path rather than a prefix.
+        assert_eq!(bre_literal("1234+user@users.noreply.github.com"), "1234+user@users\\.noreply\\.github\\.com");
+        assert_eq!(bre_literal("A.B [bot] <>"), "A\\.B \\[bot] <>");
+        assert_eq!(bre_literal("a\\b*^$"), "a\\\\b\\*\\^\\$");
+        assert_eq!(exact_exclude("vendor/lib"), ":(exclude,glob)[v]endor/lib");
+        // Characters a glob would read are escaped.
+        assert_eq!(exact_exclude("libs/my sub[1]*"), ":(exclude,glob)[l]ibs/my sub\\[1]\\*");
+        // No plain character to class: the first one is escaped, which makes it a pattern all the same.
+        assert_eq!(exact_exclude("\u{65e5}\u{672c}"), ":(exclude,glob)\\\u{65e5}\u{672c}");
+    }
 
     #[test]
     fn a_shortlog_becomes_people_with_counts_in_the_order_git_gave() {

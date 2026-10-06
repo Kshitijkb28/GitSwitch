@@ -13,7 +13,7 @@ import { UpdateDrawer } from "../components/repo/UpdateDrawer";
 import { markMoved, reconcilePlan } from "../lib/updatePlan";
 import { useRepoSelection } from "../lib/repoSelection";
 import { usePersistedState } from "../lib/persist";
-import { baseName } from "../lib/paths";
+import { baseName, canonicalJoin, normPath } from "../lib/paths";
 import { useRefreshOnFocus } from "../lib/focus";
 import { useGitJob } from "../lib/gitJobs";
 import { open as pickFolder } from "@tauri-apps/plugin-dialog";
@@ -62,7 +62,10 @@ export function Repo() {
   const [reloadKey, setReloadKey] = useState(0);
   const lastMoveKey = useRef("");
   /** The Update drawer: preview, blockers, Update now. */
-  const [drawer, setDrawer] = useState(false);
+  // The Update drawer, and the repository it was opened for: it shows only
+  // while that repository is the one on screen.
+  const [drawerFor, setDrawerFor] = useState<string | null>(null);
+  const drawer = drawerFor !== null && drawerFor === sel.effectivePath;
   const pathRef = useRef("");
 
   const [pullMode, setPullMode] = usePersistedState<PullMode>("changes.pullMode", "ff-only");
@@ -169,8 +172,11 @@ export function Repo() {
   const onStatus = useCallback((s: RepoStatus | null, loading: boolean) => {
     setStatus(s);
     setLoadingStatus(loading);
-    // A plan made for another HEAD or upstream is stale: drop it.
-    reconcilePlan(pathRef.current, s);
+    // A plan made for another HEAD or upstream is stale: drop it — judged on
+    // a settled reading only. While a refresh is in flight the status here is
+    // still the previous one, and a plan made a moment ago for the HEAD the
+    // backend sees would be thrown away against it.
+    if (!loading) reconcilePlan(pathRef.current, s);
     if (s) {
       const key = `${s.path}|${s.head_oid ?? ""}|${s.ahead}|${s.behind}|${s.upstream ?? ""}|${s.stash_count}|${s.conflicted_count}|${s.last_fetch_secs !== null && s.last_fetch_secs < 10 ? "fresh" : ""}`;
       if (lastMoveKey.current && lastMoveKey.current !== key) setReloadKey((k) => k + 1);
@@ -229,32 +235,51 @@ export function Repo() {
 
   const go = (t: Tab) => navigate(`/repo/${t}`);
   pathRef.current = sel.effectivePath;
-  // The drawer belongs to one repository.
+  // The drawer belongs to one repository: moving to another closes it.
   useEffect(() => {
-    setDrawer(false);
-  }, [sel.effectivePath]);
-  /** The run was refused because upstream moved: the drawer re-plans and says why. */
-  const onAssessAgain = () => {
-    markMoved(sel.effectivePath);
-    setDrawer(true);
+    if (drawerFor !== null && drawerFor !== sel.effectivePath) setDrawerFor(null);
+  }, [sel.effectivePath, drawerFor]);
+  /**
+   * A run on `repo` was refused because upstream moved: its plan is marked
+   * stale; the drawer re-plans and says why — if that repository is the one
+   * on screen. A run that outlived a repository switch marks only its own.
+   */
+  const onAssessAgain = (repo: string) => {
+    markMoved(repo);
+    if (repo === pathRef.current) setDrawerFor(repo);
   };
   /**
    * A paused update hands over: the superproject's conflicts are on the
    * Changes tab; a submodule's are inside it, so it becomes the scope first.
    */
+  /**
+   * Opens a submodule of the repository an update ran on. With no scope that
+   * is a submodule of this repository, and it becomes the scope. From inside
+   * a scope it is one level further down — and a nested repository can only
+   * be the page's repository, never a scope — so it is opened as one.
+   */
+  const openSubOfScope = (p: string) => {
+    if (!sel.sub) {
+      sel.setSub(p);
+      return;
+    }
+    const abs = canonicalJoin(sel.effectivePath, p);
+    setExtraRepos((l) => (l.includes(abs) ? l : [...l, abs]));
+    sel.setPath(abs);
+  };
   const goToConflicts = (where: string) => {
     if (where.startsWith("submodule")) {
       const p = where.split(":")[1];
-      if (p) sel.setSub(p);
+      if (p) openSubOfScope(p);
     }
-    setDrawer(false);
+    setDrawerFor(null);
     go("changes");
     setTimeout(() => document.getElementById("conflicts")?.scrollIntoView({ behavior: "smooth", block: "start" }), 200);
   };
   const runUpdate = (stash: boolean, bundles: boolean, fingerprint: [string, string][]) => {
     const a = actionsRef.current;
     if (!a) return;
-    setDrawer(false);
+    setDrawerFor(null);
     void a.update(sel.effectivePath, stash, bundles, fingerprint).finally(() => {
       setReloadKey((k) => k + 1);
       actionsRef.current?.refresh();
@@ -277,16 +302,17 @@ export function Repo() {
         break;
       case "open":
         if (sub) {
-          setDrawer(false);
-          workInside(sub);
+          setDrawerFor(null);
+          openSubOfScope(sub);
+          go("changes");
         }
         return;
       case "untracked-in-the-way":
-        setDrawer(false);
+        setDrawerFor(null);
         go("changes");
         return;
       case "choose-branch":
-        setDrawer(false);
+        setDrawerFor(null);
         a.branches();
         return;
       default:
@@ -460,7 +486,7 @@ export function Repo() {
         peeking={peeking}
         onPeek={doPeek}
         onPeekDismiss={() => setPeek(null)}
-        onPreview={() => setDrawer(true)}
+        onPreview={() => setDrawerFor(sel.effectivePath)}
       />
 
       {sel.effectivePath && (
@@ -527,16 +553,18 @@ export function Repo() {
         onOpenHistory={() => go("history")}
         onAssessAgain={onAssessAgain}
         onGoToConflicts={goToConflicts}
-        onPreview={() => setDrawer(true)}
+        onPreview={() => setDrawerFor(sel.effectivePath)}
       />
       <HistoryTab
         repo={sel.effectivePath}
         account={sel.account}
         accountEmail={accountEmail}
+        accountsReady={!loadingRepos}
         visible={tab === "history"}
         reloadKey={reloadKey}
         onOpenChanges={() => go("changes")}
         onRepoChanged={() => actionsRef.current?.refresh()}
+        hasSubmodules={gitlinks > 0}
       />
       <SubmodulesTab
         repoPath={sel.path}
@@ -553,17 +581,21 @@ export function Repo() {
         onPullInside={(s) => runOnRepo((a) => a.pullInside(sel.path, s))}
         onUpdateOne={(p) => runOnRepo((a) => a.updateOne(sel.path, p))}
         onPreview={() => {
+          // The whole repository is what updates; the drawer is opened for it
+          // in the same step, so the scope change does not close it.
           sel.setSub("");
-          setDrawer(true);
+          setDrawerFor(canonicalJoin(sel.path, ""));
         }}
       />
 
-      {drawer && status && (
+      {/* Only with the status of the repository the drawer is for: right
+          after a scope change the page still holds the previous one's. */}
+      {drawer && drawerFor && status && normPath(status.path) === drawerFor && (
         <UpdateDrawer
-          repoPath={sel.effectivePath}
+          repoPath={drawerFor}
           status={status}
           busy={busy}
-          onClose={() => setDrawer(false)}
+          onClose={() => setDrawerFor(null)}
           onRun={runUpdate}
           onRemedy={remedy}
         />

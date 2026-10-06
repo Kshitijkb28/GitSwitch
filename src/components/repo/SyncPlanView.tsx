@@ -3,6 +3,7 @@ import { Button } from "../Button";
 import { Checkbox } from "../Checkbox";
 import type { SyncCommitRef, SyncPlan, SyncSubPlan } from "../../lib/api";
 import { formatWhen } from "../../lib/time";
+import { UpdatePreview } from "./UpdatePreview";
 
 const short = (oid: string | null | undefined) => (oid ? oid.slice(0, 7) : "—");
 
@@ -55,6 +56,7 @@ function remedyButton(code: string | null, sub: string | null): { label: string;
     case "finish-operation":
     case "resolve-conflicts":
     case "stash-inside":
+    case "untracked-inside":
       return { label: `Open ${sub ?? "it"}`, code: "open" };
     case "turn-on-stash":
       return { label: "Turn on stashing", code };
@@ -62,6 +64,9 @@ function remedyButton(code: string | null, sub: string | null): { label: string;
       return { label: "Stash them now", code };
     case "untracked-in-the-way":
       return { label: "Go to Changes", code };
+    case "commit-first":
+      // Committing is done on the Changes tab; the handler is the same one.
+      return { label: "Go to Changes", code: "untracked-in-the-way" };
     default:
       return null;
   }
@@ -182,36 +187,7 @@ export function SyncPlanView({ plan, stash, onStash, bundles, onBundles, busy, o
               </ul>
             </details>
           )}
-          {sup.incoming.length > 0 && (
-            <details open>
-              <summary className="cursor-pointer select-none hover:text-zinc-300">
-                Coming in: {sup.incoming.length}
-                {(sup.more_incoming ?? 0) > 0 ? `+${sup.more_incoming}` : ""} commit{sup.incoming.length === 1 && !sup.more_incoming ? "" : "s"} from{" "}
-                {sup.upstream}
-              </summary>
-              <ul className="mt-1 space-y-0.5">
-                {sup.incoming.map((c) => (
-                  <CommitLine key={c.oid} c={c} />
-                ))}
-                {(sup.more_incoming ?? 0) > 0 && <li className="text-zinc-600">+{sup.more_incoming} more</li>}
-              </ul>
-            </details>
-          )}
-          {sup.own_commits.length > 0 && (
-            <details open>
-              <summary className="cursor-pointer select-none hover:text-zinc-300">
-                Your {sup.own_commits.length}
-                {(sup.more_own ?? 0) > 0 ? `+${sup.more_own}` : ""} commit{sup.own_commits.length === 1 && !sup.more_own ? "" : "s"} that stay on top
-                {sup.own_commits.some((c) => c.already_upstream) && <span className="text-zinc-500"> — except what upstream already has</span>}
-              </summary>
-              <ul className="mt-1 space-y-0.5">
-                {sup.own_commits.map((c) => (
-                  <CommitLine key={c.oid} c={c} />
-                ))}
-                {(sup.more_own ?? 0) > 0 && <li className="text-zinc-600">+{sup.more_own} more</li>}
-              </ul>
-            </details>
-          )}
+          {!plan.nothing_to_do && <UpdatePreview plan={plan} />}
         </div>
       )}
 

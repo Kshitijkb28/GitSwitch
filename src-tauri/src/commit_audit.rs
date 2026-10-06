@@ -38,9 +38,15 @@ pub struct RepoAudit {
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     let started = std::time::Instant::now();
+    // Signature checks must never land in output that is parsed.
+    let safe: Vec<&str> = match args.first().and_then(|sub| crate::git_exec::parse_safe_cfg(sub)) {
+        Some(kv) => vec!["-c", kv],
+        None => Vec::new(),
+    };
     let out = crate::spawn::command("git")
         .arg("-C")
         .arg(repo)
+        .args(&safe)
         .args(args)
         .output()
         .map_err(|e| format!("failed to run git: {}", e))?;
@@ -49,6 +55,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
         ["git", "-C", &repo.to_string_lossy()]
             .iter()
             .map(|a| a.to_string())
+            .chain(safe.iter().map(|a| a.to_string()))
             .chain(args.iter().map(|a| a.to_string()))
             .collect(),
         out.status.code().unwrap_or(-1),

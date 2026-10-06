@@ -27,8 +27,7 @@ import {
   STATUS_CLEAN,
   STATUS_DIRTY,
   STATUS_DETACHED,
-  AUTHORS,
-} from "./history-fixtures.mjs";
+  AUTHORS, HISTORY_PAGE_BUMP } from "./history-fixtures.mjs";
 
 if (!DIST_OK) {
   console.error("dist/ is missing — run `bun run build` first");
@@ -51,6 +50,17 @@ async function openHistoryPage(browser, server, opts = {}) {
     refuse: opts.refuse ?? {},
     hang: opts.hang ?? false,
     submodules: opts.submodules ?? [],
+    historyPage: opts.historyPage ?? null,
+    /** The selected account's profile id, when a test needs "this account". */
+    account: opts.account ?? null,
+    /** Persisted settings to seed before the page loads: { "history.hidePointerOnly": true }. */
+    persist: opts.persist ?? null,
+    /** Milliseconds the list of repositories (and with it the accounts) takes to arrive. */
+    reposDelay: opts.reposDelay ?? 0,
+    /** The people who commit here, when a test needs others than the fixture's. */
+    authors: opts.authors ?? null,
+    /** The repositories (and with them the accounts), when a test needs others than the fixture's. */
+    repos: opts.repos ?? null,
     peek: opts.peek ?? { branch: "main", upstream: "origin/main", remote: "origin", remote_tip: "440d0af1234567890abcdef1234567890abcdef12", known_tip: "e81d1c51234567890abcdef1234567890abcdef12", changed: true, branch_gone: false, new_commits: 3, counted_by: "github", message: "3 new commits on origin/main since your last fetch (440d0af). Nothing was downloaded — Fetch to see them." },
   };
   const page = await browser.newPage();
@@ -68,6 +78,8 @@ async function openHistoryPage(browser, server, opts = {}) {
       localStorage.clear();
       localStorage.setItem("gitswitch:history.repo", JSON.stringify(fx.repo));
       localStorage.setItem("gitswitch:repo.path", JSON.stringify(fx.repo));
+      if (cfg.account) localStorage.setItem("gitswitch:repo.account", JSON.stringify(cfg.account));
+      if (cfg.persist) for (const [k, v] of Object.entries(cfg.persist)) localStorage.setItem(`gitswitch:${k}`, JSON.stringify(v));
       // Headless Chrome has no clipboard permission; record what the app tried to copy.
       try {
         Object.defineProperty(navigator, "clipboard", {
@@ -114,13 +126,13 @@ async function openHistoryPage(browser, server, opts = {}) {
             case "clone_progress":
               return Promise.resolve(null);
             case "history_list_repos":
-              return Promise.resolve(fx.repos);
+              return cfg.reposDelay ? new Promise((res) => setTimeout(() => res(cfg.repos ?? fx.repos), cfg.reposDelay)) : Promise.resolve(cfg.repos ?? fx.repos);
             case "history_branches":
               return Promise.resolve(cfg.branches);
             case "history_page":
-              return Promise.resolve(fx.historyPage);
+              return Promise.resolve(cfg.historyPage ?? fx.historyPage);
             case "history_authors":
-              return Promise.resolve(fx.authors);
+              return Promise.resolve(cfg.authors ?? fx.authors);
             case "history_sync_status":
               return Promise.resolve(fx.syncStatus);
             case "history_commit_detail":
@@ -267,14 +279,131 @@ try {
     const s = await text(page);
     ok("the people list was read for this repository and revision", (await calls(page, "history_authors")).length >= 1);
     ok("every row shows the date AND the time", /\d{4}-\d\d-\d\d \d\d:\d\d/.test(s), s.slice(0, 300));
-    ok("  everyone is the default, with the total", s.includes("Everyone · 3"));
-    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Everyone · 3")).click());
-    await page.waitForFunction(() => document.body.innerText.includes("Other Person · 1"), { timeout: 4000 });
-    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Other Person · 1")).click());
+    // The author's time is what a row shows (it survives a rebase); the committer's is in the title.
+    const local = (iso) =>
+      page.evaluate((iso) => {
+        const d = new Date(iso);
+        const p = (n) => String(n).padStart(2, "0");
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+      }, iso);
+    const authored = await local("2026-09-20T09:30:00+02:00");
+    const committed = await local("2026-09-20T10:00:00+02:00");
+    const stamps = await page.evaluate(() => [...document.querySelectorAll("span.tabular-nums[title]")].filter((e) => /^\d{4}-\d\d-\d\d \d\d:\d\d$/.test(e.innerText.trim())).map((e) => ({ text: e.innerText.trim(), title: e.title })));
+    ok("  it is the author's time", stamps.length > 0 && stamps.every((x) => x.text === authored) && !stamps.some((x) => x.text === committed), JSON.stringify(stamps.slice(0, 2)));
+    ok("  with the committer's time in the title", stamps.every((x) => x.title.includes("committed 2026-09-20T10:00:00+02:00")), JSON.stringify(stamps.slice(0, 1)));
+    ok("  everyone is the default, with the total", s.includes("Everyone · 8"));
+    const pick = async (trigger, option) => {
+      await page.evaluate((t) => [...document.querySelectorAll("button")].find((b) => b.innerText.includes(t)).click(), trigger);
+      await page.waitForFunction((o) => [...document.querySelectorAll("button")].some((b) => b.innerText.includes(o)), { timeout: 4000 }, option);
+      await page.evaluate((o) => [...document.querySelectorAll("button")].find((b) => b.innerText.includes(o)).click(), option);
+    };
+    await pick("Everyone · 8", "Other Person · 1");
     await page.waitForFunction(() => document.body.innerText.includes("by Other Person"), { timeout: 4000 });
     const last = await lastCall(page, "history_page");
-    ok("choosing a person re-reads the page filtered by their email, from the first page", last && last.args.author === "other@example.test" && last.args.offset === 0, JSON.stringify(last && last.args));
+    ok("choosing a person re-reads the page filtered by their email, from the first page", last && JSON.stringify(last.args.authors) === '["other@example.test"]' && last.args.offset === 0, JSON.stringify(last && last.args));
     ok("  and says so in the summary line", (await text(page)).includes("by Other Person"));
+    // Open the list again: the bot is marked, and a preset leaves bots out.
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Other Person · 1")).click());
+    await page.waitForFunction(() => document.body.innerText.includes("People only (hide bots and CI) · 3"), { timeout: 4000 });
+    const opened = await text(page);
+    ok("  a bot is marked as one in the list", opened.includes("github-actions[bot] (bot) · 5"));
+    ok("  People only is offered because a bot commits here, with the human total", opened.includes("People only (hide bots and CI) · 3"));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("People only (hide bots and CI) · 3")).click());
+    await page.waitForFunction(() => document.body.innerText.includes("by people only"), { timeout: 4000 });
+    const ppl = await lastCall(page, "history_page");
+    ok("  choosing it sends every human's email and no bot", ppl && JSON.stringify(ppl.args.authors) === '["me@personal.test","other@example.test"]' && ppl.args.offset === 0, JSON.stringify(ppl && ppl.args));
+    await page.close();
+  }
+  {
+    // A repository without submodules, opened with the toggle left on from another one.
+    const page = await open({ persist: { "history.hidePointerOnly": true } });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_page"), { timeout: 4000 });
+    const first = await lastCall(page, "history_page");
+    ok("a toggle left on elsewhere hides nothing where there are no submodules", first && first.args.hidePointerOnly === false, JSON.stringify(first && first.args));
+    ok("  and is not offered there", (await page.$('input[aria-label="Hide pointer-only commits"]')) === null);
+    await page.close();
+  }
+  {
+    // With the repository's account selected, "Just me" is one of the people.
+    const page = await open({ account: "p1" });
+    await page.waitForFunction(() => document.body.innerText.includes("Everyone · 8"), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Everyone · 8")).click());
+    await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Just me · 2"), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Just me · 2").click());
+    await page.waitForFunction(() => document.body.innerText.includes("by me"), { timeout: 4000 });
+    const mine = await lastCall(page, "history_page");
+    ok("Just me filters by the account's own address, from the first page", mine && JSON.stringify(mine.args.authors) === '["me@personal.test"]' && mine.args.offset === 0, JSON.stringify(mine && mine.args));
+    await page.close();
+  }
+  {
+    // "Just me", left on from the last visit — and the people are read before the accounts are.
+    const page = await open({ account: "p1", persist: { "history.author": "me" }, reposDelay: 700 });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_authors"), { timeout: 4000 });
+    await page.waitForFunction(() => document.body.innerText.includes("by me"), { timeout: 4000 }).catch(() => {});
+    await sleep(900);
+    const kept = await page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:history.author")));
+    ok("Just me, left on from the last visit, survives the people arriving before the accounts", kept === "me", JSON.stringify(kept));
+    const mine = await lastCall(page, "history_page");
+    ok("  and filters by the account's address once that is known", mine && JSON.stringify(mine.args.authors) === '["me@personal.test"]', JSON.stringify(mine && mine.args));
+    ok("  the summary line says so", (await text(page)).includes("by me"));
+    const pages = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "history_page").map((c) => c.args.authors));
+    ok("  nobody else's commits were shown as mine meanwhile: the page waited for the accounts", pages.length === 1 && JSON.stringify(pages[0]) === '["me@personal.test"]', JSON.stringify(pages));
+    await page.close();
+  }
+  {
+    // The older checkbox ("Only commits authored by this account") waits for the accounts the same way.
+    const page = await open({ account: "p1", persist: { "history.onlyMine": true }, reposDelay: 700 });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_page"), { timeout: 4000 });
+    await sleep(300);
+    const pages = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "history_page").map((c) => c.args.authors));
+    ok("the account-only checkbox also waits for the accounts: one request, filtered", pages.length === 1 && JSON.stringify(pages[0]) === '["me@personal.test"]', JSON.stringify(pages));
+    await page.close();
+  }
+  {
+    // An account whose "address" is not an address (an import's `sam <sam>`): "me" is asked for as that whole identity.
+    const repos = [{ path: REPO, name: "gitswitch", profile_id: "p1", profile_name: "Sam", profile_email: "sam" }];
+    const people = [{ name: "Sam", email: "sam", commits: 2 }, { name: "Samantha Lee", email: "samantha@x.test", commits: 1 }];
+    const page = await open({ account: "p1", repos, authors: people, persist: { "history.author": "me" } });
+    await page.waitForFunction(() => document.body.innerText.includes("by me"), { timeout: 4000 });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_page" && c.args.authors && c.args.authors[0] === "Sam <sam>"), { timeout: 4000 }).catch(() => {});
+    const me = await lastCall(page, "history_page");
+    ok("Just me for an account without an @ sends the whole identity, not a word everyone's name may contain", me && JSON.stringify(me.args.authors) === '["Sam <sam>"]', JSON.stringify(me && me.args.authors));
+    await page.close();
+  }
+  {
+    // With no account selected there is no "me" here: the preset is dropped, as before.
+    const page = await open({ persist: { "history.author": "me" }, reposDelay: 300 });
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem("gitswitch:history.author")) === "", { timeout: 4000 }).catch(() => {});
+    const kept = await page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:history.author")));
+    ok("  with no account selected, a Just me left on elsewhere is still let go", kept === "", JSON.stringify(kept));
+    await page.close();
+  }
+  {
+    // People whose commits carry no address, or one that is not an address, are picked by their whole identity.
+    const people = [
+      { name: "Sam", email: "", commits: 2 },
+      { name: "Samantha Lee", email: "samantha@x.test", commits: 1 },
+      { name: "jdoe", email: "jdoe", commits: 1 },
+    ];
+    const page = await open({ authors: people });
+    await page.waitForFunction(() => document.body.innerText.includes("Everyone · 4"), { timeout: 4000 });
+    const pick = async (trigger, option) => {
+      await page.evaluate((t) => [...document.querySelectorAll("button")].find((b) => b.innerText.includes(t)).click(), trigger);
+      await page.waitForFunction((o) => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === o), { timeout: 4000 }, option);
+      await page.evaluate((o) => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === o).click(), option);
+    };
+    await pick("Everyone · 4", "Sam · 2");
+    await page.waitForFunction(() => document.body.innerText.includes("by Sam"), { timeout: 4000 });
+    const sam = await lastCall(page, "history_page");
+    ok("a person with no address is asked for by their whole identity, not a name that others contain", sam && JSON.stringify(sam.args.authors) === '["Sam <>"]', JSON.stringify(sam && sam.args));
+    await pick("Sam · 2", "jdoe · 1");
+    await page.waitForFunction(() => document.body.innerText.includes("by jdoe"), { timeout: 4000 });
+    const jd = await lastCall(page, "history_page");
+    ok("  and so is one whose address is not an address", jd && JSON.stringify(jd.args.authors) === '["jdoe <jdoe>"]', JSON.stringify(jd && jd.args));
+    await pick("jdoe · 1", "Samantha Lee · 1");
+    await page.waitForFunction(() => document.body.innerText.includes("by Samantha Lee"), { timeout: 4000 });
+    const sl = await lastCall(page, "history_page");
+    ok("  a real address is still sent as the address", sl && JSON.stringify(sl.args.authors) === '["samantha@x.test"]', JSON.stringify(sl && sl.args));
     await page.close();
   }
 
@@ -709,8 +838,17 @@ try {
       sub({ path: "harness", name: "harness", own_ahead: 0, own_behind: 1, summary: "1 commit behind its upstream" }),
       sub({ path: "forge-tooling/x", name: "x", initialised: false, listed: false, gitdir_valid: false, state: "unmapped", actual: null, actual_short: null, summary: "not initialised" }),
     ];
-    const page = await openHistoryPage(browser, server, { submodules: SUBS });
+    const page = await openHistoryPage(browser, server, { submodules: SUBS, historyPage: HISTORY_PAGE_BUMP });
     await page.waitForFunction(() => document.body.innerText.includes("Submodules:"), { timeout: 5000 });
+    ok("a commit that only bumps a submodule pointer says so on its row", (await text(page)).includes("submodule bump: trinity"));
+    const hideBox = await page.$('input[aria-label="Hide pointer-only commits"]');
+    ok("  and the list offers to hide such commits", hideBox !== null);
+    await hideBox.evaluate((el) => el.click());
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "history_page").some((c) => c.args.hidePointerOnly === true), { timeout: 4000 });
+    const hidden = await lastCall(page, "history_page");
+    ok("  which re-reads the page from the start with the bumps left out", hidden && hidden.args.hidePointerOnly === true && hidden.args.offset === 0, JSON.stringify(hidden && hidden.args));
+    await hideBox.evaluate((el) => el.click());
+    await page.waitForFunction(() => { const l = window.__CALLS__.filter((c) => c.cmd === "history_page"); return l.length > 0 && l[l.length - 1].args.hidePointerOnly === false; }, { timeout: 4000 });
     let s = await text(page);
     ok("populated, mapped submodules are listed as chips with their own ahead/behind", s.includes("staging ↑2") && s.includes("harness ↓1"));
     ok("  an uninitialised gitlink is not offered", !s.includes("forge-tooling"));

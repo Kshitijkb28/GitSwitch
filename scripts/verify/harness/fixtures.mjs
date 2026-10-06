@@ -172,6 +172,7 @@ export function status(over = {}) {
 const SYNC_SUPER = {
   branch: "main",
   upstream: "origin/main",
+  remote: "origin",
   head: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
   upstream_oid: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
   ahead: 2,
@@ -234,6 +235,22 @@ export const SYNC_PLAN = {
   fingerprint: [["", SYNC_SUPER.upstream_oid], ["A", SYNC_SUB_A.target], ["B", SYNC_SUB_B.target]],
   summary: "Your 2 commits are replayed on top of 3 new commits from origin/main, rebasing the submodules that carry your work",
 };
+/** One of my commits is already upstream: the preview strikes it through and leaves it out of the count. */
+export const SYNC_PLAN_DROPPED = {
+  ...SYNC_PLAN,
+  superproject: { ...SYNC_SUPER, own_commits: [SYNC_SUPER.own_commits[0], { ...SYNC_SUPER.own_commits[1], already_upstream: true }] },
+};
+/** Level with upstream: only submodules move, the branch is not rebased. */
+export const SYNC_PLAN_LEVEL = {
+  ...SYNC_PLAN,
+  summary: "Only submodules need aligning.",
+  superproject: { ...SYNC_SUPER, behind: 0, incoming: [], more_incoming: 0, will_stash: false, file_overlap: [] },
+};
+/** More commits of mine than are listed, some of the older ones already upstream. */
+export const SYNC_PLAN_MANY = {
+  ...SYNC_PLAN,
+  superproject: { ...SYNC_SUPER, ahead: 35, more_own: 33, more_own_dropped: 3 },
+};
 export const SYNC_PLAN_NOSTASH = {
   ...SYNC_PLAN,
   can_run: false,
@@ -293,6 +310,18 @@ export const SYNC_PAUSED = {
   upstream: "origin/main",
   sub_path: null,
   sub_target: null,
+};
+/** A pointer the update could not place itself: nothing to resolve inside A, its row here has to be staged. */
+export const SYNC_HANDED_OVER = {
+  ...SYNC_PAUSED,
+  needs_user: {
+    where_: "submodule:A",
+    paths: ["A"],
+    hint: "A is checked out at 1111111 but your commit records 2222222. Put it where you want it (with your commits on top of 7a9d38a), stage it, then Continue update.",
+    at_commit: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  },
+  unresolved: 1,
+  handed_over: true,
 };
 export const SYNC_PAUSED_IN_SUB = {
   ...SYNC_PAUSED,
@@ -518,6 +547,26 @@ export const SCENARIOS = {
   syncPausedInSub: status({
     operation: REBASE_OP,
     sync: SYNC_PAUSED_IN_SUB,
+    has_submodules: true,
+    entries: [entry({ path: "A", kind: "conflicted", staged: "U", unstaged: "U", conflict: "both modified", is_submodule: true })],
+    conflicted_count: 1,
+    can_amend: false,
+  }),
+  // Paused between the superproject's rebase and the submodule work: no git
+  // operation is in progress here, yet the update owns the repository.
+  syncPausedAligning: status({
+    has_submodules: true,
+    sync: { ...SYNC_PAUSED_IN_SUB, phase: "aligning", unresolved: 0 },
+  }),
+  // Paused on a file, every conflict resolved and staged: Continue update is live.
+  syncPausedResolved: status({
+    operation: REBASE_OP,
+    sync: { ...SYNC_PAUSED, unresolved: 0 },
+    can_amend: false,
+  }),
+  syncHandedOver: status({
+    operation: REBASE_OP,
+    sync: SYNC_HANDED_OVER,
     has_submodules: true,
     entries: [entry({ path: "A", kind: "conflicted", staged: "U", unstaged: "U", conflict: "both modified", is_submodule: true })],
     conflicted_count: 1,

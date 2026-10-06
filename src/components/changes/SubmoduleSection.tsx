@@ -18,7 +18,10 @@ export function needsSection(s: RepoStatus): boolean {
   return s.entries.length > 0 || s.ahead > 0 || !!s.operation || s.detached || s.conflicted_count > 0;
 }
 
-type Apply = (key: string, fn: () => Promise<OpResult>, target?: string) => Promise<OpResult | undefined>;
+/** The "…anyway" a conflict-markers refusal offers: the refused call again, markers allowed. */
+export type MarkersRetry = { label: string; run: () => void };
+export type ApplyOptions = { quietRefusal?: string; markers?: MarkersRetry };
+type Apply = (key: string, fn: () => Promise<OpResult>, target?: string, opts?: ApplyOptions) => Promise<OpResult | undefined>;
 
 type Props = {
   sub: SubmoduleStatus;
@@ -70,6 +73,13 @@ export function SubmoduleSection({
     committed !== null && (parentStatus === committed.parent || parentRow?.sub_commit_changed === true);
   const changed = st.entries.filter((e) => e.kind === "tracked").length;
   const message = draft || (st.merge_message ?? "");
+
+  // Stage / continue inside this submodule, each with its "…anyway" retry on
+  // the same path, so a marker refusal here never re-runs on the parent.
+  const stageHere = (paths: string[], allow: boolean) =>
+    apply("stage", () => api.changesStage(path, paths, allow), path, allow ? undefined : { markers: { label: "Mark resolved anyway", run: () => void stageHere(paths, true) } });
+  const continueHere = (allow: boolean) =>
+    apply("continue", () => api.changesContinue(path, allow), path, allow ? undefined : { markers: { label: "Continue anyway", run: () => void continueHere(true) } });
 
   const onCommit = async () => {
     const parentAtCommit = parentStatus;
@@ -165,7 +175,7 @@ export function SubmoduleSection({
                   variant="primary"
                   disabled={busy || st.conflicted_count > 0}
                   title={st.conflicted_count > 0 ? "Resolve and stage every conflicted file first" : op.continue_command}
-                  onClick={() => apply("continue", () => api.changesContinue(path), path)}
+                  onClick={() => void continueHere(false)}
                 >
                   <Play size={13} />
                   Continue in {sub.path}
@@ -190,7 +200,7 @@ export function SubmoduleSection({
             status={st}
             busy={busy}
             onOpen={setDiffFor}
-            onStage={(paths) => apply("stage", () => api.changesStage(path, paths), path)}
+            onStage={(paths) => void stageHere(paths, false)}
             onUnstage={(paths) => apply("unstage", () => api.changesUnstage(path, paths), path)}
             onDiscard={onDiscard}
             onResolveSide={(paths, side) => apply("resolve", () => api.changesResolveSide(path, paths, side), path)}
