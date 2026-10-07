@@ -161,6 +161,7 @@ pub fn run() {
             commands::changes_push_state,
             commands::changes_set_push_mode,
             commands::changes_repair_push_block,
+            commands::changes_push_coverage,
             commands::changes_repair_push_lock,
             commands::push_lock_helper_status,
             commands::push_lock_uninstall,

@@ -988,21 +988,21 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         )));
     }
 
-    let status_out = GitCmd::at(&repo)
+    let status_args = |inside: &'static str| ["status", "--porcelain=v2", "-z", "--branch", "--show-stash", "--untracked-files=all", inside];
+    let mut status_out = GitCmd::at(&repo)
         // Don't fight the user's terminal for index.lock while polling.
         .top_flag("--no-optional-locks")
-        .args([
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--branch",
-            "--show-stash",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ])
+        .args(status_args("--ignore-submodules=none"))
         .timeout(READ_TIMEOUT)
         .run()
         .await?;
+    // A submodule whose download was interrupted (a .git entry with no work
+    // tree behind it) makes git refuse the whole status. The repository's own
+    // status is still readable without looking inside the submodules — each
+    // of those is measured on its own by the submodule list anyway.
+    if !status_out.ok() && (status_out.stderr.contains("failed in submodule") || status_out.stderr.contains("not a git repository")) {
+        status_out = GitCmd::at(&repo).top_flag("--no-optional-locks").args(status_args("--ignore-submodules=all")).timeout(READ_TIMEOUT).run().await?;
+    }
     if !status_out.ok() {
         // With filter.lfs.required set and git-lfs gone, status itself fails
         // with a message that looks like a dropped connection. Say what it is.

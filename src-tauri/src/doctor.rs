@@ -713,6 +713,25 @@ pub async fn check_push_locks() -> Result<Vec<Finding>, AppError> {
             );
             continue;
         }
+        // The submodules the lock does not reach: the code lives there.
+        let repo_dir = std::path::Path::new(&l.repo);
+        let unlocked: Vec<String> = crate::push_guard::populated_submodules(repo_dir)
+            .await
+            .into_iter()
+            .filter(|rel| !status.locks.iter().any(|x| x.repo == push_lock::canonical(&repo_dir.join(rel))))
+            .collect();
+        if !unlocked.is_empty() {
+            out.push(Finding::new(
+                &format!("push-lock-submodules-uncovered:{}", l.repo),
+                "warning",
+                format!("{} is locked, but {} of its submodules {} not", name, unlocked.len(), if unlocked.len() == 1 { "is" } else { "are" }),
+                format!(
+                    "A push from inside {} is not stopped by the lock. Open {} on the Repository page and use Repair (administrator) under Push access to lock them too.",
+                    unlocked.join(", "),
+                    name
+                ),
+            ));
+        }
         let state = match crate::git_status::push_state_for(&l.repo).await {
             Ok(s) => s,
             Err(e) => {

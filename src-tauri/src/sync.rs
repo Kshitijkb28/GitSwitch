@@ -2458,13 +2458,31 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
             (false, "new upstream; the rebased branch does not record it after all".to_string())
         } else {
             let url = g(repo).args(["config", "--get", &format!("remote.{}.url", st.plan.superproject.remote)]).ok_text().await.unwrap_or_default();
-            let report = crate::sparse::update_submodules(repo, None, None, url.trim(), Some(std::slice::from_ref(&path)), None).await;
+            let repo_s = repo.to_string_lossy().to_string();
+            let report = crate::sparse::update_submodules(repo, None, None, url.trim(), Some(std::slice::from_ref(&path)), Some(repo_s.as_str())).await;
             match (&report.error, report.downloaded) {
                 (None, n) if n > 0 => (true, format!("new upstream; downloaded at {}", short(&recorded))),
                 (None, _) => (false, "new upstream; could not be downloaded — Download it from the Submodules tab".to_string()),
                 (Some(e), _) => (false, format!("new upstream; could not be downloaded: {} — Download it from the Submodules tab", e.trim())),
             }
         };
+        // Under a blocked or locked repository the new submodule gets the
+        // same guard-rail at once (the lock's own layer is Repair's).
+        let mut note = note;
+        if ok {
+            if let Ok(ps) = crate::git_status::push_state_for(&repo.to_string_lossy()).await {
+                if ps.repo_blocked || ps.lock.locked {
+                    let notes = crate::push_guard::cover_submodules(&repo.to_string_lossy(), Some(std::slice::from_ref(&path))).await;
+                    note = if !notes.is_empty() {
+                        format!("{}; the push block could not be extended to it: {}", note, notes.join("; "))
+                    } else if ps.lock.locked {
+                        format!("{}; given the repository's guard-rail — the lock's own layer for it needs Repair (administrator) under Push access", note)
+                    } else {
+                        format!("{}; given the repository's push block", note)
+                    };
+                }
+            }
+        }
         st.subs.push(SubState {
             path: path.clone(),
             branch_before: None,

@@ -75,7 +75,8 @@ pub struct SubmoduleInfo {
     pub dirty_untracked: usize,
     /// The untracked count hit the parser's cap, so it is a floor, not a total.
     pub dirty_untracked_capped: bool,
-    /// "clean" | "moved" | "dirty" | "moved-and-dirty" | "not-initialised" | "unmapped"
+    /// "clean" | "moved" | "dirty" | "moved-and-dirty" | "not-initialised" | "unmapped" |
+    /// "incomplete" (a `.git` entry but no commit checked out: a download that was interrupted)
     pub state: String,
     /// One plain sentence, written here so every surface says the same thing.
     pub summary: String,
@@ -313,6 +314,9 @@ pub fn summarise(
         }
         "not-initialised" => {
             return "not downloaded yet — Download fetches it (git submodule update --init)".to_string()
+        }
+        "incomplete" => {
+            return "its download was interrupted — nothing is checked out; Download finishes it (git submodule update --init)".to_string()
         }
         _ => {}
     }
@@ -622,6 +626,12 @@ pub async fn list_submodules(repo_path: &str) -> Result<Vec<SubmoduleInfo>, AppE
             info.dirty_untracked,
         )
         .to_string();
+        // A download that was interrupted (a stall, a crash, a reboot): the
+        // folder has a .git entry but nothing is checked out. Not populated —
+        // Download finishes it.
+        if info.initialised && (info.actual.is_none() || !info.gitdir_valid) {
+            info.state = "incomplete".into();
+        }
         info.summary = summarise(
             &info.state,
             info.listed,

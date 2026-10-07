@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import { Button } from "../Button";
 import * as api from "../../lib/api";
-import type { PushState, PushMode, PushModeResult, JobOutcomeKind } from "../../lib/api";
+import type { PushState, PushMode, PushModeResult, JobOutcomeKind, PushCoverage } from "../../lib/api";
 import { LockDisclosure } from "./LockDisclosure";
 
 interface Props {
@@ -181,6 +181,22 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
   const [pending, setPending] = useState<PushMode | null>(null);
   const [result, setResult] = useState<PushModeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // How far the block or lock reaches into the submodules — where the code
+  // lives. Re-read whenever the repository's own state changes.
+  const [coverage, setCoverage] = useState<PushCoverage | null>(null);
+  useEffect(() => {
+    let stale = false;
+    api
+      .changesPushCoverage(repoPath)
+      .then((c) => !stale && setCoverage(c))
+      .catch(() => !stale && setCoverage(null));
+    return () => {
+      stale = true;
+    };
+    // Re-read when the repository's own state changes — not on every status
+    // object the page re-reads after a stage or a commit.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoPath, refreshKey, push.blocked, push.repo_blocked, push.lock.locked, push.needs_repair, push.lock.needs_elevation]);
 
   const mode = currentMode(push);
   const lock = push.lock;
@@ -216,7 +232,8 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
 
   const repairLock = async () => {
     setBusy(true);
-    setWaiting(lock.needs_elevation);
+    // The repository's own layers, or a submodule's: either way the prompt.
+    setWaiting(lock.needs_elevation || (coverage?.needs_repair ?? false));
     setError(null);
     try {
       const r = await api.changesRepairPushLock(repoPath);
@@ -279,6 +296,22 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
       </div>
 
       <p className="text-xs text-zinc-400 leading-relaxed">{push.reason}</p>
+      {coverage && coverage.summary && (
+        <div className={`flex items-start gap-2 ${coverage.needs_repair ? "rounded-lg bg-amber-500/10 border border-amber-500/30 px-2.5 py-2" : ""}`}>
+          {coverage.needs_repair && <AlertTriangle size={13} className="shrink-0 mt-0.5 text-amber-400" />}
+          <div className="min-w-0 flex-1">
+            <p className={`text-xs leading-relaxed ${coverage.needs_repair ? "text-amber-200/90" : "text-zinc-500"}`} title="Submodules are repositories of their own: a push can start inside one, so the block or lock is extended to each of them">
+              {coverage.summary}
+            </p>
+            {coverage.needs_repair && (
+              <Button size="sm" variant="secondary" className="mt-1.5" disabled={busy} onClick={() => void (mode === "locked" ? repairLock() : repairGuardrail())}>
+                <Wrench size={12} />
+                {mode === "locked" ? "Repair — cover them too (administrator prompt)" : "Repair — cover them too"}
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
       <PushesAs repoPath={repoPath} refreshKey={refreshKey} />
 
       <div className="flex rounded-lg border border-zinc-700 overflow-hidden w-fit max-w-full" role="radiogroup" aria-label="Push access">

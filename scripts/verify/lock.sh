@@ -446,6 +446,63 @@ ok "uninstall from the app applies" "$(printf '%s' "$OUT" | jqf outcome)" "appli
 ok "  the helper is gone" "$([ -e "$HELPER" ] && echo present || echo gone)" "gone"
 ok "  the registry is gone" "$(reg_left)" "gone"
 
+section "A block on a superproject reaches its submodules — the repositories the code lives in"
+SUP="$SB/super-cover"; for r in remote lib lib2 inner; do git init -q --bare "$SB/cover-$r.git"; done
+for r in lib lib2 inner; do git clone -q "$SB/cover-$r.git" "$SB/cover-author-$r" 2>/dev/null; printf '%s v1\n' "$r" > "$SB/cover-author-$r/$r.txt"; git -C "$SB/cover-author-$r" add -A >/dev/null; git -C "$SB/cover-author-$r" commit -qm "$r: initial"; git -C "$SB/cover-author-$r" push -q origin main 2>/dev/null; done
+# lib has a submodule of its own.
+( cd "$SB/cover-author-lib" && git submodule add -q "$SB/cover-inner.git" inner 2>/dev/null ); git -C "$SB/cover-author-lib" commit -qam "lib: add inner" >/dev/null; git -C "$SB/cover-author-lib" push -q origin main 2>/dev/null
+git clone -q "$SB/cover-remote.git" "$SB/cover-author" 2>/dev/null; printf 'readme\n' > "$SB/cover-author/README.md"; git -C "$SB/cover-author" add -A >/dev/null; git -C "$SB/cover-author" commit -qm "super: initial"
+( cd "$SB/cover-author" && git submodule add -q "$SB/cover-lib.git" lib 2>/dev/null ); git -C "$SB/cover-author" commit -qam "super: add lib" >/dev/null; git -C "$SB/cover-author" push -q origin main 2>/dev/null
+git clone -q --recurse-submodules "$SB/cover-remote.git" "$SUP" 2>/dev/null; git -C "$SUP/lib" checkout -q main; git -C "$SUP/lib/inner" checkout -q main
+printf 'lib v2\n' > "$SUP/lib/lib.txt"; git -C "$SUP/lib" commit -qam "lib: v2"
+cov() { pinvoke changes_push_coverage "{\"repoPath\":\"$SUP\"}"; }
+OUT=$(probe push_mode "$SUP" "guardrail")
+ok "blocking the superproject applies" "$(printf '%s' "$OUT" | jqf outcome):$(printf '%s' "$OUT" | jqf state.repo_blocked)" "applied:True"
+ok "  and reaches every populated submodule, nested ones included" "$(cov | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"];print(c["mode"], [(s["path"],s["blocked"],s["covered"]) for s in c["submodules"]], c["uncovered"], c["summary"])')" "guardrail [('lib', True, True), ('lib/inner', True, True)] [] Covers this repository and 2 submodules."
+ok "  the submodule carries the flag and the hook" "$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked):$([ "$(grep -c 'GitSwitch push guard' "$(git -C "$SUP/lib" rev-parse --git-path hooks)/pre-push")" -gt 0 ] && echo hook || echo nohook)" "true:hook"
+ok "  marked as the superproject's doing" "$(git -C "$SUP/lib" config --local --get gitswitch.pushBlockedBy)" "superproject"
+git -C "$SUP/lib" push origin main >/dev/null 2>"$SB/cover-push.err"; RC=$?
+ok "a push from inside the submodule is refused in a plain terminal" "$([ "$RC" -ne 0 ] && echo refused || echo PUSHED):$(git -C "$SB/cover-lib.git" log --format=%s -1 main)" "refused:lib: add inner"
+ok "  by GitSwitch, not by chance" "$([ "$(grep -ci gitswitch "$SB/cover-push.err")" -gt 0 ] && echo yes || echo no)" "yes"
+git -C "$SUP/lib" config --local --unset gitswitch.pushBlocked; rm -f "$(git -C "$SUP/lib" rev-parse --git-path hooks)/pre-push"
+ok "a submodule whose pieces were removed is reported as not covered" "$(cov | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"];print(c["needs_repair"], c["uncovered"], c["summary"])')" "True ['lib'] Not covering 1 of 2 submodules: lib (only its address rewrite still stops a push; Repair re-applies the rest)."
+OUT=$(pinvoke changes_repair_push_block "{\"repoPath\":\"$SUP\"}")
+ok "  Repair covers it again" "$(cov | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"];print(c["needs_repair"], c["uncovered"])')" "False []"
+# A submodule added upstream and downloaded under the block gets it at once.
+( cd "$SB/cover-author" && git submodule add -q "$SB/cover-lib2.git" lib2 2>/dev/null ); git -C "$SB/cover-author" commit -qam "super: add lib2" >/dev/null; git -C "$SB/cover-author" push -q origin main 2>/dev/null
+git -C "$SUP" pull -q --ff-only origin main 2>/dev/null
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$SUP\",\"paths\":[\"lib2\"]}")
+ok "a submodule downloaded under the block gets it at once, and the result says so" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], "got the same guard-rail" in v["detail"])'):$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked)" "True True:true"
+ok "  and counts as covered" "$(cov | jqf value.summary)" "Covers this repository and 3 submodules."
+# One blocked on its own (no superproject marker) keeps its block when the superproject allows pushes again.
+git -C "$SUP/lib2" config --local --unset gitswitch.pushBlockedBy
+OUT=$(probe push_mode "$SUP" "allowed")
+ok "allowing the superproject takes the block away from the submodules it covered" "$(printf '%s' "$OUT" | jqf outcome):$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked || echo unset):$(git -C "$SUP/lib/inner" config --local --get gitswitch.pushBlocked || echo unset):$([ -e "$(git -C "$SUP/lib" rev-parse --git-path hooks)/pre-push" ] && echo hook || echo nohook)" "applied:unset:unset:nohook"
+ok "  but not from one blocked on its own" "$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked)" "true"
+ok "  and the card says which ones are" "$(cov | jqf value.summary)" "Blocked on their own: lib2."
+git -C "$SUP/lib" push -q origin main 2>/dev/null
+ok "  a push from inside lib goes through again" "$(git -C "$SB/cover-lib.git" log --format=%s -1 main)" "lib: v2"
+# A submodule the person blocked BEFORE the superproject's block keeps it afterwards: the superproject never marks what was already theirs.
+OUT=$(probe push_mode "$SUP/lib" "guardrail")
+OUT=$(probe push_mode "$SUP" "guardrail"); OUT=$(probe push_mode "$SUP" "allowed")
+ok "a submodule blocked on its own before the superproject's block keeps it when the superproject allows again" "$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked):$(git -C "$SUP/lib" config --local --get gitswitch.pushBlockedBy || echo unmarked)" "true:unmarked"
+OUT=$(probe push_mode "$SUP/lib" "allowed")
+# A moved superproject still takes its block away from the submodules it covered: the marker names no path.
+OUT=$(probe push_mode "$SUP" "guardrail"); mv "$SUP" "$SUP-moved"; OUT=$(probe push_mode "$SUP-moved" "allowed")
+ok "allowing a superproject that was moved still uncovers its submodules" "$(printf '%s' "$OUT" | jqf outcome):$(git -C "$SUP-moved/lib" config --local --get gitswitch.pushBlocked || echo unset)" "applied:unset"
+mv "$SUP-moved" "$SUP"
+
+section "A lock on a superproject locks its submodules in the same job; unlocking frees them all"
+git -C "$SUP/lib2" config --local --unset gitswitch.pushBlocked; rm -f "$(git -C "$SUP/lib2" rev-parse --git-path hooks)/pre-push"
+OUT=$(probe push_mode "$SUP" "locked")
+ok "locking the superproject applies" "$(printf '%s' "$OUT" | jqf outcome):$(printf '%s' "$OUT" | jqf state.lock.locked)" "applied:True"
+for sub in lib lib/inner lib2; do ST=$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}"); ok "  $sub is locked too, with its mirrors in place" "$(printf '%s' "$ST" | jqf value.lock.locked):$(printf '%s' "$ST" | jqf value.lock.mirrors)" "True:ok"; done
+ok "  the coverage says so" "$(cov | jqf value.summary)" "Covers this repository and 3 submodules."
+ok "  the registry lists the four of them" "$(pinvoke push_lock_helper_status "{}" | "$PY" -c 'import sys,json;print(len([l for l in json.load(sys.stdin)["value"]["locks"] if "super-cover" in l["repo"]]))')" "4"
+OUT=$(probe push_mode "$SUP" "allowed")
+ok "unlocking the superproject unlocks them all" "$(printf '%s' "$OUT" | jqf outcome):$(for sub in lib lib/inner lib2; do pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}" | jqf value.lock.locked; done | tr '\n' ',')" "applied:False,False,False,"
+ok "  and nothing of the block is left in them" "$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked || echo unset):$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked || echo unset)" "unset:unset"
+
 # Real mode: leave the machine as it was found.
 if [ -n "$REAL" ]; then
   if [ -n "$SYSCFG_ORIG" ]; then sys_write "$SYSCFG" < "$SYSCFG_ORIG"; else sys_rm "$SYSCFG"; fi

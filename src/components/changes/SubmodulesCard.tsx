@@ -67,9 +67,12 @@ function chipClass(state: SubmoduleInfo["state"]): string {
       return "bg-amber-500/15 text-amber-300";
     case "not-initialised":
       return "bg-zinc-700/50 text-zinc-400";
+    case "incomplete":
+      return "bg-amber-500/15 text-amber-300";
     case "unmapped":
       return "bg-red-500/15 text-red-300";
   }
+  return "bg-zinc-700/50 text-zinc-400";
 }
 
 function chipLabel(state: SubmoduleInfo["state"]): string {
@@ -77,7 +80,9 @@ function chipLabel(state: SubmoduleInfo["state"]): string {
     case "moved-and-dirty":
       return "moved + dirty";
     case "not-initialised":
-      return "not initialised";
+      return "not downloaded";
+    case "incomplete":
+      return "download interrupted";
     case "unmapped":
       return "unfetchable";
     default:
@@ -436,10 +441,12 @@ export function SubmodulesCard({
 
   if (!loading && subs.length === 0 && !error) return null;
 
-  const present = subs.filter((s) => s.initialised);
-  const missing = subs.filter((s) => !s.initialised);
+  // An interrupted download is not populated: it is downloadable again.
+  const present = subs.filter((s) => s.initialised && s.state !== "incomplete");
+  const missing = subs.filter((s) => !s.initialised || s.state === "incomplete");
   const fetchable = missing.filter((s) => s.listed).length;
   const unfetchable = missing.length - fetchable;
+  const interrupted = missing.filter((s) => s.state === "incomplete").length;
 
   return (
     <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40">
@@ -493,6 +500,7 @@ export function SubmodulesCard({
             <div className="min-w-0 flex-1">
               <p className="text-xs text-zinc-400 leading-relaxed">
                 {missing.length} not downloaded yet
+                {interrupted > 0 && ` (${interrupted} download${interrupted === 1 ? "" : "s"} interrupted — Download finishes ${interrupted === 1 ? "it" : "them"})`}
                 {fetchable > 0 && unfetchable > 0
                   ? ` — ${fetchable} can be fetched with Download missing, ${unfetchable} have no entry in .gitmodules so git can't fetch them`
                   : fetchable > 0

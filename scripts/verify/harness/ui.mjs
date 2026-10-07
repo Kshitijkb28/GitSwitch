@@ -54,6 +54,8 @@ async function openPage(browser, server, scenario, opts = {}) {
     lfs: opts.lfs ?? null,
     repos: opts.repos ?? null,
     pushState: opts.pushState ?? null,
+    /** How far the block reaches into the submodules; null → none to speak of. */
+    pushCoverage: opts.pushCoverage ?? null,
     pushResult: opts.pushResult ?? null,
     subPushResult: opts.subPushResult ?? null,
     consoleEntries: opts.consoleEntries ?? [],
@@ -367,6 +369,8 @@ async function openPage(browser, server, scenario, opts = {}) {
               });
             case "push_lock_finish_manual":
               return Promise.resolve({ outcome: "applied", message: "Unlocked 1 repository.", command: null, job_nonce: null, changed: [], errors: [], bootstrapped: false });
+            case "changes_push_coverage":
+              return Promise.resolve(cfg.pushCoverage ?? { mode: "allowed", submodules: [], uncovered: [], needs_repair: false, summary: "" });
             case "changes_push_state":
               if (cfg.pushState) return Promise.resolve({ ...window.__SCENARIO__.push, ...cfg.pushState, lock: { ...window.__SCENARIO__.push.lock, ...(cfg.pushState.lock || {}) } });
               return Promise.resolve({ ...window.__SCENARIO__.push, lock: { ...window.__SCENARIO__.push.lock, locked: false }, blocked: false, repo_blocked: false, reason: "Pushing is allowed from this folder." });
@@ -632,6 +636,25 @@ try {
       d.click();
       return true;
     }, label);
+  {
+    // The block reaches into the submodules, and says so; one left out is named, with Repair.
+    const full = { mode: "guardrail", submodules: [{ path: "trinity", blocked: true, locked: false, needs_repair: false, covered: true }, { path: "staging", blocked: true, locked: false, needs_repair: false, covered: true }], uncovered: [], needs_repair: false, summary: "Covers this repository and 2 submodules." };
+    const page = await open(SCENARIOS.blocked, { pushCoverage: full });
+    await page.waitForFunction(() => document.body.innerText.includes("Covers this repository"), { timeout: 4000 }).catch(() => null);
+    ok("a blocked superproject says the block covers its submodules", (await text(page)).includes("Covers this repository and 2 submodules."));
+    await page.close();
+    const partial = { ...full, submodules: [full.submodules[0], { ...full.submodules[1], blocked: false, covered: false }], uncovered: ["staging"], needs_repair: true, summary: "Not covering 1 of 2 submodules: staging — a push from inside it is not stopped." };
+    const page2 = await open(SCENARIOS.blocked, { pushCoverage: partial });
+    await page2.waitForFunction(() => document.body.innerText.includes("Not covering"), { timeout: 4000 }).catch(() => null);
+    const s2 = await text(page2);
+    ok("  a submodule the block does not reach is named, with what that means", s2.includes("Not covering 1 of 2 submodules: staging") && s2.includes("not stopped"));
+    const repair = await button(page2, "Repair — cover them too");
+    ok("  and Repair is offered for it", repair !== null);
+    await repair?.click();
+    await page2.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_repair_push_block"), { timeout: 4000 }).catch(() => null);
+    ok("  which re-applies the block to the repository and its submodules", await page2.evaluate(() => window.__CALLS__.some((c) => c.cmd === "changes_repair_push_block" && c.args.repoPath === "/repos/gitswitch")));
+    await page2.close();
+  }
   {
     const page = await open(SCENARIOS.blocked);
     const s = await text(page);
@@ -1511,6 +1534,38 @@ try {
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_branch"), { timeout: 4000 });
     const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_branch").args);
     ok("  Enter creates the branch at the submodule's checkout and switches to it", call.repoPath === "/repos/gitswitch/trinity" && call.name === "fix/pointer" && call.from === null && call.switchTo === true, JSON.stringify(call));
+    await page.close();
+  }
+  {
+    // While submodules download, the strip shows git's progress: phase, share, which submodule, bytes and rate.
+    // A submodule that is listed in .gitmodules and not downloaded: the one Download missing fetches.
+    const missing = sub({ path: "libs/sub", name: "sub", initialised: false, actual: null, actual_short: null, own_branch: null, own_upstream: null, state: "not-initialised", summary: "not downloaded yet — Download fetches it (git submodule update --init)" });
+    const page = await open(SCENARIOS.submodules, {
+      submodules: [SUBMODULES[0], missing],
+      subInner: SUB_INNER,
+      hang: true,
+      cloneProgress: { phase: "Submodules", percent: 37, done: 3, total: 8, bytes: "10.00 MiB", rate: "2.00 MiB/s", detail: "libs/sub" },
+    });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 8000 }).catch(() => null);
+    await page.waitForFunction(() => document.body.innerText.includes("Download missing"), { timeout: 8000 }).catch(() => null);
+    const dl = await button(page, "Download missing");
+    const dlState = dl ? await dl.evaluate((e) => ({ disabled: e.disabled, text: e.innerText.trim() })) : null;
+    await dl?.click();
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules 37%"), { timeout: 8000 }).catch(() => null);
+    const s = await text(page);
+    ok("  (the Download button was there and enabled)", dlState !== null && dlState.disabled === false, JSON.stringify(dlState) + " | " + s.slice(s.indexOf("Submodules", s.indexOf("Submodules") + 1), s.indexOf("Submodules", s.indexOf("Submodules") + 1) + 500).replace(/\s+/g, " "));
+    ok("while submodules download, the strip says which one and how far", s.includes("Downloading 1 submodule") && s.includes("Submodules 37%") && s.includes("3 of 8") && s.includes("libs/sub") && s.includes("2.00 MiB/s"), s.includes("Downloading") ? s.slice(s.indexOf("Downloading"), s.indexOf("Downloading") + 160) : "no 'Downloading' on the page: " + s.slice(0, 300).replace(/\s+/g, " "));
+    ok("  as a bar", await page.evaluate(() => !!document.querySelector('[aria-label="Download progress"]')));
+    await page.close();
+  }
+  {
+    // A download that was interrupted (a .git entry, nothing checked out) is not populated: it is offered for download again.
+    const half = sub({ path: "half", name: "half", initialised: true, actual: null, actual_short: null, own_branch: null, own_upstream: null, state: "incomplete", summary: "its download was interrupted — nothing is checked out; Download finishes it (git submodule update --init)" });
+    const page = await open(SCENARIOS.submodules, { submodules: [half, SUBMODULES[0]], subInner: SUB_INNER });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    const s = await text(page);
+    ok("an interrupted download is counted among the ones to download, not the populated", s.includes("Download missing (1)") && s.includes("1 not downloaded yet"), s.slice(s.indexOf("Submodules"), s.indexOf("Submodules") + 300).replace(/\s+/g, " "));
+    ok("  and says what happened to it", s.includes("1 download interrupted — Download finishes it"), s.slice(s.indexOf("not downloaded"), s.indexOf("not downloaded") + 200).replace(/\s+/g, " "));
     await page.close();
   }
   {

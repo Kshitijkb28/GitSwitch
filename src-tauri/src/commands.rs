@@ -668,6 +668,13 @@ pub async fn changes_repair_push_block(repo_path: String) -> Result<PushState, A
     git_status::repair_push_block_for(&repo_path).await
 }
 
+/// How far the repository's push block or lock reaches into its submodules.
+#[tauri::command]
+pub async fn changes_push_coverage(repo_path: String) -> Result<crate::push_guard::PushCoverage, AppError> {
+    let state = git_status::push_state_for(&repo_path).await?;
+    Ok(crate::push_guard::coverage(&repo_path, &state).await)
+}
+
 /// Stage the named files. Never "everything" by accident: an empty list is an
 /// error, and staging all is a separate command.
 #[tauri::command]

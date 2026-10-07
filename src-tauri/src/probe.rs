@@ -186,6 +186,7 @@ pub(crate) mod tests {
             "changes_set_push_mode" => forward!(c::changes_set_push_mode, args, repo_path, mode),
             "changes_repair_push_lock" => forward!(c::changes_repair_push_lock, args, repo_path),
             "changes_repair_push_block" => forward!(c::changes_repair_push_block, args, repo_path),
+            "changes_push_coverage" => forward!(c::changes_push_coverage, args, repo_path),
             "push_lock_helper_status" => forward_plain!(c::push_lock_helper_status, args),
             "push_lock_finish_manual" => forward_plain!(c::push_lock_finish_manual, args, nonce),
             // tree: branches, undo, reset, revert, conflicts

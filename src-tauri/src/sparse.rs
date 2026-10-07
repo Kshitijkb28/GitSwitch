@@ -753,6 +753,10 @@ pub struct SubmoduleReport {
     /// collapsing them into one error string threw the detail away.
     pub failed_paths: Vec<String>,
     pub error: Option<String>,
+    /// Submodules whose interrupted download (a `.git` entry, no commit) was
+    /// cleared before downloading again.
+    #[serde(default)]
+    pub cleared: Vec<String>,
 }
 
 /// Download the submodules a repo lists in `.gitmodules` — the same end state
@@ -779,12 +783,17 @@ pub struct SubmoduleReport {
 pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, key: Option<&str>, url: &str, only: Option<&[String]>, progress_for: Option<&str>) -> SubmoduleReport {
     // `-z` (`key\nvalue\0` records): a submodule's name defaults to its path,
     // and a path with a space would otherwise split the key in the middle.
-    let listed: Vec<String> = run_git(Some(repo), &["config", "-f", ".gitmodules", "--get-regexp", "-z", r"\.path$"])
+    // (name, path): the name finds the module directory under .git/modules.
+    let listed: Vec<(String, String)> = run_git(Some(repo), &["config", "-f", ".gitmodules", "--get-regexp", "-z", r"\.path$"])
         .await
         .map(|out| {
             out.split('\0')
-                .filter_map(|rec| rec.split_once('\n').map(|(_, p)| p.trim().to_string()))
-                .filter(|p| !p.is_empty())
+                .filter_map(|rec| {
+                    let (k, p) = rec.split_once('\n')?;
+                    let name = k.trim().strip_prefix("submodule.")?.strip_suffix(".path")?.to_string();
+                    let p = p.trim().to_string();
+                    (!p.is_empty()).then_some((name, p))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -793,8 +802,8 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
         .map(|out| out.lines().filter(|l| l.starts_with("160000 ")).count())
         .unwrap_or(0);
     let unlisted = gitlinks.saturating_sub(listed.len());
-    let listed: Vec<String> = match only {
-        Some(want) => listed.into_iter().filter(|p| want.iter().any(|w| crate::paths::norm(w) == crate::paths::norm(p))).collect(),
+    let listed: Vec<(String, String)> = match only {
+        Some(want) => listed.into_iter().filter(|(_, p)| want.iter().any(|w| crate::paths::norm(w) == crate::paths::norm(p))).collect(),
         None => listed,
     };
     let mut report = SubmoduleReport {
@@ -803,6 +812,7 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
         unlisted,
         failed_paths: Vec::new(),
         error: None,
+        cleared: Vec::new(),
     };
     // Leave the repo exactly as `git clone --recurse-submodules` does: every
     // submodule counts as active, so later `git pull --recurse-submodules` /
@@ -818,11 +828,14 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
     // then thinks they're up to date, leaving empty folders behind.
     let mut failed: Vec<String> = Vec::new();
     let mut first_error: Option<String> = None;
-    for (finished, path) in listed.iter().enumerate() {
+    for (finished, (name, path)) in listed.iter().enumerate() {
         // Before, not after: the line should name the submodule while it is
         // the one taking the time.
         if let Some(dest) = progress_for {
             set_progress(dest, CloneProgress::submodules(finished, listed.len(), Some(path)));
+        }
+        if let Some(p) = clear_incomplete(repo, name, path).await {
+            report.cleared.push(p);
         }
         // Streamed, with the inner clone's progress on the page's line, and
         // stopped only when it reports nothing for a long while — never for
@@ -844,7 +857,22 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
                 set_progress(dest, CloneProgress { percent, bytes: inner.bytes, rate: inner.rate, ..CloneProgress::submodules(finished, total, Some(path)) });
             }
         };
-        let res = run_git_streaming(Some(repo), &cfg, &["submodule", "update", "--init", "--recursive", "--progress", "--", path], Some(submodule_stall()), &on_progress).await;
+        let mut res = run_git_streaming(Some(repo), &cfg, &["submodule", "update", "--init", "--recursive", "--progress", "--", path], Some(submodule_stall()), &on_progress).await;
+        // A module directory that holds the commits but has nothing checked
+        // out (HEAD pointing nowhere) makes `submodule update` give up
+        // ("Unable to find current revision"): when the recorded commit is
+        // there, check it out ourselves.
+        if !is_checked_out(&repo.join(path)).await {
+            let sub = repo.join(path);
+            let recorded = run_git(Some(repo), &["ls-files", "-s", "--", path]).await.ok().and_then(|o| o.split_whitespace().nth(1).map(|s| s.to_string()));
+            if let Some(sha) = recorded {
+                if run_git(Some(&sub), &["cat-file", "-e", &format!("{}^{{commit}}", sha)]).await.is_ok()
+                    && run_git(Some(&sub), &["checkout", "-q", "--detach", &sha]).await.is_ok()
+                {
+                    res = Ok(String::new());
+                }
+            }
+        }
         if let Err(e) = res {
             failed.push(path.clone());
             if first_error.is_none() {
@@ -870,7 +898,7 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
         ));
     }
     let mut downloaded = 0;
-    for path in &listed {
+    for (_, path) in &listed {
         if is_checked_out(&repo.join(path)).await {
             downloaded += 1;
         }
@@ -881,6 +909,75 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
 
 /// A submodule counts as downloaded only if its files are actually there:
 /// cloned-but-never-checked-out leaves `.git` with an empty folder.
+/// An interrupted download leaves a `.git` entry in the folder and a module
+/// directory with no commit in it; `git submodule update` cannot finish such
+/// a folder. When nothing of it holds a commit — nothing to lose — the
+/// leftovers are removed so the download starts afresh. The path, when it did.
+async fn clear_incomplete(repo: &Path, name: &str, path: &str) -> Option<String> {
+    let dir = repo.join(path);
+    let gitfile = dir.join(".git");
+    if !gitfile.exists() {
+        return None;
+    }
+    if run_git(Some(&dir), &["rev-parse", "--verify", "--quiet", "HEAD"]).await.is_ok() {
+        return None;
+    }
+    // A git directory holds no commit when git can read it and counts none —
+    // or when git cannot read it (no HEAD, say) and it holds neither refs nor
+    // finished objects on disk: an interrupted transfer leaves only temporary
+    // pack files. Anything with a ref or a finished object is kept.
+    let commitless = |d: PathBuf| async move {
+        // Named outright (`--git-dir`), never discovered: a module directory
+        // with no HEAD makes git walk up into the superproject's own .git
+        // and count ITS commits. When git cannot read it at all, the disk
+        // decides.
+        let gd = if d.join(".git").is_dir() { d.join(".git") } else { d.clone() };
+        let gd_s = gd.to_string_lossy().to_string();
+        if let Some(n) = run_git(None, &["--git-dir", &gd_s, "rev-list", "--all", "--count"]).await.ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+            return n == 0;
+        }
+        // A ref is a file somewhere under refs/ — the empty `heads/` and
+        // `remotes/origin/` folders git leaves behind are not refs.
+        fn any_file(dir: &Path) -> bool {
+            std::fs::read_dir(dir)
+                .map(|it| it.flatten().any(|e| e.path().is_dir() && any_file(&e.path()) || e.path().is_file()))
+                .unwrap_or(false)
+        }
+        let has_refs = gd.join("packed-refs").exists() || any_file(&gd.join("refs"));
+        let has_objects = std::fs::read_dir(gd.join("objects"))
+            .map(|it| {
+                it.flatten().any(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    n.len() == 2 && n.chars().all(|c| c.is_ascii_hexdigit())
+                })
+            })
+            .unwrap_or(false)
+            || std::fs::read_dir(gd.join("objects/pack"))
+                .map(|it| it.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".pack")))
+                .unwrap_or(false);
+        !has_refs && !has_objects
+    };
+    let modules = run_git(Some(repo), &["rev-parse", "--git-path", &format!("modules/{}", name)]).await.ok().map(|s| s.trim().to_string());
+    if let Some(m) = modules {
+        let mp = if Path::new(&m).is_absolute() { PathBuf::from(&m) } else { repo.join(&m) };
+        if mp.exists() {
+            if !commitless(mp.clone()).await {
+                return None;
+            }
+            let _ = std::fs::remove_dir_all(&mp);
+        }
+    }
+    if gitfile.is_dir() {
+        if !commitless(dir.clone()).await {
+            return None;
+        }
+        let _ = std::fs::remove_dir_all(&gitfile);
+    } else {
+        let _ = std::fs::remove_file(&gitfile);
+    }
+    Some(path.to_string())
+}
+
 async fn is_checked_out(dir: &Path) -> bool {
     if !dir.join(".git").exists() || run_git(Some(dir), &["rev-parse", "--verify", "HEAD"]).await.is_err() {
         return false;

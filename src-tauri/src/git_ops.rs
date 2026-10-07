@@ -1951,7 +1951,31 @@ pub async fn submodule_update(repo_path: &str, paths: Option<Vec<String>>) -> Re
             validate_repo_path(path)?;
         }
     }
-    let report = crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url, paths.as_deref(), None).await;
+    let guarded = before.push.repo_blocked || before.push.lock.locked;
+    let populated_before = if guarded { crate::push_guard::populated_submodules(std::path::Path::new(repo_path)).await } else { Vec::new() };
+    // Progress is recorded under the repository's path, for the page's strip.
+    let report = crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url, paths.as_deref(), Some(repo_path)).await;
+    // A submodule this download populated — nested ones included — under a
+    // blocked or locked repository gets the same guard-rail at once; the
+    // lock's own layer for it is Repair's.
+    let mut inherited = String::new();
+    let fresh: Vec<String> = if guarded {
+        crate::push_guard::populated_submodules(std::path::Path::new(repo_path)).await.into_iter().filter(|p| !populated_before.contains(p)).collect()
+    } else {
+        Vec::new()
+    };
+    if !fresh.is_empty() {
+        let notes = crate::push_guard::cover_submodules(repo_path, Some(&fresh)).await;
+        inherited = if notes.is_empty() {
+            format!(
+                " Pushes are {} here, so the downloaded submodule(s) got the same guard-rail{}.",
+                if before.push.lock.locked { "locked" } else { "blocked" },
+                if before.push.lock.locked { " — the lock's own layer for them needs Repair (administrator) under Push access" } else { "" }
+            )
+        } else {
+            format!(" Could not extend the push block to: {}.", notes.join("; "))
+        };
+    }
     let after = snapshot(repo_path).await?;
 
     let headline = format!("{} of {} submodule(s) up to date.", report.downloaded, report.listed);
@@ -1962,9 +1986,14 @@ pub async fn submodule_update(repo_path: &str, paths: Option<Vec<String>>) -> Re
             report.unlisted
         ));
     }
+    if !report.cleared.is_empty() {
+        detail.push_str(&format!("An interrupted download of {} was cleared before downloading again. ", report.cleared.join(", ")));
+    }
     if let Some(err) = &report.error {
         detail.push_str(err);
     }
+    detail.push_str(&inherited);
+    let detail = detail.trim().to_string();
 
     Ok(OpResult {
         submodules: Some(report),

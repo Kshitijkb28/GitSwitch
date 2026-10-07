@@ -54,10 +54,13 @@ function stateLabel(s: SubmoduleInfo): string {
     case "moved-and-dirty":
       return "moved + changes inside";
     case "not-initialised":
-      return "not initialised";
+      return "not downloaded";
+    case "incomplete":
+      return "download interrupted";
     case "unmapped":
       return "unfetchable";
   }
+  return s.state;
 }
 
 function stateClass(s: SubmoduleInfo): string {
@@ -66,6 +69,7 @@ function stateClass(s: SubmoduleInfo): string {
     case "moved-and-dirty":
       return "bg-sky-500/15 text-sky-300";
     case "dirty":
+    case "incomplete":
       return "bg-amber-500/15 text-amber-300";
     case "unmapped":
       return "bg-red-500/15 text-red-300";
@@ -108,8 +112,10 @@ export function SubmodulesTab({ repoPath, scope, visible, busy, refreshKey, onWo
   }, [repoPath]);
   useEffect(load, [load, refreshKey]);
 
-  const present = subs.filter((s) => s.initialised);
-  const missing = subs.filter((s) => !s.initialised && s.listed);
+  // An interrupted download (a .git entry, nothing checked out) is not
+  // populated: it is downloadable, like one never downloaded.
+  const present = subs.filter((s) => s.initialised && s.state !== "incomplete");
+  const missing = subs.filter((s) => (!s.initialised || s.state === "incomplete") && s.listed);
   const unfetchable = subs.filter((s) => !s.initialised && !s.listed);
   const moved = present.filter((s) => s.state === "moved" || s.state === "moved-and-dirty");
 

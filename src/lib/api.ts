@@ -460,6 +460,8 @@ export interface SubmoduleReport {
   /** the listed submodules whose update failed, by path */
   failed_paths: string[];
   error: string | null;
+  /** Submodules whose interrupted download was cleared before downloading again. */
+  cleared?: string[];
 }
 
 /** The large files after a checkout — present whenever the repo uses Git LFS. */
@@ -917,6 +919,29 @@ export interface PushState {
 
 export type PushMode = "allowed" | "guardrail" | "locked";
 
+/** One submodule's share of the repository's push block or lock. */
+export interface SubCoverage {
+  path: string;
+  blocked: boolean;
+  locked: boolean;
+  needs_repair: boolean;
+  /** It has what the repository has: a lock under a locked repository, at least the guard-rail under a blocked one. */
+  covered: boolean;
+  /** When not covered: what it has instead, in plain words. */
+  why: string;
+}
+
+/** How far the repository's push block or lock reaches into its submodules — where the code lives. */
+export interface PushCoverage {
+  mode: PushMode;
+  submodules: SubCoverage[];
+  /** Submodules with less than the repository has: a push from inside them is not stopped. */
+  uncovered: string[];
+  needs_repair: boolean;
+  /** One sentence for the card; empty when there is nothing to say. */
+  summary: string;
+}
+
 export type JobOutcomeKind =
   | "applied"
   | "cancelled"
@@ -1053,7 +1078,9 @@ export interface SubmoduleInfo {
     | "dirty"
     | "moved-and-dirty"
     | "not-initialised"
-    | "unmapped";
+    | "unmapped"
+    /** A `.git` entry but nothing checked out: a download that was interrupted. Downloadable again. */
+    | "incomplete";
   summary: string;
   gitdir_valid: boolean;
   operation: string | null;
@@ -1851,6 +1878,10 @@ export async function pushLockFinishManual(nonce: string): Promise<JobOutcome> {
 
 export async function doctorCheckPushLocks(): Promise<Finding[]> {
   return invoke("doctor_check_push_locks");
+}
+
+export async function changesPushCoverage(repoPath: string): Promise<PushCoverage> {
+  return invoke("changes_push_coverage", { repoPath });
 }
 
 export async function changesRepairPushBlock(repoPath: string): Promise<PushState> {

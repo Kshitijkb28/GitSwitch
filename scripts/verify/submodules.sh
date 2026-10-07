@@ -143,7 +143,7 @@ ARGS=$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"paths
 ok "a path outside the repository is refused" "$(pinvoke changes_submodule_update "$ARGS")" "isn't a path inside this repository"
 cd "$SB/super"
 
-ok "  and initialising from the Changes page reports no clone progress — no clone is running there" "$TRACE_INIT" "[]"
+ok "  and downloading from the Changes page reports progress under the repository's path, for the page's strip" "$(printf '%s' "$TRACE_INIT" | "$PY" -c 'import sys,json;t=json.load(sys.stdin);print(sorted(set(p["phase"] for p in t)), t[0]["done"] if t else None)')" "['Submodules'] 0"
 
 section "Cloning this superproject names each submodule as it arrives"
 mkdir -p "$SB/clones"
@@ -330,5 +330,39 @@ pair "$SB/pcd" lib; git -C "$SB/pcd/work/lib" checkout -q --detach; bump "$SB/pc
 # (the call on its own line: macOS bash 3.2 mangles \" inside "$( )")
 OUT=$(pinvoke changes_push "{\"repoPath\":\"$SB/pcd/work\",\"setUpstream\":false,\"allowUnpushedSubmodules\":false}")
 ok "for a detached submodule the refusal asks for a branch there first" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["refusal"]["message"])')" "Push lib first (it is detached — start a branch there first), or push anyway."
+
+section "A download that was interrupted is not 'populated': it is finished by Download"
+IC="$SB/incomplete"; mkdir -p "$IC"
+git init -q --bare "$IC/super.git"; git init -q --bare "$IC/lib.git"
+git clone -q "$IC/lib.git" "$IC/author-lib" 2>/dev/null; printf 'lib v1\n' > "$IC/author-lib/lib.txt"; git -C "$IC/author-lib" add -A >/dev/null; git -C "$IC/author-lib" commit -qm "lib: initial"; git -C "$IC/author-lib" push -q origin main 2>/dev/null
+git clone -q "$IC/super.git" "$IC/author" 2>/dev/null; printf 'readme\n' > "$IC/author/README.md"; git -C "$IC/author" add -A >/dev/null; git -C "$IC/author" commit -qm "super: initial"
+( cd "$IC/author" && git submodule add -q "$IC/lib.git" lib 2>/dev/null ); git -C "$IC/author" commit -qam "super: add lib" >/dev/null; git -C "$IC/author" push -q origin main 2>/dev/null
+git clone -q "$IC/super.git" "$IC/work" 2>/dev/null; W="$IC/work"
+# What a crash or a stall mid-download leaves: the gitfile and a module directory without a commit.
+# (`--separate-git-dir` makes exactly what `git submodule update` makes first: the gitfile in lib/, the git dir under .git/modules/.)
+mkdir -p "$W/.git/modules"; git init -q --separate-git-dir "$W/.git/modules/lib" "$W/lib" 2>/dev/null
+ok "the repository's own status still reads with such a submodule in it" "$(probe status "$W" | jqf branch)" "main"
+OUT=$(probe submodules_list "$W")
+ok "the row says the download was interrupted, and is not counted as populated" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;s=json.load(sys.stdin)[0];print(s["initialised"], s["actual"], s["state"], s["summary"])')" "True None incomplete its download was interrupted — nothing is checked out; Download finishes it (git submodule update --init)"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W\",\"paths\":[\"lib\"]}")
+ok "Download clears the leftovers and finishes it, saying so" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["downloaded"], v["submodules"]["cleared"], "was cleared before downloading again" in v["detail"])')" "True 1 ['lib'] True"
+ok "  and lib is checked out at the recorded commit" "$(git -C "$W/lib" rev-parse HEAD 2>/dev/null):$(probe submodules_list "$W" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["state"])')" "$(git -C "$W" rev-parse HEAD:lib):clean"
+# A module directory that does hold commits is never removed: a submodule whose HEAD points nowhere is finished by a checkout, its commits kept.
+git -C "$W/lib" symbolic-ref HEAD refs/heads/nowhere
+OUT=$(probe submodules_list "$W")
+ok "a submodule with commits but nothing checked out is reported as incomplete too" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;s=json.load(sys.stdin)[0];print(s["state"])')" "incomplete"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W\",\"paths\":[\"lib\"]}")
+ok "  Download does not throw its commits away" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["cleared"])'):$([ "$(git -C "$W/.git/modules/lib" rev-list --all --count)" -gt 0 ] && echo kept || echo GONE):$(git -C "$W/lib" rev-parse HEAD 2>/dev/null)" "True []:kept:$(git -C "$W" rev-parse HEAD:lib)"
+# An interrupted transfer: HEAD gone, only a temporary pack — nothing git can read, nothing to keep.
+rm -f "$W/.git/modules/lib/HEAD"; find "$W/.git/modules/lib/refs" -type f -delete; rm -f "$W/.git/modules/lib/packed-refs"; rm -rf "$W/.git/modules/lib/objects"; mkdir -p "$W/.git/modules/lib/objects/pack"; printf 'partial' > "$W/.git/modules/lib/objects/pack/tmp_pack_abc"; find "$W/lib" -mindepth 1 ! -name .git -delete
+ok "  a module directory git cannot even open, with only a temporary pack, is seen as incomplete" "$(probe submodules_list "$W" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["state"])')" "incomplete"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W\",\"paths\":[\"lib\"]}")
+ok "  and Download clears it and downloads afresh" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["cleared"])'):$(git -C "$W/lib" rev-parse HEAD 2>/dev/null)" "True ['lib']:$(git -C "$W" rev-parse HEAD:lib)"
+# The harsher leftover: a bare module directory, which git cannot even run status in. The page survives it, and Download clears it.
+git clone -q "$IC/super.git" "$IC/work2" 2>/dev/null; W2="$IC/work2"
+mkdir -p "$W2/.git/modules/lib"; git init -q --bare "$W2/.git/modules/lib" 2>/dev/null; printf 'gitdir: ../.git/modules/lib\n' > "$W2/lib/.git"
+ok "a bare leftover does not take the repository's status down" "$(probe status "$W2" | jqf branch):$(probe submodules_list "$W2" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["state"])')" "main:incomplete"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W2\",\"paths\":[\"lib\"]}")
+ok "  and Download clears it and finishes the download" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["cleared"])'):$(git -C "$W2/lib" rev-parse HEAD 2>/dev/null)" "True ['lib']:$(git -C "$W2" rev-parse HEAD:lib)"
 
 verify_result

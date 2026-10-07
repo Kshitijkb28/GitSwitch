@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
-import type { OpResult } from "./api";
+import * as api from "./api";
+import type { CloneProgress, OpResult } from "./api";
 
 /**
  * Long git operations keep running while you browse other pages, so their state
@@ -24,7 +25,12 @@ export type GitJob = {
   result?: OpResult;
   /** A failure to even run the command (not a git refusal, which is in result). */
   error?: string;
+  /** What git is doing right now, for a download that reports it (submodules). */
+  progress?: CloneProgress;
 };
+
+/** The kinds whose backend records progress under the repository's path. */
+const REPORTS_PROGRESS: ReadonlySet<GitJobKind> = new Set(["submodules"]);
 
 const jobs = new Map<string, GitJob>();
 const listeners = new Set<() => void>();
@@ -93,6 +99,21 @@ export async function runJob(
 
   jobs.set(repo, { repo, kind, label, startedAt: Date.now(), running: true });
   emit();
+  // Progress, read from the backend while the job runs — the same line the
+  // Clone page shows: phase, percentage, which submodule, bytes and rate.
+  const poll = REPORTS_PROGRESS.has(kind)
+    ? window.setInterval(() => {
+        api
+          .cloneProgress(repo)
+          .then((p) => {
+            const j = jobs.get(repo);
+            if (!j?.running || !p) return;
+            jobs.set(repo, { ...j, progress: p });
+            emit();
+          })
+          .catch(() => {});
+      }, 500)
+    : null;
 
   try {
     const result = await fn();
@@ -110,7 +131,19 @@ export async function runJob(
     });
     emit();
     return undefined;
+  } finally {
+    if (poll !== null) window.clearInterval(poll);
   }
+}
+
+/** "Submodules 37% · 3 of 8 · libs/sub · 10.00 MiB · 2.00 MiB/s" */
+export function progressLine(p: CloneProgress): string {
+  const parts = [`${p.phase}${p.percent !== null ? ` ${p.percent}%` : ""}`];
+  if (p.done !== null && p.total !== null) parts.push(`${p.done.toLocaleString()} of ${p.total.toLocaleString()}`);
+  if (p.detail) parts.push(p.detail);
+  if (p.bytes) parts.push(p.bytes);
+  if (p.rate) parts.push(p.rate);
+  return parts.join(" · ");
 }
 
 /** "3s" / "1m 04s" — shown while a job runs so a slow network is visible. */

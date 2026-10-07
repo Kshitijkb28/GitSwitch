@@ -444,7 +444,7 @@ export function ChangesTab({
         setIdentityRefresh((k) => k + 1);
       },
       initialise: (repo, paths) =>
-        runLongIn(repo, "submodules", `Initialising ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
+        runLongIn(repo, "submodules", `Downloading ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
           api.changesSubmoduleUpdate(repo, paths)
         ),
       updateOne: (repo, sub) => runLongIn(repo, "submodules", `Updating ${sub}…`, () => api.changesSubmoduleUpdate(repo, [sub])),
@@ -789,7 +789,7 @@ export function ChangesTab({
                 refreshKey={subRefresh}
                 onOpenRepo={openRepo}
                 onUpdate={(paths) =>
-                  runLong("submodules", `Initialising ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
+                  runLong("submodules", `Downloading ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
                     api.changesSubmoduleUpdate(repoPath, paths)
                   )
                 }
