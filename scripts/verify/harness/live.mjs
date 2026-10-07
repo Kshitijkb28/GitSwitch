@@ -880,7 +880,8 @@ try {
     ok("  c.txt holds my content", fs.readFileSync(`${WORK}/c.txt`, "utf8") === "mine again\n");
     ok("  Continue update is enabled once nothing is unmerged", await waitUntilAsync(async () => (await buttonState(page, "Continue update"))?.disabled === false));
     ok("Continue update", await click(page, "Continue update"));
-    ok("  the page says Updated", await waitText(page, "Updated: "));
+    const said = await waitText(page, "Updated: ");
+    ok("  the page says Updated", said, said ? "" : (await text(page)).replace(/\s+/g, " ").slice(0, 900));
     ok("  with every check passed — the resolved commit counts as on top", await waitText(page, "All 6 checks passed"));
     ok("  git: my commits are on top of upstream's, nothing in progress, the state file gone", git(WORK, "rev-list", "--count", "origin/main..HEAD") === ownBefore && !exists(`${WORK}/.git/rebase-merge`) && !exists(`${WORK}/.git/gitswitch-sync.json`));
     ok("  and c.txt is mine", git(WORK, "show", "HEAD:c.txt") === "mine again");

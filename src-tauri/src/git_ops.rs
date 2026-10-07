@@ -1737,11 +1737,13 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
     // (`fetch.unpackLimit=1`), because git reports nothing at all while it
     // unpacks a fetch of under a hundred objects, however big they are.
     let fetched = GitCmd::at(repo_path)
-        .cfg("fetch.unpackLimit", "1")
+        .for_fetch()
         .args(["fetch", "--progress", "--no-recurse-submodules", "--", &remote])
-        .stall(crate::git_exec::net_stall())
         .run()
         .await?;
+    if fetched.ok() {
+        crate::git_exec::housekeeping(repo_path).await;
+    }
     if !fetched.ok() {
         let after = snapshot(repo_path).await?;
         let a = git_advice::explain(GitOp::Fetch, &fetched.stderr, &advice_ctx(&after));
@@ -1959,8 +1961,13 @@ pub async fn submodule_update(repo_path: &str, paths: Option<Vec<String>>) -> Re
     }
     let guarded = before.push.repo_blocked || before.push.lock.locked;
     let populated_before = if guarded { crate::push_guard::populated_submodules(std::path::Path::new(repo_path)).await } else { Vec::new() };
-    // Progress is recorded under the repository's path, for the page's strip.
-    let report = crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url, paths.as_deref(), Some(repo_path)).await;
+    // Progress is recorded under the repository's path, for the page's strip,
+    // and removed when the download is over (however it ended).
+    let report = {
+        let _progress = crate::sparse::ProgressGuard::hold(repo_path);
+        let profile = crate::git_status::owning_profile_id(repo_path);
+        Box::pin(crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url, paths.as_deref(), Some(repo_path), profile.as_deref())).await
+    };
     // A submodule this download populated — nested ones included — under a
     // blocked or locked repository gets the same guard-rail at once; the
     // lock's own layer for it is Repair's.
@@ -2110,6 +2117,13 @@ pub(crate) async fn lfs_after(repo: &str, plan: &LfsAround) -> String {
 /// one that doesn't use LFS, has no stubs, or has no git-lfs installed simply
 /// reports that nothing was done.
 pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppError> {
+    Box::pin(fetch_lfs_content_reporting(repo_path, crate::lfs::progress_path(repo_path))).await
+}
+
+/// The same, with git-lfs's progress written to `progress_at` — the file the
+/// page polls. A submodule's download after an update reports into the
+/// superproject's, which is the one the page is looking at.
+pub(crate) async fn fetch_lfs_content_reporting(repo_path: &str, progress_at: std::path::PathBuf) -> Result<LfsFetch, AppError> {
     let before = crate::lfs::lfs_status(repo_path).await?;
     if !before.uses_lfs || !before.installed || before.pointers == 0 {
         return Ok(LfsFetch::nothing_to_do(before));
@@ -2139,7 +2153,7 @@ pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppEr
         configured_now = true;
     }
 
-    let progress = crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path));
+    let progress = crate::lfs::ProgressFile::start_at(progress_at);
     let out = GitCmd::at(repo_path)
         .args(["lfs", "pull"])
         // Gigabytes of large files are normal; a transfer that is still moving
@@ -2691,6 +2705,31 @@ mod tests {
                 let dashdash = args.iter().position(|a| a == "--").unwrap();
                 assert!(args.iter().position(|a| a == remote).unwrap() > dashdash);
             }
+        }
+    }
+
+    /// A command whose async work outgrows a thread's stack (2 MiB) crashes
+    /// without a word — an Update's Continue once did, in a debug build, when
+    /// its nested steps grew. The heavy nested steps are `Box::pin`ned; this
+    /// catches a future that grows grossly. (The overflow itself came from how
+    /// deep the debug build's poll frames nest, which a size cannot show: the
+    /// live harness, which drives every operation for real, is what finds it.)
+    #[test]
+    fn every_heavy_command_future_stays_far_below_a_threads_stack() {
+        let sizes: Vec<(&str, usize)> = vec![
+            ("sync_run", std::mem::size_of_val(&crate::sync::sync_run("/x", crate::sync::RunOptions { stash: true, bundles: false, fingerprint: Vec::new() }))),
+            ("sync_continue", std::mem::size_of_val(&crate::sync::sync_continue("/x", false))),
+            ("sync_abort", std::mem::size_of_val(&crate::sync::sync_abort("/x"))),
+            ("sync_plan", std::mem::size_of_val(&crate::sync::sync_plan("/x", true, true))),
+            ("submodule_update", std::mem::size_of_val(&submodule_update("/x", None))),
+            ("pull", std::mem::size_of_val(&pull("/x", PullMode::Rebase, true, true))),
+            ("push", std::mem::size_of_val(&push("/x", false, false))),
+            ("full_clone", std::mem::size_of_val(&crate::sparse::full_clone("u", "/p", None, None, true, true))),
+            ("repo_status", std::mem::size_of_val(&crate::git_status::repo_status("/x"))),
+        ];
+        for (name, size) in &sizes {
+            eprintln!("future size {}: {} bytes", name, size);
+            assert!(*size < 64 * 1024, "{} builds a {} byte future: Box::pin its heavy nested steps", name, size);
         }
     }
 

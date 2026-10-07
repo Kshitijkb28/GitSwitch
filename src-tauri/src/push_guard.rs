@@ -335,7 +335,7 @@ pub fn block_reason(
     }
 }
 
-async fn read_flag(repo: &Path) -> bool {
+pub(crate) async fn read_flag(repo: &Path) -> bool {
     GitCmd::at(repo)
         .args(["config", "--local", "--bool", "--get", FLAG])
         .ok_text()
@@ -599,7 +599,7 @@ pub async fn repair(
 const BY: &str = "gitswitch.pushBlockedBy";
 const BY_VALUE: &str = "superproject";
 
-async fn marked(dir: &Path) -> bool {
+pub(crate) async fn marked(dir: &Path) -> bool {
     GitCmd::at(dir).args(["config", "--local", "--get", BY]).ok_text().await.map(|v| !v.trim().is_empty()).unwrap_or(false)
 }
 
@@ -632,6 +632,11 @@ pub struct SubCoverage {
     pub covered: bool,
     /// When not covered: what it has instead, in the person's words.
     pub why: String,
+    /// Its block is the repository's doing (marked), not the person's own:
+    /// the repository's "Allowed" takes it away — with the administrator
+    /// prompt when it is a lock.
+    #[serde(default)]
+    pub by_superproject: bool,
 }
 
 /// How far the repository's push block or lock reaches into its submodules —
@@ -669,7 +674,7 @@ pub async fn coverage(repo_path: &str, state: &PushState) -> PushCoverage {
     let repo = PathBuf::from(repo_path);
     let mode = mode_of(state);
     let rels = populated_submodules(&repo).await;
-    let mut measured: Vec<(String, PushState)> = Vec::new();
+    let mut measured: Vec<(String, PushState, bool)> = Vec::new();
     for chunk in rels.chunks(4) {
         let handles: Vec<_> = chunk
             .iter()
@@ -679,7 +684,8 @@ pub async fn coverage(repo_path: &str, state: &PushState) -> PushCoverage {
                 tokio::spawn(async move {
                     let paths = crate::git_status::git_paths(&dir).await.ok()?;
                     let profile = crate::git_status::owning_profile_id(&dir.to_string_lossy());
-                    Some((rel, push_state(&dir, &paths.hooks, profile.as_deref()).await))
+                    let by = marked(&dir).await;
+                    Some((rel, push_state(&dir, &paths.hooks, profile.as_deref()).await, by))
                 })
             })
             .collect();
@@ -691,7 +697,7 @@ pub async fn coverage(repo_path: &str, state: &PushState) -> PushCoverage {
     }
     let mut subs = Vec::new();
     let mut uncovered: Vec<(String, String)> = Vec::new();
-    for (rel, s) in measured {
+    for (rel, s, by_superproject) in measured {
         // What the person wants to hear: whether a push from inside is really
         // stopped, and by what.
         let nothing_stops = s.gaps.iter().any(|g| g.contains("Nothing local stops a push"));
@@ -702,7 +708,12 @@ pub async fn coverage(repo_path: &str, state: &PushState) -> PushCoverage {
                 } else if s.lock.locked {
                     String::new()
                 } else if lc::validate_path(&push_lock::canonical(&repo.join(&rel))).is_err() {
-                    "its path holds a character the lock cannot carry; the guard-rail stops a push there, anyone with a terminal can turn that off".to_string()
+                    // Said by what was measured: the guard-rail only when it is there.
+                    if s.repo_blocked && !nothing_stops {
+                        "its path holds a character the lock cannot carry; the guard-rail stops a push there, anyone with a terminal can turn that off".to_string()
+                    } else {
+                        "its path holds a character the lock cannot carry, and nothing stops a push from inside it".to_string()
+                    }
                 } else if s.repo_blocked && !nothing_stops {
                     "has the guard-rail, not the lock — anyone with a terminal can turn it off; Repair adds the lock".to_string()
                 } else {
@@ -728,7 +739,7 @@ pub async fn coverage(repo_path: &str, state: &PushState) -> PushCoverage {
         if !covered {
             uncovered.push((rel.clone(), why.clone()));
         }
-        subs.push(SubCoverage { path: rel, blocked: s.blocked, locked: s.lock.locked, needs_repair: s.needs_repair, covered, why });
+        subs.push(SubCoverage { path: rel, blocked: s.blocked, locked: s.lock.locked, needs_repair: s.needs_repair, covered, why, by_superproject });
     }
     let summary = if subs.is_empty() {
         String::new()

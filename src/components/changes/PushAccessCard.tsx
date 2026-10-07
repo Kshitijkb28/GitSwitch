@@ -175,6 +175,12 @@ function PushesAs({ repoPath, refreshKey }: { repoPath: string; refreshKey: numb
   );
 }
 
+/** The submodules "Allowed" here unlocks: the ones the repository's lock reached. */
+function lockedByThisRepository(coverage: PushCoverage | null): string[] {
+  // Defensive: an answer without the list (an older backend) must not take the page down.
+  return (Array.isArray(coverage?.submodules) ? coverage.submodules : []).filter((s) => s.locked && s.by_superproject).map((s) => s.path);
+}
+
 export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props) {
   const [busy, setBusy] = useState(false);
   const [waiting, setWaiting] = useState(false);
@@ -200,7 +206,11 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
 
   const mode = currentMode(push);
   const lock = push.lock;
-  const needsPrompt = (target: PushMode) => target === "locked" || mode === "locked";
+  // "Allowed" also unlocks the submodules this repository's lock reached:
+  // then it needs the prompt even when this repository is not locked itself.
+  const reachedSubmodules = lockedByThisRepository(coverage);
+  const unlocksSubmodules = reachedSubmodules.length > 0;
+  const needsPrompt = (target: PushMode) => target === "locked" || mode === "locked" || (target === "allowed" && unlocksSubmodules);
 
   const choose = (target: PushMode) => {
     if (target === mode || busy) return;
@@ -380,7 +390,14 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
                 </>
               ) : (
                 <p>
-                  Unlocking removes the administrator-owned rule for this repository
+                  {mode === "locked" ? (
+                    <>
+                      Unlocking removes the administrator-owned rule for this repository
+                      {unlocksSubmodules ? <> and for the submodules its lock reached ({reachedSubmodules.join(", ")})</> : null}
+                    </>
+                  ) : (
+                    <>Allowing pushes again also unlocks the submodules this repository's lock reached ({reachedSubmodules.join(", ")}), which removes their administrator-owned rules</>
+                  )}
                   {pending === "guardrail" ? " and leaves the guard-rail on" : ""}. {promptSentence(lock.platform)}
                 </p>
               )}

@@ -197,7 +197,7 @@ fn with_estimate(mut p: CloneProgress, estimate_kb: Option<u64>) -> CloneProgres
 /// asking must never hold the download up.
 type EstimateCell = std::sync::Arc<std::sync::Mutex<Option<u64>>>;
 
-fn ask_size(url: &str) -> (EstimateCell, Option<tokio::task::JoinHandle<()>>) {
+fn ask_size(url: &str, accounts: Option<Vec<String>>) -> (EstimateCell, Option<tokio::task::JoinHandle<()>>) {
     let cell: EstimateCell = Default::default();
     // Only a host that can be asked: for every other address there is
     // nothing to wait for, and nothing leaves this computer.
@@ -206,7 +206,7 @@ fn ask_size(url: &str) -> (EstimateCell, Option<tokio::task::JoinHandle<()>>) {
     }
     let (into, url) = (cell.clone(), url.to_string());
     let task = tokio::spawn(async move {
-        if let Some(e) = clone_size_estimate(&url).await {
+        if let Some(e) = size_estimate(&url, accounts.as_deref()).await {
             if let Ok(mut c) = into.lock() {
                 *c = Some(e.kb);
             }
@@ -262,8 +262,16 @@ fn relay_lfs_progress(dest: &str, repo: &str, total: usize) -> tokio::task::Join
     })
 }
 
-/// Removes the entry when the clone is over, however it ended.
-struct ProgressGuard(String);
+/// Removes the entry when the clone or download is over, however it ended —
+/// so the next one does not open on this one's last line.
+pub(crate) struct ProgressGuard(String);
+
+impl ProgressGuard {
+    /// Hold the entry for `dest` (a path, normalised as the poll reads it).
+    pub(crate) fn hold(dest: &str) -> Self {
+        ProgressGuard(crate::paths::norm(dest))
+    }
+}
 impl Drop for ProgressGuard {
     fn drop(&mut self) {
         if let Ok(mut m) = progress_map().lock() {
@@ -477,6 +485,31 @@ pub struct CloneSizeEstimate {
 /// token first (private repositories), then anonymously. None when the URL is
 /// not GitHub's, or GitHub will not say.
 pub async fn clone_size_estimate(url: &str) -> Option<CloneSizeEstimate> {
+    size_estimate(url, None).await
+}
+
+/// The account keys that may look up a repository for a profile: its own
+/// GitSwitch sign-in, and its GitHub login in the gh CLI. None for no profile.
+fn account_keys(profile_id: &str, github_login: Option<&str>) -> Vec<String> {
+    let mut keys = vec![format!("profile:{}", profile_id)];
+    if let Some(login) = github_login.filter(|l| !l.trim().is_empty()) {
+        keys.push(format!("gh:{}", login.trim()));
+    }
+    keys
+}
+
+/// The accounts a profile acts as, by its id.
+fn accounts_of(profile_id: Option<&str>) -> Vec<String> {
+    let Some(id) = profile_id else { return Vec::new() };
+    let login = profiles::load_profiles().ok().and_then(|st| st.profiles.into_iter().find(|p| p.id == id)).and_then(|p| p.github_login);
+    account_keys(id, login.as_deref())
+}
+
+/// `accounts`: `None` tries every signed-in account (the address the person
+/// typed on the Clone page, before choosing whom to clone as); `Some(keys)`
+/// only those — the account a folder acts as — so one account's token never
+/// looks up a repository on another's behalf. Anonymously after either.
+async fn size_estimate(url: &str, accounts: Option<&[String]>) -> Option<CloneSizeEstimate> {
     let (owner, repo) = crate::peek::github_slug(url)?;
     // The page asks when the address is typed and the clone asks again a
     // moment later: the answer is kept for a few minutes, not asked twice.
@@ -491,8 +524,12 @@ pub async fn clone_size_estimate(url: &str) -> Option<CloneSizeEstimate> {
     let client = crate::github::http_client().ok()?;
     let api = format!("{}/repos/{}/{}", crate::remote_repos::api_base(), owner, repo);
     let mut tokens: Vec<Option<String>> = Vec::new();
-    for account in crate::remote_repos::accounts().await {
-        if let Ok(t) = crate::remote_repos::token_for(&account.key).await {
+    let keys: Vec<String> = match accounts {
+        None => crate::remote_repos::accounts().await.into_iter().map(|a| a.key).collect(),
+        Some(k) => k.to_vec(),
+    };
+    for key in keys {
+        if let Ok(t) = crate::remote_repos::token_for(&key).await {
             tokens.push(Some(t));
         }
     }
@@ -770,7 +807,7 @@ pub(crate) async fn lfs_after_checkout(repo: &Path, requested: bool, progress_fo
     if requested && before.installed && before.pointers > 0 {
         // The counts appear only while a download really runs.
         let relay = progress_for.map(|dest| relay_lfs_progress(dest, &repo_str, before.pointers));
-        let fetched = crate::git_ops::fetch_lfs_content(&repo_str).await;
+        let fetched = Box::pin(crate::git_ops::fetch_lfs_content(&repo_str)).await;
         if let Some(task) = relay {
             task.abort();
         }
@@ -869,13 +906,13 @@ pub struct SubmoduleReport {
 /// under `update = merge` that command writes a merge commit inside it, which
 /// is exactly the tangle a superproject with CI pointer bumps keeps producing.
 /// The clone path passes `None` (a fresh clone has nothing populated).
-/// `progress_for` is the clone destination whose progress line should name
-/// each submodule as it is fetched ("Submodules · 3 of 8 · libs/sub") — this
-/// same `repo` while a clone of it is in flight. The Changes page's
-/// "Initialise missing" passes `None`: no clone is running, nothing polls for
-/// an entry, and one no clone's guard owned would stay behind as stale state
-/// for the next clone into that folder.
-pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, key: Option<&str>, url: &str, only: Option<&[String]>, progress_for: Option<&str>) -> SubmoduleReport {
+/// `progress_for` is the path whose progress line should name each submodule
+/// as it is fetched ("Submodules · 3 of 8 · libs/sub") — this same `repo`:
+/// the clone's destination while a clone is in flight, or the repository the
+/// Repository page's strip is polling. Whoever passes it holds a
+/// `ProgressGuard` for it, so the entry goes when the work is over and the
+/// next download does not open on this one's last line.
+pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, key: Option<&str>, url: &str, only: Option<&[String]>, progress_for: Option<&str>, acting_profile: Option<&str>) -> SubmoduleReport {
     // `-z` (`key\nvalue\0` records): a submodule's name defaults to its path,
     // and a path with a space would otherwise split the key in the middle.
     // (name, path): the name finds the module directory under .git/modules.
@@ -952,18 +989,29 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
         // here: `submodule update` would fetch it itself — without a word of
         // progress, so a long fetch could not be shown and looked like a
         // stall. It is fetched first, here, with git's progress on.
+        let downloaded = own_repository(&sub_dir).await;
         let must_fetch = match &recorded {
-            Some(sha) if own_repository(&sub_dir).await => !have_recorded(sha.clone()).await,
+            Some(sha) if downloaded => !have_recorded(sha.clone()).await,
             _ => false,
         };
+        // Shallow (`submodule.<name>.shallow`): git downloads one commit, a
+        // fraction of what the host reports for the whole history.
+        let shallow = run_git(Some(repo), &["config", "-f", ".gitmodules", "--bool", "--get", &format!("submodule.{}.shallow", name)])
+            .await
+            .map(|v| v.trim() == "true")
+            .unwrap_or(false);
         // What its host says it weighs, for "of about 1.2 GB" and the time
-        // left — for a first download only: a fetch brings what is new, a
-        // fraction of it. Its address as git resolves it (a relative one
-        // against the superproject's): `init` is what `update --init` does first.
-        let (size, asking) = if progress_for.is_some() && !must_fetch {
+        // left — for a first, full download only: a submodule already here
+        // either has its commit (a local checkout, nothing to ask about) or
+        // fetches what is new, a fraction of it; a shallow one downloads one
+        // commit. Asked as the account the work is done as (the clone's, or
+        // the folder's profile) and no other, anonymously after it. Its address as git resolves it
+        // (a relative one against the superproject's): `init` is what
+        // `update --init` does first.
+        let (size, asking) = if progress_for.is_some() && !downloaded && !shallow {
             let _ = run_git(Some(repo), &["submodule", "init", "--", path]).await;
             let address = run_git(Some(repo), &["config", "--get", &format!("submodule.{}.url", name)]).await.unwrap_or_default();
-            ask_size(address.trim())
+            ask_size(address.trim(), Some(accounts_of(acting_profile)))
         } else {
             (EstimateCell::default(), None)
         };
@@ -1043,7 +1091,7 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
             failed.push(path.clone());
             if first_error.is_none() {
                 first_error = Some(match e {
-                    AppError::Command(msg) => explain_clone_error(&msg, key, url),
+                    AppError::Command(msg) => explain_transport_error(&msg, key, url, false),
                     other => other.to_string(),
                 });
             }
@@ -1207,9 +1255,33 @@ pub(crate) fn uses_org_certificate_url(url: &str) -> bool {
 /// from remote repository", a timed-out connection included; taking that
 /// line for a refusal sends a person to their keys and their account when
 /// their network dropped.
+/// This computer's own disk refused what arrived — not the network, and not
+/// the server. The sentence to show, or `None`.
+pub(crate) fn disk_failure(stderr: &str) -> Option<String> {
+    let s = stderr.to_lowercase();
+    if s.contains("no space left on device") || s.contains("disk quota exceeded") {
+        return Some(
+            "This computer's disk is full (or this account's disk quota is used up), so git could not write what arrived. Nothing is wrong with the network, the key or the account. Free some space, then try again."
+                .to_string(),
+        );
+    }
+    None
+}
+
 pub(crate) fn network_failure(stderr: &str) -> Option<String> {
     let s = stderr.to_lowercase();
     let has = |needle: &str| s.contains(needle);
+    // A full disk ends with the same index-pack lines as a dropped
+    // connection: it is its own failure (`disk_failure`), never this one.
+    if disk_failure(stderr).is_some() {
+        return None;
+    }
+    // The server answered — with a refusal, or an HTTP error of its own
+    // ("The requested URL returned error: 400", a size limit): that is not the
+    // network either, whatever the connection did next.
+    if has("the requested url returned error") || has("remote: fatal:") || has("remote: error:") {
+        return None;
+    }
     // The server answered and said no: that is not the network.
     if has("permission denied")
         || has("repository not found")
@@ -1269,38 +1341,61 @@ pub(crate) fn network_failure(stderr: &str) -> Option<String> {
         || has("index-pack failed");
     if dropped {
         return Some(format!(
-            "The connection dropped while data was moving. {} Try again: what git had finished before the drop is kept, and on an unstable connection a big repository can take a few tries.",
+            "The connection dropped while data was moving. {} Try again — git starts the transfer over from the beginning, so a big repository needs a connection that holds for the whole of it.",
             blameless
         ));
     }
     None
 }
 
-/// Turn git/ssh's terse failures into something that says what to do.
+/// Turn git/ssh's terse failures into something that says what to do — for
+/// the Clone page, where "Clone as" chooses the account.
 pub(crate) fn explain_clone_error(stderr: &str, key: Option<&str>, url: &str) -> String {
-    let key_name = key
-        .map(crate::paths::base_name)
-        .unwrap_or_else(|| "your default SSH key".into());
+    explain_transport_error(stderr, key, url, true)
+}
+
+/// The same for any operation on the network. `for_clone`: the advice may
+/// point at the Clone page's "Clone as"; otherwise the folder's own profile
+/// decides the account, and the advice says so.
+pub(crate) fn explain_transport_error(stderr: &str, key: Option<&str>, url: &str, for_clone: bool) -> String {
+    let key_name = key.map(crate::paths::base_name);
+    let the_key = match &key_name {
+        Some(k) => format!("the SSH key {}", k),
+        None => "the SSH key ssh offered".to_string(),
+    };
+    let then = if for_clone { "clone again" } else { "try again" };
     let network = network_failure(stderr);
+    let disk = disk_failure(stderr);
     let refused = network.is_none()
+        && disk.is_none()
         && (stderr.contains("Permission denied (publickey)")
             || stderr.contains("Repository not found")
             || stderr.contains("Could not read from remote repository"));
 
-    let mut hint = if let Some(net) = network {
+    let mut hint = if let Some(d) = disk {
+        d
+    } else if let Some(net) = network {
         net
     } else if stderr.contains("SAML SSO") {
         format!(
-            "This organization uses single sign-on, and the SSH key {} hasn't been authorized for it yet. \
-             On GitHub (signed in as the company account): Settings → SSH and GPG keys → Configure SSO next to this key → Authorize for the organization. Then clone again.",
-            key_name
+            "This organization uses single sign-on, and {} hasn't been authorized for it yet. \
+             On GitHub (signed in as the account that belongs to the organization): Settings → SSH and GPG keys → Configure SSO next to this key → Authorize for the organization. Then {}.",
+            the_key, then
         )
     } else if stderr.contains("Host key verification failed") {
-        "This Mac doesn't trust github.com's SSH host key yet. Run `ssh -T git@github.com` once in Terminal, answer \"yes\", then clone again.".to_string()
+        format!("This computer doesn't trust the server's SSH host key yet. Run `ssh -T git@github.com` (or the same for your server) once in Terminal, answer \"yes\", then {}.", then)
     } else if stderr.contains("Permission denied (publickey)") {
-        format!("GitHub refused the SSH key {}. Either it isn't registered on the GitHub account, or the organization doesn't accept it (see below). Register it from SSH Keys, or pick another profile under \"Clone as\".", key_name)
+        if for_clone {
+            format!("GitHub refused {}. Either it isn't registered on the GitHub account, or the organization doesn't accept it (see below). Register it from SSH Keys, or pick another profile under \"Clone as\".", the_key)
+        } else {
+            format!("GitHub refused {}. Either it isn't registered on the GitHub account, or the organization doesn't accept it (see below). Register it from SSH Keys, or check in Profiles which profile this folder belongs to — its key is the one used here.", the_key)
+        }
     } else if stderr.contains("Repository not found") || stderr.contains("Could not read from remote repository") {
-        format!("GitHub accepted the key {}, but that account can't see this repository. Check the URL, or under \"Clone as\" pick the profile whose account has access (e.g. your company profile for a company repo).", key_name)
+        if for_clone {
+            format!("GitHub accepted {}, but that account can't see this repository. Check the URL, or under \"Clone as\" pick the profile whose account has access (e.g. your company profile for a company repo).", the_key)
+        } else {
+            format!("GitHub accepted {}, but that account can't see this repository. Check the remote's address, or check in Profiles that this folder belongs to the profile whose account has access.", the_key)
+        }
     } else if stderr.contains("could not read Username") || stderr.contains("terminal prompts disabled") {
         "This HTTPS URL needs a username and password, which GitSwitch can't type in for you. Use the SSH URL (git@github.com:owner/repo.git) instead.".to_string()
     } else {
@@ -1311,10 +1406,14 @@ pub(crate) fn explain_clone_error(stderr: &str, key: Option<&str>, url: &str) ->
     // *requires* them, GitHub refuses plain keys (and HTTPS) outright, so the
     // generic "not registered / no access" advice above would mislead.
     if refused && uses_org_certificate_url(url) && !stderr.contains("SAML SSO") {
+        let (key_ref, cert) = match &key_name {
+            Some(k) => (k.clone(), format!("{}-cert.pub", k)),
+            None => ("your SSH key".to_string(), "<the key's name>-cert.pub".to_string()),
+        };
         hint.push_str(&format!(
             "\n\nThis link (org-…@github.com) means the organization uses SSH certificates. If it requires them, a plain key is refused even when it's registered: \
-             ask your company admin for a certificate for {}, and save it next to the key as {}-cert.pub — ssh picks it up automatically.",
-            key_name, key_name
+             ask your company admin for a certificate for {}, and save it next to the key as {} — ssh picks it up automatically.",
+            key_ref, cert
         ));
     }
 
@@ -1408,6 +1507,7 @@ async fn clone_as_profile(
         None => None,
     };
     let acting = chosen.clone().or_else(|| folder_profile.clone());
+    let acting_id = acting.as_ref().map(|p| p.id.clone());
     let key = acting.as_ref().and_then(|p| p.ssh_key_path.clone());
     if let (Some(p), None) = (chosen.as_ref(), key.as_ref()) {
         return Err(AppError::Config(format!(
@@ -1442,7 +1542,7 @@ async fn clone_as_profile(
     let progress_key = crate::paths::norm(&dest_str);
     // The host's size is for a whole repository: a partial clone downloads a
     // fraction of it, so there the time left comes from the objects alone.
-    let (size, asking) = if extra_args.iter().any(|a| a.starts_with("--filter")) { (EstimateCell::default(), None) } else { ask_size(url.trim()) };
+    let (size, asking) = if extra_args.iter().any(|a| a.starts_with("--filter")) { (EstimateCell::default(), None) } else { ask_size(url.trim(), None) };
     let cloned = run_git_streaming(Some(&parent), &[], &arg_refs, None, true, &|p| {
         let known = size.lock().ok().and_then(|c| *c);
         set_progress(&progress_key, with_estimate(p, known))
@@ -1460,7 +1560,7 @@ async fn clone_as_profile(
     // the repo is usable and `git submodule update` can be retried.
     let submodules = if with_submodules {
         set_progress(&dest_str, CloneProgress::phase("Submodules"));
-        Some(update_submodules(&dest, ssh_override.as_deref(), key.as_deref(), url, None, Some(&dest_str)).await)
+        Some(Box::pin(update_submodules(&dest, ssh_override.as_deref(), key.as_deref(), url, None, Some(&dest_str), acting_id.as_deref())).await)
     } else {
         None
     };
@@ -1630,6 +1730,14 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_looks_up_repositories_with_its_own_accounts_only() {
+        assert_eq!(account_keys("p1", Some("octo")), vec!["profile:p1".to_string(), "gh:octo".to_string()]);
+        assert_eq!(account_keys("p1", None), vec!["profile:p1".to_string()]);
+        assert_eq!(account_keys("p1", Some("  ")), vec!["profile:p1".to_string()]);
+        assert!(accounts_of(None).is_empty(), "no profile: no account's token at all");
+    }
+
+    #[test]
     fn the_time_left_comes_from_the_hosts_size_or_from_the_objects() {
         // 10 MiB of a 1.2 GB repository at 2 MiB/s: the rest of it at that rate.
         let (est, eta) = download_estimate(Some("10.00 MiB"), Some("2.00 MiB/s"), Some(45), Some(1_258_291));
@@ -1796,7 +1904,8 @@ mod tests {
         ] {
             let e = explain_clone_error(stderr, None, "org-1234567@github.com:AcmeOrg/widgets.git");
             assert!(e.contains("The connection dropped while data was moving"), "{e}");
-            assert!(e.contains("what git had finished before the drop is kept"), "{e}");
+            assert!(e.contains("git starts the transfer over"), "{e}");
+            assert!(!e.contains("is kept"), "a dropped transfer keeps nothing: {e}");
             assert!(!e.contains("SSH certificates") && !e.contains("can't see this repository"), "{e}");
         }
         // A refusal is still a refusal, whatever else the output says.
@@ -1805,6 +1914,32 @@ mod tests {
         assert_eq!(network_failure("git@github.com: Permission denied (publickey).\nfatal: the remote end hung up unexpectedly"), None);
         assert_eq!(network_failure("fatal: Authentication failed for 'https://github.com/o/r.git/'"), None);
         assert_eq!(network_failure("fatal: something else"), None);
+        // A full disk ends with index-pack's lines too: named as the disk.
+        let full = "fatal: write error: No space left on device\nfatal: fetch-pack: invalid index-pack output";
+        assert_eq!(network_failure(full), None);
+        let e = explain_clone_error(full, None, "git@github.com:o/r.git");
+        assert!(e.contains("disk is full") && !e.contains("connection dropped"), "{e}");
+        // The server answered with an HTTP error: not the network.
+        let http = "error: RPC failed; HTTP 400 curl 22 The requested URL returned error: 400\nsend-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly";
+        assert_eq!(network_failure(http), None);
+        assert_eq!(network_failure("remote: fatal: pack exceeds maximum allowed size\nfatal: the remote end hung up unexpectedly"), None);
+        // A genuine drop over HTTPS is still one.
+        assert!(network_failure("error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: CANCEL (err 8)\nfatal: early EOF").is_some());
+    }
+
+    #[test]
+    fn refusals_outside_the_clone_page_point_at_the_folders_profile() {
+        let refused = "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.";
+        let e = explain_transport_error(refused, None, "git@github.com:o/r.git", false);
+        assert!(e.contains("check in Profiles") && !e.contains("Clone as"), "{e}");
+        assert!(e.contains("the SSH key ssh offered") && !e.contains("SSH key your"), "no doubled words without a key: {e}");
+        let e = explain_transport_error("ERROR: The `Org' organization has enabled or enforced SAML SSO.", None, "git@github.com:o/r.git", false);
+        assert!(e.contains("try again") && !e.contains("clone again"), "{e}");
+        let e = explain_transport_error("ERROR: Repository not found.\nfatal: Could not read from remote repository.", Some("/k/id_work"), "git@github.com:o/r.git", false);
+        assert!(e.contains("id_work") && e.contains("check in Profiles") && !e.contains("Clone as"), "{e}");
+        // The Clone page keeps its own words.
+        let e = explain_clone_error(refused, None, "git@github.com:o/r.git");
+        assert!(e.contains("Clone as"), "{e}");
     }
 
     #[test]

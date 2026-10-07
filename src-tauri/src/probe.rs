@@ -493,5 +493,11 @@ pub(crate) mod tests {
             let trace = crate::sparse::progress_trace().lock().map(|t| t.clone()).unwrap_or_default();
             let _ = std::fs::write(path, serde_json::to_string(&trace).unwrap_or_else(|_| "[]".into()));
         }
+        // What a poll for this path would read now that the op is over: an
+        // entry left behind would open the next download on this one's line.
+        if let (Ok(file), Ok(path)) = (std::env::var("PROBE_LEFT_FILE"), std::env::var("PROBE_LEFT_FOR")) {
+            let left = crate::sparse::clone_progress(&path);
+            let _ = std::fs::write(file, serde_json::to_string(&left).unwrap_or_else(|_| "null".into()));
+        }
     }
 }

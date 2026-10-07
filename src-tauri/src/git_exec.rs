@@ -28,6 +28,24 @@ pub fn net_stall() -> Duration {
     }
     NET_TIMEOUT
 }
+/// git's own housekeeping after a fetch (see `housekeeping`): a repack of a
+/// big repository can take minutes, and nothing waits on it but the person.
+pub const HOUSEKEEPING_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// git's own housekeeping, run after a fetch that held it back (`for_fetch`):
+/// `maintenance run --auto` (or `gc --auto` for a git that predates it). It
+/// is quick when there is nothing to do and detaches where git can detach
+/// it; where it cannot (Windows, `gc.autoDetach=false`) it runs here, on a
+/// generous clock and no silence clock. Best effort: it never changes the
+/// fetch's outcome.
+pub async fn housekeeping(repo: impl AsRef<Path>) {
+    let repo = repo.as_ref();
+    let maintained = GitCmd::at(repo).args(["maintenance", "run", "--auto", "--quiet"]).timeout(HOUSEKEEPING_TIMEOUT).run().await;
+    if matches!(&maintained, Ok(o) if o.ok()) {
+        return;
+    }
+    let _ = GitCmd::at(repo).args(["gc", "--auto", "--quiet"]).timeout(HOUSEKEEPING_TIMEOUT).run().await;
+}
 /// Local mutations: add, commit, restore, stash, switch.
 pub const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Reads: status, config, rev-parse, diff.
@@ -247,6 +265,17 @@ impl GitCmd {
     pub fn stall(mut self, d: Duration) -> Self {
         self.stall = Some(d);
         self
+    }
+
+    /// A fetch the app runs (the caller passes `--progress`): stopped only for
+    /// silence; what arrives kept as a pack (`fetch.unpackLimit=1`), because
+    /// git says nothing while it unpacks a small fetch however big it is; and
+    /// git's own housekeeping held back — it would run INSIDE the fetch, and
+    /// where it cannot detach (Windows, `gc.autoDetach=false`) it repacks
+    /// without a word, which the silence clock would take for a dead
+    /// connection. Run `housekeeping` afterwards.
+    pub fn for_fetch(self) -> Self {
+        self.cfg("fetch.unpackLimit", "1").cfg("maintenance.auto", "false").cfg("gc.auto", "0").stall(net_stall())
     }
 
     /// The subcommand name, for error messages.
@@ -654,6 +683,15 @@ pub fn validate_branch_name(name: &str) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fetch_holds_back_housekeeping_and_keeps_what_arrives_as_a_pack() {
+        let c = super::GitCmd::at(".").for_fetch();
+        for kv in [("fetch.unpackLimit", "1"), ("maintenance.auto", "false"), ("gc.auto", "0")] {
+            assert!(c.cfg.iter().any(|(k, v)| k == kv.0 && v == kv.1), "{:?} missing from {:?}", kv, c.cfg);
+        }
+        assert_eq!(c.stall, Some(super::net_stall()));
+    }
+
     #[test]
     fn progress_counters_are_dropped_and_the_rest_kept() {
         let raw = "Receiving objects:  10% (1/10)\rReceiving objects: 100% (10/10), 1.00 MiB | 2.00 MiB/s, done.\nremote: Enumerating objects: 13, done.        \nremote: Total 13 (delta 0), reused 0 (delta 0)        \nremote: error: GH006: Protected branch update failed\nFrom https://example.test/r\n * branch            main -> FETCH_HEAD\nfatal: refusing";

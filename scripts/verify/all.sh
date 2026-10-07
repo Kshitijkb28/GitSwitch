@@ -48,7 +48,7 @@ if [ -d "$HERE/harness/node_modules/puppeteer-core" ] && [ -n "$JS" ]; then
 else
   printf '\n\033[1m════ Headless UI ════\033[0m\n'
   echo "SKIPPED: puppeteer-core is not installed (cd scripts/verify/harness && bun install) or no JS runtime works."
-  echo "Four suites did not run, so this is not a full pass. Set GITSWITCH_ALLOW_SKIP=1 to accept that knowingly."
+  echo "Five suites did not run (the four browser harnesses and the terminal in WebKit), so this is not a full pass. Set GITSWITCH_ALLOW_SKIP=1 to accept that knowingly."
   [ "${GITSWITCH_ALLOW_SKIP:-}" = 1 ] || status=1
 fi
 

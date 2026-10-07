@@ -915,7 +915,8 @@ fn snapshot_refs(repo: &Path, space: &str) -> String {
 /// and the comparison is returned to the caller as evidence.
 pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
     let repo = PathBuf::from(repo_path);
-    if git(&repo, &["remote"])?.trim().is_empty() {
+    let remotes: Vec<String> = git(&repo, &["remote"])?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    if remotes.is_empty() {
         return Err(AppError::Config("This repo has no remote to fetch from.".into()));
     }
 
@@ -924,24 +925,48 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
     let locals_before = snapshot_refs(&repo, "refs/heads");
     let remotes_before = snapshot_refs(&repo, "refs/remotes");
 
-    // Through the shared runner, so no credential prompt can hang it, and
-    // with git's progress on: only a long SILENCE stops it — never the size
-    // of what arrives, and never nothing at all (it used to wait for ever on
-    // a server that stopped answering). What arrives is kept as a pack
-    // (`fetch.unpackLimit=1`): git reports nothing while it unpacks a small
-    // fetch into loose objects, however long that takes. No submodule
-    // recursion, as everywhere else in the app — one unreachable submodule
-    // remote must not fail the refresh; a submodule is fetched from its own
-    // scope. Called from a blocking thread, hence `block_on`.
-    let fetched = tokio::runtime::Handle::current().block_on(
-        crate::git_exec::GitCmd::at(&repo)
-            .cfg("fetch.unpackLimit", "1")
-            .args(["fetch", "--all", "--progress", "--no-recurse-submodules"])
-            .stall(crate::git_exec::net_stall())
-            .run(),
-    )?;
-    if !fetched.ok() {
-        return Err(AppError::Command(crate::sparse::explain_clone_error(&fetched.stderr, None, "")));
+    // Each remote on its own, through the shared runner (no credential prompt
+    // can hang it) with git's progress on: only a long SILENCE stops it —
+    // never the size of what arrives, and never nothing at all (it used to
+    // wait for ever on a server that stopped answering). Not `--all`: with
+    // two remotes or more git hands each to a child fetch that is not given
+    // `--progress`, and into a pipe that child says nothing while it
+    // downloads. The remotes `--all` would skip (`skipFetchAll`) are skipped.
+    // No submodule recursion, as everywhere else in the app. Called from a
+    // blocking thread, hence `block_on`.
+    let rt = tokio::runtime::Handle::current();
+    let mut failures: Vec<String> = Vec::new();
+    for remote in &remotes {
+        if git(&repo, &["config", "--bool", "--get", &format!("remote.{}.skipFetchAll", remote)]).map(|v| v.trim() == "true").unwrap_or(false) {
+            continue;
+        }
+        if crate::git_exec::validate_remote_name(remote).is_err() {
+            failures.push(format!("{}: not a remote name git can be given safely; fetch it in a terminal.", remote));
+            continue;
+        }
+        let fetched = rt.block_on(
+            crate::git_exec::GitCmd::at(&repo)
+                .for_fetch()
+                .args(["fetch", "--progress", "--no-recurse-submodules", "--", remote])
+                .run(),
+        );
+        match fetched {
+            Ok(out) if out.ok() => {}
+            Ok(out) => {
+                // In the fetch's own words (not the Clone page's), with the
+                // remote's address so a certificate organisation is recognised.
+                let url = git(&repo, &["remote", "get-url", "--", remote]).unwrap_or_default();
+                let ctx = crate::git_advice::AdviceCtx { url: Some(url.trim()), remote: Some(remote), ..Default::default() };
+                let a = crate::git_advice::explain(crate::git_advice::GitOp::Fetch, &out.stderr, &ctx);
+                let guidance = if a.guidance.is_empty() { String::new() } else { format!(" {}", a.guidance) };
+                failures.push(format!("{}: {}{}\n\ngit said: {}", remote, a.headline, guidance, a.git_said));
+            }
+            Err(e) => failures.push(format!("{}: {}", remote, e)),
+        }
+    }
+    rt.block_on(crate::git_exec::housekeeping(&repo));
+    if !failures.is_empty() {
+        return Err(AppError::Command(failures.join("\n\n")));
     }
 
     let head_after = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default();

@@ -933,6 +933,8 @@ export interface SubCoverage {
   covered: boolean;
   /** When not covered: what it has instead, in plain words. */
   why: string;
+  /** Its block is the repository's doing: the repository's "Allowed" takes it away (with the prompt when it is a lock). */
+  by_superproject?: boolean;
 }
 
 /** How far the repository's push block or lock reaches into its submodules — where the code lives. */

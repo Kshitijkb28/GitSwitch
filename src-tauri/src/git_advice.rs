@@ -540,8 +540,14 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
         );
     }
 
-    // --- Transport: reuse the clone explainer rather than restate it ---
-    let delegated = crate::sparse::explain_clone_error(s, ctx.key_path, ctx.url.unwrap_or(""));
+    // --- The disk: a full one ends with the same lines as a dropped transfer ---
+    if let Some(d) = crate::sparse::disk_failure(s) {
+        return advice("The disk is full.", &d, None, s);
+    }
+
+    // --- Transport: reuse the clone explainer rather than restate it, in
+    // this operation's words (no "Clone as" here: the folder's profile decides) ---
+    let delegated = crate::sparse::explain_transport_error(s, ctx.key_path, ctx.url.unwrap_or(""), false);
     if delegated.trim() != s.trim() {
         // It recognised the failure; it already ends with "git said: …".
         let hint = delegated
@@ -550,7 +556,11 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
             .unwrap_or(&delegated)
             .to_string();
         return Advice {
-            headline: format!("The {} couldn't reach GitHub.", op.noun()),
+            headline: if crate::sparse::network_failure(s).is_some() {
+                format!("The {} couldn't reach the server.", op.noun())
+            } else {
+                format!("The {} was refused.", op.noun())
+            },
             guidance: hint,
             action: None,
             git_said: s.trim().to_string(),

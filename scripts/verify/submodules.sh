@@ -376,7 +376,7 @@ git -C "$SB/author-big" add -A >/dev/null; git -C "$SB/author-big" commit -qm "a
 cat > "$SB/trickle.sh" <<'TRICKLE'
 #!/bin/sh
 # Run the real pack-objects and pass its output on a little at a time.
-"$@" | perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.06); }'
+"$@" | perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.1); }'
 TRICKLE
 chmod +x "$SB/trickle.sh"
 git config --global uploadpack.packObjectsHook "$SB/trickle.sh"
@@ -411,15 +411,17 @@ git -C "$SB/grow-work" pull -q --ff-only --no-recurse-submodules origin main 2>/
 WANT=$(git -C "$SB/grow-work" ls-files -s -- grow | awk '{print $2}')
 ok "(the commit the superproject now records is not in the downloaded submodule yet)" "$(git -C "$SB/grow-work/grow" cat-file -e "$WANT^{commit}" 2>/dev/null && echo present || echo absent)" "absent"
 git config --global uploadpack.packObjectsHook "$SB/trickle.sh"
-T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=2 pinvoke changes_submodule_update "{\"repoPath\":\"$SB/grow-work\",\"paths\":[\"grow\"]}"); T1=$(date +%s)
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=3 pinvoke changes_submodule_update "{\"repoPath\":\"$SB/grow-work\",\"paths\":[\"grow\"]}"); T1=$(date +%s)
 TRACE_GROW=$(probe_trace)
 git config --global --unset uploadpack.packObjectsHook
 ok "a submodule that had to fetch 3 MiB slowly reaches the recorded commit — not stopped" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["downloaded"], v["submodules"]["failed_paths"])'):$(git -C "$SB/grow-work/grow" rev-parse HEAD)" "True 1 []:$WANT"
-ok "  it really took longer than the silence allowed (2 s)" "$([ $((T1-T0)) -ge 3 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
+ok "  it really took longer than the silence allowed (3 s)" "$([ $((T1-T0)) -ge 5 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
 ok "  while it fetched, its line said how much had arrived and how fast" "$(printf '%s' "$TRACE_GROW" | "$PY" -c 'import sys,json;e=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="grow" and p.get("bytes") and p.get("rate")];print(len(e)>0)')" "True"
 ok "  and how long was left" "$(printf '%s' "$TRACE_GROW" | "$PY" -c 'import sys,json;print(any(isinstance(p.get("eta_secs"),int) for p in json.load(sys.stdin) if p.get("detail")=="grow"))')" "True"
 ok "  with no size from a host — a fetch brings only what is new" "$(printf '%s' "$TRACE_GROW" | "$PY" -c 'import sys,json;print(any("estimate_kb" in p for p in json.load(sys.stdin)))')" "False"
 ok "  and the folder is a clean checkout of it" "$(git -C "$SB/grow-work/grow" status --porcelain | wc -l | tr -d ' '):$(ls "$SB/grow-work/grow" | grep -c '^g')" "0:24"
+OUT=$(PROBE_LEFT_FILE="$SB/left.json" PROBE_LEFT_FOR="$SB/grow-work" pinvoke changes_submodule_update "{\"repoPath\":\"$SB/grow-work\",\"paths\":[\"grow\"]}")
+ok "  when a download is over its line is gone, so the next one does not open on it" "$(printf '%s' "$(probe_trace)" | "$PY" -c 'import sys,json;print(len(json.load(sys.stdin))>0)'):$(cat "$SB/left.json")" "True:null"
 
 section "Submodules at dot-prefixed paths (.memory, .audit, a nested .seed) are cloned, listed and covered like any other"
 for r in memory audit seed; do git init -q --bare "$SB/dot-$r.git"; git clone -q "$SB/dot-$r.git" "$SB/author-dot-$r" 2>/dev/null; printf '%s\n' "$r" > "$SB/author-dot-$r/$r.txt"; git -C "$SB/author-dot-$r" add -A >/dev/null; git -C "$SB/author-dot-$r" commit -qm "$r: initial"; git -C "$SB/author-dot-$r" push -q origin main 2>/dev/null; done
@@ -440,5 +442,55 @@ git -C "$D/.memory" push origin main >/dev/null 2>&1; RC=$?
 ok "  a push from inside .memory is refused in a plain terminal" "$([ "$RC" -ne 0 ] && echo refused || echo PUSHED)" "refused"
 OUT=$(probe push_mode "$D" "allowed")
 ok "  and allowing it again frees them" "$(git -C "$D/.memory" config --local --get gitswitch.pushBlocked || echo unset):$(git -C "$D/.audit/.seed" config --local --get gitswitch.pushBlocked || echo unset)" "unset:unset"
+
+section "A submodule's size is asked for only on its first full download"
+# A fake API that logs every request and says each repository weighs 8 MiB.
+# The submodules' addresses are GitHub's; the sandbox's own config sends the
+# download itself to local copies (url.<local>.insteadOf).
+"$PY" - "$SB/api.log" > "$SB/api-port" <<'PYAPI' &
+import http.server, sys, json
+log = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(log, "a") as f:
+            f.write("%s token=%s\n" % (self.path, "yes" if self.headers.get("Authorization") else "no"))
+        body = json.dumps({"size": 8192}).encode()
+        self.send_response(200 if self.path.startswith("/repos/acme/") else 404)
+        self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYAPI
+API_PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SB/api-port" ] && break; sleep 0.5; done
+API="http://127.0.0.1:$(cat "$SB/api-port")"
+for r in widget shal; do
+  git init -q --bare "$SB/$r.git"; git clone -q "file://$SB/$r.git" "$SB/author-$r" 2>/dev/null
+  printf '%s\n' "$r" > "$SB/author-$r/$r.txt"; git -C "$SB/author-$r" add -A >/dev/null; git -C "$SB/author-$r" commit -qm "$r: v1"; git -C "$SB/author-$r" push -q origin main 2>/dev/null
+  git config --global "url.file://$SB/$r.git.insteadOf" "https://github.com/acme/$r.git"
+done
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/author-widget/w$i.bin"; done
+git -C "$SB/author-widget" add -A >/dev/null; git -C "$SB/author-widget" commit -qm "widget: 3 MiB"; git -C "$SB/author-widget" push -q origin main 2>/dev/null
+git init -q --bare "$SB/super-api.git"; git clone -q "$SB/super-api.git" "$SB/author-super-api" 2>/dev/null
+printf 'r\n' > "$SB/author-super-api/README.md"; git -C "$SB/author-super-api" add -A >/dev/null; git -C "$SB/author-super-api" commit -qm init
+( cd "$SB/author-super-api" && git submodule add -q "https://github.com/acme/widget.git" widget 2>/dev/null && git submodule add -q "https://github.com/acme/shal.git" shal 2>/dev/null )
+git -C "$SB/author-super-api" config -f .gitmodules submodule.shal.shallow true
+git -C "$SB/author-super-api" add -A >/dev/null; git -C "$SB/author-super-api" commit -qm "two submodules, one shallow"; git -C "$SB/author-super-api" push -q origin main 2>/dev/null
+git clone -q "$SB/super-api.git" "$SB/api-work" 2>/dev/null
+: > "$SB/api.log"
+git config --global uploadpack.packObjectsHook "$SB/trickle.sh"
+OUT=$(GITSWITCH_GITHUB_API="$API" pinvoke changes_submodule_update "{\"repoPath\":\"$SB/api-work\",\"paths\":[\"widget\"]}")
+TRACE_API=$(probe_trace)
+git config --global --unset uploadpack.packObjectsHook
+ok "a first download asks the host once how big the submodule is" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["submodules"]["downloaded"])'):$(grep -c '^/repos/acme/widget ' "$SB/api.log")" "1:1"
+ok "  and shows how much of that has arrived" "$(printf '%s' "$TRACE_API" | "$PY" -c 'import sys,json;print(any(p.get("estimate_kb")==8192 for p in json.load(sys.stdin) if p.get("detail")=="widget"))')" "True"
+OUT=$(GITSWITCH_GITHUB_API="$API" pinvoke changes_submodule_update "{\"repoPath\":\"$SB/api-work\",\"paths\":[\"widget\"]}")
+ok "updating a submodule that already has its commit asks nothing — nothing is downloaded" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["ok"])'):$(grep -c '^/repos/acme/widget ' "$SB/api.log")" "True:1"
+OUT=$(GITSWITCH_GITHUB_API="$API" pinvoke changes_submodule_update "{\"repoPath\":\"$SB/api-work\",\"paths\":[\"shal\"]}")
+ok "a shallow submodule is not asked about — it downloads one commit, not the history the host weighs" "$(cat "$SB/api-work/shal/shal.txt" 2>/dev/null || echo MISSING):$(grep -c '^/repos/acme/shal ' "$SB/api.log")" "shal:0"
+{ kill "$API_PID" && wait "$API_PID"; } 2>/dev/null
+for r in widget shal; do git config --global --unset "url.file://$SB/$r.git.insteadOf"; done
 
 verify_result

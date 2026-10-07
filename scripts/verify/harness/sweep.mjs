@@ -43,8 +43,8 @@ try {
       localStorage.setItem("gitswitch:changes.repo", JSON.stringify("/repos/gitswitch"));
       localStorage.setItem("gitswitch:history.repo", JSON.stringify("/repos/gitswitch"));
       const profiles = [
-        { id: "p1", name: "Kirmada", git_name: "Me", git_email: "me@personal.test", ssh_key_path: "/Users/me/.ssh/id_ed25519_personal", is_default: true, allow_push: true, signing_enabled: false, directories: ["/Users/me/Documents/Ethara/gitswitch", "/Users/me/Documents/very/long/folder/path/that/goes/on"], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
-        { id: "p2", name: "Work", git_name: "Me At Work", git_email: "me@work.test", ssh_key_path: null, is_default: false, allow_push: false, signing_enabled: true, directories: ["/Users/me/Documents/Harbor"], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
+        { id: "p1", name: "Kirmada", git_name: "Me", git_email: "me@personal.test", ssh_key_path: "/Users/me/.ssh/id_ed25519_personal", is_default: true, allow_push: true, signing_enabled: false, directories: ["/Users/me/Documents/Acme/gitswitch", "/Users/me/Documents/very/long/folder/path/that/goes/on"], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
+        { id: "p2", name: "Work", git_name: "Me At Work", git_email: "me@work.test", ssh_key_path: null, is_default: false, allow_push: false, signing_enabled: true, directories: ["/Users/me/Documents/Work"], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
       ];
       window.__TAURI_INTERNALS__ = {
         // The terminal's output stream is a Channel, and its constructor calls

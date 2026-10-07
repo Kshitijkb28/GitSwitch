@@ -1553,6 +1553,35 @@ head -c 6000 /dev/urandom > "$L/mine-other.bin"; cp "$L/mine-other.bin" "$L/dirt
 probe sync_plan "$L/dirty" >/dev/null; OUT=$(probe sync_run "$L/dirty")
 ok "an uncommitted change to a large file survives the update as itself, not as a pointer stub" "$(printf '%s' "$OUT" | jqf ok):$(cmp -s "$L/mine-other.bin" "$L/dirty/other.bin" && echo same || echo "changed: $(wc -c < "$L/dirty/other.bin" | tr -d ' ') bytes")" "True:same"
 ok "  and upstream's new large file arrived as content" "$(wc -c < "$L/dirty/model.bin" | tr -d ' ')" "5120"
+# A deliberately partial checkout: only other.bin was downloaded. Upstream
+# changes other.bin — a file this person HAS — so it must arrive as content,
+# not be turned into a stub that the download afterwards cannot tell apart
+# from the files left out on purpose.
+( cd "$L" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$L/super.git" partial 2>/dev/null ); probe lfs_pull_paths "$L/partial" "other.bin" >/dev/null
+printf 'partial\n' > "$L/partial/mine.txt"; git -C "$L/partial" add -A >/dev/null; git -C "$L/partial" commit -qm "mine: partial"
+ok "(the partial clone holds other.bin, and model.bin as a stub)" "$(wc -c < "$L/partial/other.bin" | tr -d ' '):$([ "$(wc -c < "$L/partial/model.bin" | tr -d ' ')" -lt 200 ] && echo stub || echo content)" "3000:stub"
+head -c 3500 /dev/urandom > "$L/author/other.bin"; git -C "$L/author" commit -qam "upstream: a new other"; git -C "$L/author" push -q origin main 2>/dev/null
+probe sync_plan "$L/partial" >/dev/null; OUT=$(probe sync_run "$L/partial")
+ok "in a partial checkout, a large file you had and upstream changed arrives as content" "$(printf '%s' "$OUT" | jqf ok):$(wc -c < "$L/partial/other.bin" | tr -d ' ')" "True:3500"
+# An update that finished, with its state left behind (a crash between
+# finishing and tidying up — the window a long download used to widen):
+# never shown as a paused update, never undone by an Abort. A real state is
+# made by a paused update, then marked as finished.
+printf 'theirs\n' > "$L/author/README.md"; git -C "$L/author" commit -qam "upstream: readme"; git -C "$L/author" push -q origin main 2>/dev/null
+printf 'mine\n' > "$L/up/README.md"; git -C "$L/up" commit -qam "mine: readme"
+probe sync_plan "$L/up" >/dev/null; probe sync_run "$L/up" >/dev/null
+has_sync() { probe status "$1" | "$PY" -c 'import sys,json;print(json.load(sys.stdin).get("sync") is not None)'; }
+ok "(control: a paused update is shown as one)" "$(has_sync "$L/up")" "True"
+STATE_FILE="$(git -C "$L/up" rev-parse --path-format=absolute --git-path gitswitch-sync.json)"
+"$PY" - "$STATE_FILE" <<'PYST'
+import json, sys
+st = json.load(open(sys.argv[1])); st["phase"] = "done"; st["needs_user"] = None
+json.dump(st, open(sys.argv[1], "w"))
+PYST
+UPHEAD="$(head_of "$L/up")"
+ok "a finished update's leftover state is not shown as a paused one" "$(has_sync "$L/up")" "False"
+ok "  and Abort refuses it rather than undoing the finished work" "$(probe sync_abort "$L/up" | jqf refusal.code):$(head_of "$L/up")" "no-sync:$UPHEAD"
+git -C "$L/up" rebase --abort 2>/dev/null; rm -f "$STATE_FILE"
 fi
 
 verify_result

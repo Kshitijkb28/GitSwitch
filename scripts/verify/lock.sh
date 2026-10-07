@@ -474,8 +474,12 @@ git -C "$SUP" pull -q --ff-only origin main 2>/dev/null
 OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$SUP\",\"paths\":[\"lib2\"]}")
 ok "a submodule downloaded under the block gets it at once, and the result says so" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], "got the same guard-rail" in v["detail"])'):$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked)" "True True:true"
 ok "  and counts as covered" "$(cov | jqf value.summary)" "Covers this repository and 3 submodules."
-# One blocked on its own (no superproject marker) keeps its block when the superproject allows pushes again.
-git -C "$SUP/lib2" config --local --unset gitswitch.pushBlockedBy
+# One the person blocks themselves AFTER the superproject's block reached it
+# keeps its block when the superproject allows pushes again: acting on a
+# repository makes its block theirs.
+ok "(lib2 carries the superproject's mark before the person acts on it)" "$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlockedBy)" "superproject"
+OUT=$(probe push_mode "$SUP/lib2" "guardrail")
+ok "blocking a submodule yourself makes its block yours: the superproject's mark is gone" "$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlockedBy || echo unmarked)" "unmarked"
 OUT=$(probe push_mode "$SUP" "allowed")
 ok "allowing the superproject takes the block away from the submodules it covered" "$(printf '%s' "$OUT" | jqf outcome):$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked || echo unset):$(git -C "$SUP/lib/inner" config --local --get gitswitch.pushBlocked || echo unset):$([ -e "$(git -C "$SUP/lib" rev-parse --git-path hooks)/pre-push" ] && echo hook || echo nohook)" "applied:unset:unset:nohook"
 ok "  but not from one blocked on its own" "$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked)" "true"
@@ -501,10 +505,39 @@ ok "  the coverage says so" "$(cov | jqf value.summary)" "Covers this repository
 evs() { for sub in lib lib/inner lib2; do pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}" | "$PY" -c 'import sys,json;e=json.load(sys.stdin)["value"]["lock"]["recent_events"];print(" ".join(sorted(set(x["code"] for x in e))), "|", e[0]["detail"] if e else "")'; done; }
 ok "  each submodule's own event log records its lock, and says who did it" "$(evs | tr '\n' ';')" "locked | locked with its superproject super-cover;locked | locked with its superproject super-cover;locked | locked with its superproject super-cover;"
 ok "  the registry lists the four of them" "$(pinvoke push_lock_helper_status "{}" | "$PY" -c 'import sys,json;print(len([l for l in json.load(sys.stdin)["value"]["locks"] if "super-cover" in l["repo"]]))')" "4"
+# A submodule the lock does not reach (unlocked from inside it, by the person):
+# Repair adds it, and its own log says Repair did it, for which superproject.
+OUT=$(probe push_mode "$SUP/lib2" "allowed")
+ok "(lib2 unlocked from inside it)" "$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib2\"}" | jqf value.lock.locked)" "False"
+OUT=$(pinvoke changes_repair_push_lock "{\"repoPath\":\"$SUP\"}")
+ok "Repair locks it again, and its own log says Repair did it, for which superproject" "$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib2\"}" | "$PY" -c 'import sys,json;l=json.load(sys.stdin)["value"]["lock"];print(l["locked"], l["recent_events"][0]["detail"])')" "True locked by Repair with its superproject super-cover"
 OUT=$(probe push_mode "$SUP" "allowed")
 ok "unlocking the superproject unlocks them all" "$(printf '%s' "$OUT" | jqf outcome):$(for sub in lib lib/inner lib2; do pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}" | jqf value.lock.locked; done | tr '\n' ',')" "applied:False,False,False,"
 ok "  and nothing of the block is left in them" "$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked || echo unset):$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked || echo unset)" "unset:unset"
 ok "  each submodule's own event log records the unlock too" "$(evs | tr '\n' ';')" "locked unlocked | unlocked with its superproject super-cover;locked unlocked | unlocked with its superproject super-cover;locked unlocked | unlocked with its superproject super-cover;"
+
+if [ "$PLAT" != windows ]; then
+section "A lock finished by hand (no administrator prompt) does what the prompt does"
+# lib2 is blocked by the person before the superproject is locked by hand.
+OUT=$(probe push_mode "$SUP/lib2" "guardrail")
+OUT=$(GITSWITCH_ELEVATE=manual probe push_mode "$SUP" "locked")
+ok "with no prompt available the lock is handed over as a command" "$(printf '%s' "$OUT" | jqf outcome)" "manual-required"
+CMD="$(printf '%s' "$OUT" | jqf command)"; NONCE="$(printf '%s' "$OUT" | jqf job_nonce)"
+# The person runs it (no sudo needed in the re-rooted sandbox), then says so.
+eval "${CMD#sudo }" >/dev/null 2>&1
+OUT=$(pinvoke push_lock_finish_manual "{\"nonce\":\"$NONCE\"}")
+ok "  and \"I ran it\" finishes it" "$(printf '%s' "$OUT" | jqf value.outcome):$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib\"}" | jqf value.lock.locked)" "applied:True"
+ok "  a submodule the lock reached is marked as the superproject's" "$(git -C "$SUP/lib" config --local --get gitswitch.pushBlockedBy)" "superproject"
+ok "  one the person had blocked on their own stays theirs" "$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlockedBy || echo unmarked)" "unmarked"
+ok "  and each submodule's own log names the superproject" "$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib\"}" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["lock"]["recent_events"][0]["detail"])')" "locked (finished by hand) with its superproject super-cover"
+OUT=$(GITSWITCH_ELEVATE=manual probe push_mode "$SUP" "allowed")
+CMD="$(printf '%s' "$OUT" | jqf command)"; NONCE="$(printf '%s' "$OUT" | jqf job_nonce)"
+eval "${CMD#sudo }" >/dev/null 2>&1
+OUT=$(pinvoke push_lock_finish_manual "{\"nonce\":\"$NONCE\"}")
+ok "an unlock finished by hand frees what the superproject's lock reached" "$(printf '%s' "$OUT" | jqf value.outcome):$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib\"}" | jqf value.lock.locked):$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked || echo unset)" "applied:False:unset"
+ok "  but not the one the person locked on their own" "$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib2\"}" | jqf value.lock.locked)" "True"
+OUT=$(probe push_mode "$SUP/lib2" "allowed")
+fi
 
 # Real mode: leave the machine as it was found.
 if [ -n "$REAL" ]; then

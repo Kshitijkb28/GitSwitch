@@ -805,8 +805,9 @@ pub struct SyncState {
     /// does. Left to itself git downloads them INSIDE the rebase, through the
     /// smudge filter, where a slow or unreachable LFS server fails the whole
     /// update. Off when one of your uncommitted changes is itself a large
-    /// file: the autostash would put it back as a stub. `false` in a state an
-    /// older build wrote, which then behaves as before.
+    /// file (the autostash would put it back as a stub), and off when a
+    /// checkout is deliberately partial (a file you had would become a stub).
+    /// `false` in a state an older build wrote, which then behaves as before.
     #[serde(default)]
     pub lfs_skip: bool,
 }
@@ -893,7 +894,10 @@ pub struct SyncSummary {
 }
 
 pub async fn summary_for(repo: &Path) -> Option<SyncSummary> {
-    if let Some(st) = read_state(repo).await {
+    // A state whose update is over (one a crash left behind between finishing
+    // and removing it) is not a paused update: offering Continue or Abort on
+    // it would undo finished work. The next update replaces it.
+    if let Some(st) = read_state(repo).await.filter(|st| st.phase != "done" && st.phase != "aborted") {
         // One extra `git status`, only while paused: what the person still
         // has to resolve before the update can go on.
         let mut pointer_left = false;
@@ -1008,8 +1012,8 @@ async fn dirty_large_file(repo: &Path) -> bool {
 }
 
 /// Which repositories of the update use Git LFS, whether each was complete,
-/// and whether the update may write pointer stubs (no large file among the
-/// uncommitted changes of any of them).
+/// and whether the update may write pointer stubs (every one of them
+/// complete, and no large file among their uncommitted changes).
 async fn lfs_plan(repo: &Path, subs: &[SubState]) -> (BTreeMap<String, bool>, bool) {
     let mut lfs = BTreeMap::new();
     let mut dirty_large = false;
@@ -1024,7 +1028,12 @@ async fn lfs_plan(repo: &Path, subs: &[SubState]) -> (BTreeMap<String, bool>, bo
             }
         }
     }
-    let skip = !lfs.is_empty() && !dirty_large;
+    // Only where every large file was present: a deliberately partial
+    // checkout (some folders downloaded, others not) would get stubs for
+    // files the person had, and the download afterwards cannot tell those
+    // from the ones left out on purpose. There git downloads inside the
+    // rewrite, as before.
+    let skip = !lfs.is_empty() && !dirty_large && lfs.values().all(|complete| *complete);
     (lfs, skip)
 }
 
@@ -1045,7 +1054,10 @@ async fn lfs_after_update(repo: &Path, st: &SyncState) -> String {
         let place = if path.is_empty() { "here".to_string() } else { format!("in {}", path) };
         let dir_s = dir.to_string_lossy().to_string();
         if *complete_before {
-            match crate::git_ops::fetch_lfs_content(&dir_s).await {
+            // Into the superproject's progress file: that is the one the page
+            // polls, whichever repository is downloading.
+            let progress_at = crate::lfs::progress_path(&repo.to_string_lossy());
+            match Box::pin(crate::git_ops::fetch_lfs_content_reporting(&dir_s, progress_at)).await {
                 Ok(f) => match f.error {
                     Some(a) => out.push_str(&format!(" The large files {} didn't download: {} The LFS card can fetch them.", place, a.headline)),
                     None if f.fetched > 0 => out.push_str(&format!(" Downloaded {} {}.", plural(f.fetched, "LFS file", "LFS files"), place)),
@@ -1500,8 +1512,9 @@ async fn fetch_remote(repo: &Path, remote: &str, extra: &[&str]) -> Result<(), S
     // Kept as a pack, because git reports nothing while it unpacks a small one.
     let mut args = vec!["fetch", "--progress", "--no-recurse-submodules", "--", remote];
     args.extend_from_slice(extra);
-    let out = g(repo).cfg("fetch.unpackLimit", "1").args(args).stall(crate::git_exec::net_stall()).run().await.map_err(|e| e.to_string())?;
+    let out = g(repo).for_fetch().args(args).run().await.map_err(|e| e.to_string())?;
     if out.ok() {
+        crate::git_exec::housekeeping(repo).await;
         Ok(())
     } else {
         Err(out.stderr.trim().lines().last().unwrap_or("fetch failed").to_string())
@@ -2175,7 +2188,7 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
     }
     st.phase = "aligning".into();
     write_state_at(state_file, st)?;
-    align_submodules(repo, st, state_file).await
+    Box::pin(align_submodules(repo, st, state_file)).await
 }
 
 /// Note the commit the superproject's rebase is replaying right now, just
@@ -2566,7 +2579,11 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
         } else {
             let url = g(repo).args(["config", "--get", &format!("remote.{}.url", st.plan.superproject.remote)]).ok_text().await.unwrap_or_default();
             let repo_s = repo.to_string_lossy().to_string();
-            let report = crate::sparse::update_submodules(repo, None, None, url.trim(), Some(std::slice::from_ref(&path)), Some(repo_s.as_str())).await;
+            let report = {
+                let _progress = crate::sparse::ProgressGuard::hold(&repo_s);
+                let profile = crate::git_status::owning_profile_id(&repo_s);
+                Box::pin(crate::sparse::update_submodules(repo, None, None, url.trim(), Some(std::slice::from_ref(&path)), Some(repo_s.as_str()), profile.as_deref())).await
+            };
             match (&report.error, report.downloaded) {
                 (None, n) if n > 0 => (true, format!("new upstream; downloaded at {}", short(&recorded))),
                 (None, _) => (false, "new upstream; could not be downloaded — Download it from the Submodules tab".to_string()),
@@ -2638,9 +2655,16 @@ pub(crate) fn shell_quote(s: &str) -> String {
 
 async fn finish(repo_path: &str, st: &SyncState, state_file: &Path) -> Result<OpResult, AppError> {
     let repo = PathBuf::from(repo_path);
-    // Done or aborted: the large files the update wrote as stubs come now, on
-    // their own clock. A pause leaves them until the update is through.
-    let large_files = if st.phase == "done" || st.phase == "aborted" { lfs_after_update(&repo, st).await } else { String::new() };
+    // Done or aborted: the update is over, so its state goes first — a
+    // download of large files can take hours, and a state left behind for
+    // that long would show a finished update as a paused one, with an Abort
+    // that undoes it. Then the large files it wrote as stubs come, on their
+    // own clock. A pause leaves them until the update is through.
+    let over = st.phase == "done" || st.phase == "aborted";
+    if over {
+        std::fs::remove_file(state_file).ok();
+    }
+    let large_files = if over { Box::pin(lfs_after_update(&repo, st)).await } else { String::new() };
     let outcome = build_outcome(&repo, st).await;
     let status = Box::pin(git_status::repo_status(repo_path)).await?;
     let mut op = if st.phase == "done" {
@@ -3392,7 +3416,7 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
                 at_commit: None,
             });
             write_state_at(&state_file, &st)?;
-            return finish(repo_path, &st, &state_file).await;
+            return Box::pin(finish(repo_path, &st, &state_file)).await;
         }
         if let Some(ss) = st.subs.iter_mut().find(|s| s.path == path) {
             let new_head = oid(&sub, "HEAD").await.unwrap_or_default();
@@ -3432,8 +3456,8 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
         }
         // The user staged the resolution of the stash. The leftover stash entry is theirs to drop; carry on.
         st.needs_user = None;
-        align_submodules(&repo, &mut st, &state_file).await?;
-        return finish(repo_path, &st, &state_file).await;
+        Box::pin(align_submodules(&repo, &mut st, &state_file)).await?;
+        return Box::pin(finish(repo_path, &st, &state_file)).await;
     }
     // A pointer the update handed over ("put it where you want it, stage it,
     // then Continue"): until it is staged there is nothing to continue with —
@@ -3465,8 +3489,8 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
                 return Err(AppError::Command(format!("rebase --continue failed: {}", out.stderr.trim())));
             }
             st.needs_user = None;
-            drive(&repo, &mut st, &state_file).await?;
-            return finish(repo_path, &st, &state_file).await;
+            Box::pin(drive(&repo, &mut st, &state_file)).await?;
+            return Box::pin(finish(repo_path, &st, &state_file)).await;
         }
         let status = Box::pin(git_status::repo_status(repo_path)).await?;
         return Ok(OpResult::refused(Refusal { code: "unmerged-paths".into(), message: "Resolve and stage every conflicted file first.".into() }, status));
@@ -3482,14 +3506,16 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
         let mut notes = put_back_submodules(&repo, &mut st).await;
         notes.extend(put_back_urls(&repo, &mut st).await);
         st.phase = "aborted".into();
-        let mut r = finish(repo_path, &st, &state_file).await?;
+        let mut r = Box::pin(finish(repo_path, &st, &state_file)).await?;
         if !notes.is_empty() {
-            r.detail = notes.join(" ");
+            // As in sync_abort: the notes name what was put back; what finish
+            // said about the large files stays.
+            r.detail = r.detail.replacen("Everything is back where it was, except what is named below.", &notes.join(" "), 1);
         }
         return Ok(r);
     }
-    align_submodules(&repo, &mut st, &state_file).await?;
-    finish(repo_path, &st, &state_file).await
+    Box::pin(align_submodules(&repo, &mut st, &state_file)).await?;
+    Box::pin(finish(repo_path, &st, &state_file)).await
 }
 
 /// A submodule's pause is over: record it in the superproject's stop and carry
@@ -3529,7 +3555,7 @@ async fn resume_after_submodule(repo_path: &str, repo: &Path, st: &mut SyncState
                             st.handed_over.push(path.to_string());
                         }
                         write_state_at(state_file, st)?;
-                        return finish(repo_path, st, state_file).await;
+                        return Box::pin(finish(repo_path, st, state_file)).await;
                     }
                 }
             }
@@ -3544,11 +3570,11 @@ async fn resume_after_submodule(repo_path: &str, repo: &Path, st: &mut SyncState
         if !out.ok() && !rebase_in_progress(repo).await {
             return Err(AppError::Command(format!("rebase --continue failed: {}", out.stderr.trim())));
         }
-        drive(repo, st, state_file).await?;
+        Box::pin(drive(repo, st, state_file)).await?;
     } else {
-        align_submodules(repo, st, state_file).await?;
+        Box::pin(align_submodules(repo, st, state_file)).await?;
     }
-    finish(repo_path, st, state_file).await
+    Box::pin(finish(repo_path, st, state_file)).await
 }
 
 /// Some remote branch already has this commit: moving a checkout or a branch
@@ -3708,7 +3734,7 @@ pub async fn sync_abort(repo_path: &str) -> Result<OpResult, AppError> {
     notes.extend(put_back_urls(&repo, &mut st).await);
     st.phase = "aborted".into();
     st.needs_user = None;
-    let mut r = finish(repo_path, &st, &state_file).await?;
+    let mut r = Box::pin(finish(repo_path, &st, &state_file)).await?;
     if !notes.is_empty() {
         // The notes name what was put back; what finish said about the large files stays.
         r.detail = r.detail.replacen("Everything is back where it was, except what is named below.", &notes.join(" "), 1);

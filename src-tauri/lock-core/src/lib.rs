@@ -1161,7 +1161,7 @@ mod tests {
             repo: "/Users/me/with space/argos".into(),
             gitdir: "/Users/me/with space/argos/.git".into(),
             patterns: vec!["/Users/me/with space/argos/".into()],
-            block_prefixes: vec!["git@github.com:".into(), "org-1@github.com:E/argos.git".into()],
+            block_prefixes: vec!["git@github.com:".into(), "org-1@github.com:AcmeOrg/widgets.git".into()],
             label: "argos".into(),
             locked_at: "2026-09-23T09:15:00Z".into(),
             locked_by_uid: Some(501),
@@ -1170,7 +1170,7 @@ mod tests {
         };
         let s = render_stanza(&entry);
         assert!(s.contains("[gitswitch]\n\tlocked = true\n\tlockId = abc\n\tlockedRepo = \"/Users/me/with space/argos\"\n"));
-        assert!(s.contains("[url \"gitswitch-push-blocked://\"]\n\tpushInsteadOf = \"git@github.com:\"\n\tpushInsteadOf = \"org-1@github.com:E/argos.git\"\n"));
+        assert!(s.contains("[url \"gitswitch-push-blocked://\"]\n\tpushInsteadOf = \"git@github.com:\"\n\tpushInsteadOf = \"org-1@github.com:AcmeOrg/widgets.git\"\n"));
         assert!(!s.contains("\tinsteadOf"), "a plain insteadOf would break fetch");
         assert!(!s.contains("git config"));
         assert!(!s.contains('\\'));

@@ -762,6 +762,25 @@ try {
     await page.close();
   }
   {
+    // A guard-railed repository whose earlier lock reached a submodule that is
+    // still locked: "Allowed" unlocks that submodule, so it asks first and
+    // names it — the administrator prompt must never arrive unannounced.
+    const cov = { mode: "guardrail", submodules: [
+      { path: "trinity", blocked: true, locked: true, needs_repair: false, covered: true, why: "", by_superproject: true },
+      { path: "staging", blocked: true, locked: true, needs_repair: false, covered: true, why: "", by_superproject: false },
+    ], uncovered: [], needs_repair: false, summary: "Covers this repository and 2 submodules." };
+    const page = await open(SCENARIOS.blocked, { pushCoverage: cov });
+    await page.waitForFunction(() => document.body.innerText.includes("Covers this repository"), { timeout: 4000 }).catch(() => null);
+    await clickSegment(page, "Allowed");
+    await sleep(200);
+    const s = await text(page);
+    ok("Allowed on a repository whose lock reached a submodule asks first, naming that submodule and the prompt",
+      s.includes("also unlocks the submodules this repository's lock reached (trinity)") && !s.includes("(trinity, staging)") && (await button(page, "Unlock (administrator prompt)")) !== null,
+      s.slice(s.indexOf("Allowing pushes again"), s.indexOf("Allowing pushes again") + 220));
+    ok("  and nothing has run yet", !(await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "changes_set_push_mode"))));
+    await page.close();
+  }
+  {
     // Locking from Allowed: confirmation first, then the outcome.
     const page = await open(SCENARIOS.clean);
     ok("Allowed is on for a plain repo", (await segment(page, "Allowed"))?.checked === true);

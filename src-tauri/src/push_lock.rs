@@ -1182,26 +1182,63 @@ async fn settle_manual_job(job_path: &Path) {
     let Ok(text) = fs::read_to_string(job_path) else { return };
     let Ok(job) = serde_json::from_str::<lc::Job>(&text) else { return };
     let repos: Vec<String> = job.ops.iter().filter_map(|o| o.repo().map(|r| r.to_string())).collect();
+    // The repository of the same job that holds this one: its superproject.
+    let superproject_of = |repo: &str| repos.iter().filter(|r| r.as_str() != repo && repo.starts_with(&format!("{}/", r))).max_by_key(|r| r.len()).cloned();
+    let mut covered_by: Vec<String> = Vec::new();
+    let mut uncovered_by: Vec<String> = Vec::new();
     for op in &job.ops {
         match op {
             Op::Lock { repo, .. } => {
-                let Ok(paths) = crate::git_status::git_paths(Path::new(repo)).await else { continue };
-                let _ = push_guard::apply_mirrors(Path::new(repo), &paths.hooks).await;
-                // A submodule of another repository in the same job: the lock reached it.
-                if repos.iter().any(|r| r != repo && repo.starts_with(&format!("{}/", r))) {
-                    let _ = sys_git(Path::new(repo)).args(["config", "--local", "gitswitch.pushBlockedBy", "superproject"]).run().await;
+                let dir = Path::new(repo);
+                let Ok(paths) = crate::git_status::git_paths(dir).await else { continue };
+                match superproject_of(repo) {
+                    Some(sup) => {
+                        // Read before the mirrors go on: a submodule the person
+                        // blocked on its own stays theirs, as on the prompt path.
+                        let own = push_guard::read_flag(dir).await && !push_guard::marked(dir).await;
+                        let _ = push_guard::apply_mirrors(dir, &paths.hooks).await;
+                        if !own {
+                            let _ = sys_git(dir).args(["config", "--local", "gitswitch.pushBlockedBy", "superproject"]).run().await;
+                        }
+                        log_submodule_events(std::slice::from_ref(repo), &sup, "locked", "locked (finished by hand)");
+                    }
+                    None => {
+                        let _ = push_guard::apply_mirrors(dir, &paths.hooks).await;
+                        log_event(repo, "locked", "finished by hand", false);
+                        covered_by.push(repo.clone());
+                    }
                 }
-                log_event(repo, "locked", "finished by hand", false);
             }
             Op::Unlock { repo } => {
-                let Ok(paths) = crate::git_status::git_paths(Path::new(repo)).await else { continue };
-                let _ = push_guard::remove_mirrors(Path::new(repo), &paths.hooks).await;
-                let _ = sys_git(Path::new(repo)).args(["config", "--local", "--unset", "gitswitch.pushBlockedBy"]).run().await;
-                log_event(repo, "unlocked", "finished by hand", false);
+                let dir = Path::new(repo);
+                let Ok(paths) = crate::git_status::git_paths(dir).await else { continue };
+                let _ = push_guard::remove_mirrors(dir, &paths.hooks).await;
+                let _ = sys_git(dir).args(["config", "--local", "--unset", "gitswitch.pushBlockedBy"]).run().await;
+                match superproject_of(repo) {
+                    Some(sup) => log_submodule_events(std::slice::from_ref(repo), &sup, "unlocked", "unlocked (finished by hand)"),
+                    None => {
+                        log_event(repo, "unlocked", "finished by hand", false);
+                        uncovered_by.push(repo.clone());
+                    }
+                }
             }
             _ => {}
         }
     }
+    // As the prompt path does: the submodules the lock could not carry get the
+    // guard-rail; an unlock takes the repository's guard-rail off the rest.
+    for r in &covered_by {
+        push_guard::cover_submodules(r, None).await;
+    }
+    for r in &uncovered_by {
+        push_guard::uncover_submodules(r).await;
+    }
+}
+
+/// The person acted on this repository itself: its block (or its freedom) is
+/// theirs from now on — a superproject's "Allowed" leaves it alone.
+async fn claim(repo_path: &str) {
+    let _ = sys_git(Path::new(repo_path)).args(["config", "--local", "--unset", "gitswitch.pushBlockedBy"]).run().await;
 }
 
 fn result_with_state(out: JobOutcome, state: Option<push_guard::PushState>) -> PushModeResult {
@@ -1222,6 +1259,7 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
             let sub_repos = op_repos(&sub_ops);
             if before.lock.locked && !before.lock.needs_elevation && sub_ops.is_empty() {
                 let state = push_guard::repair(repo_path, &hooks, profile.as_deref()).await?;
+                claim(repo_path).await;
                 return Ok(result_with_state(JobOutcome::simple("applied", "Already locked."), Some(state)));
             }
             let mut ops = Vec::new();
@@ -1235,11 +1273,16 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
             }
             let out = run_job(ops).await;
             if out.applied() {
-                push_guard::apply_mirrors(Path::new(repo_path), &hooks).await?;
+                claim(repo_path).await;
+                // The submodules first: their marks are the only record that this
+                // job reached them, so a failure on the repository's own step
+                // below must not leave them locked and unmarked.
                 push_guard::cover_submodules(repo_path, None).await;
                 let me = canonical(Path::new(repo_path));
-                log_event(&me, "locked", &out.message, false);
                 log_submodule_events(&sub_repos, &me, "locked", "locked");
+                let mirrors = push_guard::apply_mirrors(Path::new(repo_path), &hooks).await;
+                log_event(&me, "locked", &out.message, false);
+                mirrors?;
             }
             let state = if out.outcome == "manual-required" { None } else { Some(crate::git_status::push_state_for(repo_path).await?) };
             Ok(result_with_state(out, state))
@@ -1263,15 +1306,20 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
                     return Ok(result_with_state(out, state));
                 }
                 let me = canonical(Path::new(repo_path));
-                log_event(&me, "unlocked", &out.message, false);
+                // Only the repository the lock was on says it was unlocked.
+                if before.lock.locked {
+                    log_event(&me, "unlocked", &out.message, false);
+                }
                 let freed: Vec<String> = locked_subs.iter().map(|d| canonical(d)).collect();
                 log_submodule_events(&freed, &me, "unlocked", "unlocked");
-                push_guard::remove_mirrors(Path::new(repo_path), &hooks).await?;
                 push_guard::uncover_submodules(repo_path).await;
+                push_guard::remove_mirrors(Path::new(repo_path), &hooks).await?;
+                claim(repo_path).await;
                 let state = crate::git_status::push_state_for(repo_path).await?;
                 return Ok(result_with_state(out, Some(state)));
             }
             let state = push_guard::set_repo_blocked(repo_path, &hooks, false, profile.as_deref()).await?;
+            claim(repo_path).await;
             Ok(result_with_state(JobOutcome::simple("applied", "Pushes are allowed again."), Some(state)))
         }
         "guardrail" => {
@@ -1281,6 +1329,7 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
                 ));
             }
             let state = push_guard::set_repo_blocked(repo_path, &hooks, true, profile.as_deref()).await?;
+            claim(repo_path).await;
             Ok(result_with_state(JobOutcome::simple("applied", "Pushes are blocked (guard-rail)."), Some(state)))
         }
         other => Err(AppError::Config(format!("Unknown push mode '{}'", other))),

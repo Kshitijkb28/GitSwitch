@@ -443,25 +443,43 @@ printf 'base\n' > "$SB/net-author/base.txt"; git -C "$SB/net-author" add -A >/de
 git clone -q "file://$SB/net.git" "$SB/net-work" 2>/dev/null
 git clone -q "file://$SB/net.git" "$SB/net-stuck" 2>/dev/null
 git clone -q "file://$SB/net.git" "$SB/net-history" 2>/dev/null
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/net-author/blob$i.bin"; done
+# A repository whose own housekeeping becomes due with the pull's fetch (its
+# second pack), cannot detach (as on Windows) and is slow: its pre-auto-gc
+# hook sleeps longer than the silence window. Cloned before upstream moves.
+git clone -q "file://$SB/net.git" "$SB/net-gc" 2>/dev/null
+git -C "$SB/net-gc" config gc.autoDetach false; git -C "$SB/net-gc" config gc.autoPackLimit 1
+GC_HOOK="$(git -C "$SB/net-gc" rev-parse --path-format=absolute --git-path hooks)/pre-auto-gc"
+printf '#!/bin/sh\necho ran >> "%s"\nsleep 6\n' "$SB/gc-hook.log" > "$GC_HOOK"; chmod +x "$GC_HOOK"
+# A second remote, as a fork and its original are: with two remotes `fetch
+# --all` hands each to a child fetch that reports nothing into a pipe.
+git init -q --bare "$SB/net2.git"; git clone -q "file://$SB/net2.git" "$SB/net2-author" 2>/dev/null
+printf 'other\n' > "$SB/net2-author/other.txt"; git -C "$SB/net2-author" add -A >/dev/null; git -C "$SB/net2-author" commit -qm other; git -C "$SB/net2-author" push -q origin main 2>/dev/null
+git -C "$SB/net-history" remote add second "file://$SB/net2.git"; git -C "$SB/net-history" fetch -q second 2>/dev/null
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/net-author/blob$i.bin"; head -c 131072 /dev/urandom > "$SB/net2-author/more$i.bin"; done
 git -C "$SB/net-author" add -A >/dev/null; git -C "$SB/net-author" commit -qm "about 3 MiB that will not compress"; git -C "$SB/net-author" push -q origin main 2>/dev/null
+git -C "$SB/net2-author" add -A >/dev/null; git -C "$SB/net2-author" commit -qm "about 3 MiB more, on the second remote"; git -C "$SB/net2-author" push -q origin main 2>/dev/null
 cat > "$SB/trickle.sh" <<'TRICKLE'
 #!/bin/sh
 # Run the real program and pass its output on a little at a time.
-"$@" | perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.06); }'
+"$@" | perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.1); }'
 TRICKLE
 chmod +x "$SB/trickle.sh"
 git config --global uploadpack.packObjectsHook "$SB/trickle.sh"
-T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=2 probe pull "$SB/net-work" "ff-only"); T1=$(date +%s)
-# The History page's Fetch goes down the same slow road.
-H0=$(date +%s); HOUT=$(GITSWITCH_STALL_SECS=2 probe history_fetch "$SB/net-history"); H1=$(date +%s)
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=3 probe pull "$SB/net-work" "ff-only"); T1=$(date +%s)
+# The History page's Fetch goes down the same slow road, from both remotes.
+H0=$(date +%s); HOUT=$(GITSWITCH_STALL_SECS=3 probe history_fetch "$SB/net-history"); H1=$(date +%s)
 git config --global --unset uploadpack.packObjectsHook
+G0=$(date +%s); GOUT=$(GITSWITCH_STALL_SECS=3 probe pull "$SB/net-gc" "ff-only"); G1=$(date +%s)
 ok "a pull that takes longer than the silence allowed, but keeps arriving, is not stopped" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$SB/net-work" rev-parse HEAD)" "True:$(git -C "$SB/net-author" rev-parse HEAD)"
-ok "  it really was slower than the window (2 s)" "$([ $((T1-T0)) -ge 3 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
+ok "  it really was slower than the window (3 s)" "$([ $((T1-T0)) -ge 5 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
 ok "  and every file arrived" "$(ls "$SB/net-work" | grep -c '^blob')" "24"
 ok "  git's progress counters stay out of the result" "$(printf '%s' "$OUT" | grep -c 'Receiving objects')" "0"
 ok "History's Fetch, just as slow, is not stopped either: the remote branch moved" "$(printf '%s' "$HOUT" | "$PY" -c 'import sys,json;print("moved" if json.load(sys.stdin).get("updated_remote_refs",0)>=1 else "none")'):$(git -C "$SB/net-history" rev-parse origin/main)" "moved:$(git -C "$SB/net-author" rev-parse HEAD)"
-ok "  it really was slower than the window (2 s)" "$([ $((H1-H0)) -ge 3 ] && echo "slow enough" || echo "too quick to prove anything: $((H1-H0))s")" "slow enough"
+ok "  and from the second remote as well — two remotes are fetched one by one, each with its progress" "$(git -C "$SB/net-history" rev-parse second/main)" "$(git -C "$SB/net2-author" rev-parse HEAD)"
+ok "  it really was slower than the window (3 s)" "$([ $((H1-H0)) -ge 5 ] && echo "slow enough" || echo "too quick to prove anything: $((H1-H0))s")" "slow enough"
+ok "a pull is not stopped by the repository's own housekeeping, slow and in the foreground: it runs after the fetch, not inside it" "$(printf '%s' "$GOUT" | jqf ok):$(git -C "$SB/net-gc" rev-parse HEAD)" "True:$(git -C "$SB/net-author" rev-parse HEAD)"
+ok "  and it did run — git's housekeeping still happens" "$([ -s "$SB/gc-hook.log" ] && echo ran || echo never)" "ran"
+ok "  it really was slower than the window (3 s)" "$([ $((G1-G0)) -ge 5 ] && echo "slow enough" || echo "too quick to prove anything: $((G1-G0))s")" "slow enough"
 ok "  and it fetched without touching the branch, the files or any local branch" "$(printf '%s' "$HOUT" | jqf head_unchanged):$(printf '%s' "$HOUT" | jqf worktree_unchanged):$(printf '%s' "$HOUT" | jqf local_branches_unchanged):$(git -C "$SB/net-history" rev-parse HEAD)" "True:True:True:$(git -C "$SB/net-author" rev-parse HEAD~1)"
 
 # A server that accepts the connection and never answers.
@@ -494,15 +512,15 @@ ok "  and the commit is still here, unpushed" "$(git -C "$SB/net-stuck" log -1 -
 cat > "$SB/slow-receive.sh" <<'SLOWRCV'
 #!/bin/sh
 # What `git push` runs on the far side, with its input slowed down.
-perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.06); }' | git receive-pack "$@"
+perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.1); }' | git receive-pack "$@"
 SLOWRCV
 chmod +x "$SB/slow-receive.sh"
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/net-work/mine$i.bin"; done
 git -C "$SB/net-work" add -A >/dev/null; git -C "$SB/net-work" commit -qm "about 3 MiB of mine"
 git -C "$SB/net-work" config remote.origin.receivepack "$SB/slow-receive.sh"
-T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=2 probe push "$SB/net-work" ""); T1=$(date +%s)
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=3 probe push "$SB/net-work" ""); T1=$(date +%s)
 git -C "$SB/net-work" config --unset remote.origin.receivepack
 ok "a push that takes longer than the silence allowed, but keeps going, is not stopped" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$SB/net.git" rev-parse main)" "True:$(git -C "$SB/net-work" rev-parse HEAD)"
-ok "  it really was slower than the window (2 s)" "$([ $((T1-T0)) -ge 3 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
+ok "  it really was slower than the window (3 s)" "$([ $((T1-T0)) -ge 5 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
 
 verify_result
