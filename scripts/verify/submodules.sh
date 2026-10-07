@@ -365,4 +365,80 @@ ok "a bare leftover does not take the repository's status down" "$(probe status 
 OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W2\",\"paths\":[\"lib\"]}")
 ok "  and Download clears it and finishes the download" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["cleared"])'):$(git -C "$W2/lib" rev-parse HEAD 2>/dev/null)" "True ['lib']:$(git -C "$W2" rev-parse HEAD:lib)"
 
+section "A download that takes a while says how long is left"
+# A submodule big enough to watch, behind a remote that sends it slowly: the
+# pack goes through a hook that trickles it out. (git honours that hook from
+# the sandbox's own global config only, and only on the pack protocol — hence
+# the file:// address; a plain path is hard-linked and never downloads.)
+git init -q --bare "$SB/big.git"; git clone -q "$SB/big.git" "$SB/author-big" 2>/dev/null
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/author-big/blob$i.bin"; done
+git -C "$SB/author-big" add -A >/dev/null; git -C "$SB/author-big" commit -qm "about 3 MiB that will not compress"; git -C "$SB/author-big" push -q origin main 2>/dev/null
+cat > "$SB/trickle.sh" <<'TRICKLE'
+#!/bin/sh
+# Run the real pack-objects and pass its output on a little at a time.
+"$@" | perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.06); }'
+TRICKLE
+chmod +x "$SB/trickle.sh"
+git config --global uploadpack.packObjectsHook "$SB/trickle.sh"
+git init -q "$SB/super-big"; printf 'r\n' > "$SB/super-big/README.md"; git -C "$SB/super-big" add -A >/dev/null; git -C "$SB/super-big" commit -qm init
+( cd "$SB/super-big" && git submodule add -q "file://$SB/big.git" big 2>/dev/null ); git -C "$SB/super-big" commit -qm "a big submodule"
+OUT=$(probe clone "" "$SB/super-big,$SB/clones,bigclone,submodules")
+git config --global --unset uploadpack.packObjectsHook
+TRACE_BIG=$(probe_trace)
+ok "the slow submodule arrives all the same" "$(printf '%s' "$OUT" | jqf submodules.downloaded):$(ls "$SB/clones/bigclone/big" | wc -l | tr -d ' ')" "1:24"
+ok "  while it came in, its line said how much had arrived and how fast" "$(printf '%s' "$TRACE_BIG" | "$PY" -c 'import sys,json;e=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="big" and p.get("bytes") and p.get("rate")];print(len(e)>0, e[-1]["bytes"] if e else "", e[-1]["rate"] if e else "")')" "True"
+ok "  and how long was left, from the share of objects that had arrived" "$(printf '%s' "$TRACE_BIG" | "$PY" -c 'import sys,json;e=[p["eta_secs"] for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="big" and isinstance(p.get("eta_secs"),int)];print(len(e)>0 and all(0<=x<600 for x in e), e[:6])')" "True"
+ok "  the time left goes down as it arrives" "$(printf '%s' "$TRACE_BIG" | "$PY" -c 'import sys,json;e=[p["eta_secs"] for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="big" and isinstance(p.get("eta_secs"),int)];print(len(e)>=2 and e[-1]<=e[0], e[:1], e[-1:])')" "True"
+ok "  no size is claimed for a host that was never asked" "$(printf '%s' "$TRACE_BIG" | "$PY" -c 'import sys,json;print(any("estimate_kb" in p for p in json.load(sys.stdin)))')" "False"
+
+section "A downloaded submodule that has to fetch its new commit shows the download, and a slow one is not stopped"
+# Downloaded before; the superproject now records a commit the submodule does
+# not have. git's own `submodule update` fetches it without a word of
+# progress — nothing to show, and a long fetch looked like a stall.
+git init -q --bare "$SB/grow.git"; git clone -q "file://$SB/grow.git" "$SB/author-grow" 2>/dev/null
+printf 'v1\n' > "$SB/author-grow/v.txt"; git -C "$SB/author-grow" add -A >/dev/null; git -C "$SB/author-grow" commit -qm "grow: v1"; git -C "$SB/author-grow" push -q origin main 2>/dev/null
+git init -q --bare "$SB/super-grow.git"; git clone -q "$SB/super-grow.git" "$SB/author-super-grow" 2>/dev/null
+printf 'r\n' > "$SB/author-super-grow/README.md"; git -C "$SB/author-super-grow" add -A >/dev/null; git -C "$SB/author-super-grow" commit -qm init
+( cd "$SB/author-super-grow" && git submodule add -q "file://$SB/grow.git" grow 2>/dev/null ); git -C "$SB/author-super-grow" commit -qm "add grow"; git -C "$SB/author-super-grow" push -q origin main 2>/dev/null
+git clone -q --recurse-submodules "$SB/super-grow.git" "$SB/grow-work" 2>/dev/null
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/author-grow/g$i.bin"; done
+git -C "$SB/author-grow" add -A >/dev/null; git -C "$SB/author-grow" commit -qm "grow: about 3 MiB more"; git -C "$SB/author-grow" push -q origin main 2>/dev/null
+git -C "$SB/author-super-grow/grow" pull -q --ff-only origin main 2>/dev/null; git -C "$SB/author-super-grow" add grow; git -C "$SB/author-super-grow" commit -qm "grow: bump"; git -C "$SB/author-super-grow" push -q origin main 2>/dev/null
+# The superproject alone: git's own pull would fetch the submodule's commit on
+# the quiet (`fetch.recurseSubmodules=on-demand`), which is what the app's
+# Pull turns off and what a plain `git pull --no-recurse-submodules` does.
+git -C "$SB/grow-work" pull -q --ff-only --no-recurse-submodules origin main 2>/dev/null
+WANT=$(git -C "$SB/grow-work" ls-files -s -- grow | awk '{print $2}')
+ok "(the commit the superproject now records is not in the downloaded submodule yet)" "$(git -C "$SB/grow-work/grow" cat-file -e "$WANT^{commit}" 2>/dev/null && echo present || echo absent)" "absent"
+git config --global uploadpack.packObjectsHook "$SB/trickle.sh"
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=2 pinvoke changes_submodule_update "{\"repoPath\":\"$SB/grow-work\",\"paths\":[\"grow\"]}"); T1=$(date +%s)
+TRACE_GROW=$(probe_trace)
+git config --global --unset uploadpack.packObjectsHook
+ok "a submodule that had to fetch 3 MiB slowly reaches the recorded commit — not stopped" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["downloaded"], v["submodules"]["failed_paths"])'):$(git -C "$SB/grow-work/grow" rev-parse HEAD)" "True 1 []:$WANT"
+ok "  it really took longer than the silence allowed (2 s)" "$([ $((T1-T0)) -ge 3 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
+ok "  while it fetched, its line said how much had arrived and how fast" "$(printf '%s' "$TRACE_GROW" | "$PY" -c 'import sys,json;e=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="grow" and p.get("bytes") and p.get("rate")];print(len(e)>0)')" "True"
+ok "  and how long was left" "$(printf '%s' "$TRACE_GROW" | "$PY" -c 'import sys,json;print(any(isinstance(p.get("eta_secs"),int) for p in json.load(sys.stdin) if p.get("detail")=="grow"))')" "True"
+ok "  with no size from a host — a fetch brings only what is new" "$(printf '%s' "$TRACE_GROW" | "$PY" -c 'import sys,json;print(any("estimate_kb" in p for p in json.load(sys.stdin)))')" "False"
+ok "  and the folder is a clean checkout of it" "$(git -C "$SB/grow-work/grow" status --porcelain | wc -l | tr -d ' '):$(ls "$SB/grow-work/grow" | grep -c '^g')" "0:24"
+
+section "Submodules at dot-prefixed paths (.memory, .audit, a nested .seed) are cloned, listed and covered like any other"
+for r in memory audit seed; do git init -q --bare "$SB/dot-$r.git"; git clone -q "$SB/dot-$r.git" "$SB/author-dot-$r" 2>/dev/null; printf '%s\n' "$r" > "$SB/author-dot-$r/$r.txt"; git -C "$SB/author-dot-$r" add -A >/dev/null; git -C "$SB/author-dot-$r" commit -qm "$r: initial"; git -C "$SB/author-dot-$r" push -q origin main 2>/dev/null; done
+( cd "$SB/author-dot-audit" && git submodule add -q "$SB/dot-seed.git" .seed 2>/dev/null ); git -C "$SB/author-dot-audit" commit -qm "audit: add .seed"; git -C "$SB/author-dot-audit" push -q origin main 2>/dev/null
+git init -q --bare "$SB/super-dots.git"; git clone -q "$SB/super-dots.git" "$SB/author-super-dots" 2>/dev/null
+printf 'r\n' > "$SB/author-super-dots/README.md"; git -C "$SB/author-super-dots" add -A >/dev/null; git -C "$SB/author-super-dots" commit -qm init
+( cd "$SB/author-super-dots" && git submodule add -q "$SB/dot-memory.git" .memory 2>/dev/null && git submodule add -q "$SB/dot-audit.git" .audit 2>/dev/null )
+git -C "$SB/author-super-dots" commit -qm "add .memory and .audit"; git -C "$SB/author-super-dots" push -q origin main 2>/dev/null
+OUT=$(probe clone "" "$SB/super-dots.git,$SB/clones,dotclone,submodules")
+D="$SB/clones/dotclone"
+ok "cloning with submodules downloads both" "$(printf '%s' "$OUT" | jqf submodules.downloaded):$(printf '%s' "$OUT" | jqf submodules.listed):$(printf '%s' "$OUT" | jqf submodules.failed_paths)" "2:2:[]"
+ok "  and the nested one inside .audit" "$(cat "$D/.audit/.seed/seed.txt" 2>/dev/null || echo MISSING)" "seed"
+ok "  the Submodules tab lists them as downloaded and up to date — not missing, not interrupted" "$(probe submodules_list "$D" | "$PY" -c 'import sys,json;print(sorted((s["path"], s["state"]) for s in json.load(sys.stdin)))')" "[('.audit', 'clean'), ('.memory', 'clean')]"
+ok "  the repository's status is whole" "$(probe status "$D" | jqf branch):$(probe status "$D" | jqf has_submodules)" "main:True"
+OUT=$(probe push_mode "$D" "guardrail")
+ok "blocking pushes reaches all three, the nested one included" "$(pinvoke changes_push_coverage "{\"repoPath\":\"$D\"}" | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"];print(sorted(s["path"] for s in c["submodules"] if s["covered"]), c["summary"])')" "['.audit', '.audit/.seed', '.memory'] Covers this repository and 3 submodules."
+git -C "$D/.memory" push origin main >/dev/null 2>&1; RC=$?
+ok "  a push from inside .memory is refused in a plain terminal" "$([ "$RC" -ne 0 ] && echo refused || echo PUSHED)" "refused"
+OUT=$(probe push_mode "$D" "allowed")
+ok "  and allowing it again frees them" "$(git -C "$D/.memory" config --local --get gitswitch.pushBlocked || echo unset):$(git -C "$D/.audit/.seed" config --local --get gitswitch.pushBlocked || echo unset)" "unset:unset"
+
 verify_result

@@ -25,7 +25,41 @@ export function TerminalView({ repoPath, sizeKey, visible }: Props) {
   const term = useRef<Terminal | null>(null);
   const fit = useRef<FitAddon | null>(null);
   const session = useRef<string | null>(null);
+  /** The size the shell was last told it has; null until it has been told. */
+  const told = useRef<{ cols: number; rows: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // The shell must always believe in the size that is drawn. When it believes
+  // in more rows, a full-screen program paints its last lines below the
+  // visible edge and they cannot be reached until something resizes the
+  // drawer. So every change of the terminal's size is passed on — and a size
+  // that changed before the shell existed is passed on the moment it starts.
+  const tell = (cols: number, rows: number) => {
+    const id = session.current;
+    if (!id) return; // no shell yet: the start of the session syncs
+    if (told.current && told.current.cols === cols && told.current.rows === rows) return;
+    told.current = { cols, rows };
+    void api.terminalResize(id, cols, rows).catch(() => {
+      // Not delivered: forget it, so the next fit says it again.
+      if (told.current && told.current.cols === cols && told.current.rows === rows) told.current = null;
+    });
+  };
+
+  // Fit the rows to the box. The terminal reports its own change (`onResize`),
+  // which is what tells the shell.
+  const refit = () => {
+    const t = term.current;
+    const f = fit.current;
+    if (!t || !f) return;
+    try {
+      f.fit();
+    } catch {
+      return;
+    }
+    // The same size as before reports nothing; say it anyway if the shell
+    // has not heard it (a resize that could not be delivered, a late start).
+    tell(t.cols, t.rows);
+  };
 
   // One shell per repository. A new repo means a new shell, and the old one is
   // closed rather than left running in a folder nobody is looking at.
@@ -65,9 +99,16 @@ export function TerminalView({ repoPath, sizeKey, visible }: Props) {
     }
     term.current = t;
     fit.current = f;
+    told.current = null;
+    // Whoever changes the terminal's size — the fit, or anything else — the
+    // shell hears it from here.
+    t.onResize(({ cols, rows }) => tell(cols, rows));
 
+    // The size the shell is started with; it may be stale by the time the
+    // shell exists.
+    const opened = { cols: t.cols, rows: t.rows };
     api
-      .terminalOpen(repoPath, t.cols, t.rows, (chunk) => {
+      .terminalOpen(repoPath, opened.cols, opened.rows, (chunk) => {
         if (!dead) t.write(chunk);
       })
       .then((id) => {
@@ -76,11 +117,15 @@ export function TerminalView({ repoPath, sizeKey, visible }: Props) {
           return;
         }
         session.current = id;
+        told.current = opened;
         t.onData((data) => {
           void api.terminalWrite(id, data).catch(() => {
             /* the shell exited; its farewell is already on screen */
           });
         });
+        // Fit once more now that there is a shell to tell, and pass on
+        // whatever the size became while it was starting.
+        refit();
       })
       .catch((e) => {
         if (!dead) setError(String(e));
@@ -90,25 +135,14 @@ export function TerminalView({ repoPath, sizeKey, visible }: Props) {
       dead = true;
       const id = session.current;
       session.current = null;
+      told.current = null;
       if (id) void api.terminalClose(id);
       t.dispose();
       term.current = null;
       fit.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repoPath]);
-
-  // Fit the rows to the box and tell the shell, so its wrapping stays right.
-  const refit = () => {
-    const t = term.current;
-    const f = fit.current;
-    if (!t || !f) return;
-    try {
-      f.fit();
-    } catch {
-      return;
-    }
-    if (session.current) void api.terminalResize(session.current, t.cols, t.rows).catch(() => {});
-  };
 
   // The window changed shape, or the drawer was dragged.
   useEffect(() => {

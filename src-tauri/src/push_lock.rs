@@ -666,6 +666,9 @@ pub async fn measure(repo: &Path, facts: &MirrorFacts) -> LockState {
             RegistryRead::Unreadable(why) => state.drift.push(format!("registry-unreadable:{}", why)),
             _ => {}
         }
+        // Not locked (or not any more): its history still says what happened
+        // to it — an unlock, a lock through its superproject.
+        state.recent_events = recent_events(&repo_c);
         return state;
     };
 
@@ -1138,6 +1141,20 @@ async fn submodule_lock_ops(repo_path: &str) -> Vec<Op> {
     ops
 }
 
+/// The repositories of a job's lock ops — the submodules a superproject's job
+/// reached — so each gets its own line in its own event log.
+fn op_repos(ops: &[Op]) -> Vec<String> {
+    ops.iter().filter_map(|o| o.repo().map(str::to_string)).collect()
+}
+
+/// Record, in each submodule's own log, what its superproject's job did to it.
+fn log_submodule_events(sub_repos: &[String], superproject: &str, code: &str, how: &str) {
+    let name = crate::paths::base_name(superproject);
+    for r in sub_repos {
+        log_event(r, code, &format!("{} with its superproject {}", how, name), false);
+    }
+}
+
 /// The populated submodules that carry a lock the repository's lock brought
 /// along — marked as its doing; one the person locked on their own is not listed.
 async fn locked_submodules(repo_path: &str) -> Vec<std::path::PathBuf> {
@@ -1202,6 +1219,7 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
             // The submodules too — the repositories the code lives in — in
             // the same job, so one prompt covers them all.
             let sub_ops = submodule_lock_ops(repo_path).await;
+            let sub_repos = op_repos(&sub_ops);
             if before.lock.locked && !before.lock.needs_elevation && sub_ops.is_empty() {
                 let state = push_guard::repair(repo_path, &hooks, profile.as_deref()).await?;
                 return Ok(result_with_state(JobOutcome::simple("applied", "Already locked."), Some(state)));
@@ -1219,7 +1237,9 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
             if out.applied() {
                 push_guard::apply_mirrors(Path::new(repo_path), &hooks).await?;
                 push_guard::cover_submodules(repo_path, None).await;
-                log_event(&canonical(Path::new(repo_path)), "locked", &out.message, false);
+                let me = canonical(Path::new(repo_path));
+                log_event(&me, "locked", &out.message, false);
+                log_submodule_events(&sub_repos, &me, "locked", "locked");
             }
             let state = if out.outcome == "manual-required" { None } else { Some(crate::git_status::push_state_for(repo_path).await?) };
             Ok(result_with_state(out, state))
@@ -1242,7 +1262,10 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
                     let state = if out.outcome == "manual-required" { None } else { Some(before) };
                     return Ok(result_with_state(out, state));
                 }
-                log_event(&canonical(Path::new(repo_path)), "unlocked", &out.message, false);
+                let me = canonical(Path::new(repo_path));
+                log_event(&me, "unlocked", &out.message, false);
+                let freed: Vec<String> = locked_subs.iter().map(|d| canonical(d)).collect();
+                log_submodule_events(&freed, &me, "unlocked", "unlocked");
                 push_guard::remove_mirrors(Path::new(repo_path), &hooks).await?;
                 push_guard::uncover_submodules(repo_path).await;
                 let state = crate::git_status::push_state_for(repo_path).await?;
@@ -1277,6 +1300,7 @@ pub async fn repair_lock(repo_path: &str) -> Result<PushModeResult, AppError> {
     if !state.lock.needs_elevation && state.lock.helper != "outdated" && sub_ops.is_empty() {
         return Ok(result_with_state(JobOutcome::simple("applied", "Everything is in place."), Some(state)));
     }
+    let sub_repos = op_repos(&sub_ops);
     let mut ops = vec![lock_op_for(repo_path).await?, Op::RepairSystem, Op::InstallRemoteHelper];
     ops.extend(sub_ops);
     if state.lock.helper == "outdated" {
@@ -1287,7 +1311,9 @@ pub async fn repair_lock(repo_path: &str) -> Result<PushModeResult, AppError> {
     let out = run_job(ops).await;
     if out.applied() {
         push_guard::cover_submodules(repo_path, None).await;
-        log_event(&canonical(Path::new(repo_path)), "repaired", &out.message, true);
+        let me = canonical(Path::new(repo_path));
+        log_event(&me, "repaired", &out.message, true);
+        log_submodule_events(&sub_repos, &me, "locked", "locked by Repair");
     }
     let state = if out.outcome == "manual-required" { None } else { Some(crate::git_status::push_state_for(repo_path).await?) };
     Ok(result_with_state(out, state))

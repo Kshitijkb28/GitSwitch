@@ -1,6 +1,7 @@
 // Headless checks for the Changes page against a mocked backend.
 // Serves the built app and replaces Tauri's invoke bridge before any app code
 // runs, so every repo state can be shown without touching a real repository.
+import fs from "node:fs";
 import { launch, serve, tally, DIST_OK } from "./browser.mjs";
 import {
   REPOS,
@@ -98,10 +99,11 @@ async function openPage(browser, server, scenario, opts = {}) {
     /** The clone page: what git is doing, and how big GitHub says the repo is. */
     cloneProgress: opts.cloneProgress ?? null,
     cloneSize: opts.cloneSize ?? null,
+    /** How long the shell takes to start: the pty answers after this many ms. */
+    terminalOpenDelayMs: opts.terminalOpenDelayMs ?? 0,
   };
-  const page = await browser.newPage();
-  await page.setViewport({ width: cfg.width, height: 900 });
-  await page.evaluateOnNewDocument(
+  // Named, so another engine can be handed the very same bridge (webkit.sh).
+  const bridge = (
     (repos, status, diffText, diffBinary, cfg) => {
       window.__CALLS__ = [];
       window.__SCENARIO__ = status;
@@ -223,7 +225,10 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "console_clear":
               return Promise.resolve(null);
             case "terminal_open":
-              return Promise.resolve("test-session");
+              // The session id arrives when the shell has started — at once, or late.
+              return cfg.terminalOpenDelayMs
+                ? new Promise((res) => setTimeout(() => res("test-session"), cfg.terminalOpenDelayMs))
+                : Promise.resolve("test-session");
             case "terminal_write":
             case "terminal_resize":
             case "terminal_close":
@@ -383,13 +388,14 @@ async function openPage(browser, server, scenario, opts = {}) {
           }
         },
       };
-    },
-    REPOS,
-    scenario,
-    DIFF_TEXT,
-    DIFF_BINARY,
-    cfg
+    }
   );
+  if (opts.bridgeOnly) {
+    return `(${bridge.toString()})(${[REPOS, scenario, DIFF_TEXT, DIFF_BINARY, cfg].map((a) => JSON.stringify(a)).join(",")});`;
+  }
+  const page = await browser.newPage();
+  await page.setViewport({ width: cfg.width, height: 900 });
+  await page.evaluateOnNewDocument(bridge, REPOS, scenario, DIFF_TEXT, DIFF_BINARY, cfg);
   await page.goto(`${server.url}/repo/changes`, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 5000 });
   return page;
@@ -541,6 +547,17 @@ async function openClonePage(browser, server, opts = {}) {
   await page.goto(`${server.url}/sparse`, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => document.body.innerText.includes("Clone"), { timeout: 5000 });
   return page;
+}
+
+// webkit.sh loads the built app into the system's WebKit — the engine the app
+// itself runs in on macOS — and needs this same bridge as a script to inject.
+if (process.env.GITSWITCH_BRIDGE_OUT) {
+  const src = await openPage(null, null, SCENARIOS.clean, {
+    bridgeOnly: true,
+    terminalOpenDelayMs: Number(process.env.GITSWITCH_TERMINAL_DELAY_MS ?? 0),
+  });
+  fs.writeFileSync(process.env.GITSWITCH_BRIDGE_OUT, src);
+  process.exit(0);
 }
 
 const server = await serve();
@@ -1544,7 +1561,7 @@ try {
       submodules: [SUBMODULES[0], missing],
       subInner: SUB_INNER,
       hang: true,
-      cloneProgress: { phase: "Submodules", percent: 37, done: 3, total: 8, bytes: "10.00 MiB", rate: "2.00 MiB/s", detail: "libs/sub" },
+      cloneProgress: { phase: "Submodules", percent: 37, done: 3, total: 8, bytes: "10.00 MiB", rate: "2.00 MiB/s", detail: "libs/sub", estimate_kb: 1258291, eta_secs: 603 },
     });
     await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 8000 }).catch(() => null);
     await page.waitForFunction(() => document.body.innerText.includes("Download missing"), { timeout: 8000 }).catch(() => null);
@@ -1555,6 +1572,7 @@ try {
     const s = await text(page);
     ok("  (the Download button was there and enabled)", dlState !== null && dlState.disabled === false, JSON.stringify(dlState) + " | " + s.slice(s.indexOf("Submodules", s.indexOf("Submodules") + 1), s.indexOf("Submodules", s.indexOf("Submodules") + 1) + 500).replace(/\s+/g, " "));
     ok("while submodules download, the strip says which one and how far", s.includes("Downloading 1 submodule") && s.includes("Submodules 37%") && s.includes("3 of 8") && s.includes("libs/sub") && s.includes("2.00 MiB/s"), s.includes("Downloading") ? s.slice(s.indexOf("Downloading"), s.indexOf("Downloading") + 160) : "no 'Downloading' on the page: " + s.slice(0, 300).replace(/\s+/g, " "));
+    ok("  with how much of the submodule's size has arrived, and how long is left at that rate", s.includes("10.00 MiB of about 1.2 GB") && s.includes("about 10 min left"), s.slice(s.indexOf("Submodules 37%"), s.indexOf("Submodules 37%") + 140));
     ok("  as a bar", await page.evaluate(() => !!document.querySelector('[aria-label="Download progress"]')));
     await page.close();
   }
@@ -1830,7 +1848,7 @@ try {
       path: `/repos/team-${i}`,
       name: `team-repo-${i}`,
       profile_id: `acct-${i}`,
-      profile_name: i === 12 ? "Ethara" : `Team ${i}`,
+      profile_name: i === 12 ? "Acme" : `Team ${i}`,
       profile_email: `me${i}@x.test`,
     }));
     const page = await open(SCENARIOS.clean, { repos: [...REPOS, ...manyAccountRepos] });
@@ -1844,15 +1862,15 @@ try {
     await page.evaluate(() => {
       const i = document.querySelector('input[aria-label="Search"]');
       const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-      setter.call(i, "ethara");
+      setter.call(i, "acme");
       i.dispatchEvent(new Event("input", { bubbles: true }));
     });
     await sleep(200);
     const narrowed = await page.evaluate(() => ({
-      ethara: [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Ethara"),
+      acme: [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Acme"),
       teams: [...document.querySelectorAll("button")].filter((b) => b.innerText.trim().startsWith("Team ")).length,
     }));
-    ok("  and searching it works, ignoring case", narrowed.ethara && narrowed.teams === 0);
+    ok("  and searching it works, ignoring case", narrowed.acme && narrowed.teams === 0);
     await page.close();
   }
   {
@@ -1943,6 +1961,71 @@ try {
     ok("  and is honest that the guards can be stepped around", note.includes("not a barrier"));
     await page.close();
   }
+  // The rows the terminal draws, the box they are drawn in, and the rows the
+  // shell was last told it has. When the shell believes in more rows than are
+  // drawn, a full-screen program paints below the visible edge and the last
+  // lines cannot be reached — until something resizes the drawer.
+  const termShape = (page) => page.evaluate(() => {
+    const drawer = document.querySelector('[aria-label="Terminal"]');
+    const rowsEl = drawer?.querySelector(".xterm-rows");
+    const xterm = drawer?.querySelector(".xterm");
+    if (!rowsEl || !xterm) return null;
+    const host = xterm.parentElement.getBoundingClientRect();
+    const rows = rowsEl.children.length;
+    const cell = rows ? rowsEl.children[0].getBoundingClientRect().height : 0;
+    const lastBottom = rows ? rowsEl.lastElementChild.getBoundingClientRect().bottom : 0;
+    const sized = window.__CALLS__.filter((c) => c.cmd === "terminal_open" || c.cmd === "terminal_resize");
+    const last = sized[sized.length - 1];
+    return {
+      rows, cell: Math.round(cell * 100) / 100, boxHeight: Math.round(host.height), lastBottom: Math.round(lastBottom), boxBottom: Math.round(host.bottom),
+      windowHeight: window.innerHeight, toldRows: last?.args?.rows ?? null, toldBy: last?.cmd ?? null,
+      opened: window.__CALLS__.some((c) => c.cmd === "terminal_open"),
+    };
+  });
+  const openTerminal = async (page) => {
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"] .xterm-rows'), { timeout: 8000 });
+  };
+  {
+    const page = await open(SCENARIOS.clean);
+    await openTerminal(page);
+    await sleep(1500);
+    const s = await termShape(page);
+    ok("every row the terminal draws is inside the drawer: the last one ends above its bottom edge",
+      !!s && s.rows > 0 && s.lastBottom <= s.boxBottom + 1 && s.lastBottom <= s.windowHeight, JSON.stringify(s));
+    ok("  and the box is used: one more row would not fit",
+      !!s && s.cell > 0 && s.boxHeight - s.rows * s.cell < s.cell, JSON.stringify(s));
+    ok("  the shell was told the same number of rows it is drawn with", !!s && s.toldRows === s.rows, JSON.stringify(s));
+    // The box shrinks without the window changing: the note opens above it.
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.includes("What it guards")).click();
+    });
+    await sleep(900);
+    const n = await termShape(page);
+    ok("when the note opens above it the rows are fitted again, still inside the drawer",
+      !!n && n.rows < s.rows && n.lastBottom <= n.boxBottom + 1, JSON.stringify(n));
+    ok("  and the shell is told the new number", !!n && n.toldRows === n.rows && n.toldBy === "terminal_resize", JSON.stringify(n));
+    await page.close();
+  }
+  {
+    // A shell that takes a while to start: the box changes shape before the
+    // session exists, so the resize has nowhere to go at that moment.
+    const page = await open(SCENARIOS.clean, { terminalOpenDelayMs: 1800 });
+    await openTerminal(page);
+    await sleep(300);
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.includes("What it guards")).click();
+    });
+    await sleep(2600);
+    const s = await termShape(page);
+    ok("a shell that starts late is still told the rows the terminal ended up with",
+      !!s && s.rows > 0 && s.toldRows === s.rows, JSON.stringify(s));
+    ok("  which fit the drawer", !!s && s.lastBottom <= s.boxBottom + 1 && s.boxHeight - s.rows * s.cell < s.cell, JSON.stringify(s));
+    await page.close();
+  }
   {
     const page = await open(SCENARIOS.clean);
     await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
@@ -1968,8 +2051,8 @@ try {
   {
     // The drawer filters by account, the same way the Changes page does.
     const mixed = [
-      { path: "/repos/work-a", name: "work-a", profile_id: "p2", profile_name: "Ethara", profile_email: "me@work.test" },
-      { path: "/repos/work-b", name: "work-b", profile_id: "p2", profile_name: "Ethara", profile_email: "me@work.test" },
+      { path: "/repos/work-a", name: "work-a", profile_id: "p2", profile_name: "Acme", profile_email: "me@work.test" },
+      { path: "/repos/work-b", name: "work-b", profile_id: "p2", profile_name: "Acme", profile_email: "me@work.test" },
       { path: "/repos/mine-a", name: "mine-a", profile_id: "p1", profile_name: "Kirmada", profile_email: "me@personal.test" },
     ];
     const page = await open(SCENARIOS.clean, { repos: mixed });
@@ -1989,7 +2072,7 @@ try {
     });
     await sleep(200);
     await page.evaluate(() => {
-      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Ethara").click();
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Acme").click();
     });
     await sleep(400);
     ok("  choosing an account narrows the repositories to it", (await drawerText()).includes("work-"));
@@ -2453,7 +2536,34 @@ try {
     await page.waitForFunction(() => document.body.innerText.includes("Submodules 37%"), { timeout: 4000 });
     const s = await text(page);
     ok("while submodules download, the line says which one it is on", s.includes("Submodules 37%") && s.includes("3 of 8") && s.includes("libs/sub"), s.slice(s.indexOf("Submodules"), s.indexOf("Submodules") + 60));
-    ok("  without the GitHub size estimate, which is about the main download", !s.includes("of about"));
+    ok("  with no size and no time left claimed while nothing says either", !s.includes("of about") && !s.includes("left"));
+    await page.close();
+  }
+  {
+    // A submodule in flight: what its host says it weighs, what has arrived, and the time left.
+    const page = await openClonePage(browser, server, {
+      cloneHang: true,
+      cloneProgress: { phase: "Submodules", percent: 40, done: 3, total: 8, bytes: "10.00 MiB", rate: "2.00 MiB/s", detail: "libs/sub", estimate_kb: 1258291, eta_secs: 603 },
+    });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Clone").click());
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules 40%"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a submodule's download shows how much has arrived of its own size, the rate, and how long is left",
+      s.includes("libs/sub") && s.includes("10.00 MiB of about 1.2 GB") && s.includes("2.00 MiB/s") && s.includes("about 10 min left"),
+      s.slice(s.indexOf("Submodules 40%"), s.indexOf("Submodules 40%") + 160));
+    await page.close();
+  }
+  {
+    // A host that does not say how big the repository is: the time left still shows, the size does not.
+    const page = await openClonePage(browser, server, {
+      cloneHang: true,
+      cloneProgress: { phase: "Submodules", percent: 40, done: 3, total: 8, bytes: "10.00 MiB", rate: "2.00 MiB/s", detail: "libs/sub", eta_secs: 4200 },
+    });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Clone").click());
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules 40%"), { timeout: 4000 });
+    const s = await text(page);
+    ok("on a host that does not say the size, the time left still shows and no size is invented",
+      s.includes("about 1 h 10 min left") && !s.includes("of about"), s.slice(s.indexOf("Submodules 40%"), s.indexOf("Submodules 40%") + 160));
     await page.close();
   }
   {
@@ -2483,7 +2593,7 @@ try {
   {
     const page = await openClonePage(browser, server, {
       cloneHang: true,
-      cloneProgress: { phase: "Receiving objects", percent: 45, done: 556, total: 1234, bytes: "10.00 MiB", rate: "2.00 MiB/s" },
+      cloneProgress: { phase: "Receiving objects", percent: 45, done: 556, total: 1234, bytes: "10.00 MiB", rate: "2.00 MiB/s", estimate_kb: 1258291, eta_secs: 603 },
     });
     await page.waitForFunction(() => document.body.innerText.includes("About 1.2 GB on GitHub"), { timeout: 4000 });
     ok("before cloning, the page says how big GitHub says the repository is", true);

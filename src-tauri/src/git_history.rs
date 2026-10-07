@@ -924,7 +924,25 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
     let locals_before = snapshot_refs(&repo, "refs/heads");
     let remotes_before = snapshot_refs(&repo, "refs/remotes");
 
-    git(&repo, &["fetch", "--all", "--quiet"])?;
+    // Through the shared runner, so no credential prompt can hang it, and
+    // with git's progress on: only a long SILENCE stops it — never the size
+    // of what arrives, and never nothing at all (it used to wait for ever on
+    // a server that stopped answering). What arrives is kept as a pack
+    // (`fetch.unpackLimit=1`): git reports nothing while it unpacks a small
+    // fetch into loose objects, however long that takes. No submodule
+    // recursion, as everywhere else in the app — one unreachable submodule
+    // remote must not fail the refresh; a submodule is fetched from its own
+    // scope. Called from a blocking thread, hence `block_on`.
+    let fetched = tokio::runtime::Handle::current().block_on(
+        crate::git_exec::GitCmd::at(&repo)
+            .cfg("fetch.unpackLimit", "1")
+            .args(["fetch", "--all", "--progress", "--no-recurse-submodules"])
+            .stall(crate::git_exec::net_stall())
+            .run(),
+    )?;
+    if !fetched.ok() {
+        return Err(AppError::Command(crate::sparse::explain_clone_error(&fetched.stderr, None, "")));
+    }
 
     let head_after = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default();
     let worktree_after = git(&repo, &["status", "--porcelain"]).unwrap_or_default();

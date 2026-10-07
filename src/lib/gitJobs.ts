@@ -136,13 +136,37 @@ export async function runJob(
   }
 }
 
-/** "Submodules 37% · 3 of 8 · libs/sub · 10.00 MiB · 2.00 MiB/s" */
+/** "1.2 GB" from a host's kilobytes. */
+export function formatKb(kb: number): string {
+  if (kb < 1024) return `${kb} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
+  return `${(mb / 1024).toFixed(mb / 1024 < 10 ? 1 : 0)} GB`;
+}
+
+/** "about 10 min left" — an estimate, and worded as one. */
+export function timeLeftLabel(secs: number): string {
+  if (secs < 60) return "less than a minute left";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `about ${mins} min left`;
+  return `about ${Math.floor(mins / 60)} h ${mins % 60} min left`;
+}
+
+/** "10.00 MiB of about 1.2 GB" when the host said how big it is, else "10.00 MiB". */
+export function arrivedLabel(p: CloneProgress): string | null {
+  if (!p.bytes) return null;
+  return p.estimate_kb ? `${p.bytes} of about ${formatKb(p.estimate_kb)}` : p.bytes;
+}
+
+/** "Submodules 37% · 3 of 8 · libs/sub · 10.00 MiB of about 1.2 GB · 2.00 MiB/s · about 10 min left" */
 export function progressLine(p: CloneProgress): string {
   const parts = [`${p.phase}${p.percent !== null ? ` ${p.percent}%` : ""}`];
   if (p.done !== null && p.total !== null) parts.push(`${p.done.toLocaleString()} of ${p.total.toLocaleString()}`);
   if (p.detail) parts.push(p.detail);
-  if (p.bytes) parts.push(p.bytes);
+  const arrived = arrivedLabel(p);
+  if (arrived) parts.push(arrived);
   if (p.rate) parts.push(p.rate);
+  if (typeof p.eta_secs === "number") parts.push(timeLeftLabel(p.eta_secs));
   return parts.join(" · ");
 }
 

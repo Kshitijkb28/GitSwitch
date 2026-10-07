@@ -431,4 +431,78 @@ OUT=$(probe submodule "$SB/work")
 ok "submodule update reports what it restored" "$(printf '%s' "$OUT" | jqf headline)" "submodule(s) up to date"
 ok "  and the submodule really has its files back" "$([ -e "$SB/work/vendor/sub/s.txt" ] && echo present || echo MISSING)" "present"
 
+section "A pull or a push is stopped for silence, never for taking long"
+# The transfer used to have three minutes in total: a big repository on an
+# ordinary connection was cut off while it was still arriving. Now it runs
+# with git's progress on, and only a silence that long stops it.
+#
+# The remote speaks the pack protocol (file://), and the suite's own config
+# sends every pack through a hook that trickles it out — a slow connection.
+git init -q --bare "$SB/net.git"; git clone -q "file://$SB/net.git" "$SB/net-author" 2>/dev/null
+printf 'base\n' > "$SB/net-author/base.txt"; git -C "$SB/net-author" add -A >/dev/null; git -C "$SB/net-author" commit -qm base; git -C "$SB/net-author" push -q origin main 2>/dev/null
+git clone -q "file://$SB/net.git" "$SB/net-work" 2>/dev/null
+git clone -q "file://$SB/net.git" "$SB/net-stuck" 2>/dev/null
+git clone -q "file://$SB/net.git" "$SB/net-history" 2>/dev/null
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/net-author/blob$i.bin"; done
+git -C "$SB/net-author" add -A >/dev/null; git -C "$SB/net-author" commit -qm "about 3 MiB that will not compress"; git -C "$SB/net-author" push -q origin main 2>/dev/null
+cat > "$SB/trickle.sh" <<'TRICKLE'
+#!/bin/sh
+# Run the real program and pass its output on a little at a time.
+"$@" | perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.06); }'
+TRICKLE
+chmod +x "$SB/trickle.sh"
+git config --global uploadpack.packObjectsHook "$SB/trickle.sh"
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=2 probe pull "$SB/net-work" "ff-only"); T1=$(date +%s)
+# The History page's Fetch goes down the same slow road.
+H0=$(date +%s); HOUT=$(GITSWITCH_STALL_SECS=2 probe history_fetch "$SB/net-history"); H1=$(date +%s)
+git config --global --unset uploadpack.packObjectsHook
+ok "a pull that takes longer than the silence allowed, but keeps arriving, is not stopped" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$SB/net-work" rev-parse HEAD)" "True:$(git -C "$SB/net-author" rev-parse HEAD)"
+ok "  it really was slower than the window (2 s)" "$([ $((T1-T0)) -ge 3 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
+ok "  and every file arrived" "$(ls "$SB/net-work" | grep -c '^blob')" "24"
+ok "  git's progress counters stay out of the result" "$(printf '%s' "$OUT" | grep -c 'Receiving objects')" "0"
+ok "History's Fetch, just as slow, is not stopped either: the remote branch moved" "$(printf '%s' "$HOUT" | "$PY" -c 'import sys,json;print("moved" if json.load(sys.stdin).get("updated_remote_refs",0)>=1 else "none")'):$(git -C "$SB/net-history" rev-parse origin/main)" "moved:$(git -C "$SB/net-author" rev-parse HEAD)"
+ok "  it really was slower than the window (2 s)" "$([ $((H1-H0)) -ge 3 ] && echo "slow enough" || echo "too quick to prove anything: $((H1-H0))s")" "slow enough"
+ok "  and it fetched without touching the branch, the files or any local branch" "$(printf '%s' "$HOUT" | jqf head_unchanged):$(printf '%s' "$HOUT" | jqf worktree_unchanged):$(printf '%s' "$HOUT" | jqf local_branches_unchanged):$(git -C "$SB/net-history" rev-parse HEAD)" "True:True:True:$(git -C "$SB/net-author" rev-parse HEAD~1)"
+
+# A server that accepts the connection and never answers.
+"$PY" - > "$SB/stuck-port" <<'PYSRV' &
+import socket, time
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(8)
+print(s.getsockname()[1], flush=True)
+while True:
+    c, _ = s.accept(); time.sleep(3600)
+PYSRV
+STUCK_PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SB/stuck-port" ] && break; sleep 0.5; done
+PORT="$(cat "$SB/stuck-port")"
+git -C "$SB/net-stuck" remote set-url origin "git://127.0.0.1:$PORT/net.git"
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=3 probe pull "$SB/net-stuck" "ff-only"); T1=$(date +%s)
+ok "a pull from a server that never answers is stopped" "$OUT" "made no progress for 3s and was stopped"
+ok "  after the silence, not after three minutes" "$([ $((T1-T0)) -lt 60 ] && echo quick || echo "slow: $((T1-T0))s")" "quick"
+ok "  and nothing moved" "$(git -C "$SB/net-stuck" rev-parse HEAD):$(git -C "$SB/net-stuck" status --porcelain | wc -l | tr -d ' ')" "$(git -C "$SB/net-author" rev-parse HEAD~1):0"
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=3 probe history_fetch "$SB/net-stuck"); T1=$(date +%s)
+ok "History's Fetch from a server that never answers is stopped too — it used to wait for ever" "$OUT" "made no progress for 3s and was stopped"
+ok "  after the silence" "$([ $((T1-T0)) -lt 60 ] && echo quick || echo "slow: $((T1-T0))s")" "quick"
+printf 'mine\n' > "$SB/net-stuck/mine.txt"; git -C "$SB/net-stuck" add -A >/dev/null; git -C "$SB/net-stuck" commit -qm "mine"
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=3 probe push "$SB/net-stuck" ""); T1=$(date +%s)
+ok "a push to a server that never answers is stopped the same way" "$OUT" "made no progress for 3s and was stopped"
+ok "  after the silence, not after three minutes" "$([ $((T1-T0)) -lt 60 ] && echo quick || echo "slow: $((T1-T0))s")" "quick"
+ok "  and the commit is still here, unpushed" "$(git -C "$SB/net-stuck" log -1 --format=%s)" "mine"
+{ kill "$STUCK_PID" && wait "$STUCK_PID"; } 2>/dev/null
+
+# A slow push: the far side reads the pack a little at a time.
+cat > "$SB/slow-receive.sh" <<'SLOWRCV'
+#!/bin/sh
+# What `git push` runs on the far side, with its input slowed down.
+perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.06); }' | git receive-pack "$@"
+SLOWRCV
+chmod +x "$SB/slow-receive.sh"
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/net-work/mine$i.bin"; done
+git -C "$SB/net-work" add -A >/dev/null; git -C "$SB/net-work" commit -qm "about 3 MiB of mine"
+git -C "$SB/net-work" config remote.origin.receivepack "$SB/slow-receive.sh"
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=2 probe push "$SB/net-work" ""); T1=$(date +%s)
+git -C "$SB/net-work" config --unset remote.origin.receivepack
+ok "a push that takes longer than the silence allowed, but keeps going, is not stopped" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$SB/net.git" rev-parse main)" "True:$(git -C "$SB/net-work" rev-parse HEAD)"
+ok "  it really was slower than the window (2 s)" "$([ $((T1-T0)) -ge 3 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
+
 verify_result

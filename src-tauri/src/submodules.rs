@@ -707,17 +707,17 @@ mod tests {
     fn gitmodules_is_keyed_by_path_not_name() {
         let out = cfg_z(&[
             ("submodule.trinity.path", "trinity"),
-            ("submodule.trinity.url", "org-302118749@github.com:EtharaOrion/trinity.git"),
+            ("submodule.trinity.url", "org-1234567@github.com:AcmeOrg/trinity.git"),
             ("submodule.trinity.branch", "main"),
             ("submodule.staging.path", "staging"),
-            ("submodule.staging.url", "org-302118749@github.com:EtharaOrion/staging.git"),
+            ("submodule.staging.url", "org-1234567@github.com:AcmeOrg/staging.git"),
         ]);
         let cfg = parse_gitmodules(&out);
         assert_eq!(cfg.len(), 2);
         let t = &cfg["trinity"];
         assert_eq!(t.name, "trinity");
         assert_eq!(t.branch.as_deref(), Some("main"));
-        assert!(t.url.as_deref().unwrap().contains("EtharaOrion/trinity"));
+        assert!(t.url.as_deref().unwrap().contains("AcmeOrg/trinity"));
         // No branch declared is normal.
         assert!(cfg["staging"].branch.is_none());
     }

@@ -25,6 +25,7 @@ import { useToast } from "../components/Toast";
 import { baseName, isWithin, normPath } from "../lib/paths";
 import { usePersistedState, handOff } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
+import { arrivedLabel, formatKb, timeLeftLabel } from "../lib/gitJobs";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
 import { RefreshButton } from "../components/RefreshButton";
@@ -46,37 +47,6 @@ function profileForFolder(dir: string, profiles: Profile[]): Profile | null {
 }
 
 /** Folder name git will create — mirrors the backend's repo_name_from_url. */
-/** "1.2 GB" from GitHub's kilobytes. */
-/** "10.00 MiB" / "2.00 MiB/s", as git prints them, in bytes. */
-function gitSizeBytes(s: string): number | null {
-  const m = /^\s*([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\b/.exec(s);
-  if (!m) return null;
-  const unit = { B: 1, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3, TiB: 1024 ** 4 }[m[2] as "B" | "KiB" | "MiB" | "GiB" | "TiB"];
-  return parseFloat(m[1]) * unit;
-}
-
-/**
- * "about 10 min left", from what has arrived, how fast, and how big GitHub
- * says the repository is — only the main download has that estimate.
- */
-function timeLeft(bytes: string, rate: string, estimateKb: number): string | null {
-  const have = gitSizeBytes(bytes);
-  const perSec = gitSizeBytes(rate);
-  if (have === null || perSec === null || perSec <= 0) return null;
-  const secs = Math.max(0, estimateKb * 1024 - have) / perSec;
-  if (secs < 60) return "less than a minute left";
-  const mins = Math.round(secs / 60);
-  if (mins < 60) return `about ${mins} min left`;
-  return `about ${Math.floor(mins / 60)} h ${mins % 60} min left`;
-}
-
-function formatKb(kb: number): string {
-  if (kb < 1024) return `${kb} KB`;
-  const mb = kb / 1024;
-  if (mb < 1024) return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
-  return `${(mb / 1024).toFixed(mb / 1024 < 10 ? 1 : 0)} GB`;
-}
-
 function repoNameFromUrl(url: string): string {
   const t = url.trim().replace(/\/+$/, "").replace(/(\.git)+$/, "");
   const parts = t.split(/[/:]/);
@@ -503,11 +473,13 @@ export function SparseClone() {
                     {progress.detail && <span className="text-zinc-500"> · {progress.detail}</span>}
                   </span>
                   <span className="text-zinc-500 tabular-nums">
-                    {progress.bytes}
-                    {progress.bytes && sizeEstimate && !progress.detail && ` of about ${formatKb(sizeEstimate.kb)}`}
+                    {arrivedLabel(progress)}
                     {progress.rate && ` · ${progress.rate}`}
-                    {progress.bytes && progress.rate && sizeEstimate && !progress.detail && (() => {
-                      const left = timeLeft(progress.bytes, progress.rate, sizeEstimate.kb);
+                    {(() => {
+                      // The backend says how long is left: against the host's
+                      // size when it is known, the objects otherwise — for the
+                      // main download and for each submodule alike.
+                      const left = typeof progress.eta_secs === "number" ? timeLeftLabel(progress.eta_secs) : null;
                       return left ? ` · ${left}` : "";
                     })()}
                   </span>

@@ -40,6 +40,9 @@ if [ -d "$HERE/harness/node_modules/puppeteer-core" ] && [ -n "$JS" ]; then
   run "Headless UI"           harness ui.mjs
   run "Headless UI (History)" harness history.mjs
   run "Layout sweep"          harness sweep.mjs
+  # The terminal drawer measured in the system's WebKit, the engine the app
+  # runs in on macOS; says SKIPPED (and passes) anywhere else.
+  run "Terminal in WebKit"    bash "$HERE/webkit.sh"
   # The two pages against the REAL backend (probe's `invoke` op) in a sandbox: needs git, cargo and Chrome.
   run "Live UI ↔ backend"     harness live.mjs
 else

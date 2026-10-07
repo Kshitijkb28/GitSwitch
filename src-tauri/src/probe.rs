@@ -293,6 +293,15 @@ pub(crate) mod tests {
                 let autostash = a.iter().skip(1).any(|s| s == "autostash");
                 show(git_ops::pull(&repo(), PullMode::parse(first).unwrap(), with_lfs, autostash).await)
             }
+            // The History page's Fetch, on a blocking thread as the command runs it.
+            "history_fetch" => {
+                let r = repo();
+                match tokio::task::spawn_blocking(move || crate::git_history::fetch_repo(&r)).await {
+                    Ok(Ok(res)) => emit(&res),
+                    Ok(Err(e)) => emit_err(e),
+                    Err(e) => emit_err(e),
+                }
+            }
             "peek" => match crate::peek::peek_remote(&repo()).await {
                 Ok(r) => emit(&r),
                 Err(e) => emit_err(e),
@@ -392,6 +401,22 @@ pub(crate) mod tests {
                     std::time::Duration::from_secs(20),
                 ) {
                     Ok(out) => emit(&serde_json::json!({ "output": out })),
+                    Err(e) => emit_err(e),
+                }
+            }
+            // PROBE_ARGS = "<cols>x<rows>,<cols>x<rows>,<line>": the line run in a
+            // shell opened at the first size, and again after a resize to the
+            // second — what the shell itself reports each time.
+            "term_resized" => {
+                let size = |s: &str| -> (u16, u16) {
+                    let (c, r) = s.split_once('x').unwrap_or(("80", "24"));
+                    (c.trim().parse().unwrap_or(80), r.trim().parse().unwrap_or(24))
+                };
+                let first_size = size(first);
+                let second_size = size(a.get(1).map(|s| s.as_str()).unwrap_or(""));
+                let line = a.iter().skip(2).cloned().collect::<Vec<_>>().join(",");
+                match crate::terminal::run_resized(&repo(), &line, first_size, second_size, std::time::Duration::from_secs(20)) {
+                    Ok((before, after)) => emit(&serde_json::json!({ "first": before, "second": after })),
                     Err(e) => emit_err(e),
                 }
             }

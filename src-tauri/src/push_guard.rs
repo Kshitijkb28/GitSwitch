@@ -821,8 +821,8 @@ mod tests {
             Some("git@github.com:")
         );
         assert_eq!(
-            derive_push_prefix("org-302118749@github.com:EtharaOrion/argos.git").as_deref(),
-            Some("org-302118749@github.com:")
+            derive_push_prefix("org-1234567@github.com:AcmeOrg/widgets.git").as_deref(),
+            Some("org-1234567@github.com:")
         );
         assert_eq!(
             derive_push_prefix("ssh://git@github.com/o/r.git").as_deref(),

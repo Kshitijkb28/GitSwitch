@@ -37,11 +37,31 @@ fn short(oid: &str) -> String {
 /// `owner/repo` from a GitHub remote URL (ssh or https), else None.
 pub fn github_slug(url: &str) -> Option<(String, String)> {
     let u = url.trim().trim_end_matches('/');
-    let rest = u
-        .strip_prefix("git@github.com:")
-        .or_else(|| u.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| u.strip_prefix("https://github.com/"))
-        .or_else(|| u.strip_prefix("http://github.com/"))?;
+    let rest = if let Some(web) = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")) {
+        // `https://github.com/o/r`, also with a user or token before the host.
+        let web = web.rsplit_once('@').map(|(_, host)| host).unwrap_or(web);
+        web.strip_prefix("github.com/")?
+    } else if let Some(ssh) = u.strip_prefix("ssh://") {
+        // `ssh://<user>@github.com[:port]/o/r`
+        let (user, at_host) = ssh.split_once('@')?;
+        if user.is_empty() || user.contains('/') {
+            return None;
+        }
+        let path = at_host.strip_prefix("github.com")?;
+        match path.split_once('/') {
+            Some(("", p)) => p,
+            Some((port, p)) if port.strip_prefix(':').is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) => p,
+            _ => return None,
+        }
+    } else {
+        // `<user>@github.com:o/r` — the user is `git`, or `org-<id>` where an
+        // organisation issues its own SSH certificates.
+        let (user, at_host) = u.split_once('@')?;
+        if user.is_empty() || user.contains('/') || user.contains(':') {
+            return None;
+        }
+        at_host.strip_prefix("github.com:")?
+    };
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
     let mut it = rest.splitn(2, '/');
     let owner = it.next()?.to_string();
@@ -176,5 +196,17 @@ mod tests {
         assert_eq!(github_slug("ssh://git@github.com/o/r.git"), Some(("o".into(), "r".into())));
         assert_eq!(github_slug("/tmp/remote.git"), None);
         assert_eq!(github_slug("git@gitlab.com:o/r.git"), None);
+        // The user before the host is whatever the organisation hands out.
+        assert_eq!(github_slug("org-12345@github.com:acme/widgets.git"), Some(("acme".into(), "widgets".into())));
+        assert_eq!(github_slug("ssh://org-12345@github.com/acme/widgets"), Some(("acme".into(), "widgets".into())));
+        assert_eq!(github_slug("ssh://git@github.com:22/o/r.git"), Some(("o".into(), "r".into())));
+        assert_eq!(github_slug("https://x-access-token@github.com/o/r.git"), Some(("o".into(), "r".into())));
+        // A host that only starts like GitHub's is not GitHub.
+        assert_eq!(github_slug("git@github.com.example.test:o/r.git"), None);
+        assert_eq!(github_slug("https://github.com.example.test/o/r"), None);
+        assert_eq!(github_slug("ssh://git@github.community/o/r"), None);
+        assert_eq!(github_slug("org-1@gitlab.com:o/r.git"), None);
+        assert_eq!(github_slug("github.com:o/r"), None);
+        assert_eq!(github_slug("git@github.com:o/r/extra"), None);
     }
 }

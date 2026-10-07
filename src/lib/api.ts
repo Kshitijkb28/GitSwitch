@@ -512,6 +512,10 @@ export interface CloneProgress {
   rate: string | null;
   /** What is being worked on right now: the submodule being fetched, the large file being downloaded. */
   detail?: string;
+  /** What the host says the repository being downloaded weighs, in kilobytes; absent when it does not say. */
+  estimate_kb?: number;
+  /** Seconds left at the current rate; absent when there is nothing to base it on yet. */
+  eta_secs?: number;
 }
 
 export async function cloneProgress(destPath: string): Promise<CloneProgress | null> {

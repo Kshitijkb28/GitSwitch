@@ -544,7 +544,9 @@ pub fn validate_repo_path(p: &str) -> Result<(), AppError> {
 
 /// The argv for a push. Pure, so a test can prove what it can never contain.
 pub fn build_push_args(remote: &str, local_branch: &str, remote_ref: &str, set_upstream: bool) -> Vec<String> {
-    let mut a: Vec<String> = vec!["push".into(), "--porcelain".into()];
+    // `--progress`: the counters keep coming while bytes move, so the push is
+    // stopped only for silence (`stall`), never for the size of what it sends.
+    let mut a: Vec<String> = vec!["push".into(), "--porcelain".into(), "--progress".into()];
     if set_upstream {
         a.push("--set-upstream".into());
     }
@@ -1620,7 +1622,7 @@ pub async fn push(repo_path: &str, set_upstream: bool, allow_unpushed_submodules
     let args = build_push_args(&remote, &branch, &remote_ref, needs_upstream);
     let out = GitCmd::at(repo_path)
         .args(args)
-        .timeout(NET_TIMEOUT)
+        .stall(crate::git_exec::net_stall())
         .run()
         .await?;
 
@@ -1730,10 +1732,14 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
     // Fetch only the remote's own refs: no refspec, no --prune, no --tags, so
     // nothing local can move in this step. No submodule recursion either —
     // `fetch.recurseSubmodules=on-demand` would fail the whole pull on one
-    // unreachable submodule remote.
+    // unreachable submodule remote. `--progress`, so a big fetch is stopped
+    // only when it goes silent, never for taking long — and kept as a pack
+    // (`fetch.unpackLimit=1`), because git reports nothing at all while it
+    // unpacks a fetch of under a hundred objects, however big they are.
     let fetched = GitCmd::at(repo_path)
-        .args(["fetch", "--quiet", "--no-recurse-submodules", "--", &remote])
-        .timeout(NET_TIMEOUT)
+        .cfg("fetch.unpackLimit", "1")
+        .args(["fetch", "--progress", "--no-recurse-submodules", "--", &remote])
+        .stall(crate::git_exec::net_stall())
         .run()
         .await?;
     if !fetched.ok() {

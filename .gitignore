@@ -39,3 +39,8 @@ dist-linux
 *.njsproj
 *.sln
 *.sw?
+
+# Claude Code: per-machine settings and scratch space, never part of the app
+.claude/settings.local.json
+.claude/scratch/
+.claude/worktrees/

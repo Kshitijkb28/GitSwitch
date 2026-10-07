@@ -35,6 +35,16 @@ pub struct CloneProgress {
     /// so a reader written before this field existed still parses the rest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// What the host says the repository being downloaded weighs, in
+    /// kilobytes — "10.00 MiB of about 1.2 GB". Only when the host says, and
+    /// only while what has arrived is still below it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_kb: Option<u64>,
+    /// Seconds left at the current rate: against the host's size when it is
+    /// known, otherwise against the share of objects that has arrived. Only
+    /// for a download that reports bytes and a rate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<u64>,
 }
 
 /// `done` out of `total`, as a whole percentage; `None` with no total to
@@ -48,7 +58,7 @@ fn percent_of(done: u64, total: u64) -> Option<u8> {
 
 impl CloneProgress {
     fn phase(name: &str) -> Self {
-        CloneProgress { phase: name.to_string(), percent: None, done: None, total: None, bytes: None, rate: None, detail: None }
+        CloneProgress { phase: name.to_string(), percent: None, done: None, total: None, bytes: None, rate: None, detail: None, estimate_kb: None, eta_secs: None }
     }
 
     /// `done` submodules checked out of `total`; `current` is the one being
@@ -111,7 +121,7 @@ pub fn parse_clone_progress(line: &str) -> Option<CloneProgress> {
     let line = line.trim().trim_start_matches("remote: ").trim();
     let phase = PHASES.iter().find(|p| line.starts_with(*p))?;
     let rest = line[phase.len()..].trim_start_matches(':').trim();
-    let mut p = CloneProgress { phase: phase.to_string(), percent: None, done: None, total: None, bytes: None, rate: None, detail: None };
+    let mut p = CloneProgress::phase(phase);
     // "45% (556/1234), 10.00 MiB | 2.00 MiB/s, done." — pieces separated by commas.
     for (i, piece) in rest.split(',').enumerate() {
         let piece = piece.trim();
@@ -134,6 +144,75 @@ pub fn parse_clone_progress(line: &str) -> Option<CloneProgress> {
         }
     }
     Some(p)
+}
+
+/// "10.00 MiB" / "2.00 MiB/s", as git prints them, in bytes.
+fn git_size_bytes(s: &str) -> Option<f64> {
+    let s = s.trim().trim_end_matches("/s").trim();
+    let (number, unit) = s.split_once(' ')?;
+    let n: f64 = number.trim().parse().ok()?;
+    let scale = match unit.trim() {
+        "bytes" | "B" => 1.0,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    (n >= 0.0).then_some(n * scale)
+}
+
+/// How long a download has left, and the size to show beside what arrived.
+///
+/// With the host's size for the repository (`estimate_kb`), the rest of it at
+/// the current rate. Without one — any host that does not say, or a
+/// repository nobody signed in here may ask about — the share of objects that
+/// has arrived stands in for the share of bytes; that is rough (history comes
+/// first and is small), so it is only used once a twentieth has arrived.
+/// A size the download has already passed was wrong: it is dropped, not shown.
+/// Returns (estimate to show, seconds left).
+pub(crate) fn download_estimate(bytes: Option<&str>, rate: Option<&str>, percent: Option<u8>, estimate_kb: Option<u64>) -> (Option<u64>, Option<u64>) {
+    let Some(have) = bytes.and_then(git_size_bytes) else { return (None, None) };
+    let estimate = estimate_kb.filter(|kb| (*kb as f64) * 1024.0 > have);
+    let Some(per_sec) = rate.and_then(git_size_bytes).filter(|r| *r > 0.0) else { return (estimate, None) };
+    let left = match estimate {
+        Some(kb) => Some((kb as f64) * 1024.0 - have),
+        None => percent.filter(|p| (5..100).contains(p)).map(|p| have * (100.0 - p as f64) / p as f64),
+    };
+    (estimate, left.map(|bytes_left| (bytes_left / per_sec).round() as u64))
+}
+
+/// The size the host reports and the time left, added to a line of a
+/// download in flight. Other phases (counting, deltas, checkout) pass through.
+fn with_estimate(mut p: CloneProgress, estimate_kb: Option<u64>) -> CloneProgress {
+    if p.phase == "Receiving objects" {
+        let (estimate, eta) = download_estimate(p.bytes.as_deref(), p.rate.as_deref(), p.percent, estimate_kb);
+        p.estimate_kb = estimate;
+        p.eta_secs = eta;
+    }
+    p
+}
+
+/// A cell the host's answer lands in while the download is already running:
+/// asking must never hold the download up.
+type EstimateCell = std::sync::Arc<std::sync::Mutex<Option<u64>>>;
+
+fn ask_size(url: &str) -> (EstimateCell, Option<tokio::task::JoinHandle<()>>) {
+    let cell: EstimateCell = Default::default();
+    // Only a host that can be asked: for every other address there is
+    // nothing to wait for, and nothing leaves this computer.
+    if crate::peek::github_slug(url).is_none() {
+        return (cell, None);
+    }
+    let (into, url) = (cell.clone(), url.to_string());
+    let task = tokio::spawn(async move {
+        if let Some(e) = clone_size_estimate(&url).await {
+            if let Ok(mut c) = into.lock() {
+                *c = Some(e.kb);
+            }
+        }
+    });
+    (cell, Some(task))
 }
 
 type ProgressMap = std::collections::HashMap<String, CloneProgress>;
@@ -218,12 +297,15 @@ fn submodule_stall() -> std::time::Duration {
 /// terminal) goes to `on_progress` for the page's bar. With `stall` set, a
 /// command that reports nothing for that long is stopped, its whole process
 /// tree with it — never one that is still reporting, however long it takes.
-/// `cfg` are `-c key=value` pairs for this one command.
+/// `cfg` are `-c key=value` pairs for this one command. `armed`: the stall
+/// clock runs from the start (a command that may sit on the network before it
+/// says anything) — otherwise only from the first "Cloning into".
 async fn run_git_streaming(
     repo: Option<&Path>,
     cfg: &[String],
     args: &[&str],
     stall: Option<std::time::Duration>,
+    armed: bool,
     on_progress: &(dyn Fn(CloneProgress) + Sync),
 ) -> Result<String, AppError> {
     use tokio::io::AsyncReadExt;
@@ -313,7 +395,7 @@ async fn run_git_streaming(
     // follows is local work that says nothing while it works (a long
     // checkout, a smudge filter downloading large files) and must never
     // be called a stall. A nested submodule's next "Cloning into" re-arms.
-    let mut transferring = stall.is_some();
+    let mut transferring = stall.is_some() && armed;
     let status = loop {
         tokio::select! {
             s = child.wait() => break Some(s),
@@ -396,6 +478,16 @@ pub struct CloneSizeEstimate {
 /// not GitHub's, or GitHub will not say.
 pub async fn clone_size_estimate(url: &str) -> Option<CloneSizeEstimate> {
     let (owner, repo) = crate::peek::github_slug(url)?;
+    // The page asks when the address is typed and the clone asks again a
+    // moment later: the answer is kept for a few minutes, not asked twice.
+    static KNOWN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u64)>>> = std::sync::OnceLock::new();
+    let slug = format!("{}/{}", owner, repo).to_lowercase();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some((at, kb)) = known.lock().ok().and_then(|m| m.get(&slug).copied()) {
+        if at.elapsed() < std::time::Duration::from_secs(600) {
+            return Some(CloneSizeEstimate { repo: format!("{}/{}", owner, repo), kb });
+        }
+    }
     let client = crate::github::http_client().ok()?;
     let api = format!("{}/repos/{}/{}", crate::remote_repos::api_base(), owner, repo);
     let mut tokens: Vec<Option<String>> = Vec::new();
@@ -416,6 +508,9 @@ pub async fn clone_size_estimate(url: &str) -> Option<CloneSizeEstimate> {
         }
         let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
         if let Some(kb) = v.get("size").and_then(|s| s.as_u64()) {
+            if let Ok(mut m) = known.lock() {
+                m.insert(slug.clone(), (std::time::Instant::now(), kb));
+            }
             return Some(CloneSizeEstimate { repo: format!("{}/{}", owner, repo), kb });
         }
     }
@@ -844,20 +939,91 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
         // ssh override is a `-c` for this command only.
         let cfg: Vec<String> = ssh_override.map(|kv| vec![kv.to_string()]).unwrap_or_default();
         let total = listed.len();
+        let sub_dir = repo.join(path);
+        let recorded = run_git(Some(repo), &["ls-files", "-s", "--", path])
+            .await
+            .ok()
+            .and_then(|o| o.lines().next().and_then(|l| l.split_whitespace().nth(1)).map(str::to_string));
+        let have_recorded = |sha: String| {
+            let dir = sub_dir.clone();
+            async move { run_git(Some(&dir), &["cat-file", "-e", &format!("{}^{{commit}}", sha)]).await.is_ok() }
+        };
+        // Downloaded before, and the commit the superproject records is not
+        // here: `submodule update` would fetch it itself — without a word of
+        // progress, so a long fetch could not be shown and looked like a
+        // stall. It is fetched first, here, with git's progress on.
+        let must_fetch = match &recorded {
+            Some(sha) if own_repository(&sub_dir).await => !have_recorded(sha.clone()).await,
+            _ => false,
+        };
+        // What its host says it weighs, for "of about 1.2 GB" and the time
+        // left — for a first download only: a fetch brings what is new, a
+        // fraction of it. Its address as git resolves it (a relative one
+        // against the superproject's): `init` is what `update --init` does first.
+        let (size, asking) = if progress_for.is_some() && !must_fetch {
+            let _ = run_git(Some(repo), &["submodule", "init", "--", path]).await;
+            let address = run_git(Some(repo), &["config", "--get", &format!("submodule.{}.url", name)]).await.unwrap_or_default();
+            ask_size(address.trim())
+        } else {
+            (EstimateCell::default(), None)
+        };
+        // `--recursive` downloads the submodules nested inside this one in
+        // the same command; the host's size is for this one alone, so it
+        // applies to the first download only.
+        let first_done = std::sync::atomic::AtomicBool::new(false);
         let on_progress = |inner: CloneProgress| {
             if let Some(dest) = progress_for {
                 // The bar is the submodules' share, filling once per
                 // submodule as its download comes in; the other inner phases
                 // (counting, compressing, deltas) do not move it back.
-                let percent = if inner.phase == "Receiving objects" {
+                let receiving = inner.phase == "Receiving objects";
+                let percent = if receiving {
                     Some(((finished as u64 * 100 + inner.percent.unwrap_or(0) as u64) / total.max(1) as u64) as u8)
                 } else {
                     percent_of(finished as u64, total as u64)
                 };
-                set_progress(dest, CloneProgress { percent, bytes: inner.bytes, rate: inner.rate, ..CloneProgress::submodules(finished, total, Some(path)) });
+                let nested = first_done.load(std::sync::atomic::Ordering::Relaxed);
+                let known = if nested { None } else { size.lock().ok().and_then(|c| *c) };
+                let (estimate_kb, eta_secs) = if receiving { download_estimate(inner.bytes.as_deref(), inner.rate.as_deref(), inner.percent, known) } else { (None, None) };
+                if receiving && inner.percent == Some(100) {
+                    first_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                set_progress(dest, CloneProgress { percent, bytes: inner.bytes, rate: inner.rate, estimate_kb, eta_secs, ..CloneProgress::submodules(finished, total, Some(path)) });
             }
         };
-        let mut res = run_git_streaming(Some(repo), &cfg, &["submodule", "update", "--init", "--recursive", "--progress", "--", path], Some(submodule_stall()), &on_progress).await;
+        let mut fetched = false;
+        let mut stalled: Option<AppError> = None;
+        if must_fetch {
+            // Kept as a pack (`fetch.unpackLimit=1`): git says nothing while
+            // it unpacks a fetch of under a hundred objects, however big.
+            let mut fetch_cfg = cfg.clone();
+            fetch_cfg.push("fetch.unpackLimit=1".into());
+            match run_git_streaming(Some(&sub_dir), &fetch_cfg, &["fetch", "--progress", "--no-recurse-submodules"], Some(submodule_stall()), true, &on_progress).await {
+                Ok(_) => fetched = true,
+                // Stopped for silence: the update would fetch from the same
+                // remote and wait as long again. Any other failure is left to
+                // git's own update, exactly as before.
+                Err(e) if is_stall(&e) => stalled = Some(e),
+                Err(_) => {}
+            }
+        }
+        let mut res = match stalled {
+            Some(e) => Err(e),
+            None => {
+                // With the commit already fetched there is nothing left to
+                // download but nested submodules: the clock waits for one of
+                // them to start ("Cloning into") — a long silent checkout
+                // (a smudge filter fetching large files) is not a stall.
+                let nothing_to_fetch = fetched && match &recorded {
+                    Some(sha) => have_recorded(sha.clone()).await,
+                    None => false,
+                };
+                run_git_streaming(Some(repo), &cfg, &["submodule", "update", "--init", "--recursive", "--progress", "--", path], Some(submodule_stall()), !nothing_to_fetch, &on_progress).await
+            }
+        };
+        if let Some(t) = asking {
+            t.abort();
+        }
         // A module directory that holds the commits but has nothing checked
         // out (HEAD pointing nowhere) makes `submodule update` give up
         // ("Unable to find current revision"): when the recorded commit is
@@ -891,7 +1057,7 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
     report.failed_paths = failed.clone();
     if let Some(err) = first_error {
         report.error = Some(format!(
-            "Couldn't download: {}.\n\n{}\n\nOnce that's sorted, run `git submodule update --recursive` inside the repo to fetch {}.",
+            "Couldn't download: {}.\n\n{}\n\nOnce that's sorted, Download on the repository's Submodules tab fetches {} — what already arrived is kept (in a terminal: `git submodule update --init --recursive`).",
             failed.join(", "),
             err,
             if failed.len() == 1 { "it" } else { "them" }
@@ -978,6 +1144,21 @@ async fn clear_incomplete(repo: &Path, name: &str, path: &str) -> Option<String>
     Some(path.to_string())
 }
 
+/// The folder is a repository of its own — never the superproject above it,
+/// which git finds when the folder has no `.git` of its own.
+async fn own_repository(dir: &Path) -> bool {
+    if !dir.join(".git").exists() {
+        return false;
+    }
+    let Ok(top) = run_git(Some(dir), &["rev-parse", "--show-toplevel"]).await else { return false };
+    let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+    canonical(Path::new(top.trim())).is_some() && canonical(Path::new(top.trim())) == canonical(dir)
+}
+
+fn is_stall(e: &AppError) -> bool {
+    matches!(e, AppError::Command(m) if m.contains("made no progress for"))
+}
+
 async fn is_checked_out(dir: &Path) -> bool {
     if !dir.join(".git").exists() || run_git(Some(dir), &["rev-parse", "--verify", "HEAD"]).await.is_err() {
         return false;
@@ -1018,16 +1199,97 @@ pub(crate) fn uses_org_certificate_url(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A failure of the network itself — the server never reached, its name not
+/// found, the connection dropped part way — as a sentence saying so, or
+/// `None` when the server answered and refused.
+///
+/// Read before anything else. ssh ends EVERY failure with "Could not read
+/// from remote repository", a timed-out connection included; taking that
+/// line for a refusal sends a person to their keys and their account when
+/// their network dropped.
+pub(crate) fn network_failure(stderr: &str) -> Option<String> {
+    let s = stderr.to_lowercase();
+    let has = |needle: &str| s.contains(needle);
+    // The server answered and said no: that is not the network.
+    if has("permission denied")
+        || has("repository not found")
+        || has("saml sso")
+        || has("host key verification failed")
+        || has("could not read username")
+        || has("terminal prompts disabled")
+        || has("authentication failed")
+        || has("invalid username or password")
+    {
+        return None;
+    }
+    let blameless = "Nothing is wrong with the key or the account.";
+    if has("could not resolve host") || has("name or service not known") || has("nodename nor servname") || has("temporary failure in name resolution") {
+        return Some(format!(
+            "This computer could not look up the server's name: it is offline, or its DNS is not answering. {} Check the connection (and the VPN, if the repository needs one), then try again.",
+            blameless
+        ));
+    }
+    let unreachable = (has("connect to host") && (has("timed out") || has("connection refused") || has("network is unreachable") || has("no route to host")))
+        || has("failed to connect to")
+        || has("couldn't connect to server")
+        || has("connection timed out")
+        || has("kex_exchange_identification");
+    if unreachable {
+        let mut m = format!(
+            "The server could not be reached: the connection was never made. {} Check the connection (and the VPN, if the repository needs one), then try again.",
+            blameless
+        );
+        // Port 22 itself, not 2222 or 22022.
+        let port_22 = s.match_indices("port 22").any(|(i, m)| !s[i + m.len()..].starts_with(|c: char| c.is_ascii_digit()));
+        if port_22 {
+            m.push_str(" Some networks block port 22, the one SSH uses");
+            if has("github.com") {
+                m.push_str(": GitHub also answers SSH on port 443 — in ~/.ssh/config, under `Host github.com`, set `HostName ssh.github.com` and `Port 443` — or use the repository's HTTPS address.");
+            } else {
+                m.push_str("; the repository's HTTPS address goes through where SSH does not.");
+            }
+        }
+        return Some(m);
+    }
+    let dropped = has("unexpected disconnect")
+        || has("early eof")
+        || has("unexpected eof")
+        || has("remote end hung up unexpectedly")
+        || has("connection reset")
+        || has("broken pipe")
+        || has("closed by remote host")
+        || has("connection closed by")
+        || has("rpc failed")
+        || has("outstanding read data remaining")
+        || has("was not closed cleanly")
+        || has("ssl_error_syscall")
+        || has("not responding")
+        || has("operation timed out")
+        || has("invalid index-pack output")
+        || has("index-pack failed");
+    if dropped {
+        return Some(format!(
+            "The connection dropped while data was moving. {} Try again: what git had finished before the drop is kept, and on an unstable connection a big repository can take a few tries.",
+            blameless
+        ));
+    }
+    None
+}
+
 /// Turn git/ssh's terse failures into something that says what to do.
 pub(crate) fn explain_clone_error(stderr: &str, key: Option<&str>, url: &str) -> String {
     let key_name = key
         .map(crate::paths::base_name)
         .unwrap_or_else(|| "your default SSH key".into());
-    let refused = stderr.contains("Permission denied (publickey)")
-        || stderr.contains("Repository not found")
-        || stderr.contains("Could not read from remote repository");
+    let network = network_failure(stderr);
+    let refused = network.is_none()
+        && (stderr.contains("Permission denied (publickey)")
+            || stderr.contains("Repository not found")
+            || stderr.contains("Could not read from remote repository"));
 
-    let mut hint = if stderr.contains("SAML SSO") {
+    let mut hint = if let Some(net) = network {
+        net
+    } else if stderr.contains("SAML SSO") {
         format!(
             "This organization uses single sign-on, and the SSH key {} hasn't been authorized for it yet. \
              On GitHub (signed in as the company account): Settings → SSH and GPG keys → Configure SSO next to this key → Authorize for the organization. Then clone again.",
@@ -1178,12 +1440,21 @@ async fn clone_as_profile(
     let _progress = ProgressGuard(crate::paths::norm(&dest_str));
     set_progress(&dest_str, CloneProgress::phase("Connecting"));
     let progress_key = crate::paths::norm(&dest_str);
-    run_git_streaming(Some(&parent), &[], &arg_refs, None, &|p| set_progress(&progress_key, p))
-        .await
-        .map_err(|e| match e {
-            AppError::Command(msg) => AppError::Command(explain_clone_error(&msg, key.as_deref(), url)),
-            other => other,
-        })?;
+    // The host's size is for a whole repository: a partial clone downloads a
+    // fraction of it, so there the time left comes from the objects alone.
+    let (size, asking) = if extra_args.iter().any(|a| a.starts_with("--filter")) { (EstimateCell::default(), None) } else { ask_size(url.trim()) };
+    let cloned = run_git_streaming(Some(&parent), &[], &arg_refs, None, true, &|p| {
+        let known = size.lock().ok().and_then(|c| *c);
+        set_progress(&progress_key, with_estimate(p, known))
+    })
+    .await;
+    if let Some(t) = asking {
+        t.abort();
+    }
+    cloned.map_err(|e| match e {
+        AppError::Command(msg) => AppError::Command(explain_clone_error(&msg, key.as_deref(), url)),
+        other => other,
+    })?;
 
     // The main clone succeeded; submodule trouble is reported, not fatal —
     // the repo is usable and `git submodule update` can be retried.
@@ -1359,6 +1630,45 @@ mod tests {
     }
 
     #[test]
+    fn the_time_left_comes_from_the_hosts_size_or_from_the_objects() {
+        // 10 MiB of a 1.2 GB repository at 2 MiB/s: the rest of it at that rate.
+        let (est, eta) = download_estimate(Some("10.00 MiB"), Some("2.00 MiB/s"), Some(45), Some(1_258_291));
+        assert_eq!(est, Some(1_258_291));
+        assert_eq!(eta, Some(((1_258_291.0f64 * 1024.0 - 10.0 * 1024.0 * 1024.0) / (2.0 * 1024.0 * 1024.0)).round() as u64));
+        assert!((600..=612).contains(&eta.unwrap()), "about ten minutes: {:?}", eta);
+        // No size from the host: 45% of the objects stand in for 45% of the bytes.
+        let (est, eta) = download_estimate(Some("10.00 MiB"), Some("2.00 MiB/s"), Some(45), None);
+        assert_eq!(est, None);
+        assert_eq!(eta, Some(6), "10 MiB is 45%, so about 12.2 MiB are left: 6 s at 2 MiB/s");
+        // Too early to say from the objects alone.
+        assert_eq!(download_estimate(Some("1.00 MiB"), Some("2.00 MiB/s"), Some(2), None), (None, None));
+        // A size the download has already passed was wrong: dropped, and the objects answer instead.
+        let (est, eta) = download_estimate(Some("2.00 GiB"), Some("1.00 MiB/s"), Some(50), Some(1_258_291));
+        assert_eq!(est, None);
+        assert_eq!(eta, Some(2048));
+        // Nothing to divide by, or nothing arrived: no time is claimed.
+        assert_eq!(download_estimate(Some("10.00 MiB"), None, Some(45), Some(1_258_291)), (Some(1_258_291), None));
+        assert_eq!(download_estimate(Some("10.00 MiB"), Some("0 bytes/s"), Some(45), None), (None, None));
+        assert_eq!(download_estimate(None, Some("2.00 MiB/s"), Some(45), Some(1_258_291)), (None, None));
+        // Every unit git prints.
+        assert_eq!(git_size_bytes("512 bytes"), Some(512.0));
+        assert_eq!(git_size_bytes("1.50 KiB"), Some(1536.0));
+        assert_eq!(git_size_bytes("3.00 GiB"), Some(3.0 * 1024.0 * 1024.0 * 1024.0));
+        assert_eq!(git_size_bytes("2.00 MiB/s"), Some(2.0 * 1024.0 * 1024.0));
+        assert_eq!(git_size_bytes("fast"), None);
+        // On the line itself: a download carries both, any other phase neither.
+        let p = with_estimate(parse_clone_progress("Receiving objects:  45% (556/1234), 10.00 MiB | 2.00 MiB/s").unwrap(), Some(1_258_291));
+        assert_eq!((p.estimate_kb, p.eta_secs.is_some()), (Some(1_258_291), true));
+        let p = with_estimate(parse_clone_progress("Resolving deltas:  45% (5/11)").unwrap(), Some(1_258_291));
+        assert_eq!((p.estimate_kb, p.eta_secs), (None, None));
+        // Left out of the JSON when there is nothing to say; read when present.
+        let json = serde_json::to_string(&CloneProgress::submodules(3, 8, Some("libs/sub"))).unwrap();
+        assert!(!json.contains("eta_secs") && !json.contains("estimate_kb"), "{}", json);
+        let back: CloneProgress = serde_json::from_str(r#"{"phase":"Submodules","percent":37,"done":3,"total":8,"bytes":"10.00 MiB","rate":"2.00 MiB/s","detail":"libs/sub","estimate_kb":1258291,"eta_secs":603}"#).unwrap();
+        assert_eq!((back.estimate_kb, back.eta_secs), (Some(1_258_291), Some(603)));
+    }
+
+    #[test]
     fn clone_progress_lines_are_read_in_every_shape_git_prints() {
         let p = parse_clone_progress("Receiving objects:  45% (556/1234), 10.00 MiB | 2.00 MiB/s").unwrap();
         assert_eq!(p.phase, "Receiving objects");
@@ -1442,6 +1752,59 @@ mod tests {
         assert!(e.contains("SSH URL"), "{e}");
 
         assert_eq!(explain_clone_error("fatal: something else", None, "git@github.com:o/r.git"), "fatal: something else");
+    }
+
+    #[test]
+    fn a_network_failure_is_not_blamed_on_the_key_or_the_account() {
+        let tail = "\nfatal: Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.";
+        // ssh ends a timeout with the very line it ends a refusal with.
+        let timed_out = format!("ssh: connect to host github.com port 22: Operation timed out{}", tail);
+        for url in ["git@github.com:acme/api.git", "org-1234567@github.com:AcmeOrg/widgets.git"] {
+            let e = explain_clone_error(&timed_out, Some("/Users/me/.ssh/id_company"), url);
+            assert!(e.contains("could not be reached"), "{e}");
+            assert!(e.contains("Nothing is wrong with the key or the account"), "{e}");
+            assert!(e.contains("ssh.github.com") && e.contains("Port 443"), "the way round a blocked port 22: {e}");
+            assert!(!e.contains("can't see this repository") && !e.contains("isn't registered"), "not an access problem: {e}");
+            assert!(!e.contains("SSH certificates"), "nor a certificate one: {e}");
+            assert!(e.contains("git said: ssh: connect to host github.com port 22: Operation timed out"), "git's own words stay: {e}");
+        }
+        // Linux's wording, another host: no GitHub-only advice.
+        let e = explain_clone_error(&format!("ssh: connect to host git.example.test port 22: Connection timed out{}", tail), None, "git@git.example.test:o/r.git");
+        assert!(e.contains("could not be reached") && e.contains("block port 22") && !e.contains("ssh.github.com"), "{e}");
+        let e = explain_clone_error(&format!("ssh: connect to host git.example.test port 2222: Connection refused{}", tail), None, "ssh://git@git.example.test:2222/o/r.git");
+        assert!(e.contains("could not be reached") && !e.contains("block port 22"), "port 2222 is not port 22: {e}");
+        // The name could not be looked up — both systems' wording.
+        for stderr in [
+            format!("ssh: Could not resolve hostname github.com: nodename nor servname provided, or not known{}", tail),
+            format!("ssh: Could not resolve hostname github.com: Name or service not known{}", tail),
+            "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com".to_string(),
+        ] {
+            let e = explain_clone_error(&stderr, None, "git@github.com:o/r.git");
+            assert!(e.contains("could not look up the server's name"), "{e}");
+            assert!(!e.contains("can't see this repository"), "{e}");
+        }
+        // HTTPS that never connects.
+        let e = explain_clone_error("fatal: unable to access 'https://github.com/o/r.git/': Failed to connect to github.com port 443 after 75003 ms: Couldn't connect to server", None, "https://github.com/o/r.git");
+        assert!(e.contains("could not be reached") && !e.contains("port 22"), "{e}");
+        // Dropped part way through the download.
+        for stderr in [
+            "fetch-pack: unexpected disconnect while reading sideband packet\nfatal: early EOF\nfatal: fetch-pack: invalid index-pack output",
+            "Connection to github.com closed by remote host.\nfatal: the remote end hung up unexpectedly\nfatal: early EOF\nfatal: index-pack failed",
+            "error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly: CANCEL (err 8)\nerror: 6017 bytes of body are still expected\nfetch-pack: unexpected disconnect while reading sideband packet",
+            "client_loop: send disconnect: Broken pipe\nfatal: the remote end hung up unexpectedly",
+            "Timeout, server github.com not responding.\nfatal: the remote end hung up unexpectedly",
+        ] {
+            let e = explain_clone_error(stderr, None, "org-1234567@github.com:AcmeOrg/widgets.git");
+            assert!(e.contains("The connection dropped while data was moving"), "{e}");
+            assert!(e.contains("what git had finished before the drop is kept"), "{e}");
+            assert!(!e.contains("SSH certificates") && !e.contains("can't see this repository"), "{e}");
+        }
+        // A refusal is still a refusal, whatever else the output says.
+        assert_eq!(network_failure("git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository."), None);
+        assert_eq!(network_failure("ERROR: Repository not found.\nfatal: Could not read from remote repository."), None);
+        assert_eq!(network_failure("git@github.com: Permission denied (publickey).\nfatal: the remote end hung up unexpectedly"), None);
+        assert_eq!(network_failure("fatal: Authentication failed for 'https://github.com/o/r.git/'"), None);
+        assert_eq!(network_failure("fatal: something else"), None);
     }
 
     #[test]

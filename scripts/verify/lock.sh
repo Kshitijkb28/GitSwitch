@@ -498,10 +498,13 @@ OUT=$(probe push_mode "$SUP" "locked")
 ok "locking the superproject applies" "$(printf '%s' "$OUT" | jqf outcome):$(printf '%s' "$OUT" | jqf state.lock.locked)" "applied:True"
 for sub in lib lib/inner lib2; do ST=$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}"); ok "  $sub is locked too, with its mirrors in place" "$(printf '%s' "$ST" | jqf value.lock.locked):$(printf '%s' "$ST" | jqf value.lock.mirrors)" "True:ok"; done
 ok "  the coverage says so" "$(cov | jqf value.summary)" "Covers this repository and 3 submodules."
+evs() { for sub in lib lib/inner lib2; do pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}" | "$PY" -c 'import sys,json;e=json.load(sys.stdin)["value"]["lock"]["recent_events"];print(" ".join(sorted(set(x["code"] for x in e))), "|", e[0]["detail"] if e else "")'; done; }
+ok "  each submodule's own event log records its lock, and says who did it" "$(evs | tr '\n' ';')" "locked | locked with its superproject super-cover;locked | locked with its superproject super-cover;locked | locked with its superproject super-cover;"
 ok "  the registry lists the four of them" "$(pinvoke push_lock_helper_status "{}" | "$PY" -c 'import sys,json;print(len([l for l in json.load(sys.stdin)["value"]["locks"] if "super-cover" in l["repo"]]))')" "4"
 OUT=$(probe push_mode "$SUP" "allowed")
 ok "unlocking the superproject unlocks them all" "$(printf '%s' "$OUT" | jqf outcome):$(for sub in lib lib/inner lib2; do pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}" | jqf value.lock.locked; done | tr '\n' ',')" "applied:False,False,False,"
 ok "  and nothing of the block is left in them" "$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked || echo unset):$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked || echo unset)" "unset:unset"
+ok "  each submodule's own event log records the unlock too" "$(evs | tr '\n' ';')" "locked unlocked | unlocked with its superproject super-cover;locked unlocked | unlocked with its superproject super-cover;locked unlocked | unlocked with its superproject super-cover;"
 
 # Real mode: leave the machine as it was found.
 if [ -n "$REAL" ]; then

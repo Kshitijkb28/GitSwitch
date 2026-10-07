@@ -1515,4 +1515,44 @@ ok "  A fetches from the new address now, in its own config and the superproject
 ok "  its remote-tracking branch comes from there, and the parking is cleared" "$(git -C "$W/local/A" rev-parse origin/main):$(git -C "$W/local/A" for-each-ref refs/gitswitch-moved/ | wc -l | tr -d ' ')" "$(git -C "$W/local" rev-parse HEAD:A):0"
 ok "  and the result says so" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin)['sync'];print([s['note'] for s in d['submodules'] if s['path']=='A'][0])")" "fast-forwarded to $(git -C "$W/local" rev-parse --short=7 HEAD:A); now fetches from $W/A-moved.git"
 
+if git lfs version >/dev/null 2>&1; then
+section "Large files: the update writes pointer stubs and downloads afterwards — an LFS server that does not answer does not fail it"
+# Left to itself git downloads large files INSIDE the rebase, through the
+# smudge filter, on the rebase's clock: a slow or unreachable LFS server
+# failed the whole update. Pull already avoids that; the update now does too.
+L="$SB/lfsw"; mkdir -p "$L"
+git init -q --bare "$L/super.git"; git clone -q "$L/super.git" "$L/author" 2>/dev/null
+( cd "$L/author" && git lfs install --local >/dev/null 2>&1 && git lfs track "*.bin" >/dev/null )
+head -c 4096 /dev/urandom > "$L/author/model.bin"; head -c 3000 /dev/urandom > "$L/author/other.bin"; printf 'readme\n' > "$L/author/README.md"
+git -C "$L/author" add -A >/dev/null; git -C "$L/author" commit -qm "super: initial"; git -C "$L/author" push -q origin main 2>/dev/null
+for c in down up dirty; do
+  ( cd "$L" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$L/super.git" "$c" 2>/dev/null ); probe lfs_pull "$L/$c" >/dev/null
+  printf '%s\n' "$c" > "$L/$c/mine.txt"; git -C "$L/$c" add -A >/dev/null; git -C "$L/$c" commit -qm "mine: $c"
+done
+ok "(each clone starts with every large file present)" "$(for c in down up dirty; do probe lfs_status "$L/$c" | jqf pointers; done | tr '\n' ',')" "0,0,0,"
+head -c 5120 /dev/urandom > "$L/author/model.bin"; git -C "$L/author" commit -qam "upstream: a new model"; git -C "$L/author" push -q origin main 2>/dev/null
+# The LFS server stops answering: its objects are moved away.
+mv "$L/super.git/lfs" "$L/lfs-away"
+probe sync_plan "$L/down" >/dev/null; OUT=$(probe sync_run "$L/down")
+ok "an update whose large file cannot be downloaded right now still updates" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf headline)" "True:Updated: 1 commit of yours on top of 1 new commit"
+ok "  your commit is on top of upstream's" "$(subjects "$L/down" HEAD~2..HEAD)" "mine: down|upstream: a new model|"
+ok "  the new large file is a pointer stub for now" "$([ "$(wc -c < "$L/down/model.bin" | tr -d ' ')" -lt 200 ] && echo stub || echo content)" "stub"
+ok "  and the result says how to fetch it" "$(printf '%s' "$OUT" | jqf detail)" "The large files here didn't download"
+ok "  nothing is half-written: the working tree is clean, no rebase is left" "$(git -C "$L/down" status --porcelain | wc -l | tr -d ' '):$([ -d "$(git -C "$L/down" rev-parse --git-path rebase-merge)" ] && echo rebasing || echo none)" "0:none"
+# git-lfs made a fresh, empty store meanwhile; the real one goes back in its place.
+rm -rf "$L/super.git/lfs"; mv "$L/lfs-away" "$L/super.git/lfs"
+probe lfs_pull "$L/down" >/dev/null
+ok "  once the server answers, the LFS card brings it" "$(wc -c < "$L/down/model.bin" | tr -d ' '):$(probe lfs_status "$L/down" | jqf pointers)" "5120:0"
+# The server answers: the large file is downloaded after the rebase, not inside it.
+probe sync_plan "$L/up" >/dev/null; OUT=$(probe sync_run "$L/up")
+ok "with the server answering, the update downloads the new large file afterwards and says so" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf detail)" "Downloaded 1 LFS file here."
+ok "  it is content, and every large file is present again" "$(wc -c < "$L/up/model.bin" | tr -d ' '):$(probe lfs_status "$L/up" | jqf pointers)" "5120:0"
+# One of your own uncommitted changes is a large file: the update stashes it
+# and puts it back, so it must come back as itself — never as a stub.
+head -c 6000 /dev/urandom > "$L/mine-other.bin"; cp "$L/mine-other.bin" "$L/dirty/other.bin"
+probe sync_plan "$L/dirty" >/dev/null; OUT=$(probe sync_run "$L/dirty")
+ok "an uncommitted change to a large file survives the update as itself, not as a pointer stub" "$(printf '%s' "$OUT" | jqf ok):$(cmp -s "$L/mine-other.bin" "$L/dirty/other.bin" && echo same || echo "changed: $(wc -c < "$L/dirty/other.bin" | tr -d ' ') bytes")" "True:same"
+ok "  and upstream's new large file arrived as content" "$(wc -c < "$L/dirty/model.bin" | tr -d ' ')" "5120"
+fi
+
 verify_result
