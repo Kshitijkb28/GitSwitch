@@ -521,6 +521,7 @@ async function openClonePage(browser, server, opts = {}) {
     cloneError: opts.cloneError ?? null,
     cloneProgress: opts.cloneProgress ?? null,
     cloneSize: opts.cloneSize ?? { repo: "me/big-data", kb: 1258291 },
+    profiles: opts.profiles ?? [],
     url: opts.url ?? "git@github.com:me/big-data.git",
     submodules: opts.submodules ?? null,
   };
@@ -538,7 +539,7 @@ async function openClonePage(browser, server, opts = {}) {
         window.__CALLS__.push({ cmd, args });
         switch (cmd) {
           case "get_profiles":
-            return Promise.resolve([]);
+            return Promise.resolve(cfg.profiles);
           case "lfs_available":
             return Promise.resolve(cfg.lfsTool);
           case "clone_destination_status":
@@ -562,6 +563,159 @@ async function openClonePage(browser, server, opts = {}) {
   }, cfg);
   await page.goto(`${server.url}/sparse`, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => document.body.innerText.includes("Clone"), { timeout: 5000 });
+  return page;
+}
+
+/**
+ * The GitHub sign-in page against a scripted backend. Each device-flow call
+ * answers from a list, in order: {resolve: value}, {reject: "text"} (sent the
+ * way an AppError is: "Command execution error: text"), or "hold", which parks
+ * the answer on window.__HELD__[cmd] for the test to release. An exhausted poll
+ * list answers authorization_pending. With keepStorage, what the page stored
+ * survives a reload or another page of the app.
+ */
+async function openAuthPage(browser, server, opts = {}) {
+  const cfg = {
+    ghAccounts: opts.ghAccounts ?? [],
+    code: { device_code: "dc", user_code: "ABCD-1234", verification_uri: "https://github.com/login/device", expires_in: opts.expires ?? 120, interval: 1 },
+    codeHold: opts.codeHold ?? false,
+    polls: opts.polls ?? [],
+    verifies: opts.verifies ?? [],
+    logoutError: opts.logoutError ?? null,
+    keepStorage: opts.keepStorage ?? false,
+  };
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    if (!cfg.keepStorage || !sessionStorage.getItem("__seeded__")) {
+      localStorage.clear();
+      sessionStorage.setItem("__seeded__", "1");
+    }
+    let accounts = [...cfg.ghAccounts];
+    let polls = 0;
+    let verifies = 0;
+    window.__HELD__ = {};
+    const reply = (cmd, entry, fallback) => {
+      if (entry === "hold") return new Promise((res, rej) => { window.__HELD__[cmd] = { res, rej }; });
+      if (entry && entry.reject !== undefined) return Promise.reject(`Command execution error: ${entry.reject}`);
+      if (entry && entry.resolve !== undefined) return Promise.resolve(entry.resolve);
+      return fallback();
+    };
+    window.__TAURI_INTERNALS__ = {
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args, at: Date.now() });
+        switch (cmd) {
+          case "gh_list_accounts":
+            return accounts.length ? Promise.resolve(accounts) : Promise.reject("Command execution error: No gh accounts found. Run `gh auth login` first.");
+          case "gh_logout":
+            if (cfg.logoutError) return Promise.reject(cfg.logoutError);
+            accounts = accounts.filter((a) => a !== args.account);
+            return Promise.resolve(`Removed ${args.account} from the GitHub CLI`);
+          case "github_device_code":
+            return cfg.codeHold
+              ? new Promise((res, rej) => { window.__HELD__.code = { res: () => res(cfg.code), rej }; })
+              : Promise.resolve(cfg.code);
+          case "github_poll_token":
+            return reply(cmd, cfg.polls[polls++], () => Promise.reject("Command execution error: authorization_pending"));
+          case "verify_github_token":
+            return reply(cmd, cfg.verifies[verifies++], () => Promise.reject("Command execution error: nothing scripted"));
+          case "get_profiles":
+          case "list_ssh_keys":
+            return Promise.resolve([]);
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}/github`, { waitUntil: "networkidle0" });
+  await page.waitForFunction(() => document.body.innerText.includes("Sign in with GitHub"), { timeout: 5000 });
+  return page;
+}
+
+/** The SSH Keys page against a mocked backend: one key from an earlier visit, two gh logins. */
+async function openSshPage(browser, server, opts = {}) {
+  const cfg = {
+    register: opts.register ?? { resolve: "Registered on alice" },
+    noClipboard: opts.noClipboard ?? false,
+  };
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    if (cfg.noClipboard) {
+      Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
+      document.execCommand = () => false;
+    }
+    window.__TAURI_INTERNALS__ = {
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args });
+        switch (cmd) {
+          case "list_ssh_keys":
+            return Promise.resolve(["/home/me/.ssh/id_ed25519_gitswitch_work"]);
+          case "gh_list_accounts":
+            return Promise.resolve(["alice", "bob"]);
+          case "get_public_key":
+            return Promise.resolve("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGitSwitchTestKey me@example.test");
+          case "gh_register_ssh_key":
+            return cfg.register.reject ? Promise.reject(`Command execution error: ${cfg.register.reject}`) : Promise.resolve(cfg.register.resolve);
+          case "resolve_key_account":
+            return Promise.resolve("alice");
+          case "generate_ssh_key":
+            return Promise.resolve(["/home/me/.ssh/id_ed25519_new", "/home/me/.ssh/id_ed25519_new.pub"]);
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}/ssh`, { waitUntil: "networkidle0" });
+  await page.waitForFunction(() => document.body.innerText.includes("Existing SSH Keys"), { timeout: 5000 });
+  return page;
+}
+
+/** Auto Assign against a mocked backend: a profile with a key, one with only a saved account. */
+async function openAutoAssignPage(browser, server, opts = {}) {
+  const page = await browser.newPage();
+  await page.setViewport({ width: opts.width ?? 900, height: 900 });
+  await page.evaluateOnNewDocument(() => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    localStorage.setItem("gitswitch:autoassign.root", JSON.stringify("/w"));
+    const prof = (id, name, key, login, isDefault) => ({ id, name, git_name: name, git_email: `${id}@example.test`, ssh_key_path: key, is_default: isDefault, allow_push: true, signing_enabled: false, directories: [], remote_patterns: [], github_login: login, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" });
+    window.__TAURI_INTERNALS__ = {
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args });
+        switch (cmd) {
+          case "get_profiles":
+            return Promise.resolve([prof("p1", "Personal", "/k", null, true), prof("pk", "Bot", null, "acme-bot", false)]);
+          case "scan_repos":
+            return Promise.resolve([
+              { path: "/w/widgets", remote_url: "git@github.com:acme/widgets.git", owner: "acme", name: "widgets" },
+              { path: "/w/secret", remote_url: "git@github.com:acme/secret.git", owner: "acme", name: "secret" },
+            ]);
+          case "resolve_key_account":
+            return Promise.resolve("me-personal");
+          case "gh_list_accounts":
+            return Promise.resolve(["acme-bot", "me-personal"]);
+          case "gh_get_token":
+            return Promise.resolve(`t-${args.account}`);
+          case "verify_github_token":
+            return Promise.resolve({ id: 1, login: String(args.token).slice(2), name: null, email: null, avatar_url: "" });
+          case "check_repo_access":
+            return Promise.resolve(args.repo === "widgets" && args.token === "t-acme-bot" ? { admin: false, push: true, pull: true } : null);
+          case "update_profile":
+            return Promise.resolve({});
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  });
+  await page.goto(`${server.url}/auto-assign`, { waitUntil: "networkidle0" });
+  await page.waitForFunction(() => document.body.innerText.includes("Auto Assign"), { timeout: 5000 });
   return page;
 }
 
@@ -2917,6 +3071,300 @@ try {
       }
       await page.close();
     }
+  }
+
+  // -----------------------------------------------------------------
+  section("GitHub CLI accounts: removing one");
+  {
+    const clickText = (page, label) =>
+      page.evaluate((l) => {
+        const b = [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === l);
+        if (!b) return false;
+        b.click();
+        return true;
+      }, label);
+    const openRemove = (page) => page.evaluate(() => document.querySelector('button[title="Remove this account from the GitHub CLI"]')?.click());
+    {
+      const page = await openAuthPage(browser, server, { ghAccounts: ["alice", "bob"], logoutError: "Command execution error: gh logout failed for alice: no accounts matched that criteria" });
+      await page.waitForFunction(() => document.body.innerText.includes("alice"), { timeout: 4000 });
+      await openRemove(page);
+      await sleep(200);
+      await clickText(page, "Remove Account");
+      await sleep(400);
+      const s = await text(page);
+      ok("a failed removal says why, inside the dialog", s.includes("Remove GitHub Account?") && s.includes("no accounts matched that criteria"), s.slice(0, 300));
+      ok("  and Remove Account can be pressed again", await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Remove Account")?.disabled === false));
+      await clickText(page, "Cancel");
+      await sleep(200);
+      await openRemove(page);
+      await sleep(200);
+      ok("  reopening the dialog starts clean", !(await text(page)).includes("no accounts matched"));
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { ghAccounts: ["alice", "bob"] });
+      await page.waitForFunction(() => document.body.innerText.includes("alice"), { timeout: 4000 });
+      await openRemove(page);
+      await sleep(200);
+      await clickText(page, "Remove Account");
+      await sleep(500);
+      const s = await text(page);
+      ok("a successful removal closes the dialog", !s.includes("Remove GitHub Account?"));
+      ok("  and the list is read again, without the account", (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "gh_list_accounts").length)) >= 2 && !s.includes("alice") && s.includes("bob"));
+      await page.close();
+    }
+  }
+
+  section("GitHub sign-in: a way out of every wait");
+  {
+    const signIn = (page) => page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
+    const polls = (page) => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "github_poll_token").length);
+    {
+      const page = await openAuthPage(browser, server, { codeHold: true });
+      await signIn(page);
+      await page.waitForFunction(() => document.body.innerText.includes("Requesting a sign-in code"), { timeout: 4000 });
+      ok("while a sign-in code is requested, the page offers Cancel", await page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Cancel")));
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Cancel")?.click());
+      await sleep(300);
+      const s = await text(page);
+      ok("  Cancel there returns to both sign-in choices", s.includes("GitHub Device Authorization") && s.includes("Use GitHub CLI"));
+      await page.evaluate(() => window.__HELD__.code?.res());
+      await sleep(2500);
+      ok("  a code that arrives after Cancel is neither shown nor polled for", !(await text(page)).includes("ABCD-1234") && (await polls(page)) === 0);
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { codeHold: true });
+      await signIn(page);
+      await page.waitForFunction(() => document.body.innerText.includes("Requesting a sign-in code"), { timeout: 4000 });
+      await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Profiles"))?.click());
+      await sleep(300);
+      await page.evaluate(() => window.__HELD__.code?.res());
+      await sleep(2500);
+      ok("a code that arrives after the page is left starts no polling", (await polls(page)) === 0);
+      await page.close();
+    }
+  }
+
+  section("GitHub sign-in reaches Connected! through failures that are not GitHub's answer");
+  {
+    const user = { id: 4242, login: "octo-signin", name: "Octo Signin", email: null, avatar_url: "" };
+    const page = await openAuthPage(browser, server, {
+      polls: [
+        { reject: "authorization_pending" },
+        { reject: "Failed to poll for token: error sending request for url (https://github.com/login/oauth/access_token): operation timed out" },
+        { reject: "GitHub returned 502 Bad Gateway: " },
+        { reject: "slow_down" },
+        { resolve: { access_token: "gho_test", token_type: "bearer", scope: "read:user" } },
+      ],
+      verifies: [{ reject: "HTTP request failed: connection reset" }, { resolve: user }],
+    });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
+    const stillTrying = await page.waitForFunction(() => document.body.innerText.includes("still trying"), { timeout: 8000 }).then(() => true).catch(() => false);
+    ok("a check GitHub did not answer keeps the code on screen, and the page says it is still trying", stillTrying && (await text(page)).includes("ABCD-1234"));
+    const connected = await page.waitForFunction(() => document.body.innerText.includes("Connected!"), { timeout: 30000 }).then(() => true).catch(() => false);
+    const calls = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "github_poll_token" || c.cmd === "verify_github_token").map((c) => ({ cmd: c.cmd, at: c.at, token: c.args?.token })));
+    const pollsAt = calls.filter((c) => c.cmd === "github_poll_token").map((c) => c.at);
+    const verifies = calls.filter((c) => c.cmd === "verify_github_token");
+    ok("the device-flow sign-in reaches Connected! with the account's login", connected && (await text(page)).includes("@octo-signin"));
+    ok("  a timed-out check or a 502 while waiting does not end the sign-in", pollsAt.length === 5, String(pollsAt.length));
+    ok("  after slow_down the next check waits at least 5 s longer", pollsAt.length === 5 && pollsAt[4] - pollsAt[3] >= 5500, String(pollsAt[4] - pollsAt[3]));
+    ok("  a token GitHub granted is checked again, not polled for again", verifies.length === 2 && verifies.every((v) => v.token === "gho_test") && pollsAt.length === 5);
+    await page.close();
+  }
+
+  section("A GitHub sign-in fills a profile later, as a gh login does");
+  {
+    const user = { id: 4242, login: "octo-signin", name: "Octo Signin", email: null, avatar_url: "" };
+    const page = await openAuthPage(browser, server, {
+      keepStorage: true,
+      polls: [{ resolve: { access_token: "gho_test", token_type: "bearer", scope: "read:user" } }],
+      verifies: [{ resolve: user }],
+    });
+    const field = (label) =>
+      page.evaluate((l) => [...document.querySelectorAll("label")].find((x) => x.innerText.trim() === l)?.parentElement.querySelector("input")?.value ?? null, label);
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
+    await page.waitForFunction(() => document.body.innerText.includes("Connected!"), { timeout: 8000 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Create Profile from GitHub")?.click());
+    await page.waitForFunction(() => [...document.querySelectorAll("label")].some((l) => l.innerText.trim() === "Git Email"), { timeout: 4000 });
+    await sleep(300);
+    ok("Create Profile from GitHub fills the login and the no-reply email, as the form's autofill does",
+      (await field("Git Username")) === "octo-signin" && (await field("Git Email")) === "4242+octo-signin@users.noreply.github.com",
+      `${await field("Git Username")} / ${await field("Git Email")}`);
+    ok("  the account is preselected in Autofill from GitHub", (await text(page)).includes("octo-signin · signed in with GitHub"));
+    await page.goto(`${server.url}/profile/new`, { waitUntil: "networkidle0" });
+    await page.waitForFunction(() => document.body.innerText.toLowerCase().includes("autofill from github"), { timeout: 4000 }).catch(() => null);
+    ok("with no gh login, the profile form offers Autofill from the account signed in with GitHub", (await text(page)).toLowerCase().includes("autofill from github"));
+    await page.evaluate(() => {
+      const card = [...document.querySelectorAll("div")].find((d) => d.innerText.toLowerCase().startsWith("autofill from github"));
+      card?.querySelector("button")?.click();
+    });
+    await sleep(250);
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("octo-signin · signed in with GitHub") && b.closest(".absolute"))?.click());
+    await sleep(500);
+    ok("  picking it fills the same login and email", (await field("Git Username")) === "octo-signin" && (await field("Git Email")) === "4242+octo-signin@users.noreply.github.com");
+    ok("  without asking gh for a token", !(await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "gh_get_token"))));
+    await page.goto(`${server.url}/github`, { waitUntil: "networkidle0" });
+    await page.waitForFunction(() => document.body.innerText.includes("Signed in with GitHub on this computer"), { timeout: 4000 }).catch(() => null);
+    ok("the sign-in is listed on the GitHub page after a reload", (await text(page)).includes("Signed in with GitHub on this computer") && (await text(page)).includes("octo-signin"));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Forget")?.click());
+    await sleep(300);
+    await page.goto(`${server.url}/profile/new`, { waitUntil: "networkidle0" });
+    await sleep(400);
+    ok("  and once forgotten, the form no longer offers it", !(await text(page)).toLowerCase().includes("autofill from github"));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Autofill fills the account's own git identity");
+  {
+    const scoped = { id: 42, login: "octo-home", name: "Octo Home", email: null, avatar_url: "", emails: ["me@home.test", "alt@home.test"], primary_email: "me@home.test", email_scope_missing: false };
+    const unscoped = { ...scoped, emails: [], primary_email: null, email_scope_missing: true };
+    const pick = async (page, login) => {
+      await page.waitForFunction(() => document.body.innerText.toLowerCase().includes("autofill from github"), { timeout: 5000 }).catch(() => null);
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll("div")].find((d) => d.innerText.toLowerCase().startsWith("autofill from github"));
+        card?.querySelector("button")?.click();
+      });
+      await sleep(250);
+      await page.evaluate((l) => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === l)?.click(), login);
+      await sleep(600);
+    };
+    const value = (page, placeholder) => page.evaluate((ph) => document.querySelector(`input[placeholder="${ph}"]`)?.value ?? null, placeholder);
+    {
+      const page = await openProfilePage(browser, server, { path: "/profile/new", ghAccounts: ["octo-home"], user: scoped });
+      await pick(page, "octo-home");
+      ok("the git username is the login, not the display name", (await value(page, "Your git user.name")) === "octo-home");
+      ok("the git email is the account's primary address, not the no-reply one", (await value(page, "your@email.com")) === "me@home.test", await value(page, "your@email.com"));
+      const t = await text(page);
+      ok("  the no-reply and the other verified address are one click away", t.includes("42+octo-home@users.noreply.github.com") && t.includes("alt@home.test"));
+      await page.close();
+    }
+    {
+      const page = await openProfilePage(browser, server, { path: "/profile/new", ghAccounts: ["octo-home"], user: unscoped });
+      await pick(page, "octo-home");
+      ok("without user:email the page says how to share the private addresses", (await text(page)).includes("gh auth refresh -h github.com -s user:email"));
+      await page.close();
+    }
+    {
+      const stored = { id: "p1", name: "Home", git_name: "octo-home", git_email: "me@home.test", ssh_key_path: null, is_default: true, allow_push: true, signing_enabled: false, directories: [], remote_patterns: [], github_login: "octo-home", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+      const page = await openProfilePage(browser, server, { path: "/profile/p1/edit", profiles: [stored], ghAccounts: ["octo-home"], user: unscoped });
+      await page.waitForFunction(() => document.querySelector('input[placeholder="your@email.com"]')?.value === "me@home.test", { timeout: 5000 }).catch(() => null);
+      await pick(page, "octo-home");
+      ok("re-picking a profile's own account keeps its stored address when the token cannot read the account's", (await value(page, "your@email.com")) === "me@home.test", await value(page, "your@email.com"));
+      await page.close();
+    }
+  }
+
+  // -----------------------------------------------------------------
+  section("SSH Keys: a key made on an earlier visit can be registered from its row");
+  {
+    const clickText = (page, label) =>
+      page.evaluate((l) => {
+        const b = [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === l);
+        if (!b) return false;
+        b.click();
+        return true;
+      }, label);
+    const registerFromRow = async (page) => {
+      await clickText(page, "Register");
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Select an account…"))?.click());
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === "alice")?.click());
+      await sleep(200);
+      // The row's own Register button, inside the expanded row.
+      await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Register" && !b.disabled);
+        buttons[buttons.length - 1]?.click();
+      });
+      await sleep(600);
+    };
+    {
+      const page = await openSshPage(browser, server);
+      await registerFromRow(page);
+      const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "gh_register_ssh_key")?.args ?? null);
+      ok("a key from an earlier visit is registered from its row", call?.keyPath === "/home/me/.ssh/id_ed25519_gitswitch_work" && call?.account === "alice", JSON.stringify(call));
+      ok("  and the row says which account it authenticates as", (await text(page)).includes("authenticates as") && (await text(page)).includes("alice"));
+      await page.close();
+    }
+    {
+      const page = await openSshPage(browser, server, { register: { reject: "This gh login can't add SSH keys to alice. Grant it once with: gh auth refresh -h github.com -s admin:public_key, then press Register again." } });
+      await registerFromRow(page);
+      ok("a login without the key scope is told the command that fixes it", (await text(page)).includes("gh auth refresh"));
+      await page.close();
+    }
+    {
+      const page = await openSshPage(browser, server, { noClipboard: true });
+      await clickText(page, "Copy public key");
+      await sleep(400);
+      ok("a copy that fails says so", (await text(page)).includes("Couldn't copy"));
+      await page.close();
+    }
+    {
+      const page = await openSshPage(browser, server);
+      await page.type('input[placeholder="e.g., work, personal"]', "new");
+      await page.type('input[placeholder="your@email.com"]', "me@example.test");
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("Generate Key"))?.click());
+      await page.waitForFunction(() => document.body.innerText.includes("Next: Test Connection"), { timeout: 4000 }).catch(() => null);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Next: Test Connection"))?.click());
+      await page.waitForFunction(() => document.body.innerText.includes("Test SSH Connection"), { timeout: 4000 }).catch(() => null);
+      ok("the Test step has a way back", await clickText(page, "Back"));
+      await sleep(250);
+      ok("  to the key", (await text(page)).includes("Your Public Key"));
+      await page.close();
+    }
+  }
+
+  section("Auto Assign: a profile without a usable key is matched by its saved account");
+  {
+    const page = await openAutoAssignPage(browser, server, { width: 900 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Scan")?.click());
+    await page.waitForFunction(() => document.body.innerText.includes("2 repos found"), { timeout: 8000 }).catch(() => null);
+    await sleep(300);
+    const t = await text(page);
+    ok("a profile without an SSH key is proposed through its saved GitHub account", t.includes("Bot (acme-bot · saved account)"), t.slice(t.indexOf("repos found"), t.indexOf("repos found") + 300));
+    ok("  and the reason shows at 900 px", await page.evaluate(() => [...document.querySelectorAll("main span, main div")].some((el) => el.innerText.trim().startsWith("push · acme-bot") && el.getBoundingClientRect().width > 0)));
+    ok("a repository no account can see says why", t.includes("no account has access"));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("Apply 1 assignment"))?.click());
+    await sleep(500);
+    const upd = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "update_profile").map((c) => c.args));
+    ok("Apply assigns it to that profile", upd.some((a) => a.id === "pk" && (a.directories ?? []).includes("/w/widgets")), JSON.stringify(upd));
+    await page.close();
+  }
+
+  section("Leaving a page and coming back keeps where you were");
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll('a[role="tab"]')].find((a) => a.innerText.trim().startsWith("History"))?.click());
+    await sleep(400);
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Doctor"))?.click());
+    await sleep(400);
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Repository"))?.click());
+    await sleep(500);
+    ok("coming back to Repository opens the tab you left, History — not Changes", (await page.evaluate(() => location.pathname)) === "/repo/history");
+    await page.close();
+  }
+  {
+    const WORK = { id: "p2", name: "Work", git_name: "Me At Work", git_email: "me@work.test", ssh_key_path: "/Users/me/.ssh/id_work", is_default: false, allow_push: true, signing_enabled: false, directories: ["/work"], remote_patterns: [], github_login: null, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+    const page = await openClonePage(browser, server, { profiles: [WORK] });
+    await page.evaluate(() => {
+      const label = [...document.querySelectorAll("label")].find((l) => l.innerText.trim() === "Clone as");
+      label?.parentElement.querySelector("button")?.click();
+    });
+    await sleep(250);
+    await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim().startsWith("Work"))?.click());
+    await sleep(200);
+    await page.type('input[placeholder="Defaults to the repo name"]', "data-work");
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Doctor"))?.click());
+    await sleep(400);
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Clone"))?.click());
+    await sleep(500);
+    const asLabel = await page.evaluate(() => [...document.querySelectorAll("label")].find((l) => l.innerText.trim() === "Clone as")?.parentElement.querySelector("button")?.innerText.trim() ?? "");
+    const folder = await page.evaluate(() => document.querySelector('input[placeholder="Defaults to the repo name"]')?.value ?? "");
+    ok("Clone as and the folder name are what you chose, after visiting another page", asLabel.startsWith("Work") && folder === "data-work", `${asLabel} / ${folder}`);
+    await page.close();
   }
 
   section("Clone page: Git LFS option");

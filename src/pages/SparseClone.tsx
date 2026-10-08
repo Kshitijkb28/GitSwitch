@@ -23,7 +23,7 @@ import { Badge } from "../components/Badge";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import { baseName, isWithin, normPath } from "../lib/paths";
-import { usePersistedState, handOff } from "../lib/persist";
+import { usePersistedState, handOff, useSessionState } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
 import { arrivedLabel, formatKb, timeLeftLabel } from "../lib/gitJobs";
 import type { Profile } from "../types/profile";
@@ -87,12 +87,12 @@ export function SparseClone() {
   const toast = useToast();
   const [url, setUrl] = usePersistedState("sparse.url", "");
   const [parentDir, setParentDir] = usePersistedState("sparse.parentDir", "");
-  const [folderName, setFolderName] = useState("");
+  const [folderName, setFolderName] = useSessionState("clone.folderName", "");
   const [mode, setMode] = usePersistedState<"full" | "sparse">("clone.mode", "full");
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [cloned, setCloned] = useState<api.CloneResult | null>(null);
   // "" = automatic: the destination folder's profile decides, like a terminal clone.
-  const [cloneAs, setCloneAs] = useState("");
+  const [cloneAs, setCloneAs] = useSessionState("clone.as", "");
   const [withSubmodules, setWithSubmodules] = usePersistedState("clone.submodules", true);
   // On by default: a clone of an LFS repository without this looks complete
   // but every large file is a pointer stub, and git status never says so.

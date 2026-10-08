@@ -16,8 +16,95 @@ import { Select } from "../components/Select";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { baseName } from "../lib/paths";
 import { useRefreshOnFocus } from "../lib/focus";
+import { copyText } from "../lib/clipboard";
 import * as api from "../lib/api";
 import { RefreshButton } from "../components/RefreshButton";
+
+/**
+ * Register one key on a GitHub account through a gh login, then say which
+ * account the key authenticates as. Used for the key just generated and for
+ * any key already in ~/.ssh — a key made on an earlier visit is no less
+ * registrable.
+ */
+function RegisterKey({ keyPath, accounts }: { keyPath: string; accounts: string[] }) {
+  const [account, setAccount] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const [resolved, setResolved] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState(false);
+
+  async function verify() {
+    setVerifying(true);
+    setResolved(null);
+    try {
+      const acct = await api.resolveKeyAccount(keyPath);
+      setResolved(acct ?? "(no GitHub account — not registered yet)");
+    } catch (e) {
+      setResolved(`error: ${String(e)}`);
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  async function register() {
+    if (!account) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      setMessage({ ok: true, text: await api.ghRegisterSshKey(account, keyPath) });
+      void verify();
+    } catch (e) {
+      setMessage({ ok: false, text: String(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (accounts.length === 0) {
+    return (
+      <p className="text-xs text-zinc-500">
+        No <span className="font-mono">gh</span> account is signed in — sign in with{" "}
+        <span className="font-mono">gh auth login</span> (see GitHub Auth), then Refresh.
+      </p>
+    );
+  }
+  return (
+    <div>
+      <div className="flex gap-2">
+        <Select
+          value={account}
+          onChange={setAccount}
+          placeholder="Select an account…"
+          optionIcon={<GitHubIcon size={14} />}
+          options={accounts.map((a) => ({ value: a, label: a }))}
+          className="flex-1 min-w-0"
+        />
+        <Button type="button" onClick={register} disabled={!account || busy}>
+          {busy ? (
+            <>
+              <Loader2 size={16} className="animate-spin" />
+              Registering…
+            </>
+          ) : (
+            "Register"
+          )}
+        </Button>
+      </div>
+      {message && (
+        <div className={`mt-3 flex items-start gap-2 text-sm break-words ${message.ok ? "text-emerald-400" : "text-red-400"}`}>
+          {message.ok ? <CheckCircle2 size={16} className="shrink-0 mt-0.5" /> : <XCircle size={16} className="shrink-0 mt-0.5" />}
+          <span className="min-w-0">{message.text}</span>
+        </div>
+      )}
+      {(verifying || resolved) && (
+        <p className="mt-2 text-xs text-zinc-400 break-words">
+          {verifying ? "Verifying which account this key maps to…" : "This key authenticates as: "}
+          {!verifying && <span className="font-mono text-emerald-400">{resolved}</span>}
+        </p>
+      )}
+    </div>
+  );
+}
 
 type Step = "generate" | "pubkey" | "test";
 
@@ -38,11 +125,12 @@ export function SSHWizard() {
   const [keyToDelete, setKeyToDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [ghAccounts, setGhAccounts] = useState<string[]>([]);
-  const [registerAccount, setRegisterAccount] = useState("");
-  const [registering, setRegistering] = useState(false);
-  const [registerMsg, setRegisterMsg] = useState<string | null>(null);
-  const [resolvedAccount, setResolvedAccount] = useState<string | null>(null);
-  const [verifying, setVerifying] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
+  /** The existing key whose row is opened for registering. */
+  const [openRow, setOpenRow] = useState<string | null>(null);
+  const [rowNote, setRowNote] = useState<Record<string, string>>({});
+  /** After a successful test: the account the key itself authenticates as. */
+  const [testedAs, setTestedAs] = useState<string | null>(null);
 
   function loadKeys() {
     api.listSshKeys().then(setExistingKeys).catch(() => {});
@@ -64,37 +152,23 @@ export function SSHWizard() {
     api.ghListAccounts().then(setGhAccounts).catch(() => setGhAccounts([]));
   }, []);
 
-  async function handleRegister() {
-    if (!registerAccount) return;
-    setRegistering(true);
-    setRegisterMsg(null);
-    setError(null);
+  /** A row's public key to the clipboard, saying so when the webview refuses. */
+  async function copyRowKey(k: string) {
     try {
-      const msg = await api.ghRegisterSshKey(
-        registerAccount,
-        privateKeyPath,
-        "GitSwitch (macbook)"
-      );
-      setRegisterMsg(msg);
-      // Confirm which account the key now maps to.
-      handleVerify();
+      const ok = await copyText(await api.getPublicKey(k));
+      setRowNote((n) => ({ ...n, [k]: ok ? "Public key copied." : "Couldn't copy — open the .pub file and copy it by hand." }));
     } catch (e) {
-      setError(String(e));
-    } finally {
-      setRegistering(false);
+      setRowNote((n) => ({ ...n, [k]: String(e) }));
     }
   }
 
-  async function handleVerify() {
-    setVerifying(true);
-    setResolvedAccount(null);
+  async function checkRowAccount(k: string) {
+    setRowNote((n) => ({ ...n, [k]: "Asking github.com which account this key is…" }));
     try {
-      const acct = await api.resolveKeyAccount(privateKeyPath);
-      setResolvedAccount(acct ?? "(no GitHub account — not registered yet)");
+      const acct = await api.resolveKeyAccount(k);
+      setRowNote((n) => ({ ...n, [k]: acct ? `This key authenticates as: ${acct}` : "github.com refused this key: it isn't on any account yet." }));
     } catch (e) {
-      setResolvedAccount(`error: ${String(e)}`);
-    } finally {
-      setVerifying(false);
+      setRowNote((n) => ({ ...n, [k]: String(e) }));
     }
   }
 
@@ -132,22 +206,30 @@ export function SSHWizard() {
   }
 
   async function handleCopy() {
-    try {
-      await navigator.clipboard.writeText(publicKey);
+    if (await copyText(publicKey)) {
+      setCopyFailed(false);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch {}
+    } else {
+      setCopyFailed(true);
+    }
   }
 
   async function handleTest() {
     setTestResult({ status: "testing", message: "Testing connection..." });
+    setTestedAs(null);
     try {
       const result = await api.testConnectionWithKey(privateKeyPath);
       setTestResult({ status: "success", message: result });
+      // The test runs through ~/.ssh/config, where another key can be pinned
+      // for github.com: ask the key itself who it is.
+      api.resolveKeyAccount(privateKeyPath).then((a) => setTestedAs(a ?? "")).catch(() => {});
     } catch (e) {
       setTestResult({ status: "error", message: String(e) });
     }
   }
+  /** "Hi <login>!" in ssh's greeting. */
+  const greeted = /Hi ([^!\s]+)!/.exec(testResult.message)?.[1] ?? null;
 
   return (
     <div className="space-y-6">
@@ -269,63 +351,23 @@ export function SSHWizard() {
               )}
             </button>
           </div>
+          {copyFailed && (
+            <p className="text-xs text-amber-300/80 mt-2">Couldn't copy — select the key above and copy it by hand.</p>
+          )}
           <p className="text-xs text-zinc-500 mt-2 font-mono break-all">
             Key saved at: {privateKeyPath}
           </p>
 
-          {ghAccounts.length > 0 && (
-            <div className="mt-5 pt-5 border-t border-zinc-800">
-              <h3 className="text-sm font-semibold text-zinc-200 mb-1">
-                Register this key on a GitHub account
-              </h3>
-              <p className="text-xs text-zinc-500 mb-3">
-                Uses your local <span className="font-mono">gh</span> login — no
-                copy-paste needed. A key can belong to only one account.
-              </p>
-              <div className="flex gap-2">
-                <Select
-                  value={registerAccount}
-                  onChange={setRegisterAccount}
-                  placeholder="Select an account…"
-                  optionIcon={<GitHubIcon size={14} />}
-                  options={ghAccounts.map((a) => ({ value: a, label: a }))}
-                  className="flex-1"
-                />
-                <Button
-                  type="button"
-                  onClick={handleRegister}
-                  disabled={!registerAccount || registering}
-                >
-                  {registering ? (
-                    <>
-                      <Loader2 size={16} className="animate-spin" />
-                      Registering…
-                    </>
-                  ) : (
-                    "Register"
-                  )}
-                </Button>
-              </div>
-              {registerMsg && (
-                <div className="mt-3 flex items-center gap-2 text-emerald-400 text-sm">
-                  <CheckCircle2 size={16} />
-                  {registerMsg}
-                </div>
-              )}
-              {(verifying || resolvedAccount) && (
-                <p className="mt-2 text-xs text-zinc-400">
-                  {verifying
-                    ? "Verifying which account this key maps to…"
-                    : `This key authenticates as: `}
-                  {!verifying && (
-                    <span className="font-mono text-emerald-400">
-                      {resolvedAccount}
-                    </span>
-                  )}
-                </p>
-              )}
-            </div>
-          )}
+          <div className="mt-5 pt-5 border-t border-zinc-800">
+            <h3 className="text-sm font-semibold text-zinc-200 mb-1">
+              Register this key on a GitHub account
+            </h3>
+            <p className="text-xs text-zinc-500 mb-3">
+              Uses your local <span className="font-mono">gh</span> login — no
+              copy-paste needed. A key can belong to only one account.
+            </p>
+            <RegisterKey keyPath={privateKeyPath} accounts={ghAccounts} />
+          </div>
 
           <div className="flex justify-end mt-4">
             <Button onClick={() => setStep("test")}>
@@ -347,10 +389,15 @@ export function SSHWizard() {
           </p>
 
           {testResult.status === "idle" && (
-            <Button onClick={handleTest}>
-              <Key size={16} />
-              Test SSH Connection
-            </Button>
+            <div className="flex gap-2 flex-wrap">
+              <Button variant="secondary" onClick={() => setStep("pubkey")}>
+                Back
+              </Button>
+              <Button onClick={handleTest}>
+                <Key size={16} />
+                Test SSH Connection
+              </Button>
+            </div>
           )}
 
           {testResult.status === "testing" && (
@@ -366,12 +413,25 @@ export function SSHWizard() {
                 <CheckCircle2 size={20} />
                 <span className="font-medium">Connection successful!</span>
               </div>
+              {greeted && <p className="text-sm text-zinc-300">Authenticated as <span className="font-mono text-emerald-400">{greeted}</span></p>}
+              {testedAs !== null && greeted && testedAs.toLowerCase() !== greeted.toLowerCase() && (
+                <p className="text-xs text-amber-300/80 break-words">
+                  {testedAs
+                    ? `On its own this key is ${testedAs}: the test went through another key that ~/.ssh/config gives github.com.`
+                    : "On its own this key is refused by github.com: the test went through another key that ~/.ssh/config gives github.com. Register this one."}
+                </p>
+              )}
               <pre className="p-3 bg-zinc-900 rounded-lg border border-zinc-700 text-xs text-zinc-400 font-mono whitespace-pre-wrap break-words overflow-x-auto">
                 {testResult.message}
               </pre>
-              <Button onClick={handleTest} variant="secondary" size="sm">
-                Test Again
-              </Button>
+              <div className="flex gap-2">
+                <Button onClick={() => setStep("pubkey")} variant="secondary" size="sm">
+                  Back
+                </Button>
+                <Button onClick={handleTest} variant="secondary" size="sm">
+                  Test Again
+                </Button>
+              </div>
             </div>
           )}
 
@@ -387,9 +447,14 @@ export function SSHWizard() {
               <p className="text-xs text-zinc-500">
                 Make sure the public key has been added to your GitHub account.
               </p>
-              <Button onClick={handleTest} variant="secondary" size="sm">
-                Retry
-              </Button>
+              <div className="flex gap-2">
+                <Button onClick={() => setStep("pubkey")} variant="secondary" size="sm">
+                  Back
+                </Button>
+                <Button onClick={handleTest} variant="secondary" size="sm">
+                  Retry
+                </Button>
+              </div>
             </div>
           )}
         </Card>
@@ -409,20 +474,36 @@ export function SSHWizard() {
         ) : (
           <div className="space-y-1.5">
             {existingKeys.map((k) => (
-              <div
-                key={k}
-                className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-zinc-800/70 border border-zinc-700/50"
-              >
-                <span className="text-sm text-zinc-300 font-mono truncate min-w-0">
-                  {baseName(k)}
-                </span>
-                <button
-                  onClick={() => setKeyToDelete(k)}
-                  className="p-1.5 rounded shrink-0 hover:bg-zinc-700 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer"
-                  title="Delete key"
-                >
-                  <Trash2 size={15} />
-                </button>
+              <div key={k} className="rounded-lg bg-zinc-800/70 border border-zinc-700/50">
+                <div className="flex items-center justify-between gap-3 px-3 py-2 flex-wrap">
+                  <span className="text-sm text-zinc-300 font-mono truncate min-w-0 flex-1">
+                    {baseName(k)}
+                  </span>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Button size="sm" variant="ghost" onClick={() => setOpenRow(openRow === k ? null : k)} aria-expanded={openRow === k}>
+                      Register
+                    </Button>
+                    <Button size="sm" variant="ghost" onClick={() => copyRowKey(k)}>
+                      Copy public key
+                    </Button>
+                    <Button size="sm" variant="ghost" onClick={() => checkRowAccount(k)}>
+                      Check account
+                    </Button>
+                    <button
+                      onClick={() => setKeyToDelete(k)}
+                      className="p-1.5 rounded shrink-0 hover:bg-zinc-700 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer"
+                      title="Delete key"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                </div>
+                {rowNote[k] && <p className="px-3 pb-2 text-xs text-zinc-400 break-words">{rowNote[k]}</p>}
+                {openRow === k && (
+                  <div className="px-3 pb-3">
+                    <RegisterKey keyPath={k} accounts={ghAccounts} />
+                  </div>
+                )}
               </div>
             ))}
           </div>

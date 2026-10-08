@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
+import { readPersisted, writePersisted } from "./lib/persist";
 import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequestArrow, SquareTerminal } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
@@ -16,8 +17,22 @@ import { Repo } from "./pages/Repo";
 import { ConsoleDrawer } from "./components/console/ConsoleDrawer";
 import { toggleConsole, useConsole } from "./lib/console";
 
+const REPO_TABS = ["changes", "history", "submodules"];
+
+/** The Repository page's tab the person was last on. */
+function rememberedRepoTab(): string {
+  const t = readPersisted<string>("repo.tab", "changes");
+  return REPO_TABS.includes(t) ? t : "changes";
+}
+
 function App() {
   const location = useLocation();
+  // The tab on screen is remembered, so the sidebar's Repository and /repo
+  // bring the person back to it after another page.
+  const repoTabHere = /^\/repo\/(changes|history|submodules)\/?$/.exec(location.pathname)?.[1] ?? null;
+  useEffect(() => {
+    if (repoTabHere) writePersisted("repo.tab", repoTabHere);
+  }, [repoTabHere]);
   const { open: consoleOpen, height: consoleHeight } = useConsole();
 
   // Ctrl/Cmd + ` is the shortcut every other editor uses for its terminal.
@@ -61,7 +76,7 @@ function App() {
             Clone
           </SidebarLink>
           <SidebarLink
-            to="/repo/changes"
+            to={`/repo/${repoTabHere ?? rememberedRepoTab()}`}
             icon={<GitPullRequestArrow size={18} />}
             active={/^\/repo(\/|$)/.test(location.pathname)}
           >
@@ -111,7 +126,7 @@ function App() {
           <Route path="/repos" element={<Repositories />} />
           <Route path="/sparse" element={<SparseClone />} />
           <Route path="/repo/:tab" element={<Repo />} />
-          <Route path="/repo" element={<Navigate to="/repo/changes" replace />} />
+          <Route path="/repo" element={<Navigate to={`/repo/${rememberedRepoTab()}`} replace />} />
           <Route path="/changes" element={<Navigate to="/repo/changes" replace />} />
           <Route path="/auto-assign" element={<AutoAssign />} />
           <Route path="/doctor" element={<Doctor />} />

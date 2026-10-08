@@ -10,20 +10,30 @@ import { copyText } from "../lib/clipboard";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "../lib/api";
 import { RefreshButton } from "../components/RefreshButton";
+import { forgetSignIn, identityOf, rememberSignIn, rememberedSignIns, SIGNIN_PREFIX, type SignIn } from "../lib/signins";
 
 type AuthStep = "idle" | "waiting" | "success" | "error";
+
+/** GitHub's own answers that end a device-flow sign-in; anything else is tried again until the code expires. */
+const FINAL_ERRORS = ["access_denied", "expired_token", "incorrect_device_code", "incorrect_client_credentials", "unsupported_grant_type", "device_flow_disabled"];
 
 export function GitHubAuth() {
   const navigate = useNavigate();
   const [step, setStep] = useState<AuthStep>("idle");
   const [deviceCode, setDeviceCode] = useState<api.DeviceCodeResponse | null>(null);
   const [user, setUser] = useState<api.GitHubUser | null>(null);
+  /** How the account on the Connected screen was reached: a gh login, or the device flow. */
+  const [via, setVia] = useState<"gh" | "device">("device");
   const [error, setError] = useState<string | null>(null);
+  /** A check GitHub did not answer, shown while the page keeps waiting. */
+  const [retryNote, setRetryNote] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [ghAccounts, setGhAccounts] = useState<string[]>([]);
   const [ghBusy, setGhBusy] = useState<string | null>(null);
   const [removeTarget, setRemoveTarget] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
   const [removing, setRemoving] = useState(false);
+  const [signins, setSignins] = useState<SignIn[]>(rememberedSignIns);
   const pollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollGenRef = useRef(0);
 
@@ -40,6 +50,7 @@ export function GitHubAuth() {
 
   async function refreshGhAccounts() {
     setGhRefreshing(true);
+    setSignins(rememberedSignIns());
     try {
       const accts = await api.ghListAccounts();
       setGhAccounts(accts);
@@ -54,20 +65,37 @@ export function GitHubAuth() {
     // Best-effort: populate accounts from the local gh CLI if it's available.
     loadGhAccounts();
     return () => {
+      // Leaving the page ends the sign-in: a check in flight, or a code
+      // that arrives late, must start nothing more.
+      pollGenRef.current++;
       if (pollTimeoutRef.current) clearTimeout(pollTimeoutRef.current);
     };
   }, []);
 
+  function openRemove(acct: string) {
+    setRemoveError(null);
+    setRemoveTarget(acct);
+  }
+
+  function closeRemove() {
+    if (removing) return;
+    setRemoveTarget(null);
+    setRemoveError(null);
+  }
+
   async function handleRemoveAccount() {
     if (!removeTarget) return;
     setRemoving(true);
-    setError(null);
+    setRemoveError(null);
     try {
       await api.ghLogout(removeTarget);
       setRemoveTarget(null);
       loadGhAccounts();
     } catch (e) {
-      setError(String(e));
+      // Said where it was asked for, in the dialog; the list is read again,
+      // so a row for an account already gone disappears.
+      setRemoveError(String(e));
+      loadGhAccounts();
     } finally {
       setRemoving(false);
     }
@@ -80,6 +108,7 @@ export function GitHubAuth() {
       const token = await api.ghGetToken(account);
       const ghUser = await api.verifyGithubToken(token);
       setUser(ghUser);
+      setVia("gh");
       // Note: tokens are not persisted here — gh already stores them securely,
       // and nothing in the app reads a per-account copy.
       setStep("success");
@@ -101,25 +130,33 @@ export function GitHubAuth() {
 
   async function startDeviceFlow() {
     stopPolling(); // kill any poller from a previous attempt so it can't hijack the UI
+    const myGen = pollGenRef.current;
     const clientId = getEffectiveClientId();
     setError(null);
+    setRetryNote(null);
     setStep("waiting");
     setDeviceCode(null);
 
     // The very first network request from the app can cold-start-fail; retry a
     // couple times before surfacing an error so users don't see a spurious "Try again".
+    // A code that arrives after Cancel, or after the page was left, is dropped.
     let lastErr: unknown = null;
     for (let attempt = 0; attempt < 3; attempt++) {
+      if (pollGenRef.current !== myGen) return;
       try {
         const code = await api.githubDeviceCode(clientId);
+        if (pollGenRef.current !== myGen) return;
         setDeviceCode(code);
         startPolling(code, clientId);
         return;
       } catch (e) {
+        if (pollGenRef.current !== myGen) return;
         lastErr = e;
         await new Promise((r) => setTimeout(r, 700));
+        if (pollGenRef.current !== myGen) return;
       }
     }
+    if (pollGenRef.current !== myGen) return;
     setError(String(lastErr));
     setStep("error");
   }
@@ -131,6 +168,10 @@ export function GitHubAuth() {
     // So: recursive setTimeout, one request at a time, interval grows on slow_down.
     const deadline = Date.now() + code.expires_in * 1000;
     let delay = (code.interval || 5) * 1000;
+    // Once GitHub has issued the token the device code is used up: a failure
+    // after that retries reading the account with the same token, never polls again.
+    let granted: string | null = null;
+    let lastErr = "";
     pollGenRef.current++;
     const myGen = pollGenRef.current;
 
@@ -141,31 +182,54 @@ export function GitHubAuth() {
     const tick = async () => {
       if (pollGenRef.current !== myGen) return; // superseded/cancelled
       if (Date.now() > deadline) {
-        setError("The code expired before you authorized. Click Sign in for a fresh code.");
+        setError(
+          granted
+            ? `GitHub granted the sign-in, but the account could not be read: ${lastErr}`
+            : "The code expired before you authorized. Click Sign in for a fresh code."
+        );
         setStep("error");
         return;
       }
       try {
-        const token = await api.githubPollToken(code.device_code, clientId);
+        if (!granted) {
+          const token = await api.githubPollToken(code.device_code, clientId);
+          if (pollGenRef.current !== myGen) return;
+          granted = token.access_token;
+        }
+        const ghUser = await api.verifyGithubToken(granted);
         if (pollGenRef.current !== myGen) return;
-        const ghUser = await api.verifyGithubToken(token.access_token);
-        if (pollGenRef.current !== myGen) return;
+        rememberSignIn(ghUser);
+        setSignins(rememberedSignIns());
+        setRetryNote(null);
         setUser(ghUser);
+        setVia("device");
         setStep("success");
         return; // done — stop the loop
       } catch (e) {
         if (pollGenRef.current !== myGen) return;
         const msg = String(e);
-        if (msg.includes("slow_down")) {
-          delay += 5000; // GitHub told us to back off — obey it
+        lastErr = msg;
+        if (!granted && msg.includes("slow_down")) {
+          // GitHub told us to back off: by its own interval when it sends one.
+          const asked = Number(/interval=(\d+)/.exec(msg)?.[1]) || 0;
+          delay = Math.max(delay + 5000, asked * 1000);
+          setRetryNote(null);
           schedule();
           return;
         }
-        if (msg.includes("authorization_pending")) {
+        if (!granted && msg.includes("authorization_pending")) {
+          setRetryNote(null);
           schedule(); // keep waiting at the same interval
           return;
         }
-        // terminal errors
+        const final = !granted && (FINAL_ERRORS.some((f) => msg.includes(f)) || /GitHub returned 4(?!29)\d\d/.test(msg));
+        if (!final) {
+          // Not GitHub's answer — a check that timed out, a server error, a
+          // reply that could not be read: the sign-in goes on until the code expires.
+          setRetryNote(`GitHub did not answer the last check — still trying: ${msg}`);
+          schedule();
+          return;
+        }
         if (msg.includes("access_denied")) {
           setError(
             "Authorization was denied or blocked. If GitHub showed an organization / third-party error, that account's org restricts OAuth apps — use \"Use GitHub CLI\" below instead."
@@ -201,9 +265,13 @@ export function GitHubAuth() {
     });
   }
 
+  /** The same identity the profile form's Autofill gives: the login, and the public or no-reply email. */
   function handleCreateProfile() {
     if (!user) return;
-    navigate(`/profile/new?github_name=${encodeURIComponent(user.login)}&github_email=${encodeURIComponent(user.email || "")}&git_name=${encodeURIComponent(user.name || user.login)}`);
+    const idty = identityOf(user);
+    const account = via === "device" && !ghAccounts.some((a) => a.toLowerCase() === user.login.toLowerCase()) ? `${SIGNIN_PREFIX}${user.login}` : user.login;
+    const q = new URLSearchParams({ github_name: idty.login, github_email: idty.email, git_name: idty.login, account });
+    navigate(`/profile/new?${q.toString()}`);
   }
 
   if (step === "idle") {
@@ -232,6 +300,33 @@ export function GitHubAuth() {
             Sign in with GitHub
           </Button>
         </Card>
+
+        {signins.length > 0 && (
+          <Card>
+            <h3 className="text-sm font-medium text-zinc-200 mb-1">Signed in with GitHub on this computer</h3>
+            <p className="text-xs text-zinc-500 mb-3">
+              Their name and email fill a profile from "Autofill from GitHub". Only those are kept, not
+              the sign-in: listing repositories and registering keys use the GitHub CLI's logins.
+            </p>
+            <div className="space-y-1.5">
+              {signins.map((s) => (
+                <div key={s.login} className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-zinc-800/70 border border-zinc-700/50">
+                  <span className="text-sm text-zinc-200 font-mono truncate min-w-0">{s.login}</span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => {
+                      forgetSignIn(s.login);
+                      setSignins(rememberedSignIns());
+                    }}
+                  >
+                    Forget
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </Card>
+        )}
 
         <Card>
             <div className="flex items-center justify-between mb-1 gap-3 flex-wrap">
@@ -293,7 +388,7 @@ export function GitHubAuth() {
                       )}
                     </Button>
                     <button
-                      onClick={() => setRemoveTarget(acct)}
+                      onClick={() => openRemove(acct)}
                       title="Remove this account from the GitHub CLI"
                       className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer"
                     >
@@ -308,23 +403,28 @@ export function GitHubAuth() {
 
         <Modal
           open={removeTarget !== null}
-          onClose={() => setRemoveTarget(null)}
+          onClose={closeRemove}
           title="Remove GitHub Account?"
         >
           <p className="text-sm text-zinc-400 mb-2">
             This logs{" "}
             <span className="font-mono text-zinc-200">{removeTarget}</span> out
             of the GitHub CLI (<span className="font-mono">gh</span>) on this
-            machine.
+            machine — from every host gh has it signed in to.
           </p>
           <p className="text-xs text-zinc-500 mb-4">
             Your SSH keys and GitSwitch profiles are not affected. You can sign
             back in anytime with <span className="font-mono">gh auth login</span>.
           </p>
+          {removeError && (
+            <p role="alert" className="text-sm text-red-400 mb-4 whitespace-pre-wrap break-words">
+              {removeError}
+            </p>
+          )}
           <div className="flex justify-end gap-3">
             <Button
               variant="secondary"
-              onClick={() => setRemoveTarget(null)}
+              onClick={closeRemove}
               disabled={removing}
             >
               Cancel
@@ -363,6 +463,18 @@ export function GitHubAuth() {
           <p className="text-sm text-zinc-400">
             Requesting a sign-in code from GitHub…
           </p>
+          <div className="flex justify-center mt-4">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                stopPolling();
+                setStep("idle");
+              }}
+            >
+              Cancel
+            </Button>
+          </div>
         </Card>
       </div>
     );
@@ -408,6 +520,9 @@ export function GitHubAuth() {
             <Loader2 size={16} className="animate-spin" />
             Waiting for authorization...
           </div>
+          {retryNote && (
+            <p className="text-xs text-amber-300/80 text-center mt-2 max-w-md mx-auto break-words">{retryNote}</p>
+          )}
           <p className="text-xs text-zinc-600 text-center mt-3 max-w-sm mx-auto">
             This completes automatically once you authorize on GitHub. If GitHub
             shows a third-party / organization error there, that account blocks
@@ -447,17 +562,24 @@ export function GitHubAuth() {
               alt={user.login}
               className="w-16 h-16 rounded-full border-2 border-emerald-500"
             />
-            <div>
-              <h3 className="text-lg font-semibold text-zinc-100">{user.name || user.login}</h3>
+            <div className="min-w-0">
+              <h3 className="text-lg font-semibold text-zinc-100 truncate">{user.name || user.login}</h3>
               <p className="text-sm text-zinc-400">@{user.login}</p>
               {user.email && (
-                <p className="text-sm text-zinc-500">{user.email}</p>
+                <p className="text-sm text-zinc-500 break-all">{user.email}</p>
               )}
             </div>
-            <CheckCircle2 size={24} className="ml-auto text-emerald-400" />
+            <CheckCircle2 size={24} className="ml-auto text-emerald-400 shrink-0" />
           </div>
+          {via === "device" && (
+            <p className="text-xs text-zinc-500 mb-5">
+              GitSwitch remembers this account's name and email for "Autofill from GitHub" when you
+              create or edit a profile. The sign-in itself is not kept: listing repositories and
+              registering keys use the GitHub CLI's logins.
+            </p>
+          )}
 
-          <div className="flex gap-3">
+          <div className="flex gap-3 flex-wrap">
             <Button onClick={handleCreateProfile}>
               Create Profile from GitHub
             </Button>
@@ -480,7 +602,7 @@ export function GitHubAuth() {
         <Card className="text-center py-8">
           <div className="text-red-400 mb-4">
             <p className="font-medium">Authentication failed</p>
-            {error && <p className="text-sm text-zinc-500 mt-1">{error}</p>}
+            {error && <p className="text-sm text-zinc-500 mt-1 break-words">{error}</p>}
           </div>
           <Button onClick={() => { stopPolling(); setStep("idle"); setError(null); }}>
             Try Again

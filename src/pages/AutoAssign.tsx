@@ -58,6 +58,7 @@ export function AutoAssign() {
   const [statusLine, setStatusLine] = useState("");
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [profileLogins, setProfileLogins] = useState<Record<string, string | null>>({});
+  const [loginSources, setLoginSources] = useState<Record<string, "key" | "saved" | null>>({});
   const [rows, setRows] = useState<RepoRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -90,21 +91,28 @@ export function AutoAssign() {
       setStatusLine("Resolving which account each profile's SSH key belongs to…");
       const profs = await api.getProfiles();
       setProfiles(profs);
+      // The key first — it is who git authenticates as; without a key the
+      // check can use (none, or one locked by a passphrase), the GitHub
+      // account the profile says it pushes as.
       const logins: Record<string, string | null> = {};
+      const sources: Record<string, "key" | "saved" | null> = {};
       await Promise.all(
         profs.map(async (p) => {
-          if (!p.ssh_key_path) {
-            logins[p.id] = null;
-            return;
+          let byKey: string | null = null;
+          if (p.ssh_key_path) {
+            try {
+              byKey = await api.resolveKeyAccount(p.ssh_key_path);
+            } catch {
+              byKey = null;
+            }
           }
-          try {
-            logins[p.id] = await api.resolveKeyAccount(p.ssh_key_path);
-          } catch {
-            logins[p.id] = null;
-          }
+          const saved = (p.github_login ?? "").trim().replace(/^@/, "") || null;
+          logins[p.id] = byKey ?? saved;
+          sources[p.id] = byKey ? "key" : saved ? "saved" : null;
         })
       );
       setProfileLogins(logins);
+      setLoginSources(sources);
 
       // 3. Collect gh accounts + tokens
       setStatusLine("Loading GitHub CLI accounts…");
@@ -403,7 +411,7 @@ export function AutoAssign() {
                         ...profiles.map((p) => ({
                           value: p.id,
                           label: profileLogins[p.id]
-                            ? `${p.name} (${profileLogins[p.id]})`
+                            ? `${p.name} (${profileLogins[p.id]}${loginSources[p.id] === "saved" ? " · saved account" : ""})`
                             : p.name,
                         })),
                       ]}
@@ -423,9 +431,9 @@ export function AutoAssign() {
           </div>
           <p className="text-xs text-zinc-600 mt-3">
             "push · account" means that account can push to the repo — repos are
-            proposed to the profile whose SSH key belongs to an account with push
-            access. A folder moves to exactly one profile; conflicts are cleaned
-            up automatically.
+            proposed to the profile whose SSH key — or, without a usable key, whose
+            saved GitHub account — has push access. A folder moves to exactly one
+            profile; conflicts are cleaned up automatically.
           </p>
         </Card>
       )}

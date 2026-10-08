@@ -52,6 +52,8 @@ export function Repo() {
   const [subs, setSubs] = useState<SubmoduleInfo[]>([]);
   /** Every gitlink, populated or not — whether the repository has submodules at all. */
   const [gitlinkPaths, setGitlinkPaths] = useState<string[]>([]);
+  /** The repository the gitlink list above was read for. */
+  const [gitlinksFor, setGitlinksFor] = useState("");
   const gitlinks = gitlinkPaths.length;
   const [status, setStatus] = useState<RepoStatus | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(false);
@@ -141,6 +143,7 @@ export function Repo() {
     if (!sel.path) {
       setSubs([]);
       setGitlinkPaths([]);
+      setGitlinksFor("");
       return;
     }
     let cancelled = false;
@@ -150,6 +153,7 @@ export function Repo() {
         if (cancelled) return;
         const usable = list.filter((m) => m.initialised && m.listed && m.gitdir_valid);
         setGitlinkPaths(list.map((m) => m.path));
+        setGitlinksFor(sel.path);
         setSubs(usable);
         // A scope that is no gitlink at all is stale (the submodule was removed);
         // one that merely is not initialised or mapped stays — "Open as its own
@@ -238,6 +242,11 @@ export function Repo() {
   const movedCount = subs.filter((m) => m.state === "moved" || m.state === "moved-and-dirty").length;
 
   const go = (t: Tab) => navigate(`/repo/${t}`);
+  useEffect(() => {
+    if (tab === "submodules" && !sel.sub && sel.path && gitlinksFor === sel.path && gitlinkPaths.length === 0) {
+      navigate("/repo/changes", { replace: true });
+    }
+  }, [tab, sel.sub, sel.path, gitlinksFor, gitlinkPaths.length, navigate]);
   pathRef.current = sel.effectivePath;
   // The drawer belongs to one repository: moving to another closes it.
   useEffect(() => {

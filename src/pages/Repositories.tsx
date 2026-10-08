@@ -343,8 +343,8 @@ export function Repositories() {
           <BookMarked size={32} className="mx-auto text-zinc-600 mb-3" />
           <h3 className="text-lg font-medium text-zinc-300">No GitHub accounts signed in</h3>
           <p className="text-sm text-zinc-500 mt-1 max-w-md mx-auto">
-            Sign in with the GitHub CLI (<span className="font-mono">gh auth login</span>) or on the
-            GitHub Auth page, and your repositories will show up here.
+            Sign in with the GitHub CLI (<span className="font-mono">gh auth login</span> in a terminal),
+            then Refresh, and the repositories each account can reach show up here.
           </p>
           <Button className="mt-4" variant="secondary" onClick={() => navigate("/github")}>
             <GitHubIcon size={16} />

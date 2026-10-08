@@ -165,13 +165,51 @@ pub async fn check_environment() -> Result<Vec<Finding>, AppError> {
             "GitHub CLI (gh) not found",
             "Optional, but it powers one-click key registration, account sign-in, autofill and Auto Assign. Install from https://cli.github.com",
         ));
-    } else if gh_cli::gh_list_accounts().await.is_err() {
-        out.push(Finding::new(
-            "gh-not-authenticated",
-            "info",
-            "GitHub CLI has no signed-in accounts",
-            "Run `gh auth login` so GitSwitch can verify repo access and register keys.",
-        ));
+    } else {
+        match gh_cli::gh_auth_status().await {
+            Ok(accounts) if !accounts.is_empty() => {
+                // What each github.com token lacks for what GitSwitch asks of
+                // it. A token gh lists no scopes for (fine-grained, an app's)
+                // has none to lack, so it is not reported.
+                for a in accounts.iter().filter(|a| a.host == "github.com") {
+                    let Some(scopes) = &a.scopes else { continue };
+                    let needs_signing = store
+                        .profiles
+                        .iter()
+                        .any(|p| p.signing_enabled && p.github_login.as_deref().is_none_or(|l| l.trim_start_matches('@').eq_ignore_ascii_case(&a.login)));
+                    let missing = gh_cli::missing_scopes(scopes, needs_signing);
+                    if missing.is_empty() {
+                        continue;
+                    }
+                    let names: Vec<&str> = missing.iter().map(|(n, _)| *n).collect();
+                    let why: Vec<String> = missing.iter().map(|(n, w)| format!("{} for {}", n, w)).collect();
+                    // `gh auth refresh` acts on the active account only.
+                    let refresh = format!("gh auth refresh -h github.com -s {}", names.join(","));
+                    let command = if a.active == Some(false) {
+                        format!("gh auth switch -h github.com -u {} && {}", a.login, refresh)
+                    } else {
+                        refresh
+                    };
+                    out.push(Finding::new(
+                        &format!("gh-token-scopes:{}", a.login),
+                        "info",
+                        format!("gh's token for @{} lacks {}", a.login, names.join(", ")),
+                        format!(
+                            "Its scopes: {}. It needs {}. In a terminal: {}",
+                            if scopes.is_empty() { "none".to_string() } else { scopes.join(", ") },
+                            why.join("; "),
+                            command
+                        ),
+                    ));
+                }
+            }
+            _ => out.push(Finding::new(
+                "gh-not-authenticated",
+                "info",
+                "GitHub CLI has no signed-in accounts",
+                "Run `gh auth login` so GitSwitch can verify repo access and register keys.",
+            )),
+        }
     }
 
     // ~/.ssh/config pinning a key for github.com defeats per-folder switching.
@@ -401,6 +439,16 @@ pub async fn check_keys() -> Result<Vec<Finding>, AppError> {
                     ));
                 }
             }
+            Ok(None) if ssh_keys::rejected_because_locked(ssh_keys::key_has_passphrase(key), ssh_keys::agent_holds_key(key).await) => out.push(Finding::new(
+                "key-locked",
+                "info",
+                format!("Couldn't verify profile \"{}\"'s key: it needs its passphrase", p.name),
+                format!(
+                    "{} is passphrase-protected and not loaded in ssh-agent, so GitSwitch could not unlock it to ask github.com which account it belongs to. Pushes may still work: ssh can unlock it through your ssh config or keychain. Load it with `ssh-add {}` and run the checks again for a definite answer.",
+                    key,
+                    crate::paths::shell_quote(key)
+                ),
+            )),
             Ok(None) => out.push(Finding::new(
                 "key-not-registered",
                 "error",

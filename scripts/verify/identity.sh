@@ -300,4 +300,152 @@ ok "  the hook that was there before still runs" "$C" "FOREIGN HOOK RAN"
 ST=$(pinvoke changes_repo_status "$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1]}))' "$G")")
 ok "  and the Changes page reads the guard's email" "$(printf '%s' "$ST" | jqf value.identity.guard_email)" "work2@example.test"
 
+section "Removing a GitHub CLI account signs it out of every host it is on"
+# A gh that answers `auth status` from a file and records each logout,
+# refusing the way gh 2.40+ does.
+GHB="$SB/ghbin"; mkdir -p "$GHB"
+cat > "$GHB/gh" <<'FAKEGH'
+#!/bin/sh
+status="$GH_FAKE_DIR/gh-status.txt"
+case "$1 $2" in
+  "auth status") cat "$status" >&2; exit 0 ;;
+  "auth logout")
+    echo "$*" >> "$GH_FAKE_DIR/gh-calls.txt"
+    if [ -n "${GH_TOKEN:-}" ]; then echo "The value of the GH_TOKEN environment variable is being used for authentication." >&2; exit 1; fi
+    shift 2; host=""; user=""
+    while [ $# -gt 0 ]; do case "$1" in --hostname) host="$2"; shift 2;; --user) user="$2"; shift 2;; *) shift;; esac; done
+    n=$(grep -c "account $user " "$status")
+    if [ "$n" = 0 ]; then echo "no accounts matched that criteria" >&2; exit 1; fi
+    if [ -z "$host" ] && [ "$n" -gt 1 ]; then echo "unable to determine which account to log out of, please specify --hostname and --user" >&2; exit 1; fi
+    if [ -n "$host" ]; then grep -v "to $host account $user " "$status" > "$status.new"; else grep -v "account $user " "$status" > "$status.new"; fi
+    mv "$status.new" "$status"; exit 0 ;;
+esac
+exit 1
+FAKEGH
+chmod +x "$GHB/gh"
+printf '  ✓ Logged in to github.com account alice (keyring)\n  - Active account: true\n  ✓ Logged in to github.com account bob (keyring)\n  ✓ Logged in to ghe.example.com account alice (keyring)\n' > "$SB/gh-status.txt"
+: > "$SB/gh-calls.txt"
+ghx() { ( unset GH_TOKEN GITHUB_TOKEN; PATH="$GHB:$PATH" GH_FAKE_DIR="$SB" pinvoke "$@" ); }
+ok "(gh lists each login once)" "$(ghx gh_list_accounts '{}' | jqf value)" '["alice", "bob"]'
+OUT=$(ghx gh_logout '{"account":"alice"}')
+ok "an account on two hosts is removed from both" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf value)" "True:Removed alice"
+ok "  github.com named explicitly" "$(cat "$SB/gh-calls.txt")" "--hostname github.com --user alice"
+ok "  and the other host" "$(cat "$SB/gh-calls.txt")" "--hostname ghe.example.com --user alice"
+ok "  the other account is still signed in" "$(ghx gh_list_accounts '{}' | jqf value)" '["bob"]'
+ok "an account already signed out elsewhere counts as removed" "$(ghx gh_logout '{"account":"carol"}' | jqf value)" "already signed out"
+OUT=$( PATH="$GHB:$PATH" GH_FAKE_DIR="$SB" GH_TOKEN=x pinvoke gh_logout '{"account":"bob"}' )
+ok "a refusal reaches the person in gh's own words" "$(printf '%s' "$OUT" | jqf error)" "GH_TOKEN"
+
+section "An account's own addresses come back with it, when the token may read them"
+"$PY" - "$SB/emails-api.log" > "$SB/emails-api-port" <<'PYAPI' &
+import http.server, sys, json
+log = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(log, "a") as f:
+            f.write(self.path + "\n")
+        auth = self.headers.get("Authorization", "")
+        if self.path == "/user":
+            body = json.dumps({"id": 42, "login": "octo-home", "name": "Octo Home", "email": None, "avatar_url": ""}).encode()
+            self.send_response(200)
+            self.send_header("X-OAuth-Scopes", "repo, user:email" if auth.endswith("t-scoped") else "repo, read:org")
+        elif self.path == "/user/emails":
+            body = json.dumps([
+                {"email": "old@home.test", "primary": False, "verified": False},
+                {"email": "me@home.test", "primary": True, "verified": True},
+                {"email": "alt@home.test", "primary": False, "verified": True},
+            ]).encode()
+            self.send_response(200)
+        else:
+            body = b"{}"
+            self.send_response(404)
+        self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYAPI
+EMAILS_PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SB/emails-api-port" ] && break; sleep 0.5; done
+EAPI="http://127.0.0.1:$(cat "$SB/emails-api-port")"
+OUT=$(GITSWITCH_GITHUB_API="$EAPI" pinvoke verify_github_token '{"token":"t-scoped"}')
+ok "the primary verified address comes back" "$(printf '%s' "$OUT" | jqf value.primary_email)" "me@home.test"
+ok "  with every verified address and no unverified one" "$(printf '%s' "$OUT" | jqf value.emails)" '["me@home.test", "alt@home.test"]'
+: > "$SB/emails-api.log"
+OUT=$(GITSWITCH_GITHUB_API="$EAPI" pinvoke verify_github_token '{"token":"t-plain"}')
+ok "a token without user:email says so" "$(printf '%s' "$OUT" | jqf value.email_scope_missing)" "True"
+ok "  and spends no request on the addresses" "$(grep -c '^/user/emails' "$SB/emails-api.log" || true)" "0"
+{ kill "$EMAILS_PID" && wait "$EMAILS_PID"; } 2>/dev/null
+
+section "Doctor names the gh token scopes an account lacks"
+FGH="$SB/fakegh"; mkdir -p "$FGH"
+cat > "$FGH/gh" <<'FAKEGH'
+#!/bin/sh
+case "$1" in --version) echo "gh version 2.60.0"; exit 0;; esac
+if [ "$1 $2" = "auth status" ]; then cat >&2 <<'STATUS'
+github.com
+  ✓ Logged in to github.com account alice-dev (keyring)
+  - Active account: true
+  - Token scopes: 'gist', 'read:org', 'repo'
+
+  ✓ Logged in to github.com account bob-work (keyring)
+  - Active account: false
+  - Token scopes: 'read:org', 'repo'
+
+  ✓ Logged in to github.com account dave-full (keyring)
+  - Active account: false
+  - Token scopes: 'admin:public_key', 'repo', 'write:ssh_signing_key'
+
+  ✓ Logged in to github.com account carol-fg (GH_TOKEN)
+  - Active account: false
+  - Token: github_pat_************************************
+STATUS
+exit 0; fi
+exit 1
+FAKEGH
+chmod +x "$FGH/gh"
+"$PY" - "$SB/psign.json" <<'JSONPY'
+import json, sys
+json.dump({"name": "Signer", "git_name": "alice-dev", "git_email": "alice@example.test", "directories": [], "signing_enabled": True, "github_login": "alice-dev"}, open(sys.argv[1], "w"))
+JSONPY
+probe profile_apply "$SB" "$SB/psign.json" >/dev/null
+E=$( PATH="$FGH:$PATH" pinvoke doctor_check_environment '{}' )
+ok "an account missing the key scope is named" "$E" "gh-token-scopes:alice-dev"
+ok "  with the scope registering keys needs" "$E" "admin:public_key"
+ok "  and the signing scope its signing profile needs" "$E" "write:ssh_signing_key"
+ok "  with the command that grants them" "$E" "gh auth refresh -h github.com -s admin:public_key,write:ssh_signing_key"
+ok "an inactive account is switched to first" "$E" "gh auth switch -h github.com -u bob-work"
+ok "an account with every scope is not reported" "$(printf '%s' "$E" | grep -c dave-full || true)" "0"
+ok "a token gh lists no scopes for is not reported" "$(printf '%s' "$E" | grep -c carol-fg || true)" "0"
+
+section "Doctor does not condemn a passphrase key it cannot unlock"
+mkdir -p "$SB/keys"
+ssh-keygen -q -t ed25519 -N secret -C locked -f "$SB/keys/locked" </dev/null
+ssh-keygen -q -t ed25519 -N '' -C open -f "$SB/keys/open" </dev/null
+printf 'not a key\n' > "$SB/keys/garbage"; printf 'not a key\n' > "$SB/keys/garbage.pub"
+FSSH="$SB/fakessh"; mkdir -p "$FSSH"; REAL_SSH="$(command -v ssh)"
+cat > "$FSSH/ssh" <<FAKESSH
+#!/bin/sh
+case "\$1" in -G) exec "$REAL_SSH" "\$@" ;; esac
+echo "git@github.com: Permission denied (publickey)." >&2
+exit 255
+FAKESSH
+chmod +x "$FSSH/ssh"
+for k in locked open garbage; do
+  "$PY" - "$SB/pk-$k.json" "$k" "$SB/keys/$k" "$SB/kdir-$k" <<'JSONPY'
+import json, sys
+f, name, key, folder = sys.argv[1:]
+json.dump({"name": name.capitalize(), "git_name": name, "git_email": name + "@example.test", "ssh_key_path": key, "directories": [folder]}, open(f, "w"))
+JSONPY
+  mkdir -p "$SB/kdir-$k"; probe profile_apply "$SB" "$SB/pk-$k.json" >/dev/null
+done
+K=$( PATH="$FSSH:$FGH:$PATH" SSH_AUTH_SOCK= pinvoke doctor_check_keys '{}' )
+L=$(printf '%s' "$K" | "$PY" -c 'import sys,json;print("\n".join(f["id"]+"|"+f["title"] for f in json.load(sys.stdin)["value"]))')
+ok "a passphrase key github.com refused, not in the agent, is not called unregistered" "$(printf '%s\n' "$L" | grep -c 'key-not-registered|Profile "Locked"' || true)" "0"
+ok "  it says it could not verify it, for want of the passphrase" "$L" 'key-locked|Couldn'"'"'t verify profile "Locked"'
+ok "  and how to load it" "$K" "ssh-add"
+ok "a passphrase-free key github.com refused is still unregistered" "$L" 'key-not-registered|Profile "Open"'
+ok "a key ssh-keygen cannot read at all is not called passphrase-protected" "$(printf '%s\n' "$L" | grep -c 'key-locked|Couldn'"'"'t verify profile "Garbage"' || true)" "0"
+
 verify_result

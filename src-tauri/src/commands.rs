@@ -187,23 +187,23 @@ pub async fn gh_logout(account: String) -> Result<String, AppError> {
 /// Automate "Step 2": register a local key's public half on a specific gh account.
 /// `key_path` is the PRIVATE key path; we read `<key_path>.pub`.
 #[tauri::command]
-pub async fn gh_register_ssh_key(
-    account: String,
-    key_path: String,
-    title: String,
-) -> Result<String, AppError> {
+pub async fn gh_register_ssh_key(account: String, key_path: String) -> Result<String, AppError> {
     let token = gh_cli::gh_get_token(&account).await?;
     let public_key = ssh_keys::get_public_key(&key_path)?;
-
-    match github::upload_ssh_key(&token, &title, &public_key).await {
-        Ok(k) => Ok(format!("Registered '{}' on {}", k.title, account)),
-        Err(AppError::Command(msg))
-            if msg.contains("already in use") || msg.contains("key is already") =>
-        {
-            Ok(format!("Key already registered on {}", account))
-        }
-        Err(e) => Err(e),
-    }
+    let title = ssh_keys::key_title(ssh_keys::computer_name().as_deref());
+    let (status, body, scope) = github::post_ssh_key(&token, &title, &public_key).await?;
+    // "Already in use" is a success only when THIS account holds the key:
+    // otherwise it is the wrong-account case the whole flow exists for.
+    let (mine, holder) = if status == 422 {
+        let material = |k: &str| k.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        let wanted = material(&public_key);
+        let mine = github::list_ssh_keys_github(&token).await.ok().map(|keys| keys.iter().any(|k| material(&k.key) == wanted));
+        let holder = if mine == Some(false) { ssh_keys::resolve_key_account(&key_path).await.ok().flatten() } else { None };
+        (mine, holder)
+    } else {
+        (None, None)
+    };
+    github::key_upload_outcome(&account, status, &body, scope.as_deref(), mine, holder.as_deref())
 }
 
 /// Automate "Step 5": which GitHub account does this key authenticate as?

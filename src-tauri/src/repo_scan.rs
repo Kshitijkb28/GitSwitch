@@ -86,18 +86,13 @@ pub(crate) fn mask_token(url: &str) -> String {
     crate::cmdlog::redact(url)
 }
 
-fn get_origin(dir: &std::path::Path) -> Option<String> {
+fn git_text(dir: &std::path::Path, args: &[&str]) -> Option<String> {
     let started = std::time::Instant::now();
-    let out = crate::spawn::command("git")
-        .args(["-C", &dir.to_string_lossy(), "remote", "get-url", "origin"])
-        .output()
-        .ok()?;
+    let d = dir.to_string_lossy().to_string();
+    let out = crate::spawn::command("git").arg("-C").arg(&d).args(args).output().ok()?;
     crate::cmdlog::record(
         dir,
-        ["git", "-C", &dir.to_string_lossy(), "remote", "get-url", "origin"]
-            .iter()
-            .map(|a| a.to_string())
-            .collect(),
+        ["git", "-C", &d].iter().map(|a| a.to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
         out.status.code().unwrap_or(-1),
         started.elapsed(),
         &String::from_utf8_lossy(&out.stdout),
@@ -106,12 +101,16 @@ fn get_origin(dir: &std::path::Path) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if url.is_empty() {
-        None
-    } else {
-        Some(url)
-    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// origin's URL, or — in a clone whose remote is called something else —
+/// the first remote's.
+fn get_origin(dir: &std::path::Path) -> Option<String> {
+    git_text(dir, &["remote", "get-url", "origin"]).or_else(|| {
+        let first = git_text(dir, &["remote"])?.lines().next()?.trim().to_string();
+        git_text(dir, &["remote", "get-url", &first])
+    })
 }
 
 fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
@@ -152,9 +151,11 @@ fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
                     continue;
                 }
                 let dirname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if dirname.starts_with('.')
-                    || matches!(dirname, "node_modules" | "target" | "Library" | "dist" | "build")
-                {
+                // Noise folders are not walked into — but one that is itself a
+                // repository (a project called `build`, say) is still one.
+                let noise = dirname.starts_with('.')
+                    || matches!(dirname, "node_modules" | "target" | "Library" | "dist" | "build");
+                if noise && !path.join(".git").exists() {
                     continue;
                 }
                 stack.push((path, depth + 1));
@@ -256,6 +257,32 @@ mod tests {
         assert!(has("repo_b"));
         assert!(!has("inner"), "must not descend into a repo");
         assert!(!has("dep"), "must skip node_modules");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn scan_finds_repositories_whatever_their_folder_is_called() {
+        let base = std::env::temp_dir().join(format!("gitswitch-scan-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["build", "dist", "node_modules/dep", "plain"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+            let ok = crate::spawn::command("git").args(["init", "-q"]).arg(base.join(d)).status().map(|s| s.success()).unwrap_or(false);
+            if !ok {
+                return; // no git here: nothing to prove
+            }
+        }
+        let _ = crate::spawn::command("git").arg("-C").arg(base.join("plain")).args(["remote", "add", "upstream", "git@github.com:acme/x.git"]).status();
+        let found = scan_sync(&base.to_string_lossy()).unwrap();
+        let names: Vec<String> = found.iter().map(|r| crate::paths::base_name(&r.path)).collect();
+        assert!(names.contains(&"build".to_string()) && names.contains(&"dist".to_string()), "{names:?}");
+        assert!(!names.contains(&"dep".to_string()), "a repository inside node_modules is not walked into: {names:?}");
+        let plain = found.iter().find(|r| r.path.ends_with("plain")).unwrap();
+        assert_eq!((plain.owner.as_str(), plain.name.as_str()), ("acme", "x"));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

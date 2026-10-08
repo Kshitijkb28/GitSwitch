@@ -59,6 +59,28 @@ export function handOff(_page: "changes" | "history", repo: string) {
   writePersisted("history.rev", "--all");
 }
 
+const session = new Map<string, unknown>();
+
+/**
+ * Like usePersistedState, but kept only while the app runs: a value that
+ * must survive leaving a page and coming back, and must not outlive the
+ * session (an account chosen for one clone, days later, for another).
+ */
+export function useSessionState<T>(key: string, initial: T) {
+  const [value, setValue] = useState<T>(() => (session.has(key) ? (session.get(key) as T) : initial));
+  const set = useCallback(
+    (next: T | ((prev: T) => T)) => {
+      setValue((prev) => {
+        const v = typeof next === "function" ? (next as (p: T) => T)(prev) : next;
+        session.set(key, v);
+        return v;
+      });
+    },
+    [key]
+  );
+  return [value, set] as const;
+}
+
 export function usePersistedState<T>(key: string, initial: T) {
   const [value, setValue] = useState<T>(() => read(key, initial));
 

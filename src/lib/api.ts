@@ -90,10 +90,9 @@ export async function ghLogout(account: string): Promise<string> {
 
 export async function ghRegisterSshKey(
   account: string,
-  keyPath: string,
-  title: string
+  keyPath: string
 ): Promise<string> {
-  return invoke("gh_register_ssh_key", { account, keyPath, title });
+  return invoke("gh_register_ssh_key", { account, keyPath });
 }
 
 export async function resolveKeyAccount(
@@ -720,8 +719,14 @@ export interface GitHubUser {
   id: number;
   login: string;
   name: string | null;
+  /** The public address, if the account shows one. */
   email: string | null;
   avatar_url: string;
+  /** The account's verified addresses, primary first (needs the user:email scope). */
+  emails?: string[];
+  primary_email?: string | null;
+  /** The token could not read the account's addresses. */
+  email_scope_missing?: boolean;
 }
 
 export interface GitHubKey {

@@ -143,6 +143,9 @@ pub(crate) mod tests {
         match cmd.as_str() {
             // profiles / repositories
             "get_profiles" => reply(c::get_profiles()),
+            "verify_github_token" => forward!(c::verify_github_token, args, token),
+            "gh_list_accounts" => forward!(c::gh_list_accounts, args),
+            "gh_logout" => forward!(c::gh_logout, args, account),
             "apply_git_config" => reply(c::apply_git_config()),
             "history_list_repos" => forward!(c::history_list_repos, args),
             "path_exists" => {
@@ -266,7 +269,7 @@ pub(crate) mod tests {
                 let str_of = |k: &str| v[k].as_str().unwrap_or_default().to_string();
                 let dirs: Vec<String> = v["directories"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default();
                 let remotes: Vec<String> = v["remote_patterns"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default();
-                match crate::profiles::create_profile(str_of("name"), str_of("git_name"), str_of("git_email"), v["ssh_key_path"].as_str().map(String::from), dirs, v["allow_push"].as_bool().unwrap_or(true), false, remotes, v["github_login"].as_str().map(String::from)) {
+                match crate::profiles::create_profile(str_of("name"), str_of("git_name"), str_of("git_email"), v["ssh_key_path"].as_str().map(String::from), dirs, v["allow_push"].as_bool().unwrap_or(true), v["signing_enabled"].as_bool().unwrap_or(false), remotes, v["github_login"].as_str().map(String::from)) {
                     Ok(p) => match crate::git_config::apply_git_config() {
                         Ok(()) => emit(&p),
                         Err(e) => emit_err(e),
