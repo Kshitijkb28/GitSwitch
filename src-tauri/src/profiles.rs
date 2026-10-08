@@ -35,6 +35,14 @@ pub struct Profile {
     /// The Changes page compares it with the account a push would really use.
     #[serde(default)]
     pub github_login: Option<String>,
+    /// HTTPS clones in this profile's folders push over SSH with its key —
+    /// git's pushInsteadOf: fetch stays on HTTPS — so a push goes as the key's
+    /// account, not whichever one the credential helper holds. Off unless
+    /// turned on (`None` in older stores): an organisation that requires SSH
+    /// certificates refuses a plain key, and a push that works over HTTPS
+    /// today must not start failing after an update.
+    #[serde(default)]
+    pub push_over_ssh: Option<bool>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -255,6 +263,7 @@ pub fn create_profile(
     signing_enabled: bool,
     remote_patterns: Vec<String>,
     github_login: Option<String>,
+    push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
     let mut store = load_profiles()?;
 
@@ -284,6 +293,7 @@ pub fn create_profile(
         github_login: github_login.map(|l| l.trim().trim_start_matches('@').to_string()).filter(|l| !l.is_empty()),
         created_at: now,
         updated_at: now,
+        push_over_ssh,
     };
 
     // A folder belongs to exactly one profile — strip it from any others.
@@ -306,6 +316,7 @@ pub fn update_profile(
     signing_enabled: Option<bool>,
     remote_patterns: Option<Vec<String>>,
     github_login: Option<String>,
+    push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
     let mut store = load_profiles()?;
 
@@ -315,6 +326,9 @@ pub fn update_profile(
         .find(|p| p.id == id)
         .ok_or(AppError::NotFound(format!("Profile {} not found", id)))?;
 
+    if push_over_ssh.is_some() {
+        profile.push_over_ssh = push_over_ssh;
+    }
     if let Some(n) = name {
         profile.name = n.trim().to_string();
     }
@@ -457,6 +471,7 @@ mod tests {
             directories: dirs.iter().map(|s| s.to_string()).collect(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            push_over_ssh: None,
         }
     }
 

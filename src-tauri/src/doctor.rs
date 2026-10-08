@@ -595,7 +595,7 @@ pub async fn apply_fix(fix: &str) -> Result<String, AppError> {
             // guards in the folder refreshed — the repositories there now
             // belong to the other profile, and a guard still expecting this
             // one's address would refuse every commit.
-            crate::commands::update_profile_core(p.id.clone(), None, None, None, None, Some(keep), None, None, None, None).await?;
+            crate::commands::update_profile_core(p.id.clone(), None, None, None, None, Some(keep), None, None, None, None, None).await?;
             Ok(format!("Removed {} from \"{}\"", dir, p.name))
         }
         DoctorFix::RegisterKey { profile_id } => {
@@ -614,7 +614,7 @@ pub async fn apply_fix(fix: &str) -> Result<String, AppError> {
             }
             let mut dirs = p.directories.clone();
             dirs.push(path.clone());
-            crate::commands::update_profile_core(p.id.clone(), None, None, None, None, Some(dirs), None, None, None, None).await?;
+            crate::commands::update_profile_core(p.id.clone(), None, None, None, None, Some(dirs), None, None, None, None, None).await?;
             Ok(format!("{} now belongs to \"{}\"", path, p.name))
         }
         DoctorFix::RegisterSigning { login, profile_id } => {

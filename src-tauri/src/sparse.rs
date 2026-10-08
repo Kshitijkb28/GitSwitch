@@ -1690,7 +1690,7 @@ async fn clone_as_profile(
         if !already {
             let mut dirs = p.directories.clone();
             dirs.push(dest_str.clone());
-            profiles::update_profile(p.id.clone(), None, None, None, None, Some(dirs), None, None, None, None)
+            profiles::update_profile(p.id.clone(), None, None, None, None, Some(dirs), None, None, None, None, None)
                 .and_then(|_| crate::git_config::apply_git_config())
                 .map_err(|e| {
                     AppError::Config(format!(
@@ -1981,6 +1981,7 @@ mod tests {
             directories: dirs.iter().map(|d| d.to_string()).collect(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            push_over_ssh: None,
         }
     }
 

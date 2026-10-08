@@ -277,7 +277,7 @@ pub(crate) mod tests {
                 let str_of = |k: &str| v[k].as_str().unwrap_or_default().to_string();
                 let dirs: Vec<String> = v["directories"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default();
                 let remotes: Vec<String> = v["remote_patterns"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default();
-                match crate::profiles::create_profile(str_of("name"), str_of("git_name"), str_of("git_email"), v["ssh_key_path"].as_str().map(String::from), dirs, v["allow_push"].as_bool().unwrap_or(true), v["signing_enabled"].as_bool().unwrap_or(false), remotes, v["github_login"].as_str().map(String::from)) {
+                match crate::profiles::create_profile(str_of("name"), str_of("git_name"), str_of("git_email"), v["ssh_key_path"].as_str().map(String::from), dirs, v["allow_push"].as_bool().unwrap_or(true), v["signing_enabled"].as_bool().unwrap_or(false), remotes, v["github_login"].as_str().map(String::from), v["push_over_ssh"].as_bool()) {
                     Ok(p) => match crate::git_config::apply_git_config() {
                         Ok(()) => emit(&p),
                         Err(e) => emit_err(e),
@@ -315,7 +315,7 @@ pub(crate) mod tests {
                 let email = v["git_email"].as_str().map(String::from);
                 let key = v["ssh_key_path"].as_str().map(String::from);
                 let signs = v["signing_enabled"].as_bool();
-                match crate::commands::update_profile_core(v["id"].as_str().unwrap_or_default().to_string(), None, None, email, key, dirs, None, signs, None, None).await {
+                match crate::commands::update_profile_core(v["id"].as_str().unwrap_or_default().to_string(), None, None, email, key, dirs, None, signs, None, None, v["push_over_ssh"].as_bool()).await {
                     Ok(p) => emit(&p),
                     Err(e) => emit_err(e),
                 }

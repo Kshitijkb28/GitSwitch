@@ -26,6 +26,8 @@ export function ProfileForm() {
   const [gitEmail, setGitEmail] = useState(searchParams.get("github_email") || "");
   const [sshKeyPath, setSshKeyPath] = useState("");
   const [allowPush, setAllowPush] = useState(true);
+  // HTTPS clones in the folders push over SSH with the key (off unless turned on).
+  const [pushOverSsh, setPushOverSsh] = useState(false);
   const [signingEnabled, setSigningEnabled] = useState(false);
   const [signingBusy, setSigningBusy] = useState(false);
   const [signingMsg, setSigningMsg] = useState<string | null>(null);
@@ -181,6 +183,7 @@ export function ProfileForm() {
         setGitEmail(profile.git_email);
         setSshKeyPath(profile.ssh_key_path ?? "");
         setAllowPush(profile.allow_push);
+        setPushOverSsh(profile.push_over_ssh ?? false);
       setSigningEnabled(profile.signing_enabled);
         setIsDefaultProfile(profile.is_default);
         setDirectories(profile.directories);
@@ -264,6 +267,7 @@ export function ProfileForm() {
           allowPush,
           signingEnabled,
           remotePatterns,
+          pushOverSsh,
           // Only a pick the person made changes the stored account; the
           // background preselection is a display guess, not a decision.
           githubLogin: userPicked.current && autofillAccount ? pickedLogin : githubLogin,
@@ -279,6 +283,7 @@ export function ProfileForm() {
           allowPush,
           signingEnabled,
           remotePatterns,
+          pushOverSsh,
           githubLogin: (userPicked.current && pickedLogin) || githubLogin || null,
         });
         toast.success(`Profile "${name}" created successfully`);
@@ -781,6 +786,37 @@ export function ProfileForm() {
                   on the Changes page.
                 </span>
               )}
+            </span>
+          </label>
+          <label
+            className={`flex items-start gap-3 select-none mt-4 pt-4 border-t border-zinc-800 ${
+              allowPush && sshKeyPath ? "cursor-pointer" : "opacity-60 cursor-not-allowed"
+            }`}
+          >
+            <Checkbox
+              checked={pushOverSsh && allowPush && !!sshKeyPath}
+              disabled={!allowPush || !sshKeyPath}
+              onChange={setPushOverSsh}
+              className="mt-0.5"
+            />
+            <span className="min-w-0">
+              <span className="text-sm text-zinc-200 font-medium">
+                Push HTTPS clones over SSH with this profile's key
+              </span>
+              <span className="block text-xs text-zinc-500 mt-0.5">
+                A repository cloned with an <span className="font-mono">https://github.com/</span> address
+                pushes with this key — as its GitHub account — instead of whichever account
+                the credential helper remembers. Only the push moves (git's{" "}
+                <span className="font-mono">pushInsteadOf</span>): fetch, pull and Git LFS
+                downloads stay on HTTPS. A remote with its own push URL keeps it. Leave it off for an
+                organisation that requires SSH certificates (its addresses start with{" "}
+                <span className="font-mono">org-…@github.com</span>): it refuses a plain key.
+              </span>
+              {!sshKeyPath ? (
+                <span className="block text-xs text-amber-400/80 mt-1">Pick an SSH key above first.</span>
+              ) : !allowPush ? (
+                <span className="block text-xs text-zinc-600 mt-1">Pushes are blocked in these folders.</span>
+              ) : null}
             </span>
           </label>
         </Card>

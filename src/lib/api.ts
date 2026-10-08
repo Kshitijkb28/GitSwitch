@@ -27,6 +27,7 @@ export async function createProfile(params: {
   signingEnabled?: boolean | null;
   remotePatterns?: string[] | null;
   githubLogin?: string | null;
+  pushOverSsh?: boolean | null;
 }): Promise<Profile> {
   return invoke("create_profile", params);
 }
@@ -42,6 +43,7 @@ export async function updateProfile(params: {
   signingEnabled?: boolean | null;
   remotePatterns?: string[] | null;
   githubLogin?: string | null;
+  pushOverSsh?: boolean | null;
 }): Promise<Profile> {
   return invoke("update_profile", params);
 }

@@ -724,6 +724,7 @@ mod tests {
             directories: dirs.iter().map(|s| s.to_string()).collect(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            push_over_ssh: None,
         }
     }
 

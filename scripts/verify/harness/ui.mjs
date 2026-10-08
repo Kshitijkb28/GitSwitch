@@ -3177,6 +3177,29 @@ try {
     }
   }
 
+  section("Profiles: HTTPS clones push over SSH with the profile's key");
+  {
+    const work = { id: "p2", name: "Work", git_name: "octo-work", git_email: "me@work.test", ssh_key_path: "/k/id_work", github_login: "octo-work", is_default: false, allow_push: true, signing_enabled: false, directories: ["/w"], remote_patterns: [], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+    const box = (pg) =>
+      pg.evaluate(() => {
+        const i = [...document.querySelectorAll("label")].find((x) => x.innerText.includes("Push HTTPS clones over SSH"))?.querySelector('input[type="checkbox"]');
+        return i ? JSON.stringify({ checked: i.checked, disabled: i.disabled }) : "missing";
+      });
+    const page = await openProfilePage(browser, server, { path: "/profile/p2/edit", profiles: [work] });
+    await page.waitForFunction(() => document.body.innerText.includes("Push HTTPS clones over SSH"), { timeout: 5000 }).catch(() => null);
+    ok("a profile with a key offers to push its HTTPS clones over SSH, off until turned on", (await box(page)) === JSON.stringify({ checked: false, disabled: false }), await box(page));
+    await page.evaluate(() => [...document.querySelectorAll("label")].find((x) => x.innerText.includes("Push HTTPS clones over SSH"))?.querySelector('input[type="checkbox"]')?.click());
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Update Profile")?.click());
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "update_profile"), { timeout: 4000 }).catch(() => null);
+    const sent = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "update_profile")?.args ?? null);
+    ok("  turning it on is saved as on", sent?.pushOverSsh === true, JSON.stringify(sent));
+    await page.close();
+    const nokey = await openProfilePage(browser, server, { path: "/profile/p2/edit", profiles: [{ ...work, ssh_key_path: null }] });
+    await nokey.waitForFunction(() => document.body.innerText.includes("Push HTTPS clones over SSH"), { timeout: 5000 }).catch(() => null);
+    ok("  without a key it cannot be on", (await box(nokey)) === JSON.stringify({ checked: false, disabled: true }), await box(nokey));
+    await nokey.close();
+  }
+
   // -----------------------------------------------------------------
   section("GitHub CLI accounts: removing one");
   {

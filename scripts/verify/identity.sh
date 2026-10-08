@@ -744,4 +744,30 @@ if kill -0 "$LPID" 2>/dev/null; then pkill -P "$LPID" 2>/dev/null; kill "$LPID" 
 ok "a .gitmodules naming the repository itself does not send the conversion round in circles" "$LOOPED:$(git -C "$LP" config remote.origin.url)" "finished:git@github.com:acme/loopy.git"
 ok "  and a path outside the folder is left alone" "$(git -C "$SB/outside" config remote.origin.url)" "https://github.com/acme/outside.git"
 
+section "HTTPS clones push over SSH with their profile's key"
+mkdir -p "$SB/keys"; ssh-keygen -q -t ed25519 -N '' -C overssh -f "$SB/keys/overssh" </dev/null
+for spec in "ViaSsh:viaSSH:on" "ViaHttps:viaHTTPS:" "ViaBlocked:viaBlocked:blocked"; do
+  IFS=: read -r name folder flag <<<"$spec"
+  mkdir -p "$SB/$folder"
+  "$PY" - "$SB/p$name.json" "$name" "$SB/keys/overssh" "$SB/$folder" "$flag" <<'JSONPY'
+import json, sys
+f, name, key, folder, flag = sys.argv[1:]
+p = {"name": name, "git_name": name, "git_email": name.lower() + "@example.test", "ssh_key_path": key, "directories": [folder]}
+if flag == "on": p["push_over_ssh"] = True
+if flag == "blocked": p["allow_push"] = False; p["push_over_ssh"] = True
+json.dump(p, open(f, "w"))
+JSONPY
+  probe profile_apply "$SB" "$SB/p$name.json" >/dev/null
+  git init -q "$SB/$folder/app"; git -C "$SB/$folder/app" remote add origin "https://github.com/acme/app.git"
+done
+ok "an HTTPS clone in a profile that turned it on pushes over SSH, with its key" "$(git -C "$SB/viaSSH/app" remote get-url --push origin) | $(git -C "$SB/viaSSH/app" config core.sshCommand | grep -c overssh)" "git@github.com:acme/app.git | 1"
+ok "  and still fetches over HTTPS" "$(git -C "$SB/viaSSH/app" remote get-url origin)" "https://github.com/acme/app.git"
+ok "a profile that did not turn it on pushes its HTTPS clones over HTTPS, as before" "$(git -C "$SB/viaHTTPS/app" remote get-url --push origin)" "https://github.com/acme/app.git"
+ok "a profile whose pushes are blocked blocks them — never pushes over SSH instead" "$(git -C "$SB/viaBlocked/app" remote get-url --push origin)" "gitswitch-push-blocked://acme/app.git"
+probe push_mode "$SB/viaSSH/app" "guardrail" >/dev/null
+ok "a repository's own block still wins over its profile's SSH push" "$(git -C "$SB/viaSSH/app" remote get-url --push origin)" "gitswitch-push-blocked://"
+probe push_mode "$SB/viaSSH/app" "allowed" >/dev/null
+OUT=$(pinvoke get_profiles '{}' | "$PY" -c 'import sys,json;print(sorted((p["name"], p.get("push_over_ssh")) for p in json.load(sys.stdin)["value"] if p["name"].startswith("Via")))')
+ok "  (the setting is stored as given: unset means off)" "$OUT" "[('ViaBlocked', True), ('ViaHttps', None), ('ViaSsh', True)]"
+
 verify_result

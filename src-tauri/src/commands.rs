@@ -40,6 +40,7 @@ pub async fn create_profile(
     signing_enabled: Option<bool>,
     remote_patterns: Option<Vec<String>>,
     github_login: Option<String>,
+    push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
     let profile = profiles::create_profile(
         name,
@@ -51,6 +52,7 @@ pub async fn create_profile(
         signing_enabled.unwrap_or(false),
         remote_patterns.unwrap_or_default(),
         github_login,
+        push_over_ssh,
     )?;
     git_config::apply_git_config()?;
     // A guard in these folders that expected another profile's email.
@@ -74,10 +76,11 @@ pub(crate) async fn update_profile_core(
     signing_enabled: Option<bool>,
     remote_patterns: Option<Vec<String>>,
     github_login: Option<String>,
+    push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
     let before = profiles::load_profiles()?.profiles.into_iter().find(|p| p.id == id);
     let profile = profiles::update_profile(
-        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login,
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login, push_over_ssh,
     )?;
     git_config::apply_git_config()?;
     // Only an email or a folder change can leave a guard expecting the wrong email.
@@ -110,9 +113,10 @@ pub async fn update_profile(
     signing_enabled: Option<bool>,
     remote_patterns: Option<Vec<String>>,
     github_login: Option<String>,
+    push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
     let profile = update_profile_core(
-        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login,
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login, push_over_ssh,
     )
     .await?;
     crate::tray::update_active_label(&app);

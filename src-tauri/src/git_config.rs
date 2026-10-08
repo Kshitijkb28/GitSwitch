@@ -214,6 +214,15 @@ fn get_profile_gitconfig_path(profile: &Profile) -> String {
     crate::paths::norm(&format!("{}/{}.gitconfig", app_dir.display(), profile.id))
 }
 
+/// HTTPS clones push over SSH with the profile's key: the push only — fetch,
+/// clone, LFS downloads and submodule updates stay on HTTPS. Never beside the
+/// push block (that would turn a blocked push into one over SSH), and a
+/// repository's own block or lock still wins: it names each remote's exact
+/// URL, a longer prefix than these.
+fn push_over_ssh_section() -> &'static str {
+    "[url \"git@github.com:\"]\n\tpushInsteadOf = https://github.com/\n\tpushInsteadOf = http://github.com/\n"
+}
+
 /// Config block that makes `git push` fail locally with a recognizable error
 /// ("remote helper 'gitswitch-push-blocked' aborted") while leaving fetch/pull
 /// untouched — pushes get their URL rewritten to a scheme git can't handle.
@@ -281,6 +290,8 @@ fn profile_gitconfig_content(profile: &Profile, default_signs: bool) -> String {
 
     if !profile.allow_push {
         content.push_str(push_block_section());
+    } else if profile.ssh_key_path.is_some() && profile.push_over_ssh == Some(true) {
+        content.push_str(push_over_ssh_section());
     }
 
     match crate::signing::signing_config_block(profile) {
@@ -468,7 +479,27 @@ mod tests {
             directories: dirs.iter().map(|s| s.to_string()).collect(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            push_over_ssh: None,
         }
+    }
+
+    #[test]
+    fn https_clones_push_over_ssh_only_where_the_profile_has_a_key_and_may_push() {
+        let ssh = "[url \"git@github.com:\"]\n\tpushInsteadOf = https://github.com/\n\tpushInsteadOf = http://github.com/\n";
+        let mut p = mk_profile("p", &["/w"]);
+        p.ssh_key_path = Some("/k/id_work".into());
+        assert!(!profile_gitconfig_content(&p, false).contains("[url \"git@github.com:\"]"), "nothing said: pushes go as before");
+        p.push_over_ssh = Some(true);
+        assert!(profile_gitconfig_content(&p, false).contains(ssh), "turned on, with a key and pushes allowed: over SSH");
+        p.push_over_ssh = Some(false);
+        assert!(!profile_gitconfig_content(&p, false).contains("[url \"git@github.com:\"]"), "turned off");
+        p.push_over_ssh = Some(true);
+        p.allow_push = false;
+        let blocked = profile_gitconfig_content(&p, false);
+        assert!(!blocked.contains("[url \"git@github.com:\"]") && blocked.contains("gitswitch-push-blocked://"), "a blocked push never becomes one over SSH");
+        p.allow_push = true;
+        p.ssh_key_path = None;
+        assert!(!profile_gitconfig_content(&p, false).contains("[url \"git@github.com:\"]"), "no key, nothing to push with");
     }
 
     #[test]
@@ -653,6 +684,7 @@ mod default_signing_tests {
             directories: vec!["/w".into()],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            push_over_ssh: None,
         }
     }
 
