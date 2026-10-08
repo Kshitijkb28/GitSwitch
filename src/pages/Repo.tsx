@@ -112,12 +112,33 @@ export function Repo() {
   );
 
   // A remembered repository that is in no profile folder (a submodule opened as
-  // its own repository, a folder opened by hand) stays selectable.
+  // its own repository, a folder opened by hand) stays selectable — while it
+  // is on disk. One deleted since gives way to the first repository listed,
+  // or the page (and the terminal it hands its folder to) would work in a
+  // folder that is not there.
   useEffect(() => {
     if (loadingRepos || !sel.path) return;
-    if (!repos.some((r) => r.path === sel.path)) {
-      setExtraRepos((l) => (l.includes(sel.path) ? l : [...l, sel.path]));
-    }
+    if (repos.some((r) => r.path === sel.path)) return;
+    const path = sel.path;
+    let stale = false;
+    api
+      .pathExists(path)
+      .then((exists) => {
+        if (stale) return;
+        if (exists === false) {
+          const next = visibleRepos[0]?.path ?? repos[0]?.path;
+          if (next) sel.setPath(next);
+          return;
+        }
+        setExtraRepos((l) => (l.includes(path) ? l : [...l, path]));
+      })
+      .catch(() => {
+        if (!stale) setExtraRepos((l) => (l.includes(path) ? l : [...l, path]));
+      });
+    return () => {
+      stale = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadingRepos, repos, sel.path]);
 
   // No repository yet: take the first one the scan finds.

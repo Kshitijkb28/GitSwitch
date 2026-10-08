@@ -19,6 +19,7 @@ import {
   useConsole,
 } from "../../lib/console";
 import { baseName, isWithin, normPath } from "../../lib/paths";
+import { readSelectedRepo } from "../../lib/repoSelection";
 
 /**
  * A shell, in a drawer, pinned to the bottom of the window on every page.
@@ -99,6 +100,45 @@ export function ConsoleDrawer() {
     if (!visible.length) return;
     if (!repo || (account && owner?.profile_id !== account)) setConsoleRepo(visible[0].path);
   }, [visible, repo, account, owner]);
+
+  // A remembered folder can be gone since (a clone deleted by hand): no shell
+  // is started in it. It is checked first, and one that is gone gives way to
+  // the page's folder, or else the first repository listed — and the drawer
+  // says which, once.
+  const [present, setPresent] = useState<{ path: string; exists: boolean } | null>(null);
+  /** The folder that was gone, and the one the drawer opened instead. */
+  const [gone, setGone] = useState<{ from: string; to: string } | null>(null);
+  useEffect(() => {
+    if (!started || !repo) return;
+    let stale = false;
+    api
+      .pathExists(repo)
+      .then((exists) => {
+        if (!stale) setPresent({ path: repo, exists: exists !== false });
+      })
+      .catch(() => {
+        // Could not ask: the shell says it, if the folder really is gone.
+        if (!stale) setPresent({ path: repo, exists: true });
+      });
+    return () => {
+      stale = true;
+    };
+  }, [started, repo]);
+  useEffect(() => {
+    if (!present || present.path !== repo || present.exists) return;
+    const same = (a: string) => normPath(a) === normPath(repo);
+    const wasGone = (a: string) => !!gone && normPath(a) === normPath(gone.from);
+    const page = readSelectedRepo();
+    const next = page && !same(page) && !wasGone(page) ? page : visible.find((r) => !same(r.path) && !wasGone(r.path))?.path;
+    if (!next) return;
+    setGone({ from: gone && same(gone.to) ? gone.from : repo, to: next });
+    setConsoleRepo(next);
+  }, [present, repo, visible, gone]);
+  const ready = present?.path === repo && present.exists;
+  const pickRepo = (path: string) => {
+    setGone(null);
+    setConsoleRepo(path);
+  };
 
   const relative = (path: string, base: string) => normPath(path).slice(normPath(base).length + 1);
   const repoOptions = [
@@ -211,7 +251,7 @@ export function ConsoleDrawer() {
         <div className="w-64 max-w-full">
           <Select
             value={repo}
-            onChange={setConsoleRepo}
+            onChange={pickRepo}
             searchable
             searchLabel="Search repositories"
             placeholder={repoOptions.length ? "Pick a repository" : "No repositories found"}
@@ -282,11 +322,22 @@ export function ConsoleDrawer() {
 
       {/* Both panels stay mounted. Unmounting the terminal would close its pty,
           so the inactive one is hidden exactly as the drawer hides itself. */}
+      {gone && gone.to === repo && (
+        <p className="shrink-0 border-b border-zinc-800 px-3 py-1.5 text-[11px] text-amber-300/80 break-words" title={gone.from}>
+          {baseName(gone.from)} is no longer on this Mac, so the terminal opened in {baseName(repo)} instead.
+        </p>
+      )}
       <div className={`min-h-0 flex-1 bg-zinc-900 px-2 py-1 ${tab === "terminal" ? "" : "hidden"}`}>
-        {repo ? (
+        {repo && ready ? (
           <Suspense fallback={<p className="p-3 text-sm text-zinc-500">Starting a shell…</p>}>
             <TerminalView repoPath={repo} sizeKey={sizeKey} visible={open && tab === "terminal"} />
           </Suspense>
+        ) : repo && present?.path === repo && !present.exists ? (
+          <p className="p-3 text-sm text-zinc-500 break-words">
+            {repo} is no longer on this Mac. Pick a repository and a shell opens in that folder.
+          </p>
+        ) : repo ? (
+          <p className="p-3 text-sm text-zinc-500">Starting a shell…</p>
         ) : (
           <p className="p-3 text-sm text-zinc-500">
             Pick a repository and a shell opens in that folder.

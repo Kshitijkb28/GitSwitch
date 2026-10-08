@@ -57,6 +57,10 @@ async function openPage(browser, server, scenario, opts = {}) {
     pushState: opts.pushState ?? null,
     /** How far the block reaches into the submodules; null → none to speak of. */
     pushCoverage: opts.pushCoverage ?? null,
+    /** Folders deleted since they were listed or remembered: path_exists says no, and a shell cannot start there. */
+    gonePaths: opts.gonePaths ?? [],
+    /** Folders that are there, but where a shell fails to start. */
+    terminalFails: opts.terminalFails ?? [],
     /** What Repair (locked) answers; null → "Everything is in place." */
     repairLockResult: opts.repairLockResult ?? null,
     pushResult: opts.pushResult ?? null,
@@ -235,7 +239,11 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve((args?.sinceId ?? 0) > 0 ? [] : cfg.consoleEntries);
             case "console_clear":
               return Promise.resolve(null);
+            case "path_exists":
+              return Promise.resolve(!cfg.gonePaths.includes(args?.path));
             case "terminal_open":
+              if (cfg.gonePaths.includes(args?.repoPath)) return Promise.reject(`Command execution error: Not found: ${args.repoPath} no longer exists on disk`);
+              if (cfg.terminalFails.includes(args?.repoPath)) return Promise.reject("Command execution error: Could not open a terminal: no pty");
               // The session id arrives when the shell has started — at once, or late.
               return cfg.terminalOpenDelayMs
                 ? new Promise((res) => setTimeout(() => res("test-session"), cfg.terminalOpenDelayMs))
@@ -2578,6 +2586,61 @@ try {
       await waitOpens(page, 2);
       ok("  Ctrl+` follows the page the same way", (await opens(page)).at(-1) === "/repos/gitswitch", JSON.stringify(await opens(page)));
       ok("  and the shell it leaves is closed, once", (await closes(page)) === 1, String(await closes(page)));
+      await page.close();
+    }
+    {
+      // The drawer's list was read before a clone was deleted: picking that
+      // clone starts no shell there — the drawer goes back to the page's
+      // folder and says why.
+      const gone = { path: "/repos/gone-clone", name: "gone-clone", profile_id: "p2", profile_name: "Work", profile_email: "me@work.test" };
+      const page = await open(SCENARIOS.clean, { repos: [...REPOS, gone], gonePaths: [gone.path] });
+      await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+      await sidebarTerminal(page);
+      await waitOpens(page, 1);
+      await openDrawerPicker(page);
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll(".absolute.z-50 button")].find((x) => x.innerText.trim().startsWith("gone-clone"))?.click());
+      await sleep(1200);
+      const s = await text(page);
+      ok("a folder deleted since the drawer listed it gets no shell", !(await opens(page)).includes(gone.path), JSON.stringify(await opens(page)));
+      ok("  the drawer goes back to the page's folder, and says why", (await opens(page)).at(-1) === "/repos/gitswitch" && s.includes("gone-clone is no longer on this Mac"), JSON.stringify(await opens(page)));
+      ok("  and no error is left on screen", !s.includes("no longer exists on disk"));
+      await page.close();
+    }
+    {
+      // A shell that could not start says so on a line of its own, not over
+      // the prompt, and the message goes once a shell starts elsewhere.
+      const page = await open(SCENARIOS.clean, { terminalFails: ["/repos/argos"] });
+      await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+      ok("(the page picks argos)", await pickOnPage(page, "argos"));
+      await sidebarTerminal(page);
+      await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"] [role="alert"]'), { timeout: 8000 }).catch(() => null);
+      const geo = await page.evaluate(() => {
+        const d = document.querySelector('[aria-label="Terminal"]');
+        const alert = d?.querySelector('[role="alert"]')?.getBoundingClientRect();
+        const xterm = d?.querySelector(".xterm")?.getBoundingClientRect();
+        return alert && xterm ? { alertBottom: Math.round(alert.bottom), xtermTop: Math.round(xterm.top) } : null;
+      });
+      ok("a shell that could not start says so above the terminal, not over its first line", !!geo && geo.alertBottom <= geo.xtermTop + 1, JSON.stringify(geo));
+      await openDrawerPicker(page);
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll(".absolute.z-50 button")].find((x) => x.innerText.trim().startsWith("gitswitch"))?.click());
+      await waitOpens(page, 2);
+      await sleep(500);
+      ok("  and the message goes once a shell starts in another folder", !(await page.evaluate(() => !!document.querySelector('[aria-label="Terminal"] [role="alert"]'))));
+      await page.close();
+    }
+    {
+      // The page itself remembered the deleted clone: it moves to a
+      // repository that is there, and so does the terminal.
+      const page = await open(SCENARIOS.clean, { storage: { "repo.path": "/repos/gone-clone", "changes.repo": "/repos/gone-clone", "console.repo": "/repos/gone-clone" }, gonePaths: ["/repos/gone-clone"] });
+      await page.waitForFunction(() => JSON.parse(localStorage.getItem("gitswitch:repo.path") ?? '""') !== "/repos/gone-clone", { timeout: 6000 }).catch(() => null);
+      const now = await page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:repo.path") ?? '""'));
+      ok("a remembered repository deleted since gives way to one that is there", now === "/repos/gitswitch", now);
+      await sidebarTerminal(page);
+      await waitOpens(page, 1);
+      await sleep(400);
+      ok("  and the terminal opens there, never in the deleted folder", !(await opens(page)).includes("/repos/gone-clone") && (await opens(page)).at(-1) === "/repos/gitswitch", JSON.stringify(await opens(page)));
       await page.close();
     }
     {

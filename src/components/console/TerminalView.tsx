@@ -66,6 +66,9 @@ export function TerminalView({ repoPath, sizeKey, visible }: Props) {
   useEffect(() => {
     if (!host.current || !repoPath) return;
     let dead = false;
+    // A new shell starts clean: an error from the folder before (one deleted
+    // since, say) must not stay on screen over this one.
+    setError(null);
 
     const t = new Terminal({
       fontSize: 12,
@@ -195,14 +198,16 @@ export function TerminalView({ repoPath, sizeKey, visible }: Props) {
     if (visible) term.current?.focus();
   }, [visible]);
 
+  // The error has a line of its own above the shell — drawn over the shell
+  // it hid the prompt — and the shell is fitted to what is left.
   return (
-    <div className="relative h-full w-full min-h-0">
+    <div className="flex h-full w-full min-h-0 flex-col">
       {error && (
-        <p className="absolute inset-x-0 top-0 z-10 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+        <p role="alert" className="shrink-0 break-words bg-red-500/10 px-3 py-2 text-xs text-red-300">
           {error}
         </p>
       )}
-      <div ref={host} className="h-full w-full" />
+      <div ref={host} className="min-h-0 w-full flex-1" />
     </div>
   );
 }
