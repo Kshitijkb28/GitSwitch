@@ -1104,7 +1104,7 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
 
     let identity = read_identity(&repo, &paths.hooks).await;
     let push =
-        crate::push_guard::push_state(&repo, &paths.hooks, identity.profile_id.as_deref()).await;
+        Box::pin(crate::push_guard::push_state(&repo, &paths.hooks, identity.profile_id.as_deref())).await;
 
     // Amending a published commit would require a force-push, which this app
     // never does — so the UI must know before offering the checkbox.
@@ -1234,7 +1234,7 @@ pub async fn push_state_for(repo_path: &str) -> Result<crate::push_guard::PushSt
     let repo = PathBuf::from(repo_path);
     let paths = git_paths(&repo).await?;
     let profile_id = profile_for_repo(repo_path).await.map(|p| p.id);
-    Ok(crate::push_guard::push_state(&repo, &paths.hooks, profile_id.as_deref()).await)
+    Ok(Box::pin(crate::push_guard::push_state(&repo, &paths.hooks, profile_id.as_deref())).await)
 }
 
 pub async fn repair_push_block_for(repo_path: &str) -> Result<crate::push_guard::PushState, AppError> {

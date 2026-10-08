@@ -408,16 +408,19 @@ pub async fn push_state(repo: &Path, hooks: &Path, profile_id: Option<&str>) -> 
         uncovered_remotes: remotes.iter().filter(|r| !r.rewritten && !r.has_explicit_pushurl).map(|r| r.name.clone()).collect(),
         remote_urls: raw_urls.clone(),
     };
-    let mut lock = push_lock::measure(repo, &facts(repo_blocked, config_block_present, &hook, &remotes)).await;
+    // Boxed, here and below: this measurement sits deep inside an Update's
+    // Continue (status reads, submodules downloaded under a block), where a
+    // debug build's nested poll frames outgrew a 2 MiB thread stack.
+    let mut lock = Box::pin(push_lock::measure(repo, &facts(repo_blocked, config_block_present, &hook, &remotes))).await;
 
     if lock.locked && lock.mirrors == "drifted" && push_lock::heal_allowed(repo) {
         let before = lock.drift.iter().filter(|d| d.starts_with("mirror-")).cloned().collect::<Vec<_>>().join(", ");
-        let healed = apply_mirrors_held(repo, hooks).await.is_ok();
+        let healed = Box::pin(apply_mirrors_held(repo, hooks)).await.is_ok();
         repo_blocked = read_flag(repo).await;
         config_block_present = read_rewrite_present(repo).await;
         hook = hook_kind(hooks);
         remotes = read_remotes(repo).await;
-        let again = push_lock::measure(repo, &facts(repo_blocked, config_block_present, &hook, &remotes)).await;
+        let again = Box::pin(push_lock::measure(repo, &facts(repo_blocked, config_block_present, &hook, &remotes))).await;
         let ok = healed && again.mirrors != "drifted";
         lock = again;
         if ok {
@@ -588,7 +591,7 @@ fn remove_hook(hooks: &Path) -> Result<(), AppError> {
 /// GitSwitch file into a tracked folder — husky — or a shared hooks dir).
 pub async fn apply_mirrors(repo: &Path, hooks: &Path) -> Result<(), AppError> {
     let _turn = repo_turn(repo).await;
-    apply_mirrors_held(repo, hooks).await
+    Box::pin(apply_mirrors_held(repo, hooks)).await
 }
 
 /// `apply_mirrors` for a caller that already has the repository's turn.
@@ -601,7 +604,7 @@ async fn apply_mirrors_held(repo: &Path, hooks: &Path) -> Result<(), AppError> {
             .text()
             .await?;
     }
-    write_config_block(repo).await?;
+    Box::pin(write_config_block(repo)).await?;
     if read_hooks_path(repo).await.is_none() {
         install_hook(hooks)?;
     }
@@ -665,13 +668,13 @@ pub async fn repair_noting(
     profile_id: Option<&str>,
 ) -> Result<(PushState, Vec<String>), AppError> {
     let repo = PathBuf::from(repo_path);
-    let state = push_state(&repo, hooks, profile_id).await;
+    let state = Box::pin(push_state(&repo, hooks, profile_id)).await;
     if !state.repo_blocked && !state.lock.locked {
         return Ok((state, Vec::new()));
     }
-    apply_mirrors(&repo, hooks).await?;
-    let notes = cover_submodules(repo_path, None).await;
-    Ok((push_state(&repo, hooks, profile_id).await, notes))
+    Box::pin(apply_mirrors(&repo, hooks)).await?;
+    let notes = Box::pin(cover_submodules(repo_path, None)).await;
+    Ok((Box::pin(push_state(&repo, hooks, profile_id)).await, notes))
 }
 
 /// Written into a submodule the repository's block or lock was extended to,
@@ -807,7 +810,7 @@ pub async fn coverage(repo_path: &str, state: &PushState) -> PushCoverage {
         let dir = repo.join(&*rel);
         if let Ok(paths) = crate::git_status::git_paths(&dir).await {
             let profile = crate::git_status::owning_profile_id(&dir.to_string_lossy());
-            *s = push_state(&dir, &paths.hooks, profile.as_deref()).await;
+            *s = Box::pin(push_state(&dir, &paths.hooks, profile.as_deref())).await;
         }
     }
     let mut subs = Vec::new();
@@ -912,7 +915,7 @@ pub async fn cover_submodules(repo_path: &str, only: Option<&[String]>) -> Vec<S
         // Blocked on its own already, by the person: the block stays theirs,
         // so "allowed" on the repository will not take it away.
         let own = read_flag(&dir).await && !marked(&dir).await;
-        if let Err(e) = apply_mirrors(&dir, &paths.hooks).await {
+        if let Err(e) = Box::pin(apply_mirrors(&dir, &paths.hooks)).await {
             notes.push(format!("{}: {}", rel, e));
             continue;
         }
@@ -937,11 +940,11 @@ pub async fn uncover_submodules(repo_path: &str) -> Vec<String> {
             continue;
         }
         let profile = crate::git_status::owning_profile_id(&dir.to_string_lossy());
-        if push_state(&dir, &paths.hooks, profile.as_deref()).await.lock.locked {
+        if Box::pin(push_state(&dir, &paths.hooks, profile.as_deref())).await.lock.locked {
             notes.push(format!("{} stays locked on its own", rel));
             continue;
         }
-        if let Err(e) = remove_mirrors(&dir, &paths.hooks).await {
+        if let Err(e) = Box::pin(remove_mirrors(&dir, &paths.hooks)).await {
             notes.push(format!("{}: {}", rel, e));
             continue;
         }

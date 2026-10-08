@@ -1141,7 +1141,7 @@ async fn submodule_lock_ops_in(repo_path: &str, only: Option<&[String]>) -> Vec<
         if lc::validate_path(&canonical(&dir)).is_err() {
             continue;
         }
-        if let Ok(s) = crate::git_status::push_state_for(&dir_s).await {
+        if let Ok(s) = Box::pin(crate::git_status::push_state_for(&dir_s)).await {
             if s.lock.locked && !s.lock.needs_elevation {
                 continue;
             }
@@ -1163,7 +1163,7 @@ async fn every_lock_kept(repo_path: &str, only: &[String]) -> bool {
             continue;
         }
         seen += 1;
-        match crate::git_status::push_state_for(&repo.join(&rel).to_string_lossy()).await {
+        match Box::pin(crate::git_status::push_state_for(&repo.join(&rel).to_string_lossy())).await {
             Ok(s) if s.lock.locked && !s.lock.needs_elevation => {}
             _ => return false,
         }

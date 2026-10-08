@@ -2737,9 +2737,9 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
             }
         }
         if ok {
-            if let Ok(ps) = crate::git_status::push_state_for(&repo.to_string_lossy()).await {
+            if let Ok(ps) = Box::pin(crate::git_status::push_state_for(&repo.to_string_lossy())).await {
                 if ps.repo_blocked || ps.lock.locked {
-                    let notes = crate::push_guard::cover_submodules(&repo.to_string_lossy(), Some(std::slice::from_ref(&path))).await;
+                    let notes = Box::pin(crate::push_guard::cover_submodules(&repo.to_string_lossy(), Some(std::slice::from_ref(&path)))).await;
                     note = if !notes.is_empty() {
                         format!("{}; the push block could not be extended to it: {}", note, notes.join("; "))
                     } else if ps.lock.locked {
