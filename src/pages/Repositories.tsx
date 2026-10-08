@@ -22,7 +22,7 @@ import { Select } from "../components/Select";
 import { Checkbox } from "../components/Checkbox";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { useToast } from "../components/Toast";
-import { usePersistedState } from "../lib/persist";
+import { handOff, usePersistedState } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
@@ -287,14 +287,8 @@ export function Repositories() {
       refreshLocal();
       return;
     }
-    try {
-      localStorage.setItem("gitswitch:history.repo", JSON.stringify(path));
-      localStorage.setItem("gitswitch:history.account", JSON.stringify(""));
-      localStorage.setItem("gitswitch:history.rev", JSON.stringify("--all"));
-    } catch {
-      /* storage unavailable — History will simply open on its default repo */
-    }
-    navigate("/history");
+    handOff("history", path);
+    navigate("/repo/history");
   }
 
   async function copyLink(url: string) {

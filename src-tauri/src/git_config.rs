@@ -105,9 +105,19 @@ fn build_includeif_blocks(profiles: &[Profile]) -> String {
                 crate::paths::gitdir_pattern(dir),
                 get_profile_gitconfig_path(profile),
             ));
+            // git matches the repository's real path first (links resolved,
+            // letters as the disk spells them) and the path it was reached by
+            // only from a shell that went there that way: a folder named
+            // through a symbolic link, or stored in another letter case, is
+            // written both ways, so the profile applies however the
+            // repository is opened.
+            if let Some(real) = crate::paths::real_form(dir).filter(|r| *r != crate::paths::norm(dir)) {
+                entries.push((crate::paths::gitdir_pattern(&real), get_profile_gitconfig_path(profile)));
+            }
         }
     }
     entries.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+    entries.dedup();
 
     for (dir, path) in entries {
         blocks.push_str(&format!(
@@ -208,12 +218,16 @@ fn get_profile_gitconfig_path(profile: &Profile) -> String {
 /// ("remote helper 'gitswitch-push-blocked' aborted") while leaving fetch/pull
 /// untouched — pushes get their URL rewritten to a scheme git can't handle.
 ///
-/// pushInsteadOf is a literal prefix match, so cover every common github.com
-/// remote form. Known limits (documented in the UI): custom ssh-config host
-/// aliases and remotes with an explicit remote.<name>.pushurl are not caught,
-/// a LONGER rewrite in any scope wins over these (git picks the longest
-/// match), and `GIT_CONFIG_NOSYSTEM` / another git binary skip config
-/// altogether. This section is only ever written into per-folder include
+/// pushInsteadOf is a literal prefix match, and git uses the longest one that
+/// matches. The empty prefix at the end matches every URL — an organisation's
+/// `org-<id>@github.com:`, `https://user@github.com/`, an ssh alias, another
+/// host, a local path — so every remote of every repository in the profile's
+/// folders is rewritten, whatever its address; the github.com forms before it
+/// rewrite those to a shorter, readable URL. Known limits (documented in the
+/// UI): git never applies it to a remote's explicit remote.<name>.pushurl, a
+/// longer rewrite of the person's own wins, and a git that does not read this
+/// user's global config (another HOME, GIT_CONFIG_GLOBAL) never sees it.
+/// This section is only ever written into per-folder include
 /// files, never the main ~/.gitconfig: a block there would apply to every
 /// folder, and undoing it per folder would need a longer rewrite for each URL
 /// form. The push lock (push_lock.rs) is the variant that needs the
@@ -228,7 +242,8 @@ fn push_block_section() -> &'static str {
      \tpushInsteadOf = ssh://git@ssh.github.com:443/\n\
      \tpushInsteadOf = https://github.com/\n\
      \tpushInsteadOf = http://github.com/\n\
-     \tpushInsteadOf = github.com:\n"
+     \tpushInsteadOf = github.com:\n\
+     \tpushInsteadOf = \"\"\n"
 }
 
 /// Everything one folder profile's include file says. Pure, so a test can
@@ -260,6 +275,20 @@ fn write_profile_gitconfig(profile: &Profile) -> Result<(), AppError> {
 
     let path = config_dir.join(format!("{}.gitconfig", profile.id));
     fs::write(&path, profile_gitconfig_content(profile))?;
+    Ok(())
+}
+
+/// Rewrite every folder profile's include file from the store: identity, key
+/// and push block as this build writes them. Run at start-up, so a block
+/// written by an older build gets what this one writes without the profile
+/// being saved again. ~/.gitconfig itself is not touched.
+pub fn refresh_profile_includes() -> Result<(), AppError> {
+    let store = load_profiles()?;
+    for profile in &store.profiles {
+        if !profile.directories.is_empty() || !profile.remote_patterns.is_empty() {
+            write_profile_gitconfig(profile)?;
+        }
+    }
     Ok(())
 }
 
@@ -446,6 +475,24 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_named_through_a_link_is_written_both_ways() {
+        let root = std::env::temp_dir().join(format!("gitswitch-includeif-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Real")).expect("dirs");
+        let root = std::fs::canonicalize(&root).expect("canonical");
+        std::os::unix::fs::symlink(root.join("Real"), root.join("link")).expect("symlink");
+        let (link, real) = (root.join("link").to_string_lossy().to_string(), root.join("Real").to_string_lossy().to_string());
+        let block = build_includeif_blocks(&[mk_profile("l", &[&link])]);
+        assert!(block.contains(&format!("gitdir:{}/", link)), "{block}");
+        assert!(block.contains(&format!("gitdir:{}/", real)), "{block}");
+        // A folder that is its own real path is written once.
+        let block = build_includeif_blocks(&[mk_profile("r", &[&real])]);
+        assert_eq!(block.matches("gitdir:").count(), 1, "{block}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn config_values_never_contain_backslashes() {
         // Regression guard: a Windows path written verbatim into a git config
@@ -557,6 +604,9 @@ mod tests {
         assert!(s.contains("pushInsteadOf = ssh://git@github.com/"));
         assert!(s.contains("pushInsteadOf = ssh://git@github.com:22/"));
         assert!(s.contains("pushInsteadOf = ssh://git@ssh.github.com:443/"));
+        // …and every other address: the empty prefix matches them all, and
+        // loses to any longer one.
+        assert!(s.contains("\tpushInsteadOf = \"\"\n"));
         // …but never fetches (a plain insteadOf would break pull/clone).
         assert!(!s.contains("\tinsteadOf"));
     }

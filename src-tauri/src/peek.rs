@@ -72,6 +72,36 @@ pub fn github_slug(url: &str) -> Option<(String, String)> {
     Some((owner, repo))
 }
 
+/// `owner/repo` from the path of an SSH remote whose host stands for GitHub:
+/// after `ssh://<authority>/`, or after the colon of `[user@]host:path`, read
+/// by GitHub's own rules.
+fn slug_behind_alias(url: &str) -> Option<(String, String)> {
+    let u = url.trim();
+    let path = match u.strip_prefix("ssh://") {
+        Some(rest) => rest.split_once('/')?.1,
+        None => u.split_once(':')?.1,
+    };
+    github_slug(&format!("git@github.com:{}", path))
+}
+
+/// `owner/repo` like [`github_slug`], also through an SSH host alias for
+/// GitHub — `git@gh-work:o/r.git`, `git@github.com-work:o/r.git`,
+/// `ssh://git@ssh.github.com:443/o/r` — the usual way to keep two accounts'
+/// keys apart. ssh says what the alias stands for (`ssh -G`, on this
+/// computer); an alias for any other host gives None.
+pub async fn github_slug_resolved(url: &str) -> Option<(String, String)> {
+    if let Some(slug) = github_slug(url) {
+        return Some(slug);
+    }
+    let remote = crate::ssh_config::ssh_host_of_url(url)?;
+    let host = crate::ssh_config::resolve(&remote.host).await?;
+    let real = host.hostname.to_ascii_lowercase();
+    if real != "github.com" && real != "ssh.github.com" {
+        return None;
+    }
+    slug_behind_alias(url)
+}
+
 async fn github_compare(owner: &str, repo: &str, base: &str, head: &str) -> Option<usize> {
     let client = crate::github::http_client().ok()?;
     let api = crate::remote_repos::api_base();
@@ -208,5 +238,15 @@ mod tests {
         assert_eq!(github_slug("org-1@gitlab.com:o/r.git"), None);
         assert_eq!(github_slug("github.com:o/r"), None);
         assert_eq!(github_slug("git@github.com:o/r/extra"), None);
+    }
+
+    #[test]
+    fn a_github_alias_path_is_read_like_githubs_own() {
+        assert_eq!(slug_behind_alias("git@gh-work:o/r.git"), Some(("o".into(), "r".into())));
+        assert_eq!(slug_behind_alias("gh-work:o/r"), Some(("o".into(), "r".into())));
+        assert_eq!(slug_behind_alias("ssh://git@gh-work:2222/o/r.git"), Some(("o".into(), "r".into())));
+        assert_eq!(slug_behind_alias("ssh://git@ssh.github.com:443/o/r"), Some(("o".into(), "r".into())));
+        assert_eq!(slug_behind_alias("git@gh-work:o/r/x"), None);
+        assert_eq!(slug_behind_alias("git@gh-work:"), None);
     }
 }

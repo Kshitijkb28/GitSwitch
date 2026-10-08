@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-pub const BACKUP_PREFIX: &str = "gitswitch-before-sync-";
+pub const BACKUP_PREFIX: &str = "gitswitch-before-update-";
+/// Every name an Update's backup branch has had, so a backup an earlier build
+/// made is still recognised as one: the feature was called Sync before.
+pub const BACKUP_PREFIXES: &[&str] = &[BACKUP_PREFIX, "gitswitch-before-sync-"];
 const STATE_FILE: &str = "gitswitch-sync.json";
 const STATE_VERSION: u32 = 1;
 const MAX_LISTED: usize = 30;
@@ -810,6 +813,12 @@ pub struct SyncState {
     /// `false` in a state an older build wrote, which then behaves as before.
     #[serde(default)]
     pub lfs_skip: bool,
+    /// The page's "Also download Git LFS files", as Pull honours it: every
+    /// large file still a pointer stub after the update is downloaded, in
+    /// each repository of it that uses LFS. Kept in the state, so an update
+    /// continued after a pause still does it.
+    #[serde(default)]
+    pub with_lfs: bool,
 }
 
 /// `rebase` announces each commit it leaves out as empty: "dropping <oid>
@@ -1012,9 +1021,10 @@ async fn dirty_large_file(repo: &Path) -> bool {
 }
 
 /// Which repositories of the update use Git LFS, whether each was complete,
-/// and whether the update may write pointer stubs (every one of them
-/// complete, and no large file among their uncommitted changes).
-async fn lfs_plan(repo: &Path, subs: &[SubState]) -> (BTreeMap<String, bool>, bool) {
+/// and whether the update may write pointer stubs: no large file among their
+/// uncommitted changes, and every one of them complete — or the person asked
+/// for every large file to be downloaded afterwards anyway (`with_lfs`).
+async fn lfs_plan(repo: &Path, subs: &[SubState], with_lfs: bool) -> (BTreeMap<String, bool>, bool) {
     let mut lfs = BTreeMap::new();
     let mut dirty_large = false;
     let mut repos: Vec<(String, PathBuf)> = vec![(String::new(), repo.to_path_buf())];
@@ -1032,28 +1042,37 @@ async fn lfs_plan(repo: &Path, subs: &[SubState]) -> (BTreeMap<String, bool>, bo
     // checkout (some folders downloaded, others not) would get stubs for
     // files the person had, and the download afterwards cannot tell those
     // from the ones left out on purpose. There git downloads inside the
-    // rewrite, as before.
-    let skip = !lfs.is_empty() && !dirty_large && lfs.values().all(|complete| *complete);
+    // rewrite, as before — unless every large file is to be downloaded
+    // afterwards anyway, as Pull does when asked.
+    let skip = !lfs.is_empty() && !dirty_large && (with_lfs || lfs.values().all(|complete| *complete));
     (lfs, skip)
 }
 
-/// After an update that wrote pointer stubs: where every large file was
-/// present before, download what is now missing, so that stays true; where
-/// some were left out on purpose, leave them out and say how many are stubs.
-/// Sentences with their leading space, one per repository that has news.
+/// After the update: download the large files that are now pointer stubs —
+/// everywhere when the person asked for them (`with_lfs`, as Pull does),
+/// otherwise where every large file was present before and the update wrote
+/// stubs, so that stays true. Anywhere else, say how many are stubs rather
+/// than leave them silently. Sentences with their leading space, one per
+/// repository that has news.
 async fn lfs_after_update(repo: &Path, st: &SyncState) -> String {
-    if !st.lfs_skip {
-        return String::new();
-    }
     let mut out = String::new();
-    for (path, complete_before) in &st.lfs {
+    let mut targets: Vec<(String, bool)> = st.lfs.iter().map(|(p, c)| (p.clone(), *c)).collect();
+    if st.with_lfs {
+        // A submodule the update itself downloaded was not measured before.
+        for s in &st.subs {
+            if !st.lfs.contains_key(&s.path) {
+                targets.push((s.path.clone(), false));
+            }
+        }
+    }
+    for (path, complete_before) in &targets {
         let dir = if path.is_empty() { repo.to_path_buf() } else { repo.join(path) };
         if !dir.is_dir() {
             continue;
         }
         let place = if path.is_empty() { "here".to_string() } else { format!("in {}", path) };
         let dir_s = dir.to_string_lossy().to_string();
-        if *complete_before {
+        if st.with_lfs || (st.lfs_skip && *complete_before) {
             // Into the superproject's progress file: that is the one the page
             // polls, whichever repository is downloading.
             let progress_at = crate::lfs::progress_path(&repo.to_string_lossy());
@@ -1066,12 +1085,14 @@ async fn lfs_after_update(repo: &Path, st: &SyncState) -> String {
                 Err(e) => out.push_str(&format!(" The large files {} didn't download: {} The LFS card can fetch them.", place, e)),
             }
         } else if let Ok(s) = crate::lfs::lfs_status(&dir_s).await {
-            if s.pointers > 0 {
+            if s.uses_lfs && s.pointers > 0 {
                 out.push_str(&format!(
-                    " {} {} {} a pointer stub; the LFS card downloads them.",
+                    " {} {} {} still {} — use Pull LFS files to download {}.",
                     plural(s.pointers, "LFS file", "LFS files"),
                     place,
-                    if s.pointers == 1 { "is" } else { "are" }
+                    if s.pointers == 1 { "is" } else { "are" },
+                    if s.pointers == 1 { "a pointer stub" } else { "pointer stubs" },
+                    if s.pointers == 1 { "it" } else { "them" }
                 ));
             }
         }
@@ -2025,6 +2046,9 @@ pub struct Verified {
 pub struct RunOptions {
     pub stash: bool,
     pub bundles: bool,
+    /// Download every large file still a pointer stub afterwards (the page's
+    /// "Also download Git LFS files").
+    pub with_lfs: bool,
     /// From the plan; empty skips the "upstream moved since you assessed" check (tests only).
     pub fingerprint: Vec<(String, String)>,
 }
@@ -3299,8 +3323,9 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         pointer_upstreams: Vec::new(),
         lfs: BTreeMap::new(),
         lfs_skip: false,
+        with_lfs: opts.with_lfs,
     };
-    let (lfs, lfs_skip) = lfs_plan(&repo, &st.subs).await;
+    let (lfs, lfs_skip) = lfs_plan(&repo, &st.subs, opts.with_lfs).await;
     st.lfs = lfs;
     st.lfs_skip = lfs_skip;
     write_state_at(&state_file, &st)?;
@@ -3327,7 +3352,7 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         }
     }
     if opts.bundles {
-        if let Some(dir) = dirs::data_dir().map(|d| d.join("com.gitswitch.app").join("sync-backups").join(format!("{}-{}", crate::paths::base_name(repo_path), id))) {
+        if let Some(dir) = dirs::data_dir().map(|d| d.join("com.gitswitch.app").join("update-backups").join(format!("{}-{}", crate::paths::base_name(repo_path), id))) {
             if let Ok(p) = write_bundle(&repo, &dir, "superproject").await {
                 st.bundles.push(p);
             }
@@ -4244,6 +4269,7 @@ mod tests {
             pointer_upstreams: vec![],
             lfs: BTreeMap::new(),
             lfs_skip: false,
+            with_lfs: false,
         };
         let a = "a".repeat(40);
         let stderr = format!(
@@ -4476,6 +4502,7 @@ mod tests {
             bundles: vec![],
             lfs: BTreeMap::from([(String::new(), true), ("A".to_string(), false)]),
             lfs_skip: true,
+            with_lfs: true,
         };
         let json = serde_json::to_string(&st).unwrap();
         let back: SyncState = serde_json::from_str(&json).unwrap();

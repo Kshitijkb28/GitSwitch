@@ -353,7 +353,7 @@ export function AutoAssign() {
               return (
                 <div
                   key={r.repo.path}
-                  className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-zinc-800/50 border border-zinc-700/50 min-w-0 flex-wrap sm:flex-nowrap"
+                  className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-zinc-800/50 border border-zinc-700/50 min-w-0 flex-wrap lg:flex-nowrap"
                 >
                   <Folder size={15} className="text-zinc-500 shrink-0" />
                   <div className="min-w-0 flex-1">
@@ -367,7 +367,8 @@ export function AutoAssign() {
                     </p>
                   </div>
 
-                  <div className="hidden lg:flex items-center gap-1 shrink-0 max-w-[38%] overflow-hidden">
+                  {/* Below 1024 px the reasons get a line of their own rather than disappearing. */}
+                  <div className="flex flex-wrap items-center gap-1 basis-full order-last lg:order-none lg:basis-auto lg:flex-nowrap lg:shrink-0 lg:max-w-[38%] lg:overflow-hidden">
                     {r.repo.owner ? (
                       <>
                         {accessEntries.map(([login, perms]) => (

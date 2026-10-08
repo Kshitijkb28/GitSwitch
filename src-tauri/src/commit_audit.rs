@@ -319,8 +319,9 @@ pub fn fix_unpushed(repo_path: &str) -> Result<String, AppError> {
 const HOOK_TEMPLATE: &str = r#"#!/bin/sh
 # >>> GitSwitch identity guard >>>
 # Blocks commits whose email doesn't match the profile that owns this folder.
-# Managed by GitSwitch — remove via the app (Commit Audit -> guard off).
-expected="__EXPECTED_EMAIL__"
+# Managed by GitSwitch — switch it off in GitSwitch: Repository > Changes, the guard beside "Committing as".
+# gitswitch-expected-email: __EXPECTED_EMAIL_NOTE__
+expected=__EXPECTED_EMAIL_SH__
 actual="$(git config user.email)"
 if [ "$actual" != "$expected" ]; then
   echo "GitSwitch: commit blocked."
@@ -333,6 +334,16 @@ fi
 # <<< GitSwitch identity guard <<<
 __CHAIN__
 "#;
+
+/// The guard's text for this email, with the call to the hook that was there
+/// before (or none). A profile's email may hold `"`, `$` or a backtick:
+/// single-quoted for the shell, where nothing but `'` itself is special.
+fn hook_body(expected_email: &str, chain: &str) -> String {
+    HOOK_TEMPLATE
+        .replace("__EXPECTED_EMAIL_NOTE__", expected_email)
+        .replace("__EXPECTED_EMAIL_SH__", &format!("'{}'", expected_email.replace('\'', "'\\''")))
+        .replace("__CHAIN__", chain)
+}
 
 /// Install a pre-commit hook that refuses commits with the wrong identity.
 /// An existing foreign hook is preserved and chained, never discarded.
@@ -349,19 +360,23 @@ pub fn install_guard(repo_path: &str, expected_email: &str) -> Result<String, Ap
     std::fs::create_dir_all(&hooks)?;
     let hook = hooks.join("pre-commit");
 
-    let mut chain = String::new();
+    // The hook that was here before GitSwitch is kept and run after the check:
+    // moved aside on the first install, and still chained when the guard is
+    // written again (a new email, say).
+    let saved = hooks.join("pre-commit.gitswitch-saved");
     if hook.exists() {
         let existing = std::fs::read_to_string(&hook)?;
         if !existing.contains(MARKER) {
-            let saved = hooks.join("pre-commit.gitswitch-saved");
             std::fs::rename(&hook, &saved)?;
-            chain = "# run the hook that was here before GitSwitch\nif [ -x \"$(dirname \"$0\")/pre-commit.gitswitch-saved\" ]; then\n  \"$(dirname \"$0\")/pre-commit.gitswitch-saved\" \"$@\" || exit $?\nfi".to_string();
         }
     }
+    let chain = if saved.exists() {
+        "# run the hook that was here before GitSwitch\nif [ -x \"$(dirname \"$0\")/pre-commit.gitswitch-saved\" ]; then\n  \"$(dirname \"$0\")/pre-commit.gitswitch-saved\" \"$@\" || exit $?\nfi".to_string()
+    } else {
+        String::new()
+    };
 
-    let body = HOOK_TEMPLATE
-        .replace("__EXPECTED_EMAIL__", expected_email)
-        .replace("__CHAIN__", &chain);
+    let body = hook_body(expected_email, &chain);
     std::fs::write(&hook, body)?;
 
     #[cfg(unix)]
@@ -378,6 +393,70 @@ pub fn install_guard(repo_path: &str, expected_email: &str) -> Result<String, Ap
             " (existing hook preserved and chained)".to_string()
         }
     ))
+}
+
+/// The email a GitSwitch guard in this hooks directory expects; None when the
+/// pre-commit hook there is not GitSwitch's. Hooks written before the email
+/// had its own comment line carry it as `expected="…"`.
+pub(crate) fn guard_email_in(hooks: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(hooks.join("pre-commit")).ok()?;
+    if !text.contains(MARKER) {
+        return None;
+    }
+    let lines = || text.lines().map(str::trim);
+    lines()
+        .find_map(|l| l.strip_prefix("# gitswitch-expected-email:").map(|e| e.trim().to_string()))
+        .or_else(|| lines().find_map(|l| l.strip_prefix("expected=\"").and_then(|e| e.strip_suffix('"')).map(str::to_string)))
+}
+
+/// The profile a repository commits as: by folder, else by the include file
+/// git reads its email from (a remote rule's clone outside every folder).
+pub(crate) fn profile_for_repo<'a>(repo: &Path, profs: &'a [profiles::Profile]) -> Option<&'a profiles::Profile> {
+    let path = crate::paths::norm(&repo.to_string_lossy());
+    owning_profile(&path, profs).or_else(|| {
+        let origin = git(repo, &["config", "--show-origin", "--get", "user.email"]).ok()?;
+        let file = origin.split('\t').next()?.trim().trim_start_matches("file:").to_string();
+        profiles::profile_for_include_origin(&file, profs)
+    })
+}
+
+/// Bring every GitSwitch guard under these folders in line with the profile
+/// that now owns its repository: after a profile's email changed, or a folder
+/// moved to another profile, a guard expecting the old email would refuse
+/// every commit. A repository no profile owns any more keeps its guard — the
+/// commit box offers to switch it off; protection is never dropped silently.
+/// One line per guard rewritten.
+pub async fn refresh_guards(dirs: &[String]) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    for dir in dirs {
+        if let Ok(repos) = repo_scan::scan_repos(dir.clone()).await {
+            for r in repos {
+                if !paths.contains(&r.path) {
+                    paths.push(r.path);
+                }
+            }
+        }
+    }
+    tokio::task::spawn_blocking(move || {
+        let Ok(store) = profiles::load_profiles() else { return Vec::new() };
+        let mut out = Vec::new();
+        for path in paths {
+            let repo = PathBuf::from(&path);
+            let Ok(hooks) = hooks_dir(&repo) else { continue };
+            let Some(expects) = guard_email_in(&hooks.dir) else { continue };
+            let Some(owner) = profile_for_repo(&repo, &store.profiles) else { continue };
+            let email = owner.git_email.trim();
+            if expects.trim().eq_ignore_ascii_case(email) {
+                continue;
+            }
+            if install_guard(&path, email).is_ok() {
+                out.push(format!("{}: the identity guard now expects {} (was {})", path, email, expects));
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
 }
 
 pub fn uninstall_guard(repo_path: &str) -> Result<String, AppError> {
@@ -448,11 +527,28 @@ mod tests {
 
     #[test]
     fn hook_template_embeds_email_and_marker() {
-        let body = HOOK_TEMPLATE
-            .replace("__EXPECTED_EMAIL__", "a@b.com")
-            .replace("__CHAIN__", "");
-        assert!(body.contains("expected=\"a@b.com\""));
+        let body = hook_body("a@b.com", "");
+        assert!(body.contains("expected='a@b.com'"));
+        assert!(body.contains("# gitswitch-expected-email: a@b.com"));
         assert!(body.contains(MARKER));
         assert!(body.starts_with("#!/bin/sh"));
+        // A quote in the email cannot end the shell's string.
+        assert!(hook_body("o'neil@b.com", "").contains(r"expected='o'\''neil@b.com'"));
+    }
+
+    #[test]
+    fn the_guard_email_is_read_back_from_new_and_old_hooks() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-guard-email-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hook = dir.join("pre-commit");
+        std::fs::write(&hook, hook_body("new@x.test", "")).unwrap();
+        assert_eq!(guard_email_in(&dir).as_deref(), Some("new@x.test"));
+        // Written by a build before the email had a line of its own.
+        std::fs::write(&hook, format!("#!/bin/sh\n# >>> {} >>>\nexpected=\"old@x.test\"\n", MARKER)).unwrap();
+        assert_eq!(guard_email_in(&dir).as_deref(), Some("old@x.test"));
+        // Somebody else's hook: no guard of ours to read.
+        std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(guard_email_in(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

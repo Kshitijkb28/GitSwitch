@@ -523,8 +523,9 @@ OUT=$(probe push_mode "$SUP/lib2" "guardrail")
 OUT=$(GITSWITCH_ELEVATE=manual probe push_mode "$SUP" "locked")
 ok "with no prompt available the lock is handed over as a command" "$(printf '%s' "$OUT" | jqf outcome)" "manual-required"
 CMD="$(printf '%s' "$OUT" | jqf command)"; NONCE="$(printf '%s' "$OUT" | jqf job_nonce)"
-# The person runs it (no sudo needed in the re-rooted sandbox), then says so.
-eval "${CMD#sudo }" >/dev/null 2>&1
+# The person runs it as an administrator, then says so: through `sudo -n` on a
+# REAL runner, unprivileged under the test root (where $SUDO is empty).
+eval "$SUDO ${CMD#sudo }" >/dev/null 2>&1
 OUT=$(pinvoke push_lock_finish_manual "{\"nonce\":\"$NONCE\"}")
 ok "  and \"I ran it\" finishes it" "$(printf '%s' "$OUT" | jqf value.outcome):$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib\"}" | jqf value.lock.locked)" "applied:True"
 ok "  a submodule the lock reached is marked as the superproject's" "$(git -C "$SUP/lib" config --local --get gitswitch.pushBlockedBy)" "superproject"
@@ -532,12 +533,18 @@ ok "  one the person had blocked on their own stays theirs" "$(git -C "$SUP/lib2
 ok "  and each submodule's own log names the superproject" "$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib\"}" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["lock"]["recent_events"][0]["detail"])')" "locked (finished by hand) with its superproject super-cover"
 OUT=$(GITSWITCH_ELEVATE=manual probe push_mode "$SUP" "allowed")
 CMD="$(printf '%s' "$OUT" | jqf command)"; NONCE="$(printf '%s' "$OUT" | jqf job_nonce)"
-eval "${CMD#sudo }" >/dev/null 2>&1
+eval "$SUDO ${CMD#sudo }" >/dev/null 2>&1
 OUT=$(pinvoke push_lock_finish_manual "{\"nonce\":\"$NONCE\"}")
 ok "an unlock finished by hand frees what the superproject's lock reached" "$(printf '%s' "$OUT" | jqf value.outcome):$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib\"}" | jqf value.lock.locked):$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked || echo unset)" "applied:False:unset"
 ok "  but not the one the person locked on their own" "$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib2\"}" | jqf value.lock.locked)" "True"
 OUT=$(probe push_mode "$SUP/lib2" "allowed")
 fi
+
+section "The run ends with the helper uninstalled, as it began"
+OUT=$(probe lock_uninstall "$APP")
+ok "uninstall applies" "$(printf '%s' "$OUT" | jqf outcome)" "applied"
+ok "  the helper is gone" "$([ -e "$HELPER" ] && echo present || echo gone)" "gone"
+ok "  the registry is gone" "$(reg_left)" "gone"
 
 # Real mode: leave the machine as it was found.
 if [ -n "$REAL" ]; then

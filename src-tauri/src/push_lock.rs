@@ -1561,6 +1561,17 @@ mod tests {
         assert_eq!(v["bundle"]["externalBin"][0].as_str().unwrap(), "binaries/gitswitch-lock-helper");
     }
 
+    /// Without a signature an Apple Silicon Mac calls a downloaded copy
+    /// "damaged" and offers only the Trash; sealed ad hoc (no paid Developer
+    /// ID), it says the developer cannot be verified and offers Open Anyway.
+    /// The bundler seals the app and its sidecars before the .dmg is made.
+    #[test]
+    fn the_macos_bundle_is_sealed_ad_hoc() {
+        let conf = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        assert_eq!(v["bundle"]["macOS"]["signingIdentity"].as_str(), Some("-"));
+    }
+
     #[test]
     fn run_outcomes_map_exit_codes_to_sentences() {
         let tmp = std::env::temp_dir().join(format!("gitswitch-lock-test-{}", std::process::id()));

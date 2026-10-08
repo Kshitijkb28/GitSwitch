@@ -107,7 +107,7 @@ export function SparseClone() {
   const navigate = useNavigate();
   const openInChanges = (path: string) => {
     handOff("changes", path);
-    navigate("/changes");
+    navigate("/repo/changes");
   };
 
   // Arriving from Repositories: take the link (and suggested profile) it sent,
@@ -169,7 +169,9 @@ export function SparseClone() {
   // Refresh must not keep what leaving the page would have dropped.
   function reloadAll() {
     reloadProfiles();
+    // What leaving and coming back drops: the last result, and its error.
     setCloned(null);
+    setError(null);
     setSparseLfs(null);
     setFromRepo(null);
     setRecheck((n) => n + 1);
@@ -220,7 +222,9 @@ export function SparseClone() {
     const urlChanged = sizeUrl.current !== url;
     sizeUrl.current = url;
     if (urlChanged) setSizeEstimate(null);
-    if (!/github\.com[:/]/.test(url)) return;
+    // Any address: the backend answers at once when it cannot ask (not GitHub,
+    // and not an SSH alias that stands for it).
+    if (!url.trim()) return;
     const id = window.setTimeout(() => {
       api
         .cloneSizeEstimate(url)
@@ -547,7 +551,8 @@ export function SparseClone() {
           />
           {sizeEstimate && (
             <p className="text-xs text-zinc-500" aria-label="Repository size">
-              About <span className="text-zinc-300">{formatKb(sizeEstimate.kb)}</span> on GitHub — large
+              About <span className="text-zinc-300">{formatKb(sizeEstimate.kb)}</span> on GitHub for this
+              repository — {mode === "full" && withSubmodules ? "its submodules download on top, and " : ""}large
               files kept in LFS are extra.
             </p>
           )}

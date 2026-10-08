@@ -12,6 +12,7 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { useToast } from "../components/Toast";
 import * as api from "../lib/api";
+import { notePushChanged } from "../lib/console";
 import { RefreshButton } from "../components/RefreshButton";
 
 type Step = {
@@ -110,11 +111,20 @@ export function Doctor() {
         const cut = rest.indexOf(":");
         const msg = await api.doctorUnsetLocal(rest.slice(cut + 1), rest.slice(0, cut));
         toast.success(msg);
+      } else if (finding.fix.startsWith("respell-folders:")) {
+        // Saving the profile again stores each folder as the disk spells it.
+        const id = finding.fix.slice("respell-folders:".length);
+        const profile = (await api.getProfiles()).find((p) => p.id === id);
+        if (profile) {
+          await api.updateProfile({ id, directories: profile.directories });
+          toast.success(`"${profile.name}" now names its folders as the disk spells them`);
+        }
       } else if (finding.fix.startsWith("lock-")) {
         // Most of these open the administrator prompt; the outcome — cancelled
         // included — comes back as a sentence rather than an exception.
         const r = await api.pushLockFix(finding.fix);
         if (r.outcome === "applied") {
+          notePushChanged();
           toast.success(r.message);
         } else if (r.outcome === "manual-required" && r.command) {
           setError(`${r.message}\n${r.command}`);

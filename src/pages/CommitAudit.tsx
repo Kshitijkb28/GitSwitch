@@ -167,7 +167,7 @@ export function CommitAudit() {
               <p className="text-xs text-zinc-500 font-mono truncate mt-1">{a.path}</p>
               <p className="text-xs text-zinc-500 mt-1">
                 should commit as{" "}
-                <span className="text-emerald-400 font-mono">{a.expected_email}</span>
+                <span className="text-emerald-400 font-mono break-all">{a.expected_email}</span>
               </p>
             </div>
             <div className="flex items-center gap-2 shrink-0 ml-auto">
@@ -269,7 +269,7 @@ export function CommitAudit() {
             {confirmFix?.unpushed_count === 1 ? "" : "s"}
           </strong>{" "}
           in <span className="font-mono text-zinc-300">{confirmFix?.repo_name}</span> to{" "}
-          <span className="font-mono text-emerald-400">{confirmFix?.expected_email}</span>.
+          <span className="font-mono text-emerald-400 break-all">{confirmFix?.expected_email}</span>.
         </p>
         <ul className="text-xs text-zinc-500 space-y-1.5 mb-4 list-disc pl-5">
           <li>Only commits that haven't been pushed are touched.</li>

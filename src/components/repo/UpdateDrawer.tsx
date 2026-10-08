@@ -151,7 +151,7 @@ export function UpdateDrawer({ repoPath, status, busy, onClose, onRun, onRemedy 
               <summary className="cursor-pointer select-none hover:text-zinc-400">What git will run</summary>
               <ol className="mt-1 space-y-0.5 list-decimal list-inside font-mono">
                 <li>git fetch {plan.superproject.remote || upstream.split("/")[0]}</li>
-                <li>git branch gitswitch-before-sync-&lt;time&gt; (a backup of where you are)</li>
+                <li>git branch gitswitch-before-update-&lt;time&gt; (a backup of where you are)</li>
                 {plan.superproject.behind > 0 && (
                   <li>
                     git rebase {plan.superproject.will_stash ? "--autostash " : ""}

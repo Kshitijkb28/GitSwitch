@@ -70,6 +70,10 @@ jobs:
         env:
           LOCK_REAL: "1"
         run: bash scripts/verify/lock.sh
+      # identity.sh runs the VS Code extension's own resolver, which is TypeScript.
+      - name: Setup Bun
+        if: matrix.os != 'windows-latest'
+        uses: oven-sh/setup-bun@v2
       - name: Git suites (Changes sandbox, regression, submodules, LFS, sync, tree, stashes)
         if: matrix.os != 'windows-latest'
         shell: bash
@@ -138,10 +142,17 @@ jobs:
         run: npm ci
       - name: TypeScript
         run: npx tsc --noEmit
+      - name: No deprecated React event types
+        run: |
+          if grep -rnwE 'FormEvent|FormEventHandler' src; then
+            echo "type a form submit as SubmitEvent<HTMLFormElement>"; exit 1
+          fi
       - name: Build the frontend
         run: npm run build
       - name: IPC contract (commands.rs ↔ lib.rs ↔ api.ts)
         run: python3 scripts/verify/harness/ipc.py
+      - name: Packaging and install docs
+        run: python3 scripts/verify/harness/packaging.py
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Rust cache
@@ -166,6 +177,55 @@ jobs:
           node history.mjs
           node sweep.mjs
           node live.mjs
+
+  # The VS Code extension, as a file anyone can install: compiled, packed,
+  # checked for its entry point, kept as an artifact — and attached to the
+  # release on a tag (release-extension below).
+  verify-extension:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: vscode-extension
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Type-check and test the extension
+        run: |
+          npx tsc -p .
+          node out/test/resolve.test.js
+          node out/test/gitrun.test.js
+      - name: Carry the release's version
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+      - name: Package (compiles first, through vscode:prepublish)
+        run: npm run package
+      - name: The package carries the compiled entry point
+        run: unzip -l *.vsix | grep -q 'extension/out/extension.js'
+      - name: Keep the .vsix
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitswitch-vscode
+          path: vscode-extension/*.vsix
+
+  release-extension:
+    if: github.ref_type == 'tag'
+    needs: [build, verify-extension]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: gitswitch-vscode
+      - name: Attach the extension to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" *.vsix --clobber --repo "$GITHUB_REPOSITORY"
 
   build:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
@@ -231,9 +291,24 @@ jobs:
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: "GitSwitch ${{ github.ref_name }}"
+          releaseBody: |
+            **macOS, first open:** the app is sealed but not notarized. On macOS 15 and later, open it once and click Done, then System Settings → Privacy & Security → "GitSwitch was blocked…" → Open Anyway → Open. On macOS 14 and earlier, Control-click it in Applications → Open → Open. If macOS says it is damaged: `xattr -dr com.apple.quarantine /Applications/GitSwitch.app`.
+
+            **Windows:** SmartScreen says "Windows protected your PC" for an unsigned installer: More info → Run anyway.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      # An unsealed app on Apple Silicon is "damaged" once downloaded; a sealed
+      # one only asks to be confirmed. Check the bundle that was shipped.
+      - name: The macOS app is sealed
+        if: matrix.platform == 'macos-latest'
+        run: |
+          app="$(ls -d src-tauri/target/*/release/bundle/macos/GitSwitch.app src-tauri/target/release/bundle/macos/GitSwitch.app 2>/dev/null | head -1)"
+          test -n "$app" || { echo "no GitSwitch.app was bundled"; exit 1; }
+          test -f "$app/Contents/_CodeSignature/CodeResources"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'
 
       # When run manually (no tag), still expose the installers as artifacts
       - name: Upload installers as artifacts

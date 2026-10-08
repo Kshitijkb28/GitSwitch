@@ -4,7 +4,7 @@ import { Button } from "../Button";
 import { Card } from "../Card";
 import { useToast } from "../Toast";
 import { TreeLists, type DiscardVariant } from "../changes/TreeLists";
-import { CommitBox } from "../changes/CommitBox";
+import { CommitBox, type GuardAction } from "../changes/CommitBox";
 import { DiffPanel } from "../changes/DiffPanel";
 import { TidyUpStrip } from "./TidyUpStrip";
 import type { RepoActions } from "./StatusStrip";
@@ -25,7 +25,8 @@ import { DiscardAllModal } from "../changes/DiscardAllModal";
 import { usePersistedState } from "../../lib/persist";
 import { canonicalJoin } from "../../lib/paths";
 import { useRefreshOnFocus } from "../../lib/focus";
-import { elapsedLabel, runJob, useGitJob, clearJob, type GitJobKind } from "../../lib/gitJobs";
+import { notePushChanged } from "../../lib/console";
+import { elapsedLabel, runJob, useGitJob, clearJob, jobWritingFiles, type GitJobKind } from "../../lib/gitJobs";
 import * as api from "../../lib/api";
 import type { ChangeEntry, OpResult, PullMode, RepoStatus, SubmoduleInfo, SubmoduleStatus } from "../../lib/api";
 
@@ -184,7 +185,12 @@ export function ChangesTab({
   }, [subRefresh]);
 
   // Folders change behind the app's back: a terminal commit, a deleted clone.
-  useRefreshOnFocus(() => loadStatus(repoPath), 4000);
+  // Not while a job is writing this folder: a status read of a repository
+  // mid-download competes with the download and made the app lag.
+  useRefreshOnFocus(() => {
+    if (jobWritingFiles(repoPath)) return;
+    loadStatus(repoPath);
+  }, 4000);
 
   // The strip above the tabs shows what this tab knows.
   useEffect(() => {
@@ -284,6 +290,27 @@ export function ChangesTab({
 
   /** Work in another repo (a submodule) without waiting for the scan. */
   const openRepo = (path: string) => onOpenRepo(path);
+
+  // The identity guard of this repository or of a submodule shown inline:
+  // switched here, on any repository, and rewritten when it expects an email
+  // the profile no longer has.
+  const [guardBusy, setGuardBusy] = useState(false);
+  const guardAction = async (path: string, st: RepoStatus, action: GuardAction) => {
+    setGuardBusy(true);
+    try {
+      const msg =
+        action === "off"
+          ? await api.uninstallCommitGuard(path)
+          : await api.installCommitGuard(path, st.identity.profile_email ?? "");
+      toast.success(msg);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setGuardBusy(false);
+      loadStatus(repoPath);
+      setSubRefresh((n) => n + 1);
+    }
+  };
 
   const message = drafts[repoPath] ?? "";
   const setMessage = (m: string) => setDrafts((d) => ({ ...d, [repoPath]: m }));
@@ -389,7 +416,9 @@ export function ChangesTab({
     const abs = `${repo.replace(/\/+$/, "")}/${s.path}`;
     return apply(
       `pull:${s.path}`,
-      () => api.changesPull(abs, pullMode, (status?.uses_lfs ?? false) && pullLfs, pullMode === "rebase" && pullAutostash),
+      // The page's option, as it is: whether LFS is used is the submodule's own
+      // matter, which the backend reads there (nothing to do where it is not).
+      () => api.changesPull(abs, pullMode, pullLfs, pullMode === "rebase" && pullAutostash),
       abs
     );
   };
@@ -452,8 +481,15 @@ export function ChangesTab({
       recordPointers: (repo) => apply("record", () => api.changesRecordPointers(repo)),
       recordOne: (repo, sub) => apply(`record:${sub}`, () => api.changesRecordPointers(repo, [sub])),
       startBranch: (repo, sub, name) => startBranch(repo, sub, name),
+      // The page's large-file choice, as Pull takes it: the backend decides
+      // which repositories of the update use LFS.
       update: (repo, stash, bundles, fingerprint) =>
-        runLongIn(repo, "sync", "Updating — fetching, rebasing, aligning submodules…", () => api.changesSyncRun(repo, stash, bundles, fingerprint)),
+        runLongIn(
+          repo,
+          "sync",
+          pullLfs ? "Updating — fetching, rebasing, aligning submodules, then the LFS files…" : "Updating — fetching, rebasing, aligning submodules…",
+          () => api.changesSyncRun(repo, stash, bundles, fingerprint, pullLfs)
+        ),
       stashNow: (repo) => apply("stash", () => api.changesStashPush(repo, "Before update", false)),
     });
   });
@@ -680,6 +716,7 @@ export function ChangesTab({
             onPullMode={onPullMode}
             pullLfs={pullLfs}
             onPullLfs={onPullLfs}
+            lfsInSubmodules={subStatuses.some((s) => s.status.uses_lfs)}
             pullAutostash={pullAutostash}
             onPullAutostash={onPullAutostash}
             onUndoCommit={() => apply("undo", () => api.changesUndoCommit(repoPath))}
@@ -731,6 +768,8 @@ export function ChangesTab({
                 busy={anyBusy}
                 onCommit={onCommit}
                 onSwitchBranch={() => setBranchesFor(repoPath)}
+                onGuard={(a) => guardAction(repoPath, status, a)}
+                guardBusy={guardBusy}
               />
 
               {sectionSubs.map((s) => (
@@ -748,6 +787,8 @@ export function ChangesTab({
                   onOpenRepo={openRepo}
                   onDiscard={(paths, variant) => setConfirmDiscard({ paths, variant, target: s.status.path })}
                   onSwitchBranch={() => setBranchesFor(s.status.path)}
+                  onGuard={(a) => guardAction(s.status.path, s.status, a)}
+                  guardBusy={guardBusy}
                 />
               ))}
               {quietSubs > 0 && (
@@ -764,6 +805,9 @@ export function ChangesTab({
                 refreshKey={identityRefresh}
                 push={status.push}
                 onChanged={(p) => {
+                  // The terminal drawer's badge reads it again, whichever
+                  // repository this page shows by now.
+                  notePushChanged();
                   // A mode change that lands after a switch to another
                   // repository must not carry this status over to it.
                   if (repoRef.current !== repoPath) return;

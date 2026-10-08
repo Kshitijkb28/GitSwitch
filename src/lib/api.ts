@@ -865,6 +865,8 @@ export interface RepoIdentity {
   signing_on: boolean;
   signing_key: string | null;
   guard: "gitswitch" | "foreign" | "none";
+  /** The email GitSwitch's guard expects; it goes stale when the profile's email changes. */
+  guard_email: string | null;
 }
 
 export interface RemotePushState {
@@ -1727,9 +1729,11 @@ export async function changesSyncRun(
   repoPath: string,
   stash: boolean,
   bundles: boolean,
-  fingerprint: [string, string][]
+  fingerprint: [string, string][],
+  /** Download every large file still a pointer stub afterwards, in each repository that uses LFS. */
+  withLfs = false
 ): Promise<OpResult> {
-  return invoke("changes_sync_run", { repoPath, stash, bundles, fingerprint });
+  return invoke("changes_sync_run", { repoPath, stash, bundles, fingerprint, withLfs });
 }
 
 export async function changesSyncContinue(repoPath: string, allowMarkers = false): Promise<OpResult> {

@@ -2,7 +2,7 @@ import { useState } from "react";
 import { AlertTriangle, Box, ChevronDown, ChevronRight, CircleSlash, FolderOpen, Play } from "lucide-react";
 import { Badge } from "../Badge";
 import { Button } from "../Button";
-import { CommitBox } from "./CommitBox";
+import { CommitBox, type GuardAction } from "./CommitBox";
 import { DiffPanel } from "./DiffPanel";
 import { TreeLists, type DiscardVariant } from "./TreeLists";
 import * as api from "../../lib/api";
@@ -38,6 +38,8 @@ type Props = {
   /** Asks first — the page owns the confirmation, keyed to this submodule. */
   onDiscard: (paths: string[], variant: DiscardVariant) => void;
   onSwitchBranch?: () => void;
+  onGuard?: (action: GuardAction) => void;
+  guardBusy?: boolean;
 };
 
 /**
@@ -59,6 +61,8 @@ export function SubmoduleSection({
   onOpenRepo,
   onDiscard,
   onSwitchBranch,
+  onGuard,
+  guardBusy,
 }: Props) {
   const st = sub.status;
   const path = st.path;
@@ -216,6 +220,8 @@ export function SubmoduleSection({
             onCommit={onCommit}
             onSwitchBranch={onSwitchBranch}
             scopeLabel={sub.path}
+            onGuard={onGuard}
+            guardBusy={guardBusy}
           />
 
           {showFooter && committed && (

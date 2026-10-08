@@ -3,6 +3,17 @@ import { readPersisted, usePersistedState, writePersisted } from "./persist";
 import { canonicalJoin, isWithin, normPath } from "./paths";
 
 /**
+ * The folder the Repository page is on right now, its submodule scope
+ * included — read at call time, for code outside the page (the terminal
+ * drawer). The hook and `handOff` write these keys as the selection changes.
+ */
+export function readSelectedRepo(): string {
+  const path = readPersisted<string>("repo.path", "");
+  if (path) return canonicalJoin(path, readPersisted<string>("repo.sub", ""));
+  return readPersisted<string>("changes.repo", "") || readPersisted<string>("history.repo", "");
+}
+
+/**
  * The one repository selection the Repository page works on: an account
  * filter, a repository, and optionally a submodule inside it ("scope").
  *

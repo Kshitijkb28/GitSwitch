@@ -29,8 +29,12 @@ export type GitJob = {
   progress?: CloneProgress;
 };
 
-/** The kinds whose backend records progress under the repository's path. */
-const REPORTS_PROGRESS: ReadonlySet<GitJobKind> = new Set(["submodules"]);
+/**
+ * The kinds whose backend records progress under the repository's path:
+ * Download (and Update to recorded), and the Update and its Continue, which
+ * download a submodule upstream added (sync.rs, under a progress guard).
+ */
+const REPORTS_PROGRESS: ReadonlySet<GitJobKind> = new Set(["submodules", "sync"]);
 
 const jobs = new Map<string, GitJob>();
 const listeners = new Set<() => void>();
@@ -44,6 +48,21 @@ function subscribe(fn: () => void) {
   return () => {
     listeners.delete(fn);
   };
+}
+
+/**
+ * A job that writes this repository's files is running here, in the
+ * repository it belongs to, or in one of its submodules (the overlap runJob
+ * itself refuses). While one does, re-reading the whole folder on every
+ * return to the window only competes with it — its end adopts the fresh status.
+ */
+export function jobWritingFiles(repo: string): boolean {
+  const writes: ReadonlySet<GitJobKind> = new Set(["lfs", "pull", "sync", "submodules"]);
+  for (const j of jobs.values()) {
+    if (!j.running || !writes.has(j.kind)) continue;
+    if (j.repo === repo || repo.startsWith(j.repo + "/") || j.repo.startsWith(repo + "/")) return true;
+  }
+  return false;
 }
 
 export function getJob(repo: string): GitJob | undefined {
@@ -97,18 +116,23 @@ export async function runJob(
     if (j.running && (repo.startsWith(j.repo + "/") || j.repo.startsWith(repo + "/"))) return undefined;
   }
 
-  jobs.set(repo, { repo, kind, label, startedAt: Date.now(), running: true });
+  const startedAt = Date.now();
+  jobs.set(repo, { repo, kind, label, startedAt, running: true });
   emit();
   // Progress, read from the backend while the job runs — the same line the
   // Clone page shows: phase, percentage, which submodule, bytes and rate.
+  // An empty answer once there was a line means that download is over (the
+  // backend's guard dropped it) while the job carries on: the line goes.
   const poll = REPORTS_PROGRESS.has(kind)
     ? window.setInterval(() => {
         api
           .cloneProgress(repo)
           .then((p) => {
             const j = jobs.get(repo);
-            if (!j?.running || !p) return;
-            jobs.set(repo, { ...j, progress: p });
+            // A late answer must not land on a newer job of the same repository.
+            if (!j?.running || j.startedAt !== startedAt) return;
+            if (!p && !j.progress) return;
+            jobs.set(repo, { ...j, progress: p ?? undefined });
             emit();
           })
           .catch(() => {});

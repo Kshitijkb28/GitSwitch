@@ -21,8 +21,28 @@ run "Rust unit tests"     bash -c "cd '$ROOT/src-tauri' && cargo test --workspac
 # compile has zero warnings, which used to read as a pass.
 run "Clippy"              bash -c "cd '$ROOT/src-tauri' && out=\$(cargo clippy --workspace --all-targets 2>&1); rc=\$?; n=\$(printf '%s\n' \"\$out\" | grep -cE '^warning: '); echo \"warnings: \$n (clippy exit \$rc)\"; [ \$rc -eq 0 ] || printf '%s\n' \"\$out\" | tail -30; [ \$rc -eq 0 ] && [ \"\$n\" -eq 0 ]"
 run "TypeScript"          bash -c "cd '$ROOT' && $TSC --noEmit && echo clean"
+# Deprecated in @types/react 19.2: a form submit is typed SubmitEvent<HTMLFormElement>.
+run "No deprecated React event types" bash -c "cd '$ROOT' && if grep -rnwE 'FormEvent|FormEventHandler' src; then echo 'type a form submit as SubmitEvent<HTMLFormElement>'; false; else echo clean; fi"
 run "Frontend build"      bash -c "cd '$ROOT' && $BUILD 2>&1 | grep -E '✓ built'"
 run "IPC contract"        python3 "$HERE/harness/ipc.py"
+run "Packaging and install docs" python3 "$HERE/harness/packaging.py"
+# The VS Code extension: its types, and its tests (resolving a repository's
+# profile as the app does; a fetch stopped only on silence). bun runs the
+# TypeScript tests as they are; node runs what the compile writes.
+ext_suite() (
+  cd "$ROOT/vscode-extension" || exit 1
+  if [ "$JS" = bun ]; then bun node_modules/typescript/bin/tsc -p . --noEmit && bun src/test/resolve.test.ts && bun src/test/gitrun.test.ts
+  else npx tsc -p . && node out/test/resolve.test.js && node out/test/gitrun.test.js; fi
+)
+if [ -d "$ROOT/vscode-extension/node_modules/typescript" ] && [ -n "$JS" ]; then
+  run "VS Code extension" ext_suite
+else
+  printf '
+[1m════ VS Code extension ════[0m
+'
+  echo "SKIPPED: the extension's TypeScript is not installed (cd vscode-extension && bun install). Set GITSWITCH_ALLOW_SKIP=1 to accept that knowingly."
+  [ "${GITSWITCH_ALLOW_SKIP:-}" = 1 ] || status=1
+fi
 run "Changes sandbox"     bash "$HERE/sandbox.sh"
 run "Regression"          bash "$HERE/regression.sh"
 run "Identity (gitconfig round-trip)" bash "$HERE/identity.sh"

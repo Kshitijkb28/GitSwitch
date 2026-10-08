@@ -289,25 +289,50 @@ pub async fn check_profiles() -> Result<Vec<Finding>, AppError> {
                     format!("Folder assigned to \"{}\" doesn't exist", p.name),
                     format!("{} is not a directory (moved or deleted?). The rule is inert until it exists.", dir),
                 ));
+                continue;
+            }
+            // Saved before folders were stored as the disk spells them, or
+            // created afterwards in another letter case.
+            let disk = crate::paths::disk_spelling(dir);
+            if crate::paths::norm(&disk) != crate::paths::norm(dir) {
+                out.push(
+                    Finding::new(
+                        "folder-spelling",
+                        "warning",
+                        format!("A folder of \"{}\" is spelled differently on disk", p.name),
+                        format!(
+                            "{} is {} on disk. git matches folder rules letter for letter: until the profile is saved again, repositories there may commit and push as another profile, and the app may list them under another.",
+                            dir, disk
+                        ),
+                    )
+                    .with_fix(format!("respell-folders:{}", p.id), "Save it as the disk spells it"),
+                );
             }
         }
     }
 
     // A folder claimed by two profiles means git's last-match-wins decides —
     // not the app. (The app dedupes on save; this catches hand-edited stores.)
-    let mut seen: Vec<(String, String)> = Vec::new();
+    // One folder may be named two ways: in another letter case, or through a
+    // symbolic link.
+    let mut seen: Vec<(&str, &str, &str, crate::paths::FolderId)> = Vec::new();
     for p in &store.profiles {
         for d in &p.directories {
-            let norm = crate::paths::norm(d);
-            if let Some((other, _)) = seen.iter().find(|(_, dd)| dd == &norm) {
+            let id = crate::paths::FolderId::of(d);
+            if let Some((_, other, other_dir, _)) = seen.iter().find(|(pid, _, _, s)| *pid != p.id && s.same(&id)) {
+                let (a, b) = (crate::paths::norm(other_dir), crate::paths::norm(d));
                 out.push(Finding::new(
                     "folder-conflict",
                     "error",
                     "A folder is claimed by two profiles",
-                    format!("{} is listed in both \"{}\" and \"{}\". Remove it from one of them.", norm, other, p.name),
+                    if a == b {
+                        format!("{} is listed in both \"{}\" and \"{}\". Remove it from one of them.", b, other, p.name)
+                    } else {
+                        format!("{} in \"{}\" and {} in \"{}\" are the same folder. Remove it from one of them.", a, other, b, p.name)
+                    },
                 ));
             }
-            seen.push((p.name.clone(), norm));
+            seen.push((p.id.as_str(), p.name.as_str(), d.as_str(), id));
         }
     }
 

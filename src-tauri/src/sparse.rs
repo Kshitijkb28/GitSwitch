@@ -199,9 +199,10 @@ type EstimateCell = std::sync::Arc<std::sync::Mutex<Option<u64>>>;
 
 fn ask_size(url: &str, accounts: Option<Vec<String>>) -> (EstimateCell, Option<tokio::task::JoinHandle<()>>) {
     let cell: EstimateCell = Default::default();
-    // Only a host that can be asked: for every other address there is
+    // Only a host that can be asked — GitHub, by its name or through an SSH
+    // alias ssh resolves inside the task: for every other address there is
     // nothing to wait for, and nothing leaves this computer.
-    if crate::peek::github_slug(url).is_none() {
+    if crate::peek::github_slug(url).is_none() && crate::ssh_config::ssh_host_of_url(url).is_none() {
         return (cell, None);
     }
     let (into, url) = (cell.clone(), url.to_string());
@@ -510,7 +511,7 @@ fn accounts_of(profile_id: Option<&str>) -> Vec<String> {
 /// only those — the account a folder acts as — so one account's token never
 /// looks up a repository on another's behalf. Anonymously after either.
 async fn size_estimate(url: &str, accounts: Option<&[String]>) -> Option<CloneSizeEstimate> {
-    let (owner, repo) = crate::peek::github_slug(url)?;
+    let (owner, repo) = crate::peek::github_slug_resolved(url).await?;
     // The page asks when the address is typed and the clone asks again a
     // moment later: the answer is kept for a few minutes, not asked twice.
     static KNOWN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u64)>>> = std::sync::OnceLock::new();
@@ -1633,22 +1634,34 @@ pub async fn repo_info(repo_path: &str) -> Result<SparseInfo, AppError> {
     let branch = run_git(Some(&repo), &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
 
     // Tree objects are fetched even with --filter=blob:none, so this works
-    // offline right after a partial clone.
-    let available_dirs: Vec<String> = run_git(Some(&repo), &["ls-tree", "-d", "--name-only", "HEAD"])
-        .await
-        .map(|out| out.lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
-        .unwrap_or_default();
+    // offline right after a partial clone. NUL-separated: otherwise git
+    // escapes a name (`"caf\303\251"`), and a folder ticked in that spelling
+    // checks out nothing.
+    let available_dirs: Vec<String> = match crate::git_exec::GitCmd::at(&repo).args(["ls-tree", "-d", "-z", "--name-only", "HEAD"]).run().await {
+        Ok(out) if out.ok() => out.stdout.split(|b| *b == 0).filter(|n| !n.is_empty()).map(|n| String::from_utf8_lossy(n).to_string()).collect(),
+        _ => Vec::new(),
+    };
 
     let is_sparse = run_git(Some(&repo), &["config", "--get", "core.sparseCheckout"])
         .await
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    // `list` has no -z: with core.quotePath off only a name holding a quote,
+    // a backslash or a control character is still escaped, and that is undone.
     let sparse_dirs: Vec<String> = if is_sparse {
-        run_git(Some(&repo), &["sparse-checkout", "list"])
-            .await
-            .map(|out| out.lines().map(str::to_string).filter(|l| !l.is_empty()).collect())
-            .unwrap_or_default()
+        match crate::git_exec::GitCmd::at(&repo).cfg("core.quotePath", "false").args(["sparse-checkout", "list"]).run().await {
+            Ok(out) if out.ok() => out
+                .stdout
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .map(|l| {
+                    let raw = if l.first() == Some(&b'"') { unquote_c_style(l).unwrap_or_else(|| l.to_vec()) } else { l.to_vec() };
+                    String::from_utf8_lossy(&raw).to_string()
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
     } else {
         Vec::new()
     };
@@ -1660,6 +1673,45 @@ pub async fn repo_info(repo_path: &str) -> Result<SparseInfo, AppError> {
         sparse_dirs,
         available_dirs,
     })
+}
+
+/// Undo git's C-style quoting of a path (`"say\"hi"`, `"caf\303\251"`): the
+/// raw bytes, or None for anything that is not a well-formed quoted name.
+fn unquote_c_style(s: &[u8]) -> Option<Vec<u8>> {
+    let inner = s.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+    let mut out = Vec::with_capacity(inner.len());
+    let mut i = 0;
+    while i < inner.len() {
+        let c = inner[i];
+        if c != b'\\' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let n = *inner.get(i + 1)?;
+        let (byte, used) = match n {
+            b'a' => (0x07, 2),
+            b'b' => (0x08, 2),
+            b'f' => (0x0c, 2),
+            b'n' => (b'\n', 2),
+            b'r' => (b'\r', 2),
+            b't' => (b'\t', 2),
+            b'v' => (0x0b, 2),
+            b'\\' => (b'\\', 2),
+            b'"' => (b'"', 2),
+            b'0'..=b'3' => {
+                let d = inner.get(i + 1..i + 4)?;
+                if !d.iter().all(|x| (b'0'..=b'7').contains(x)) {
+                    return None;
+                }
+                ((d[0] - b'0') * 64 + (d[1] - b'0') * 8 + (d[2] - b'0'), 4)
+            }
+            _ => return None,
+        };
+        out.push(byte);
+        i += used;
+    }
+    Some(out)
 }
 
 #[derive(Debug, Serialize)]
@@ -1727,6 +1779,16 @@ mod tests {
         assert!(!json.contains("detail"), "{}", json);
         let back: CloneProgress = serde_json::from_str(r#"{"phase":"Submodules","percent":37,"done":3,"total":8,"bytes":null,"rate":null,"detail":"libs/sub"}"#).unwrap();
         assert_eq!(back.detail.as_deref(), Some("libs/sub"));
+    }
+
+    #[test]
+    fn a_name_git_quoted_is_read_back_whole() {
+        assert_eq!(unquote_c_style(b"\"caf\\303\\251\""), Some("café".as_bytes().to_vec()));
+        assert_eq!(unquote_c_style(b"\"say\\\"hi\""), Some(b"say\"hi".to_vec()));
+        assert_eq!(unquote_c_style(b"\"a\\\\b\\tc\""), Some(b"a\\b\tc".to_vec()));
+        assert_eq!(unquote_c_style(b"plain"), None, "not quoted");
+        assert_eq!(unquote_c_style(b"\"bad\\q\""), None, "an unknown escape");
+        assert_eq!(unquote_c_style(b"\"cut\\30\""), None, "a short octal");
     }
 
     #[test]

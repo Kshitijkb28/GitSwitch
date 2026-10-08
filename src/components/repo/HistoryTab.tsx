@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, type SubmitEvent } from "react";
 import {
   GitMerge,
   Loader2,
@@ -29,6 +29,7 @@ import { formatWhen } from "../../lib/time";
 const PANEL_HANDLES = new Set(["would-drop-pushed", "merge-commit-needs-mainline"]);
 
 const PAGE_SIZE = 50;
+const BRANCH_PAGE = 50;
 const ROW_H = 46;
 const LANE_W = 16;
 const LANE_COLORS = [
@@ -280,7 +281,7 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
   }
 
   /** "Go to commit": any id, short id or ref the user typed. */
-  async function gotoCommit(e: React.FormEvent) {
+  async function gotoCommit(e: SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     const text = gotoText.trim();
     if (!text || !repo) return;
@@ -364,6 +365,7 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
       setResult(null);
       setDetail(null);
       setTarget(null);
+      setBranchQuery("");
     }
     loadBranches(repo);
   }, [repo, loadBranches]);
@@ -408,7 +410,18 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
     const seq = ++pageSeq.current;
     setLoadingPage(true);
     api.historyPage(repo, rev, offset, PAGE_SIZE, appliedSearch || null, effectiveAuthors, hasSubmodules && hidePointerOnly, onlyUnpushed)
-      .then((p) => { if (pageSeq.current === seq) { setPage(p); setError(null); } })
+      .then((p) => {
+        if (pageSeq.current !== seq) return;
+        // The history shrank under a later page (a reset, a push with "only
+        // not pushed" on): go back to the last page that exists. Terminates —
+        // the offset only ever drops, towards a real page or the first.
+        if (offset > 0 && p.commits.length === 0) {
+          setOffset(p.total > 0 ? Math.floor((p.total - 1) / PAGE_SIZE) * PAGE_SIZE : 0);
+          return;
+        }
+        setPage(p);
+        setError(null);
+      })
       .catch((e) => { if (pageSeq.current === seq) { setError(String(e)); setPage(null); } })
       .finally(() => { if (pageSeq.current === seq) setLoadingPage(false); });
   }, [repo, rev, offset, appliedSearch, reloadKey, authorsKey, hidePointerOnly, hasSubmodules, awaitingMe, onlyUnpushed]);
@@ -453,6 +466,13 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
   }
 
   const visibleBranches = branches.filter((b) => b.is_remote === showRemote);
+  // A repository can have hundreds of branches: a filter, and the list grows
+  // fifty at a time as it is scrolled — as every long list in the app does.
+  const [branchQuery, setBranchQuery] = useState("");
+  const [branchShown, setBranchShown] = useState(BRANCH_PAGE);
+  const q = branchQuery.trim().toLowerCase();
+  const filteredBranches = q ? visibleBranches.filter((b) => b.name.toLowerCase().includes(q)) : visibleBranches;
+  useEffect(() => setBranchShown(BRANCH_PAGE), [branchQuery, showRemote, repo]);
   const totalPages = page ? Math.max(1, Math.ceil(page.total / PAGE_SIZE)) : 1;
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
 
@@ -581,9 +601,19 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                   );
                 })}
                 <span className="ml-auto text-xs text-zinc-600">
-                  {visibleBranches.length}
+                  {q ? `${filteredBranches.length} of ${visibleBranches.length}` : visibleBranches.length}
                 </span>
               </div>
+              {visibleBranches.length > 3 && (
+                <Input
+                  aria-label="Filter branches"
+                  placeholder="Filter branches"
+                  value={branchQuery}
+                  onChange={(e) => setBranchQuery(e.target.value)}
+                  containerClassName="mb-2"
+                  className="py-1.5 text-sm"
+                />
+              )}
 
               <button
                 onClick={() => selectBranch("--all")}
@@ -602,8 +632,16 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                   Reading branches…
                 </div>
               ) : (
-                <div className="space-y-1.5 max-h-[26rem] overflow-y-auto pr-1">
-                  {visibleBranches.map((b) => (
+                <div
+                  className="space-y-1.5 max-h-[26rem] overflow-y-auto pr-1"
+                  onScroll={(e) => {
+                    const el = e.currentTarget;
+                    if (el.scrollHeight - el.scrollTop - el.clientHeight < 64) {
+                      setBranchShown((n) => (n < filteredBranches.length ? n + BRANCH_PAGE : n));
+                    }
+                  }}
+                >
+                  {filteredBranches.slice(0, branchShown).map((b) => (
                     <button
                       key={b.name}
                       onClick={() => selectBranch(b.name)}
@@ -630,6 +668,14 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                   {visibleBranches.length === 0 && (
                     <p className="text-xs text-zinc-600 py-2">
                       No {showRemote ? "remote" : "local"} branches.
+                    </p>
+                  )}
+                  {visibleBranches.length > 0 && filteredBranches.length === 0 && (
+                    <p className="text-xs text-zinc-600 py-2">No branch matches “{branchQuery.trim()}”.</p>
+                  )}
+                  {filteredBranches.length > branchShown && (
+                    <p className="text-xs text-zinc-500 py-2">
+                      Showing {branchShown} of {filteredBranches.length}. Keep scrolling, or type to narrow it down.
                     </p>
                   )}
                 </div>
@@ -818,7 +864,7 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                     <>
                       {" · "}
                       {page.total.toLocaleString()} commit{page.total === 1 ? "" : "s"}
-                      {page.total > 0 && (
+                      {page.commits.length > 0 && (
                         <>
                           {" · showing "}
                           {(offset + 1).toLocaleString()}–
@@ -894,7 +940,7 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                 ))}
               </div>
 
-              {page && page.total > PAGE_SIZE && (
+              {page && (offset > 0 || page.total > PAGE_SIZE) && (
                 <div className="flex items-center justify-between gap-3 flex-wrap pt-4 mt-2 border-t border-zinc-800">
                   <Button
                     variant="secondary"

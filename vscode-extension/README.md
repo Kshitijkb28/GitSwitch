@@ -34,9 +34,15 @@ never disagree.
 
 ## Install
 
+Download `gitswitch-<version>.vsix` from the GitHub release (or the
+`gitswitch-vscode` artifact of a CI run), then:
+
 ```bash
-code --install-extension gitswitch-0.1.0.vsix
+code --install-extension gitswitch-<version>.vsix
 ```
+
+or Extensions view → ⋯ → Install from VSIX…. To build it yourself:
+`npm ci && npm run package` (it compiles first).
 
 Requires `git` on PATH. The desktop app is optional — without it you still get
 the identity readout, just no profile comparison.

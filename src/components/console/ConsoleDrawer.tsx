@@ -18,7 +18,7 @@ import {
   setConsoleRepo,
   useConsole,
 } from "../../lib/console";
-import { baseName } from "../../lib/paths";
+import { baseName, isWithin, normPath } from "../../lib/paths";
 
 /**
  * A shell, in a drawer, pinned to the bottom of the window on every page.
@@ -32,7 +32,7 @@ import { baseName } from "../../lib/paths";
  * kill a shell that might be halfway through something.
  */
 export function ConsoleDrawer() {
-  const { open, tab, account, repo, height } = useConsole();
+  const { open, tab, account, repo, height, pushRev } = useConsole();
   const [repos, setRepos] = useState<api.RepoRef[]>([]);
   const [started, setStarted] = useState(false);
   const [sizeKey, setSizeKey] = useState(0);
@@ -45,10 +45,11 @@ export function ConsoleDrawer() {
     if (open) setStarted(true);
   }, [open]);
 
-  // The repository list is read once the drawer is first opened, not on app
-  // start: a drawer nobody opens should cost nothing.
+  // The repository list is read each time the drawer opens, not on app
+  // start: a drawer nobody opens should cost nothing, and one cloned since the
+  // last open is listed.
   useEffect(() => {
-    if (!started) return;
+    if (!started || !open) return;
     let cancelled = false;
     api
       .historyListRepos()
@@ -61,7 +62,7 @@ export function ConsoleDrawer() {
     return () => {
       cancelled = true;
     };
-  }, [started]);
+  }, [started, open]);
 
   // The accounts are whichever profiles own the repositories on this machine —
   // the same derivation the Changes page uses, so the two agree.
@@ -77,12 +78,38 @@ export function ConsoleDrawer() {
     [repos, account]
   );
 
-  // Never leave the picker naming a repository the filter just hid, or the
-  // shell and the label would disagree about where you are.
+  // The listed repository the folder is, or is inside: a submodule scope or
+  // a folder opened by hand belongs to its repository's account.
+  const owner = useMemo(
+    () =>
+      repo
+        ? repos
+            .filter((r) => isWithin(repo, r.path))
+            .sort((a, b) => normPath(b.path).length - normPath(a.path).length)[0]
+        : undefined,
+    [repos, repo]
+  );
+
+  // Never leave the picker naming a repository the person's own account
+  // filter just hid, or the shell and the label would disagree about where
+  // you are. Under every account any folder is kept: the page's submodule
+  // scope and a folder opened by hand are not in the list, and are no less
+  // where the person is.
   useEffect(() => {
     if (!visible.length) return;
-    if (!repo || !visible.some((r) => r.path === repo)) setConsoleRepo(visible[0].path);
-  }, [visible, repo]);
+    if (!repo || (account && owner?.profile_id !== account)) setConsoleRepo(visible[0].path);
+  }, [visible, repo, account, owner]);
+
+  const relative = (path: string, base: string) => normPath(path).slice(normPath(base).length + 1);
+  const repoOptions = [
+    ...visible.map((r) => ({
+      value: r.path,
+      label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
+    })),
+    ...(repo && !visible.some((r) => r.path === repo)
+      ? [{ value: repo, label: owner && owner.path !== repo ? `${owner.name} / ${relative(repo, owner.path)}` : baseName(repo) }]
+      : []),
+  ];
 
   // What this repository's push state actually is, so it is known before a
   // push is typed rather than discovered from a refusal.
@@ -110,7 +137,8 @@ export function ConsoleDrawer() {
         });
     }, 200);
     return () => window.clearTimeout(id);
-  }, [started, open, repo]);
+    // pushRev: push access was changed in the app while the drawer is open.
+  }, [started, open, repo, pushRev]);
 
   const onDrag = useCallback((e: MouseEvent) => {
     if (!dragging.current) return;
@@ -186,11 +214,8 @@ export function ConsoleDrawer() {
             onChange={setConsoleRepo}
             searchable
             searchLabel="Search repositories"
-            placeholder={visible.length ? "Pick a repository" : "No repositories found"}
-            options={visible.map((r) => ({
-              value: r.path,
-              label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
-            }))}
+            placeholder={repoOptions.length ? "Pick a repository" : "No repositories found"}
+            options={repoOptions}
           />
         </div>
         <span className="min-w-0 truncate text-[11px] text-zinc-500" title={repo}>

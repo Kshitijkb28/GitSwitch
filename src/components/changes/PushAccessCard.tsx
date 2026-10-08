@@ -291,7 +291,10 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
   const segmentDisabled = (s: Segment): string | null => {
     if (busy) return null;
     if (s.value === "locked" && !lock.supported) return "Locking is not available on this operating system yet.";
-    if (s.value !== "locked" && push.profile_blocked && mode !== "locked") {
+    // The profile's block stays whatever this repository says: Allowed cannot
+    // undo it. The Guard-rail can still be added — its hook also stops a remote
+    // with its own push URL, which the profile's rewrite never touches.
+    if (s.value === "allowed" && push.profile_blocked && mode === "allowed") {
       return "The profile blocks pushes for this folder; change it in the profile.";
     }
     return null;

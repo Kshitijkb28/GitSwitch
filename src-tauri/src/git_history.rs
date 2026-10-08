@@ -310,12 +310,17 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
                 if out.iter().any(|e| e.path == r.path) {
                     continue;
                 }
+                // Whose it is: the deepest profile folder that holds it — the
+                // rule the generated gitconfig follows — not whichever
+                // profile's folder happened to be scanned first.
+                let owner = crate::commit_audit::owning_profile(&r.path, &store.profiles).unwrap_or(p);
+                let (profile_id, profile_name, profile_email) = (owner.id.clone(), owner.name.clone(), owner.git_email.clone());
                 out.push(RepoRef {
                     name: crate::paths::base_name(&r.path),
                     path: r.path,
-                    profile_id: p.id.clone(),
-                    profile_name: p.name.clone(),
-                    profile_email: p.git_email.clone(),
+                    profile_id,
+                    profile_name,
+                    profile_email,
                 });
             }
         }
@@ -456,7 +461,27 @@ pub fn parse_shortlog(out: &str) -> Vec<AuthorCount> {
         .collect()
 }
 
-/// Who commits on the viewed revision (or everywhere, for "--all"), most
+/// What "All branches" walks: every local branch, remote-tracking branch and
+/// tag, and HEAD (a detached checkout, a submodule). Not `--all`, which also
+/// walks the stash, notes, the refs a preview parks and git's prefetch refs —
+/// and not GitSwitch's own backup branches: none of them is work anyone
+/// pushes, and listed, each was marked "not pushed" for good. A backup still
+/// opens when it is chosen by name. `--exclude` applies to the `--branches`
+/// right after it only.
+fn all_branches_revs(repo: &Path) -> Vec<String> {
+    let mut revs: Vec<String> = crate::sync::BACKUP_PREFIXES
+        .iter()
+        .chain(std::iter::once(&crate::tree::RESET_BACKUP_PREFIX))
+        .map(|p| format!("--exclude={}*", p))
+        .collect();
+    revs.extend(["--branches", "--remotes", "--tags"].map(String::from));
+    if git(repo, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).is_ok() {
+        revs.push("HEAD".into());
+    }
+    revs
+}
+
+/// Who commits on the viewed revision (or on all branches, for "--all"), most
 /// frequent first — the list behind the History page's people filter. Capped:
 /// a long-lived repository can have thousands of one-off authors.
 pub fn authors(repo_path: &str, rev: &str) -> Result<Vec<AuthorCount>, AppError> {
@@ -464,7 +489,14 @@ pub fn authors(repo_path: &str, rev: &str) -> Result<Vec<AuthorCount>, AppError>
     if rev != "--all" && rev.starts_with('-') {
         return Err(AppError::Config(format!("Invalid revision: {}", rev)));
     }
-    let raw = git(&repo, &["shortlog", "-sne", rev])?;
+    let mut args: Vec<String> = vec!["shortlog".into(), "-sne".into()];
+    if rev == "--all" {
+        args.extend(all_branches_revs(&repo));
+    } else {
+        args.push(rev.to_string());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let raw = git(&repo, &refs)?;
     let mut list = parse_shortlog(&raw);
     list.truncate(300);
     Ok(list)
@@ -572,7 +604,8 @@ fn classify_touches(files: &[String], gitlinks: &[String]) -> (Vec<String>, bool
     (touched, only)
 }
 
-/// One page of history for a branch (or every branch when `rev` is "--all").
+/// One page of history for a branch (or all branches when `rev` is "--all":
+/// see `all_branches_revs`).
 /// `authors`: only commits by any of these (emails or names, literal);
 /// `hide_pointer_only`: leave out commits that change nothing but submodule
 /// pointers (the CI bumps a superproject's history fills up with);
@@ -654,8 +687,9 @@ pub fn history_page(
         }
     }
     if rev == "--all" {
-        count_args.push("--all".into());
-        log_args.push("--all".into());
+        let all = all_branches_revs(&repo);
+        count_args.extend(all.iter().cloned());
+        log_args.extend(all);
     } else {
         count_args.push(rev.to_string());
         log_args.push(rev.to_string());

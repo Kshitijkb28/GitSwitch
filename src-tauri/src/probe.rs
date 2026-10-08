@@ -143,6 +143,7 @@ pub(crate) mod tests {
         match cmd.as_str() {
             // profiles / repositories
             "get_profiles" => reply(c::get_profiles()),
+            "apply_git_config" => reply(c::apply_git_config()),
             "history_list_repos" => forward!(c::history_list_repos, args),
             "path_exists" => {
                 let path: String = match arg(&args, "path") { Ok(v) => v, Err(e) => return reply_err(e) };
@@ -174,7 +175,7 @@ pub(crate) mod tests {
             "changes_abort" => forward!(c::changes_abort, args, repo_path),
             // sync
             "changes_sync_plan" => forward!(c::changes_sync_plan, args, repo_path, stash, fetch),
-            "changes_sync_run" => forward!(c::changes_sync_run, args, repo_path, stash, bundles, fingerprint),
+            "changes_sync_run" => forward!(c::changes_sync_run, args, repo_path, stash, bundles, fingerprint, with_lfs),
             "changes_sync_continue" => forward!(c::changes_sync_continue, args, repo_path, allow_markers),
             "changes_sync_abort" => forward!(c::changes_sync_abort, args, repo_path),
             "changes_open_path" => forward!(c::changes_open_path, args, repo_path, path, reveal),
@@ -250,6 +251,15 @@ pub(crate) mod tests {
             "invoke" => invoke().await,
             // --- identity: a profile written into the sandbox HOME's gitconfig ---
             // first = a JSON file {name, git_name, git_email, ssh_key_path?, directories[]}
+            // PROBE_ARGS = "<script>": what is on this Mac, read once, then the
+            // script runs (a clone deleted, moved or made behind the app's
+            // back), then read again — in one process, as the app does.
+            "local_clones_around" => {
+                let before = crate::remote_repos::local_clones().await.map(|c| c.clones).unwrap_or_default();
+                let _ = std::process::Command::new("sh").arg(first).status();
+                let after = crate::remote_repos::local_clones().await.map(|c| c.clones).unwrap_or_default();
+                emit(&serde_json::json!({ "before": before, "after": after }));
+            }
             "profile_apply" => {
                 let text = std::fs::read_to_string(first).expect("profile json file");
                 let v: serde_json::Value = serde_json::from_str(&text).expect("profile json");
@@ -261,6 +271,26 @@ pub(crate) mod tests {
                         Ok(()) => emit(&p),
                         Err(e) => emit_err(e),
                     },
+                    Err(e) => emit_err(e),
+                }
+            }
+            // What the app does at start-up: every profile's include file
+            // written again from the store.
+            "refresh_profile_includes" => match crate::git_config::refresh_profile_includes() {
+                Ok(()) => emit(&"refreshed"),
+                Err(e) => emit_err(e),
+            },
+            // Saves a profile with the folders and email given, as the app's
+            // update_profile command does (which also updates the tray, and
+            // that needs the app) — Doctor's "Save it as the disk spells it",
+            // or an email change the identity guards must follow.
+            "profile_update" => {
+                let text = std::fs::read_to_string(first).expect("profile json file");
+                let v: serde_json::Value = serde_json::from_str(&text).expect("profile json");
+                let dirs: Option<Vec<String>> = v["directories"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect());
+                let email = v["git_email"].as_str().map(String::from);
+                match crate::commands::update_profile_core(v["id"].as_str().unwrap_or_default().to_string(), None, None, email, None, dirs, None, None, None, None).await {
+                    Ok(p) => emit(&p),
                     Err(e) => emit_err(e),
                 }
             }
@@ -337,7 +367,7 @@ pub(crate) mod tests {
                 Err(e) => emit_err(e),
             },
             // PROBE_ARGS: "[nostash][,bundles]" — no fingerprint: the run measures afresh
-            "sync_run" => show(crate::sync::sync_run(&repo(), crate::sync::RunOptions { stash: !a.iter().any(|s| s == "nostash"), bundles: a.iter().any(|s| s == "bundles"), fingerprint: Vec::new() }).await),
+            "sync_run" => show(crate::sync::sync_run(&repo(), crate::sync::RunOptions { stash: !a.iter().any(|s| s == "nostash"), bundles: a.iter().any(|s| s == "bundles"), with_lfs: a.iter().any(|s| s == "lfs"), fingerprint: Vec::new() }).await),
             "sync_continue" => show(crate::sync::sync_continue(&repo(), false).await),
             "sync_continue_anyway" => show(crate::sync::sync_continue(&repo(), true).await),
             "sync_abort" => show(crate::sync::sync_abort(&repo()).await),
@@ -466,6 +496,10 @@ pub(crate) mod tests {
             },
             "guard_install" => match crate::commit_audit::install_guard(&repo(), first) {
                 Ok(m) => emit(&serde_json::json!({ "message": m })),
+                Err(e) => emit_err(e),
+            },
+            "guard_email" => match crate::commit_audit::hooks_dir(std::path::Path::new(&repo())) {
+                Ok(h) => emit(&crate::commit_audit::guard_email_in(&h.dir)),
                 Err(e) => emit_err(e),
             },
             "guard_uninstall" => match crate::commit_audit::uninstall_guard(&repo()) {

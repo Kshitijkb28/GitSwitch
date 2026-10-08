@@ -29,7 +29,7 @@ pub fn get_profiles() -> Result<Vec<Profile>, AppError> {
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
-pub fn create_profile(
+pub async fn create_profile(
     app: tauri::AppHandle,
     name: String,
     git_name: String,
@@ -53,13 +53,52 @@ pub fn create_profile(
         github_login,
     )?;
     git_config::apply_git_config()?;
+    // A guard in these folders that expected another profile's email.
+    log_guards(commit_audit::refresh_guards(&profile.directories).await);
     crate::tray::update_active_label(&app);
     Ok(profile)
 }
 
+/// A profile saved, its config written, and every identity guard in its old
+/// and new folders brought in line with the email that now owns them — the
+/// command without the tray, so the verification probe can run it.
+#[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
+pub(crate) async fn update_profile_core(
+    id: String,
+    name: Option<String>,
+    git_name: Option<String>,
+    git_email: Option<String>,
+    ssh_key_path: Option<String>,
+    directories: Option<Vec<String>>,
+    allow_push: Option<bool>,
+    signing_enabled: Option<bool>,
+    remote_patterns: Option<Vec<String>>,
+    github_login: Option<String>,
+) -> Result<Profile, AppError> {
+    let before = profiles::load_profiles()?.profiles.into_iter().find(|p| p.id == id);
+    let profile = profiles::update_profile(
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login,
+    )?;
+    git_config::apply_git_config()?;
+    // Only an email or a folder change can leave a guard expecting the wrong email.
+    let changed = before.as_ref().is_none_or(|b| b.git_email != profile.git_email || b.directories != profile.directories);
+    if changed {
+        let mut dirs = profile.directories.clone();
+        dirs.extend(before.map(|b| b.directories).unwrap_or_default());
+        log_guards(commit_audit::refresh_guards(&dirs).await);
+    }
+    Ok(profile)
+}
+
+fn log_guards(lines: Vec<String>) {
+    for line in lines {
+        eprintln!("GitSwitch: {}", line);
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
-pub fn update_profile(
+pub async fn update_profile(
     app: tauri::AppHandle,
     id: String,
     name: Option<String>,
@@ -72,19 +111,22 @@ pub fn update_profile(
     remote_patterns: Option<Vec<String>>,
     github_login: Option<String>,
 ) -> Result<Profile, AppError> {
-    let profile = profiles::update_profile(
+    let profile = update_profile_core(
         id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login,
-    )?;
-    git_config::apply_git_config()?;
+    )
+    .await?;
     crate::tray::update_active_label(&app);
     Ok(profile)
 }
 
 #[tauri::command]
-pub fn delete_profile(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
+pub async fn delete_profile(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
+    let dirs = profiles::load_profiles()?.profiles.into_iter().find(|p| p.id == id).map(|p| p.directories).unwrap_or_default();
     credentials::delete_token(&id).ok();
     profiles::delete_profile(id)?;
     git_config::apply_git_config()?;
+    // A parent folder's profile may own these repositories now.
+    log_guards(commit_audit::refresh_guards(&dirs).await);
     crate::tray::update_active_label(&app);
     Ok(())
 }
@@ -838,8 +880,9 @@ pub async fn changes_sync_run(
     stash: bool,
     bundles: bool,
     fingerprint: Vec<(String, String)>,
+    with_lfs: Option<bool>,
 ) -> Result<OpResult, AppError> {
-    crate::sync::sync_run(&repo_path, crate::sync::RunOptions { stash, bundles, fingerprint }).await
+    crate::sync::sync_run(&repo_path, crate::sync::RunOptions { stash, bundles, with_lfs: with_lfs.unwrap_or(false), fingerprint }).await
 }
 
 /// Resume a paused sync after conflicts were resolved and staged.

@@ -315,6 +315,9 @@ pub struct RepoIdentity {
     pub signing_key: Option<String>,
     /// "gitswitch" | "foreign" | "none"
     pub guard: String,
+    /// The email GitSwitch's guard expects, when it is GitSwitch's: it is
+    /// written into the hook, so it goes stale when the profile's email changes.
+    pub guard_email: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -957,6 +960,7 @@ async fn read_identity(repo: &Path, hooks: &Path) -> RepoIdentity {
         signing_on,
         signing_key,
         guard: crate::commit_audit::guard_state_in(hooks),
+        guard_email: crate::commit_audit::guard_email_in(hooks),
     }
 }
 

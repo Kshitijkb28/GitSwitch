@@ -14,6 +14,8 @@ type Props = {
   onPullMode: (m: PullMode) => void;
   pullLfs: boolean;
   onPullLfs: (v: boolean) => void;
+  /** A submodule uses Git LFS: "Pull inside" it honours the option too. */
+  lfsInSubmodules?: boolean;
   pullAutostash: boolean;
   onPullAutostash: (v: boolean) => void;
   onUndoCommit: () => void;
@@ -36,6 +38,7 @@ export function TidyUpStrip({
   onPullMode,
   pullLfs,
   onPullLfs,
+  lfsInSubmodules = false,
   pullAutostash,
   onPullAutostash,
   onUndoCommit,
@@ -80,10 +83,10 @@ export function TidyUpStrip({
           autostash={pullAutostash}
           onAutostash={onPullAutostash}
         />
-        {status.uses_lfs && (
+        {(status.uses_lfs || lfsInSubmodules) && (
           <label
             className="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer"
-            title="A plain pull only downloads large files when this repository's LFS filters are set up — otherwise they arrive as pointer stubs"
+            title="When pulling or updating. Git only downloads large files when the repository's LFS filters are set up — otherwise they arrive as pointer stubs"
           >
             <Checkbox
               checked={pullLfs}

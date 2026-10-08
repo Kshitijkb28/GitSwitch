@@ -42,10 +42,27 @@ try {
       localStorage.setItem("gitswitch:sparse.parentDir", JSON.stringify("/repos"));
       localStorage.setItem("gitswitch:changes.repo", JSON.stringify("/repos/gitswitch"));
       localStorage.setItem("gitswitch:history.repo", JSON.stringify("/repos/gitswitch"));
+      window.__LONG_KEY__ = "/Users/me/.ssh/id_ed25519_gitswitch_acme_platform_infrastructure_and_release_engineering";
+      window.__LONG_EMAIL__ = "releaseengineeringautomationandplatforminfrastructureteamnotifications@corpmail.example.test";
       const profiles = [
         { id: "p1", name: "Kirmada", git_name: "Me", git_email: "me@personal.test", ssh_key_path: "/Users/me/.ssh/id_ed25519_personal", is_default: true, allow_push: true, signing_enabled: false, directories: ["/Users/me/Documents/Acme/gitswitch", "/Users/me/Documents/very/long/folder/path/that/goes/on"], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
         { id: "p2", name: "Work", git_name: "Me At Work", git_email: "me@work.test", ssh_key_path: null, is_default: false, allow_push: false, signing_enabled: true, directories: ["/Users/me/Documents/Work"], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
+        // An address with no break opportunity: letters, dots and @ give none.
+        { id: "p3", name: "Long", git_name: "Long Address", git_email: window.__LONG_EMAIL__, ssh_key_path: null, is_default: false, allow_push: true, signing_enabled: false, directories: [], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" },
       ];
+      const audit = [{
+        path: "/repos/argos", repo_name: "argos", profile_name: "Long", expected_name: "Long Address", expected_email: window.__LONG_EMAIL__,
+        mismatched: [{ hash: "a".repeat(40), short: "aaaaaaa", author_name: "Someone", author_email: window.__LONG_EMAIL__, date: "2026-01-01T00:00:00Z", subject: "a commit", pushed: false }],
+        unpushed_count: 1, pushed_count: 0, has_upstream: true, dirty: false, guard: "none",
+      }];
+      // Auto Assign's scan, only once a test turns it on (window.__AUTO__): the
+      // page loop's Refresh-parity readings stay what they were.
+      const auto = {
+        scan_repos: [{ path: "/repos/argos-platform-infrastructure", remote_url: "git@github.com:acme/argos.git", owner: "acme", name: "argos" }],
+        resolve_key_account: "me", gh_list_accounts: ["me"], gh_get_token: "tok",
+        verify_github_token: { id: 1, login: "me", name: null, email: null, avatar_url: "" },
+        check_repo_access: { admin: false, push: true, pull: true },
+      };
       window.__TAURI_INTERNALS__ = {
         // The terminal's output stream is a Channel, and its constructor calls
         // this. Without it the drawer throws, renders an error instead of a
@@ -58,7 +75,10 @@ try {
         invoke: (cmd) => {
           // Every call, in order: what a page asks when it opens must be asked again by its Refresh.
           (window.__CALLS__ = window.__CALLS__ || []).push(cmd);
+          if (window.__AUTO__ && cmd in auto) return Promise.resolve(auto[cmd]);
           switch (cmd) {
+            case "audit_commits": return Promise.resolve(audit);
+            case "doctor_check_profiles": return Promise.resolve([{ id: "folder-missing", severity: "warning", title: "Folder assigned to \"Long\" doesn't exist", detail: "/Users/me/Documents/releaseengineeringautomationandplatforminfrastructureteamnotifications/workspace is not a directory.", fix: null, fix_label: null }]);
             case "get_profiles": return Promise.resolve(profiles);
             case "history_list_repos": return Promise.resolve(repos);
             case "changes_repo_status": return Promise.resolve(st);
@@ -85,6 +105,12 @@ try {
             case "list_remote_repos_page": return Promise.resolve({ listing: { account: "a", login: "me", suggested_profile_id: null, repos: [], sso_hidden_orgs: 0, truncated: false }, page: 1, per_page: 10, has_more: false });
             case "history_branches": return Promise.resolve([{ name: "main", is_current: true, is_remote: false, upstream: "origin/main", ahead: 0, behind: 0, tip: "aaa", short_tip: "aaa", last_author: "Me", last_date: "2026-01-01T00:00:00Z", subject: "x" }]);
             case "history_page": return Promise.resolve({ commits: [], total: 0, has_more: false });
+            // The SSH Key Wizard's Test step, failing on a key whose path has no
+            // break opportunity (underscores only: a hyphen would hide the bug).
+            case "generate_ssh_key": return Promise.resolve([window.__LONG_KEY__, window.__LONG_KEY__ + ".pub"]);
+            case "get_public_key": return Promise.resolve("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGitSwitchSweepKeyMaterialThatIsLongEnoughToWrap me@personal.test");
+            case "test_connection_with_key": return Promise.reject("SSH error: Permission denied for key " + window.__LONG_KEY__);
+            case "resolve_key_account": return Promise.resolve(null);
             default: return Promise.resolve([]);
           }
         },
@@ -213,6 +239,72 @@ try {
             (d.clearance < 100 ? `  (the page is not scrollable clear of it: ${d.clearance}px)` : "")
         );
       }
+    }
+    // The SSH Key Wizard's Test step with a failure that ends in a long key
+    // path: the message must wrap inside the page, not run past it.
+    {
+      await page.evaluate(() => [...document.querySelectorAll("nav a")].find((x) => x.innerText.trim().startsWith("SSH Keys"))?.click());
+      await new Promise((r) => setTimeout(r, 400));
+      await page.type('input[placeholder="e.g., work, personal"]', "gitswitch_acme_platform_infrastructure_and_release_engineering").catch(() => {});
+      await page.type('input[placeholder="your@email.com"]', "me@personal.test").catch(() => {});
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("Generate Key"))?.click());
+      await page.waitForFunction(() => document.body.innerText.includes("Next: Test Connection"), { timeout: 4000 }).catch(() => {});
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Next: Test Connection"))?.click());
+      await page.waitForFunction(() => document.body.innerText.includes("Test SSH Connection"), { timeout: 4000 }).catch(() => {});
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Test SSH Connection"))?.click());
+      const reached = await page.waitForFunction(() => document.body.innerText.includes("Permission denied for key"), { timeout: 4000 }).then(() => true).catch(() => false);
+      const w = await page.evaluate(() => {
+        const m = document.querySelector("main");
+        const right = m.getBoundingClientRect().right;
+        const past = [...m.querySelectorAll("*")].filter((el) => el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().right > right + 1).length;
+        const boxes = [...m.querySelectorAll("pre, p")].filter((el) => el.innerText.includes("id_ed25519_gitswitch_acme") && el.scrollWidth > el.clientWidth + 1 && getComputedStyle(el).overflowX !== "auto");
+        return { past, spill: boxes.length, need: m.scrollWidth, have: m.clientWidth };
+      });
+      const over = !reached || w.past > 0 || w.spill > 0 || w.need > w.have + 1;
+      if (over) bad++;
+      console.log(`  ${over ? "\x1b[31mOVERFLOW\x1b[0m" : "\x1b[32mok      \x1b[0m"} ${"SSH Key Test".padEnd(14)} ${reached ? `a failure ending in a long key path stays inside the page (past the edge: ${w.past}, spilling boxes: ${w.spill})` : "the Test step's failure was not reached"}`);
+    }
+    // Auto Assign's reasons per repository (who can push, a failed check) must
+    // stay on screen at half width: below 1024 px they used to be display:none.
+    {
+      await page.evaluate(() => {
+        localStorage.setItem("gitswitch:autoassign.root", JSON.stringify("/repos"));
+        window.__AUTO__ = true;
+      });
+      await page.evaluate(() => [...document.querySelectorAll("nav a")].find((x) => x.innerText.trim().startsWith("Profiles"))?.click());
+      await new Promise((r) => setTimeout(r, 300));
+      await page.evaluate(() => [...document.querySelectorAll("nav a")].find((x) => x.innerText.trim().startsWith("Auto Assign"))?.click());
+      await new Promise((r) => setTimeout(r, 300));
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Scan")?.click());
+      const shown = await page.waitForFunction(() => [...document.querySelectorAll("main span, main div")].some((el) => el.innerText.trim().startsWith("push ·") && el.getBoundingClientRect().width > 0), { timeout: 5000 }).then(() => true).catch(() => false);
+      const w = await page.evaluate(() => ({ need: document.querySelector("main").scrollWidth, have: document.querySelector("main").clientWidth }));
+      const over = !shown || w.need > w.have + 1;
+      if (over) bad++;
+      console.log(`  ${over ? "\x1b[31mOVERFLOW\x1b[0m" : "\x1b[32mok      \x1b[0m"} ${"Auto Assign".padEnd(14)} ${shown ? "the push · badge is on screen" : "no visible push · badge"}, needs ${w.need} has ${w.have}`);
+      await page.evaluate(() => { window.__AUTO__ = false; });
+    }
+    // The profile form's folder and remote-rule inputs fill their rows: the Add
+    // buttons sit at the right edge, not in the middle.
+    {
+      await page.goto(`${server.url}/profile/new`, { waitUntil: "networkidle0" });
+      await new Promise((r) => setTimeout(r, 300));
+      const f = await page.evaluate(() => {
+        const gap = (input) => {
+          const row = input?.closest("div.flex");
+          const add = row && [...row.querySelectorAll("button")].pop();
+          return row && add ? Math.round(row.getBoundingClientRect().right - add.getBoundingClientRect().right) : null;
+        };
+        const m = document.querySelector("main");
+        return {
+          folder: gap([...document.querySelectorAll("input")].find((i) => (i.placeholder || "").startsWith("…or type a path"))),
+          remote: gap(document.querySelector('input[aria-label="Remote rule"]')),
+          need: m.scrollWidth,
+          have: m.clientWidth,
+        };
+      });
+      const ok = f.folder !== null && f.folder <= 1 && f.remote !== null && f.remote <= 1 && f.need <= f.have + 1;
+      if (!ok) bad++;
+      console.log(`  ${ok ? "\x1b[32mok      \x1b[0m" : "\x1b[31mOVERFLOW\x1b[0m"} ${"Profile form".padEnd(14)} the inputs fill their rows (Add button short of the edge by: folder ${f.folder}px, remote ${f.remote}px), needs ${f.need} has ${f.have}`);
     }
     // What the rubber-band area past either end of a scroll shows is the
     // document's own background: it must be the app's dark, never white.

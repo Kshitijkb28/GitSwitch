@@ -217,6 +217,9 @@ pub fn run() {
         ])
         .setup(|app| {
             tray::setup_tray(app.handle())?;
+            if let Err(e) = git_config::refresh_profile_includes() {
+                eprintln!("GitSwitch: the profiles' git config files could not be refreshed: {}", e);
+            }
             Ok(())
         })
         .build(tauri::generate_context!())

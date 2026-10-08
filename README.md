@@ -250,13 +250,31 @@ incoming" check.
 It reads the same `profiles.json` this app writes rather than reimplementing
 anything, so the two can't drift apart.
 
+Install it from the `.vsix` attached to each GitHub release (also kept as the
+`gitswitch-vscode` artifact of every CI run):
+
 ```bash
-cd vscode-extension && npm install && npm run package
-code --install-extension gitswitch-0.1.0.vsix
+code --install-extension gitswitch-<version>.vsix   # or Extensions → ⋯ → Install from VSIX…
 ```
+
+Or build it from source — `npm run package` compiles it first:
+
+```bash
+cd vscode-extension && npm ci && npm run package
+```
+
+## Install
+
+Download the installer for your OS from the GitHub **Releases** page. The
+builds are not notarized by Apple or signed for Microsoft, so the first open
+needs one extra step on macOS and Windows — see
+[First open on macOS](BUILD.md#first-open-on-macos) and
+[Installing on Windows](BUILD.md#installing).
 
 ## Requirements
 
+- **macOS:** the first time, macOS asks to confirm opening an app that is not
+  notarized — see [First open on macOS](BUILD.md#first-open-on-macos).
 - **git** (required)
 - **ssh / ssh-keygen** (preinstalled on macOS, Linux, Windows 10+)
 - **gh** — the [GitHub CLI](https://cli.github.com) (optional; powers the

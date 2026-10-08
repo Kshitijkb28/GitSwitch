@@ -198,7 +198,7 @@ export function SSHWizard() {
       </div>
 
       {error && (
-        <div className="px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
+        <div className="px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm break-words">
           {error}
         </div>
       )}
@@ -224,7 +224,7 @@ export function SSHWizard() {
               onChange={(e) => setEmail(e.target.value)}
               required
             />
-            <p className="text-xs text-zinc-500">
+            <p className="text-xs text-zinc-500 break-all">
               This will generate an Ed25519 SSH key pair at
               ~/.ssh/id_ed25519_{profileName || "<name>"}
             </p>
@@ -269,7 +269,7 @@ export function SSHWizard() {
               )}
             </button>
           </div>
-          <p className="text-xs text-zinc-500 mt-2 font-mono">
+          <p className="text-xs text-zinc-500 mt-2 font-mono break-all">
             Key saved at: {privateKeyPath}
           </p>
 
@@ -381,7 +381,7 @@ export function SSHWizard() {
                 <XCircle size={20} />
                 <span className="font-medium">Connection failed</span>
               </div>
-              <pre className="p-3 bg-zinc-900 rounded-lg border border-zinc-700 text-xs text-red-400/80 font-mono whitespace-pre-wrap">
+              <pre className="p-3 bg-zinc-900 rounded-lg border border-zinc-700 text-xs text-red-400/80 font-mono whitespace-pre-wrap break-words overflow-x-auto">
                 {testResult.message}
               </pre>
               <p className="text-xs text-zinc-500">

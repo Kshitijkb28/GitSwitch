@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, useNavigate, useParams } from "react-router-dom";
-import { GitBranch, Box, GitGraph, FileDiff, GitPullRequestArrow } from "lucide-react";
+import { GitBranch, Box, GitGraph, FileDiff, GitPullRequestArrow, SquareTerminal } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
@@ -16,6 +16,7 @@ import { usePersistedState } from "../lib/persist";
 import { baseName, canonicalJoin, normPath } from "../lib/paths";
 import { useRefreshOnFocus } from "../lib/focus";
 import { useGitJob } from "../lib/gitJobs";
+import { openConsole } from "../lib/console";
 import { open as pickFolder } from "@tauri-apps/plugin-dialog";
 import * as api from "../lib/api";
 import type { PullMode, RepoRef, RepoStatus, SubmoduleInfo } from "../lib/api";
@@ -339,8 +340,6 @@ export function Repo() {
       actionsRef.current?.refresh();
     });
   };
-  // A submodule path relative to the scoped repository, as a scope of the repository.
-  const scoped = (p: string) => (sel.sub ? `${sel.sub}/${p}` : p);
   // Arriving on a tab re-reads the repository, as opening the old page did:
   // the terminal drawer or an operation on another tab may have moved HEAD.
   const firstTab = useRef(true);
@@ -351,10 +350,6 @@ export function Repo() {
     }
     actionsRef.current?.refresh();
   }, [tab]);
-  const workInside = (subPath: string) => {
-    sel.setSub(subPath);
-    go("changes");
-  };
 
   return (
     <div className="max-w-6xl mx-auto space-y-4">
@@ -422,6 +417,16 @@ export function Repo() {
             }}
           >
             Open a folder…
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={!sel.effectivePath}
+            onClick={() => openConsole(sel.effectivePath)}
+            title="Open the terminal in this repository, or the submodule you are inside"
+          >
+            <SquareTerminal size={14} />
+            Terminal here
           </Button>
         </div>
       </header>
@@ -580,9 +585,15 @@ export function Repo() {
         visible={tab === "submodules"}
         busy={busy}
         refreshKey={reloadKey}
-        onWorkInside={(p) => workInside(scoped(p))}
+        // A row is a submodule of what the page shows: at the top a scope, from
+        // inside a scope the nested repository itself (openSubOfScope) — never
+        // a two-level scope, which the page would drop as unknown.
+        onWorkInside={(p) => {
+          openSubOfScope(p);
+          go("changes");
+        }}
         onOpenHistory={(p) => {
-          sel.setSub(scoped(p));
+          openSubOfScope(p);
           go("history");
         }}
         onInitialise={(paths) => runHere((a) => a.initialise(sel.effectivePath, paths))}

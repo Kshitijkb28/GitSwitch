@@ -202,19 +202,23 @@ struct LocalIndex {
     org_ssh_users: HashMap<String, String>,
 }
 
-/// The local index for these profiles — built at most once a minute. Every
-/// page of a listing needs it, and building it walks every profile folder
-/// and asks git for every clone's remote; page two used to pay that again.
-async fn local_index(profs: &[Profile]) -> LocalIndex {
+/// The local index for these profiles. Building it walks every profile
+/// folder and asks git for every clone's remote, so the pages of one listing
+/// share it for a minute (`fresh = false`). A read of what is on this Mac
+/// (`fresh = true`) always scans again — a clone deleted, moved or made
+/// behind the app's back shows at once — and leaves its result for the pages.
+async fn local_index(profs: &[Profile], fresh: bool) -> LocalIndex {
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
     static CACHE: OnceLock<Mutex<Option<(Instant, String, LocalIndex)>>> = OnceLock::new();
     let key: String = profs.iter().flat_map(|p| std::iter::once(p.id.as_str()).chain(p.directories.iter().map(String::as_str))).collect::<Vec<_>>().join("\0");
     let cache = CACHE.get_or_init(|| Mutex::new(None));
-    if let Ok(slot) = cache.lock() {
-        if let Some((at, k, idx)) = slot.as_ref() {
-            if *k == key && at.elapsed() < Duration::from_secs(60) {
-                return idx.clone();
+    if !fresh {
+        if let Ok(slot) = cache.lock() {
+            if let Some((at, k, idx)) = slot.as_ref() {
+                if *k == key && at.elapsed() < Duration::from_secs(60) {
+                    return idx.clone();
+                }
             }
         }
     }
@@ -300,7 +304,7 @@ pub(crate) async fn token_for(account: &str) -> Result<String, AppError> {
 /// Re-read only the local side of the picture: no GitHub call, no token.
 pub async fn local_clones() -> Result<LocalClones, AppError> {
     let store = profiles::load_profiles()?;
-    let idx = local_index(&store.profiles).await;
+    let idx = local_index(&store.profiles, true).await;
     Ok(LocalClones {
         clones: idx.clones,
         owner_profiles: idx
@@ -391,7 +395,7 @@ pub async fn list_repos_with_token(account: &str, token: &str) -> Result<RepoLis
     }
 
     let store = profiles::load_profiles()?;
-    let idx = local_index(&store.profiles).await;
+    let idx = local_index(&store.profiles, false).await;
 
     let repos = map_repos(api_repos, &idx);
 
@@ -494,7 +498,7 @@ pub async fn list_repos_page(account: &str, page: u32, per_page: u32) -> Result<
     let has_more = next.is_some() && !truncated;
 
     let store = profiles::load_profiles()?;
-    let idx = local_index(&store.profiles).await;
+    let idx = local_index(&store.profiles, false).await;
     let repos = map_repos(api_repos, &idx);
     let suggested_profile_id = if page <= 1 {
         store

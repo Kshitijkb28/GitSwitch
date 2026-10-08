@@ -326,7 +326,7 @@ async function clickInDialogRow(page, title, rowText, pick, timeout = WAIT) {
     if (!panel) return false;
     // Prefer the row that NAMES rowText exactly (a leaf element whose text is
     // just that), then fall back to a substring match: a branch such as
-    // "gitswitch-before-sync-…" whose row mentions "main" must not be picked
+    // "gitswitch-before-update-…" whose row mentions "main" must not be picked
     // for "main".
     const all = [...panel.querySelectorAll("li")];
     const exact = all.filter((r) => [...r.querySelectorAll("*")].some((el) => el.children.length === 0 && el.innerText.trim() === rowText));

@@ -2,6 +2,7 @@ import { GitCommit, ShieldCheck, ShieldAlert, PenLine, AlertTriangle, GitBranch 
 import { Button } from "../Button";
 import { Checkbox } from "../Checkbox";
 import { Textarea } from "../Textarea";
+import type { ReactNode } from "react";
 import type { RepoStatus } from "../../lib/api";
 
 interface Props {
@@ -16,6 +17,20 @@ interface Props {
   onSwitchBranch?: () => void;
   /** A submodule's path: the button says where the commit lands. */
   scopeLabel?: string;
+  /** Switch this repository's identity guard: on, off, or rewritten with the profile's email. */
+  onGuard?: (action: GuardAction) => void;
+  guardBusy?: boolean;
+}
+
+export type GuardAction = "on" | "off" | "update";
+
+/** A GitSwitch guard that expects another email than git commits with: it would refuse the commit. */
+export function staleGuard(id: RepoStatus["identity"]): boolean {
+  return (
+    id.guard === "gitswitch" &&
+    !!id.guard_email &&
+    id.guard_email.trim().toLowerCase() !== (id.email ?? "").trim().toLowerCase()
+  );
 }
 
 /**
@@ -36,6 +51,9 @@ export function commitBlocker(status: RepoStatus, message: string, amend: boolea
   if (!status.identity.matches_profile) {
     const expected = status.identity.profile_email ?? "the profile's email";
     return `This folder should commit as ${expected}, but git is set to ${status.identity.email || "nothing"}.`;
+  }
+  if (staleGuard(status.identity)) {
+    return `This repository's identity guard still expects ${status.identity.guard_email} — update it or turn it off first.`;
   }
   if (amend && !status.can_amend) {
     return "That commit is already on the remote — amending it would need a force-push.";
@@ -60,6 +78,8 @@ export function CommitBox({
   onCommit,
   onSwitchBranch,
   scopeLabel,
+  onGuard,
+  guardBusy,
 }: Props) {
   const blocker = commitBlocker(status, message, amend);
   const id = status.identity;
@@ -101,12 +121,44 @@ export function CommitBox({
             </span>
             {id.guard !== "none" && (
               <span className="text-zinc-500 inline-flex items-center gap-1">
-                {id.guard === "gitswitch" ? (
+                {id.guard === "gitswitch" && !staleGuard(id) ? (
                   <ShieldCheck size={11} className="text-emerald-400" />
                 ) : (
                   <ShieldAlert size={11} className="text-amber-400" />
                 )}
-                {id.guard === "gitswitch" ? "guard on" : "third-party pre-commit hook"}
+                {id.guard === "gitswitch"
+                  ? staleGuard(id)
+                    ? <span>guard expects <span className="font-mono">{id.guard_email}</span></span>
+                    : "guard on"
+                  : "third-party pre-commit hook"}
+              </span>
+            )}
+            {onGuard && (id.profile_email || id.guard === "gitswitch") && (
+              <span className="inline-flex items-center gap-2">
+                {id.guard === "gitswitch" && staleGuard(id) && id.profile_email && (
+                  <GuardButton disabled={guardBusy} onClick={() => onGuard("update")} title={`Rewrite the guard to expect ${id.profile_email}`}>
+                    Update guard
+                  </GuardButton>
+                )}
+                {id.guard === "gitswitch" ? (
+                  <GuardButton disabled={guardBusy} onClick={() => onGuard("off")} title="Remove GitSwitch's pre-commit identity check from this repository">
+                    Turn off guard
+                  </GuardButton>
+                ) : (
+                  id.profile_email && (
+                    <GuardButton
+                      disabled={guardBusy}
+                      onClick={() => onGuard("on")}
+                      title={
+                        id.guard === "foreign"
+                          ? `Refuse commits not made as ${id.profile_email}. This repository's own pre-commit hook is kept and still runs.`
+                          : `Refuse commits not made as ${id.profile_email}, from the app, a terminal or an editor`
+                      }
+                    >
+                      Turn on guard
+                    </GuardButton>
+                  )
+                )}
               </span>
             )}
           </div>
@@ -178,5 +230,19 @@ export function CommitBox({
         </div>
       </div>
     </div>
+  );
+}
+
+function GuardButton({ children, disabled, onClick, title }: { children: ReactNode; disabled?: boolean; onClick: () => void; title: string }) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      title={title}
+      className="text-emerald-400 hover:text-emerald-300 disabled:text-zinc-600 disabled:cursor-not-allowed cursor-pointer"
+    >
+      {children}
+    </button>
   );
 }

@@ -36,7 +36,9 @@ const FLAG: &str = "gitswitch.pushBlocked";
 const HOOK_MARKER: &str = ">>> GitSwitch push guard >>>";
 
 /// GitHub in every form git accepts, so a rewrite covers the common cases even
-/// before per-remote prefixes are added. Mirrors `git_config::push_block_section`.
+/// before per-remote prefixes are added. Mirrors `git_config::push_block_section`
+/// except for its empty catch-all prefix, which only a profile's block uses:
+/// these also go into lock jobs, whose validator refuses an empty prefix.
 const BASE_PREFIXES: &[&str] = &[
     "git@github.com:",
     "git@github.com/",

@@ -45,6 +45,8 @@ export function ProfileForm() {
   const [ghAccounts, setGhAccounts] = useState<string[]>([]);
   const [autofillAccount, setAutofillAccount] = useState("");
   const [autofilling, setAutofilling] = useState(false);
+  // Working out which account a loaded profile is, in the background.
+  const [preselecting, setPreselecting] = useState(false);
   const [suggestions, setSuggestions] = useState<{ names: string[]; emails: string[] }>({
     names: [],
     emails: [],
@@ -177,17 +179,30 @@ export function ProfileForm() {
         void (async () => {
           const accounts = await accountsPromise;
           if (cancelled || userPicked.current) return;
-          const byName = accounts.find(
-            (a) => a.toLowerCase() === profile.git_name.trim().toLowerCase()
-          );
-          if (byName) await preselectAccount(byName, isCancelled);
-          if (!profile.ssh_key_path) return;
-          const login = await api
-            .resolveKeyAccount(profile.ssh_key_path)
-            .catch(() => null);
-          if (cancelled || userPicked.current || !login) return;
-          const byKey = accounts.find((a) => a.toLowerCase() === login.toLowerCase());
-          if (byKey && byKey !== byName) await preselectAccount(byKey, isCancelled);
+          setPreselecting(true);
+          try {
+            // The account the profile records comes first: it is what its
+            // pushes are checked against, whatever its git username says.
+            const stored = (profile.github_login ?? "").trim().replace(/^@/, "").toLowerCase();
+            const byStored = stored ? accounts.find((a) => a.toLowerCase() === stored) : undefined;
+            if (byStored) {
+              await preselectAccount(byStored, isCancelled);
+              return;
+            }
+            const byName = accounts.find(
+              (a) => a.toLowerCase() === profile.git_name.trim().toLowerCase()
+            );
+            if (byName) await preselectAccount(byName, isCancelled);
+            if (!profile.ssh_key_path) return;
+            const login = await api
+              .resolveKeyAccount(profile.ssh_key_path)
+              .catch(() => null);
+            if (cancelled || userPicked.current || !login) return;
+            const byKey = accounts.find((a) => a.toLowerCase() === login.toLowerCase());
+            if (byKey && byKey !== byName) await preselectAccount(byKey, isCancelled);
+          } finally {
+            if (!cancelled) setPreselecting(false);
+          }
         })();
       } catch (e) {
         if (!cancelled) setError(String(e));
@@ -411,8 +426,8 @@ export function ProfileForm() {
                 options={ghAccounts.map((a) => ({ value: a, label: a }))}
                 className="flex-1"
               />
-              {autofilling && (
-                <Loader2 size={18} className="animate-spin text-emerald-400 shrink-0" />
+              {(autofilling || preselecting) && (
+                <Loader2 size={18} className="animate-spin text-emerald-400 shrink-0" aria-label="Looking up the account" />
               )}
             </div>
           </Card>
@@ -543,7 +558,7 @@ export function ProfileForm() {
                   addDirectory();
                 }
               }}
-              className="flex-1"
+              containerClassName="flex-1 min-w-0"
             />
             <Button type="button" variant="secondary" onClick={addDirectory}>
               <FolderPlus size={16} />
@@ -660,7 +675,7 @@ export function ProfileForm() {
                 }
               }}
               aria-label="Remote rule"
-              className="flex-1"
+              containerClassName="flex-1 min-w-0"
             />
             <Button type="button" variant="secondary" onClick={addRemotePattern}>
               <Globe size={16} />
@@ -721,10 +736,12 @@ export function ProfileForm() {
                 </span>
               ) : (
                 <span className="block text-xs text-zinc-600 mt-1">
-                  Covers standard github.com remotes in this profile's folders.
-                  Remotes with a custom ssh-host alias or an explicit push URL,
-                  and anyone who sets a more specific rewrite of their own or
-                  GIT_CONFIG_NOSYSTEM, get past it. A folder profile that allows
+                  Covers every remote of every repository in this profile's
+                  folders, whatever its address: GitHub in any form, an ssh-host
+                  alias, another host, a local path. What gets past it: a remote
+                  with its own push URL (remote.&lt;name&gt;.pushurl), a more
+                  specific rewrite of your own, and a git that does not read your
+                  global config (another HOME or GIT_CONFIG_GLOBAL). A folder profile that allows
                   pushes does not undo a parent profile's block. For a block that
                   needs the administrator password to remove, lock the repository
                   on the Changes page.

@@ -263,7 +263,7 @@ export function SyncPlanView({ plan, stash, onStash, bundles, onBundles, busy, o
       {!plan.refusal && !plan.nothing_to_do && (
         <div className="space-y-1.5 pt-1">
           <label className="flex items-start gap-2 text-xs text-zinc-300 cursor-pointer">
-            <Checkbox checked={stash} onChange={onStash} className="mt-0.5" aria-label="Stash uncommitted changes during the sync" />
+            <Checkbox checked={stash} onChange={onStash} className="mt-0.5" aria-label="Stash uncommitted changes during the update" />
             <span className="leading-relaxed">
               Stash my {sup.dirty_count} uncommitted change{sup.dirty_count === 1 ? "" : "s"} during the update
               <span className="text-zinc-500"> — and put them back afterwards</span>
@@ -275,7 +275,7 @@ export function SyncPlanView({ plan, stash, onStash, bundles, onBundles, busy, o
               Also save bundle backups to a folder
               <span className="text-zinc-500">
                 {" "}
-                — a full copy of every branch in GitSwitch&apos;s data folder (sync-backups), outside the repository
+                — a full copy of every branch in GitSwitch&apos;s data folder (update-backups), outside the repository
               </span>
             </span>
           </label>

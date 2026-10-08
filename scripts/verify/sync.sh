@@ -105,9 +105,10 @@ ok "my uncommitted edits are back (superproject)" "$(git -C "$SB/local" status -
 ok "  and inside A" "$(git -C "$SB/local/A" status --porcelain | sort)" "$CAP_A"
 ok "untracked files untouched" "$([ -e "$SB/local/untracked-super.txt" ] && [ -e "$SB/local/A/untracked-A.txt" ] && echo both || echo lost)" "both"
 ok "no stash was left behind" "$(git -C "$SB/local" stash list | wc -l | tr -d ' ')" "0"
-ok "a backup branch holds the old superproject tip" "$(git -C "$SB/local" rev-parse "$(git -C "$SB/local" branch --list 'gitswitch-before-sync-*' | tr -d ' *')")" "$SUPER_HEAD0"
-ok "  and one in A holds its old tip" "$(git -C "$SB/local/A" rev-parse "$(git -C "$SB/local/A" branch --list 'gitswitch-before-sync-*' | tr -d ' *')")" "$A_HEAD0"
-ok "  the result lists them with recovery commands" "$(printf '%s' "$OUT" | jqf sync.backups)" "reset --hard gitswitch-before-sync-"
+ok "a backup branch holds the old superproject tip" "$(git -C "$SB/local" rev-parse "$(git -C "$SB/local" branch --list 'gitswitch-before-update-*' | tr -d ' *')")" "$SUPER_HEAD0"
+ok "  and one in A holds its old tip" "$(git -C "$SB/local/A" rev-parse "$(git -C "$SB/local/A" branch --list 'gitswitch-before-update-*' | tr -d ' *')")" "$A_HEAD0"
+ok "  the result lists them with recovery commands" "$(printf '%s' "$OUT" | jqf sync.backups)" "reset --hard gitswitch-before-update-"
+ok "  no backup is named after the old word" "$(git -C "$SB/local" branch --list 'gitswitch-before-sync-*' | wc -l | tr -d ' '):$(git -C "$SB/local/A" branch --list 'gitswitch-before-sync-*' | wc -l | tr -d ' ')" "0:0"
 ok "  every check passed" "$(printf '%s' "$OUT" | jqf sync.verified)" "\"dirty_paths_unchanged\": true"
 ok "  the outcome says what was done to each submodule, in its own words" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print(sorted((x['path'],x['action']) for x in d['sync']['submodules']))")" "[('A', 'rebased'), ('B', 'fast-forwarded')]"
 OUT=$(probe sync_plan "$SB/local")
@@ -214,7 +215,7 @@ ok "  the headline says a check failed" "$(printf '%s' "$OUT" | jqf headline)" "
 ok "  the on-top check is the one" "$(printf '%s' "$OUT" | jqf sync.verified.own_on_top)" "False"
 ok "  the missing commit is named, with where its original is" "$(printf '%s' "$OUT" | jqf detail)" "1 commit of yours is missing after the replay and not found upstream: my shared edit. The originals are on the backup branch"
 ok "  it is not called already upstream" "$(printf '%s' "$OUT" | jqf detail | grep -c 'already contained' || true)" "0"
-ok "  the backup branch still holds it" "$(git -C "$SB/local" log --format=%s -1 "$(git -C "$SB/local" for-each-ref --format='%(refname:short)' 'refs/heads/gitswitch-before-sync-*' | head -1)")" "my shared edit"
+ok "  the backup branch still holds it" "$(git -C "$SB/local" log --format=%s -1 "$(git -C "$SB/local" for-each-ref --format='%(refname:short)' 'refs/heads/gitswitch-before-update-*' | head -1)")" "my shared edit"
 
 section "A submodule only my commits added is not called removed"
 restore
@@ -312,7 +313,7 @@ git config --global submodule.recurse true
 probe sync_plan "$SB/local" >/dev/null
 OUT=$(probe sync_run "$SB/local")
 ok "the sync still succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
-ok "  the backup branch did NOT move with the rebase" "$(git -C "$SB/local" rev-parse "$(git -C "$SB/local" branch --list 'gitswitch-before-sync-*' | tr -d ' *')")" "$SUPER_HEAD0"
+ok "  the backup branch did NOT move with the rebase" "$(git -C "$SB/local" rev-parse "$(git -C "$SB/local" branch --list 'gitswitch-before-update-*' | tr -d ' *')")" "$SUPER_HEAD0"
 ok "  submodules stayed on their branch" "$(on_branch "$SB/local/A"):$(on_branch "$SB/local/B")" "main:main"
 git config --global --unset rebase.updateRefs; git config --global --unset submodule.recurse
 
@@ -793,11 +794,12 @@ printf 'u2\n' > "$W/upstream/u2.txt"; git -C "$W/upstream" add u2.txt; git -C "$
 ARGS="{\"repoPath\":\"$W/local\",\"stash\":true,\"bundles\":false,\"fingerprint\":$FP}"
 OUT=$(pinvoke changes_sync_run "$ARGS")
 ok "the run fetches, sees upstream moved, and refuses" "$(printf '%s' "$OUT" | jqf value.refusal.code)" "assess-again"
-ok "  nothing was touched: same commit, no backup branch, nothing paused" "$(head_of "$W/local"):$(git -C "$W/local" for-each-ref 'refs/heads/gitswitch-before-sync-*' | wc -l | tr -d ' '):$([ -e "$W/local/.git/gitswitch-sync.json" ] && echo state || echo none)" "$S0:0:none"
+ok "  nothing was touched: same commit, no backup branch, nothing paused" "$(head_of "$W/local"):$(git -C "$W/local" for-each-ref 'refs/heads/gitswitch-before-update-*' | wc -l | tr -d ' '):$([ -e "$W/local/.git/gitswitch-sync.json" ] && echo state || echo none)" "$S0:0:none"
 FP="$(probe sync_plan "$W/local" | "$PY" -c "import sys,json;print(json.dumps(json.load(sys.stdin)['fingerprint']))")"
-ARGS="{\"repoPath\":\"$W/local\",\"stash\":true,\"bundles\":false,\"fingerprint\":$FP}"
+ARGS="{\"repoPath\":\"$W/local\",\"stash\":true,\"bundles\":true,\"fingerprint\":$FP}"
 OUT=$(pinvoke changes_sync_run "$ARGS")
 ok "previewed again, the same run goes through" "$(printf '%s' "$OUT" | jqf value.ok):$(printf '%s' "$OUT" | jqf value.headline)" "True:Updated: 1 commit of yours on top of 2 new commits"
+ok "  its bundle backup is written to the update-backups folder" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,os,json;b=json.load(sys.stdin)["value"]["sync"]["bundles"];print(len(b) > 0 and all("/update-backups/" in p.replace(chr(92), "/") and os.path.isfile(p) for p in b))')" "True"
 
 section "My commit that added a submodule is already upstream, then I bumped it: handed over, never re-written without a backup"
 mini tz
@@ -1025,7 +1027,7 @@ B0="$(head_of "$W/local/B")"; C0="$(head_of "$W/local/C")"; S0="$(head_of "$W/lo
 probe sync_plan "$W/local" >/dev/null
 OUT=$(probe sync_run "$W/local")
 ok "the update pauses inside C, the branch already replayed" "$(printf '%s' "$OUT" | jqf headline):$([ "$(head_of "$W/local")" != "$S0" ] && echo replayed || echo still)" "Update paused inside C.:replayed"
-BK="$(git -C "$W/local" branch --list 'gitswitch-before-sync-*' --format='%(refname:short)' | head -1)"
+BK="$(git -C "$W/local" branch --list 'gitswitch-before-update-*' --format='%(refname:short)' | head -1)"
 git -C "$W/local/C" rebase --abort >/dev/null 2>&1; git -C "$W/local" reset -q --hard "$BK"      # in a terminal
 OUT=$(probe sync_continue "$W/local")
 ok "Continue update sees it was undone by hand" "$(printf '%s' "$OUT" | jqf headline)" "Update aborted."
@@ -1073,7 +1075,7 @@ probe sync_plan "$W/local2" >/dev/null; probe sync_run "$W/local2" >/dev/null
 probe tree_resolve_side "$W/local2" "mine,F.txt" >/dev/null
 OUT=$(probe sync_continue "$W/local2")
 ok "a message that is only a '#' line is kept too, and the update finishes" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/local2" log --format=%s origin/main..HEAD | tr '\n' '|')" "True:mine: line 9|#123 only a subject|"
-ok "  with the author and time of the original" "$(git -C "$W/local2" log -1 --format='%an %aI' HEAD~1)" "$(git -C "$W/local2" log -1 --format='%an %aI' "$(git -C "$W/local2" branch --list 'gitswitch-before-sync-*' --format='%(refname:short)' | head -1)~1")"
+ok "  with the author and time of the original" "$(git -C "$W/local2" log -1 --format='%an %aI' HEAD~1)" "$(git -C "$W/local2" log -1 --format='%an %aI' "$(git -C "$W/local2" branch --list 'gitswitch-before-update-*' --format='%(refname:short)' | head -1)~1")"
 
 section "Abort never walks a submodule's branch off a commit nothing else holds"
 mini st A
@@ -1563,6 +1565,26 @@ ok "(the partial clone holds other.bin, and model.bin as a stub)" "$(wc -c < "$L
 head -c 3500 /dev/urandom > "$L/author/other.bin"; git -C "$L/author" commit -qam "upstream: a new other"; git -C "$L/author" push -q origin main 2>/dev/null
 probe sync_plan "$L/partial" >/dev/null; OUT=$(probe sync_run "$L/partial")
 ok "in a partial checkout, a large file you had and upstream changed arrives as content" "$(printf '%s' "$OUT" | jqf ok):$(wc -c < "$L/partial/other.bin" | tr -d ' ')" "True:3500"
+# A clone made where git-lfs was not set up: no LFS filters, every large file
+# a pointer stub. Without the page's "Also download Git LFS files" the update
+# says so; with it, the update downloads them afterwards, as Pull does.
+for c in stubs stubs2 stubs3; do
+  ( cd "$L" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$L/super.git" "$c" 2>/dev/null )
+  printf '%s\n' "$c" > "$L/$c/mine.txt"; git -C "$L/$c" add -A >/dev/null; git -C "$L/$c" commit -qm "mine: $c"
+done
+ok "(a clone without LFS filters holds only pointer stubs)" "$(probe lfs_status "$L/stubs" | "$PY" -c 'import sys,json;d=json.load(sys.stdin);print(d["filters_configured"], d["pointers"] > 0)')" "False True"
+head -c 7000 /dev/urandom > "$L/author/new.bin"; git -C "$L/author" add -A >/dev/null; git -C "$L/author" commit -qm "upstream: new.bin"; git -C "$L/author" push -q origin main 2>/dev/null
+probe sync_plan "$L/stubs" >/dev/null; OUT=$(probe sync_run "$L/stubs")
+ok "without the option the update says which large files are still pointer stubs" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf detail)" "pointer stubs — use Pull LFS files"
+probe sync_plan "$L/stubs2" >/dev/null; OUT=$(probe sync_run "$L/stubs2" "lfs")
+ok "with the option the update downloads them afterwards" "$(printf '%s' "$OUT" | jqf ok):$(wc -c < "$L/stubs2/new.bin" | tr -d ' '):$(probe lfs_status "$L/stubs2" | jqf pointers)" "True:7000:0"
+ok "  and says so" "$(printf '%s' "$OUT" | jqf detail)" "Downloaded"
+# The LFS server stops answering: the update still updates, and says the download did not happen.
+mv "$L/super.git/lfs" "$L/lfs-away"
+probe sync_plan "$L/stubs3" >/dev/null; OUT=$(probe sync_run "$L/stubs3" "lfs")
+ok "with the option and the LFS server away, the update still updates" "$(printf '%s' "$OUT" | jqf ok):$([ -d "$(git -C "$L/stubs3" rev-parse --git-path rebase-merge)" ] && echo rebasing || echo none):$(git -C "$L/stubs3" status --porcelain | wc -l | tr -d ' ')" "True:none:0"
+ok "  and says the large files did not download" "$(printf '%s' "$OUT" | jqf detail)" "didn't download"
+rm -rf "$L/super.git/lfs"; mv "$L/lfs-away" "$L/super.git/lfs"
 # An update that finished, with its state left behind (a crash between
 # finishing and tidying up — the window a long download used to widen):
 # never shown as a paused update, never undone by an Abort. A real state is

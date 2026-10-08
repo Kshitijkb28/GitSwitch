@@ -38,6 +38,9 @@
       "binaries/gitswitch-lock-helper",
       "binaries/gitswitch-git-shim"
     ],
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "windows": {
       "nsis": {
         "installMode": "perMachine"

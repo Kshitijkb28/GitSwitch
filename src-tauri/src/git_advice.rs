@@ -120,12 +120,19 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
     if has("GitSwitch: commit blocked") {
         // Deliberately does not repeat the hook's own --no-verify suggestion:
         // the app fixes the identity instead of bypassing the check.
-        return advice(
-            "This folder's identity guard refused the commit.",
-            "The email git is configured with doesn't match the profile that owns this folder. Fix the identity in the Profiles page (or remove the repo-local override), then commit again.",
-            Some("fix-identity"),
-            s,
-        );
+        let said = |label: &str| {
+            s.lines()
+                .find_map(|l| l.trim().strip_prefix(label).map(|v| v.trim().to_string()))
+                .filter(|v| !v.is_empty())
+        };
+        let (expected, actual) = (said("this folder should commit as:"), said("git is currently configured as:"));
+        let guidance = match (expected, actual) {
+            (Some(e), Some(a)) => format!(
+                "The guard expects {e}; git is set to {a}. If {a} is this folder's profile email now, the guard is out of date: update it beside \"Committing as\". Otherwise fix the identity in the Profiles page (or remove the repo-local override), then commit again."
+            ),
+            _ => "The email git is configured with doesn't match the one this folder's guard expects. Fix the identity in the Profiles page (or remove the repo-local override), or update the guard beside \"Committing as\", then commit again.".to_string(),
+        };
+        return advice("This folder's identity guard refused the commit.", &guidance, Some("fix-identity"), s);
     }
 
     // --- Operation-specific ---

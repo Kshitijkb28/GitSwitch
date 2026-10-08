@@ -2717,7 +2717,7 @@ mod tests {
     #[test]
     fn every_heavy_command_future_stays_far_below_a_threads_stack() {
         let sizes: Vec<(&str, usize)> = vec![
-            ("sync_run", std::mem::size_of_val(&crate::sync::sync_run("/x", crate::sync::RunOptions { stash: true, bundles: false, fingerprint: Vec::new() }))),
+            ("sync_run", std::mem::size_of_val(&crate::sync::sync_run("/x", crate::sync::RunOptions { stash: true, bundles: false, with_lfs: false, fingerprint: Vec::new() }))),
             ("sync_continue", std::mem::size_of_val(&crate::sync::sync_continue("/x", false))),
             ("sync_abort", std::mem::size_of_val(&crate::sync::sync_abort("/x"))),
             ("sync_plan", std::mem::size_of_val(&crate::sync::sync_plan("/x", true, true))),

@@ -28,11 +28,27 @@ and run it:
 
 | OS | File | How to install |
 |----|------|----------------|
-| **macOS** | `GitSwitch_x.y.z_universal.dmg` | Open the `.dmg`, drag GitSwitch to Applications |
-| **Windows** | `GitSwitch_x.y.z_x64-setup.exe` or `.msi` | Run it, click through the installer |
-| **Linux (Debian/Ubuntu)** | `git-switch_x.y.z_amd64.deb` | `sudo dpkg -i *.deb` |
-| **Linux (any distro)** | `git-switch_x.y.z_amd64.AppImage` | `chmod +x *.AppImage && ./*.AppImage` |
-| **Linux (Fedora/RHEL)** | `git-switch-x.y.z.x86_64.rpm` | `sudo rpm -i *.rpm` |
+| **macOS** | `GitSwitch_x.y.z_universal.dmg` | Open the `.dmg`, drag GitSwitch to Applications, then see [First open on macOS](#first-open-on-macos) |
+| **Windows** | `GitSwitch_x.y.z_x64-setup.exe` or `GitSwitch_x.y.z_x64_en-US.msi` | Run it, click through the installer — SmartScreen asks once, see [Installing](#installing) |
+| **Linux (Debian/Ubuntu)** | `GitSwitch_x.y.z_amd64.deb` | `sudo apt install ./GitSwitch_x.y.z_amd64.deb` (pulls in the WebKit/GTK libraries; `dpkg -i` does not) |
+| **Linux (any distro)** | `GitSwitch_x.y.z_amd64.AppImage` | `chmod +x GitSwitch_*.AppImage && ./GitSwitch_*.AppImage` |
+| **Linux (Fedora/RHEL)** | `GitSwitch-x.y.z-1.x86_64.rpm` | `sudo dnf install ./GitSwitch-x.y.z-1.x86_64.rpm` |
+
+### First open on macOS
+
+The build is sealed but not notarized (that needs a paid Apple Developer ID),
+so the first time it is opened macOS asks for confirmation:
+
+- **macOS 15 and later:** open GitSwitch once and click **Done**, then
+  **System Settings → Privacy & Security**, find "GitSwitch was blocked…",
+  click **Open Anyway**, then **Open**.
+- **macOS 14 and earlier:** Control-click GitSwitch in Applications → **Open**
+  → **Open**.
+- If macOS says the app **is damaged** (a build from before the app was
+  sealed): `xattr -dr com.apple.quarantine /Applications/GitSwitch.app`, then
+  open it again.
+
+After that it opens like any other app.
 
 ### Runtime requirements (must exist on the user's machine)
 

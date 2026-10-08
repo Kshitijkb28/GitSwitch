@@ -144,7 +144,7 @@ export function Dashboard() {
                       <Badge variant="success">signed</Badge>
                     )}
                   </div>
-                  <p className="text-sm text-zinc-400 mt-0.5">
+                  <p className="text-sm text-zinc-400 mt-0.5 break-all">
                     {profile.git_name} &lt;{profile.git_email}&gt;
                   </p>
                   <div className="flex items-center gap-4 mt-2">

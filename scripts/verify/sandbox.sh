@@ -419,6 +419,43 @@ ok "a blocked repository says so instead of naming an account" "$(who | jqf valu
 probe block "$SB/work" "off" >/dev/null
 git -C "$SB/work" remote set-url origin "$SB/remote.git"
 
+section "A repository behind an SSH alias for GitHub has its size asked like github.com's"
+# A fake API that logs every request and says each acme repository weighs
+# 8 MiB, and a gh that lists no account: no sign-in of this machine is used.
+printf 'Host gl-work\n  HostName gitlab.example.com\n  User git\n' >> "$SB/sshcfg"
+printf '#!/bin/sh\nexit 1\n' > "$FAKE/gh"; chmod +x "$FAKE/gh"
+"$PY" - "$SB/size-api.log" > "$SB/size-api-port" <<'PYAPI' &
+import http.server, sys, json
+log = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(log, "a") as f:
+            f.write("%s token=%s\n" % (self.path, "yes" if self.headers.get("Authorization") else "no"))
+        body = json.dumps({"size": 8192}).encode()
+        self.send_response(200 if self.path.startswith("/repos/acme/") else 404)
+        self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYAPI
+SIZE_PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SB/size-api-port" ] && break; sleep 0.5; done
+SIZE_API="http://127.0.0.1:$(cat "$SB/size-api-port")"
+size_of() {
+  local j; j="$("$PY" -c 'import json,sys;print(json.dumps({"url":sys.argv[1]}))' "$1")"
+  PATH="$FAKE:$PATH" GITSWITCH_SSH_CONFIG="$SB/sshcfg" GITSWITCH_GITHUB_API="$SIZE_API" pinvoke clone_size_estimate "$j" \
+    | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print("none" if v is None else "%s %s" % (v["repo"], v["kb"]))'
+}
+ok "an SSH alias for github.com is asked about like github.com" "$(size_of git@gh-work:acme/thing.git)" "acme/thing 8192"
+ok "  ssh.github.com on port 443 too" "$(size_of ssh://git@ssh.github.com:443/acme/other.git)" "acme/other 8192"
+ok "  anonymously, with no account signed in here" "$(grep -c 'token=yes' "$SB/size-api.log")" "0"
+: > "$SB/size-api.log"
+ok "an alias for another host is not asked about" "$(size_of git@gl-work:acme/third.git):$(wc -l < "$SB/size-api.log" | tr -d ' ')" "none:0"
+ok "  nor is an address that is no host at all" "$(size_of "$SB/remote.git"):$(wc -l < "$SB/size-api.log" | tr -d ' ')" "none:0"
+{ kill "$SIZE_PID" && wait "$SIZE_PID"; } 2>/dev/null
+
 section "Submodules"
 git init -q --bare "$SB/sub.git"
 git clone -q "$SB/sub.git" "$SB/subwork" 2>/dev/null

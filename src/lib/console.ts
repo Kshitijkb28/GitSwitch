@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import { readPersisted, writePersisted } from "./persist";
+import { readSelectedRepo } from "./repoSelection";
 
 /**
  * Whether the terminal drawer is open, how tall it is, and which repository it
@@ -23,6 +24,8 @@ export type ConsoleState = {
   repo: string;
   /** Drawer height in pixels. */
   height: number;
+  /** Bumped when push access was changed in the app; the badge re-reads it. Not persisted. */
+  pushRev: number;
 };
 
 const MIN_HEIGHT = 140;
@@ -34,6 +37,7 @@ let state: ConsoleState = {
   account: readPersisted<string>("console.account", "") || readPersisted<string>("changes.account", ""),
   repo: readPersisted<string>("console.repo", "") || readPersisted<string>("changes.repo", ""),
   height: clampHeight(readPersisted<number>("console.height", 300)),
+  pushRev: 0,
 };
 
 const listeners = new Set<() => void>();
@@ -67,19 +71,50 @@ function set(next: Partial<ConsoleState>) {
   emit();
 }
 
+/**
+ * The page selection the drawer last took over. Empty at start, so the first
+ * open of every run takes the page's folder; after that the drawer follows the
+ * page only when the page has moved on, and a repository picked inside the
+ * drawer survives closing and reopening it.
+ */
+let followed = "";
+
+/** Point the drawer at the page's folder, if the page moved since last time. */
+function followPage() {
+  const selected = readSelectedRepo();
+  if (!selected || selected === followed) return;
+  followed = selected;
+  // Every account: the page keeps a folder under any account filter, and the
+  // drawer's own filter would otherwise swap it for one of that account's.
+  writePersisted("console.repo", selected);
+  writePersisted("console.account", "");
+  set({ repo: selected, account: "" });
+}
+
 /** Open the drawer, optionally pointing it at a repository. */
 export function openConsole(repo?: string) {
-  if (repo && repo !== state.repo) writePersisted("console.repo", repo);
-  set({ open: true, ...(repo ? { repo } : {}) });
+  if (repo) {
+    followed = readSelectedRepo();
+    writePersisted("console.repo", repo);
+    writePersisted("console.account", "");
+    set({ open: true, repo, account: "" });
+    return;
+  }
+  set({ open: true });
 }
 
 export function closeConsole() {
   set({ open: false });
 }
 
+/** The sidebar button and Ctrl+`: open in the page's folder, or close. */
 export function toggleConsole() {
-  if (state.open) closeConsole();
-  else openConsole();
+  if (state.open) {
+    closeConsole();
+    return;
+  }
+  followPage();
+  openConsole();
 }
 
 export function setConsoleRepo(repo: string) {
@@ -95,6 +130,15 @@ export function setConsoleTab(tab: ConsoleTab) {
 export function setConsoleAccount(account: string) {
   writePersisted("console.account", account);
   set({ account });
+}
+
+/**
+ * Push access was changed in the app (a mode, a repair, a lock job): the
+ * drawer's badge reads it again. A signal, never a poll — reading push state
+ * under a lock re-applies drifted mirrors as a side effect.
+ */
+export function notePushChanged() {
+  set({ pushRev: state.pushRev + 1 });
 }
 
 export function setConsoleHeight(px: number) {

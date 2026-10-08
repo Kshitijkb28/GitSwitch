@@ -46,7 +46,7 @@ WORKDIR="$SB/Work \"2024\" #1"; mkdir -p "$WORKDIR"
 KEY="$SB/home/.ssh/my key"; mkdir -p "$SB/home/.ssh"; printf 'not a real key\n' > "$KEY"
 NAME2='Work Person'; EMAIL2='work@example.test'
 profile_json "$SB/p2.json" "Work" "$NAME2" "$EMAIL2" "$KEY" "$WORKDIR"
-OUT=$(probe profile_apply "$SB" "$SB/p2.json")
+OUT=$(probe profile_apply "$SB" "$SB/p2.json"); WID="$(printf '%s' "$OUT" | jqf id)"
 ok "the profile is created" "$(printf '%s' "$OUT" | jqf name)" "Work"
 git init -q "$WORKDIR/repo"
 ok "git can still read the whole config, include and all" "$(git -C "$WORKDIR/repo" config --list >/dev/null 2>&1 && echo readable || echo BROKEN)" "readable"
@@ -98,6 +98,19 @@ ST=$(pinvoke changes_repo_status "$("$PY" -c 'import json,sys;print(json.dumps({
 ok "the Changes page knows which profile a remote-rule clone belongs to" "$(printf '%s' "$ST" | jqf value.identity.profile_name)" "Acme"
 WHO=$(GITSWITCH_GITHUB_API="http://127.0.0.1:9" pinvoke changes_push_identity "$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"refresh":False}))' "$SB/anywhere/https")")
 ok "  and which account its pushes are expected to go as" "$(printf '%s' "$WHO" | jqf value.expected_login)" "acme-bot"
+# The VS Code extension decides the same way, from the same config: its own
+# resolver (vscode-extension/src/resolve.ts), run by bun.
+ext() {
+  if command -v bun >/dev/null 2>&1; then bun "$VERIFY_DIR/harness/ext-identity.ts" "$1" 2>&1
+  else echo '{"error":"bun is not installed: the VS Code extension resolver cannot run"}'; fi
+}
+ok "the VS Code extension names a remote-rule clone's profile" "$(ext "$SB/anywhere/https" | jqf profile)" "Acme"
+ok "  and raises no mismatch for it" "$(ext "$SB/anywhere/https" | jqf mismatch)" "False"
+git -C "$SB/anywhere/https" config user.email ACME@EXAMPLE.TEST
+ok "  a local override that differs only in letter case is no mismatch" "$(ext "$SB/anywhere/https" | jqf mismatch)" "False"
+git -C "$SB/anywhere/https" config --unset user.email
+ok "  inside a folder profile's folder, the folder profile" "$(ext "$WORKDIR/acme-clone" | jqf profile)" "Work"
+ok "  an unrelated clone: the default profile, no mismatch" "$(ext "$SB/anywhere/unrelated" | jqf profile) $(ext "$SB/anywhere/unrelated" | jqf mismatch)" "Personal False"
 else
   echo "  (git $GITV is older than 2.36: remote rules are not available here; skipped)"
 fi
@@ -150,5 +163,141 @@ profile_json "$SB/p7.json" "Bad" "Fine Name" "e@example.test" "" "relative/dir"
 ok "a relative folder is refused" "$(probe profile_apply "$SB" "$SB/p7.json")" "full path"
 ok "  and the config file is byte-for-byte as it was" "$(sha256file "$HOME/.gitconfig")" "$BEFORE"
 ok "  still readable" "$(git config --global --list >/dev/null 2>&1 && echo readable || echo BROKEN)" "readable"
+
+section "What is on this Mac is read afresh: a clone deleted, moved or made behind the app's back"
+for r in alpha beta; do git init -q "$WORKDIR/$r"; git -C "$WORKDIR/$r" remote add origin "git@github.com:behindback/$r.git"; done
+# The folder holds quotes and a hash on purpose: it reaches the script through
+# the environment, never pasted into its text.
+cat > "$SB/behind-its-back.sh" <<'EOF'
+rm -rf "$WD/alpha"
+mv "$WD/beta" "$WD/beta-moved"
+git init -q "$WD/gamma" && git -C "$WD/gamma" remote add origin git@github.com:behindback/gamma.git
+EOF
+OUT=$(WD="$WORKDIR" probe local_clones_around "" "$SB/behind-its-back.sh")
+clones() { printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin)['$1'];print(sorted((k, v.rsplit('/',1)[-1]) for k,v in d.items() if k.startswith('behindback/')))"; }
+ok "(both clones are seen first)" "$(clones before)" "[('behindback/alpha', 'alpha'), ('behindback/beta', 'beta')]"
+ok "a clone deleted behind the app's back is gone from the very next read, a moved one is found where it is, and a new one is in it" "$(clones after)" "[('behindback/beta', 'beta-moved'), ('behindback/gamma', 'gamma')]"
+
+section "A repository in a profile folder inside another profile's folder is listed as the inner profile's"
+INNERDIR="$WORKDIR/inner"; mkdir -p "$INNERDIR"
+profile_json "$SB/p8.json" "Inner" "Inner Person" "inner@example.test" "" "$INNERDIR"
+OUT=$(probe profile_apply "$SB" "$SB/p8.json")
+git init -q "$INNERDIR/api"
+ok "(git itself gives that repository the inner profile's identity)" "$(git -C "$INNERDIR/api" config user.email)" "inner@example.test"
+LISTED=$(pinvoke history_list_repos "{}")
+ok "the History account filter lists it under the inner profile too" "$(printf '%s' "$LISTED" | "$PY" -c 'import sys,json;print([r["profile_name"] for r in json.load(sys.stdin)["value"] if r["path"].endswith("/inner/api")])')" "['Inner']"
+
+section "A profile with pushes turned off stops a push to any remote in its folders"
+# Whatever the address: an organisation's SSH-certificate form, a user in an
+# HTTPS URL, an ssh alias, another host, a local path. Nothing here reaches a
+# network: only the local one is pushed to or fetched from.
+NOPUSH="$SB/NoPush"; mkdir -p "$NOPUSH"; git init -q --bare "$SB/target.git"
+np_repo() { git init -q "$NOPUSH/$1"; git -C "$NOPUSH/$1" commit -q --allow-empty -m x; git -C "$NOPUSH/$1" remote add origin "$2"; }
+np_repo org "org-1234567@github.com:blockorg/w.git"
+np_repo userhttps "https://someone@github.com/blockorg/w.git"
+np_repo alias "gh-work:blockorg/w.git"
+np_repo otherhost "git@gitlab.example.com:blockorg/w.git"
+np_repo local "$SB/target.git"
+"$PY" - "$SB/pnopush.json" "$NOPUSH" <<'JSONPY'
+import json, sys
+f, folder = sys.argv[1:]
+json.dump({"name": "NoPush", "git_name": "No Push", "git_email": "nopush@example.test", "directories": [folder], "allow_push": False}, open(f, "w"))
+JSONPY
+OUT=$(probe profile_apply "$SB" "$SB/pnopush.json")
+ok "(a profile with pushes turned off is created)" "$(printf '%s' "$OUT" | jqf allow_push)" "False"
+for r in org userhttps alias otherhost local; do
+  ok "the push address of the $r remote is rewritten" "$(git -C "$NOPUSH/$r" remote get-url --push origin)" "gitswitch-push-blocked://"
+done
+ok "a push from a terminal fails" "$(git -C "$NOPUSH/local" push origin HEAD:refs/heads/main 2>&1)" "gitswitch-push-blocked"
+ok "  and nothing reached the repository" "$(git -C "$SB/target.git" rev-parse -q --verify refs/heads/main || echo none)" "none"
+ok "  fetch still works" "$(git -C "$NOPUSH/local" fetch origin 2>&1 && echo fetched)" "fetched"
+ok "  and the folder's identity still applies" "$(git -C "$NOPUSH/org" config user.email)" "nopush@example.test"
+ST=$(pinvoke changes_push_state "$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1]}))' "$NOPUSH/org")")
+ok "the Repository page finds no remote the block leaves open" "$(printf '%s' "$ST" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["profile_blocked"], [g for g in v.get("gaps", []) if "stopped by the URL rewrite" in g])')" "True []"
+WHERE="$("$PY" -c 'import os;h=os.environ["HOME"];c=[os.path.join(h,"Library/Application Support/com.gitswitch.app/gitconfigs"),os.path.join(h,".local/share/com.gitswitch.app/gitconfigs")];print(next((p for p in c if os.path.isdir(p)),"MISSING"))')"
+for f in "$WHERE"/*.gitconfig; do grep -q 'pushInsteadOf = ""' "$f" && sed -i.bak '/pushInsteadOf = ""/d' "$f" && rm -f "$f.bak"; done
+ok "(an include file an older build wrote has no catch-all)" "$(git -C "$NOPUSH/org" remote get-url --push origin)" "org-1234567@github.com:blockorg/w.git"
+probe refresh_profile_includes "$SB" >/dev/null
+ok "the app's start-up refresh gives it this build's block, without the profile being saved again" "$(git -C "$NOPUSH/org" remote get-url --push origin)" "gitswitch-push-blocked://"
+
+section "A folder typed in another letter case, or named through a link, still gets its profile"
+# git matches a folder rule letter for letter against the REAL path of .git;
+# macOS and Windows disks ignore letter case, so a folder typed otherwise
+# opens fine and never matches.
+mkdir -p "$SB/CaseProbe"
+if [ -d "$SB/caseprobe" ]; then
+  CASED="$SB/Cased Work"; mkdir -p "$CASED"; git init -q "$CASED/repo"
+  profile_json "$SB/pcase.json" "Cased" "Cased Person" "cased@example.test" "" "$SB/cased work"
+  OUT=$(probe profile_apply "$SB" "$SB/pcase.json")
+  CASED_ID="$(printf '%s' "$OUT" | jqf id)"
+  ok "a folder typed in another letter case is stored as the disk spells it" "$(printf '%s' "$OUT" | jqf directories)" "[\"$CASED\"]"
+  ok "  and git gives its repositories that profile" "$(git -C "$CASED/repo" config user.email)" "cased@example.test"
+else
+  echo "  (this disk tells letter case apart: a folder typed otherwise is another folder)"
+fi
+MOVE="$SB/Move Here"; mkdir -p "$MOVE"; git init -q "$MOVE/repo"
+profile_json "$SB/pm1.json" "First" "First Person" "first@example.test" "" "$MOVE"
+OUT=$(probe profile_apply "$SB" "$SB/pm1.json"); FIRST_ID="$(printf '%s' "$OUT" | jqf id)"
+ok "(the folder is First's)" "$(git -C "$MOVE/repo" config user.email)" "first@example.test"
+ln -s "$MOVE" "$SB/move-link"
+profile_json "$SB/pm2.json" "Second" "Second Person" "second@example.test" "" "$SB/move-link"
+OUT=$(probe profile_apply "$SB" "$SB/pm2.json")
+ok "named through a link, the folder moves to the profile that claims it" "$(git -C "$MOVE/repo" config user.email)" "second@example.test"
+ok "  also for git reached through the link" "$(git -C "$SB/move-link/repo" config user.email)" "second@example.test"
+ok "  the link keeps its name in the profile" "$(printf '%s' "$OUT" | jqf directories)" "[\"$SB/move-link\"]"
+holders() { pinvoke get_profiles '{}' | "$PY" -c 'import sys,os,json;print(sorted(p["name"] for p in json.load(sys.stdin)["value"] if any(os.path.exists(d) and os.path.samefile(d, sys.argv[1]) for d in p["directories"])))' "$MOVE"; }
+ok "  and only one profile lists it" "$(holders)" "['Second']"
+
+section "Doctor: a folder spelled otherwise than the disk does, and one folder named two ways"
+# Hand-edited stores (or folders saved before the spelling was corrected).
+STORE="$("$PY" -c 'import os;h=os.environ["HOME"];c=[os.path.join(h,"Library/Application Support/com.gitswitch.app/profiles.json"),os.path.join(h,".local/share/com.gitswitch.app/profiles.json")];print(next((p for p in c if os.path.exists(p)),"MISSING"))')"
+ok "(the sandbox's profile store is found)" "$([ -f "$STORE" ] && echo found || echo "$STORE")" "found"
+edit_store() { "$PY" - "$STORE" "$1" "$2" <<'PY'
+import json, sys
+f, pid, folder = sys.argv[1:]
+d = json.load(open(f))
+for p in d["profiles"]:
+    if p["id"] == pid:
+        p["directories"].append(folder)
+json.dump(d, open(f, "w"))
+PY
+}
+edit_store "$FIRST_ID" "$SB/Move Here"
+DOC=$(pinvoke doctor_check_profiles '{}')
+ok "Doctor calls one folder named two ways a conflict" "$(printf '%s' "$DOC" | "$PY" -c 'import sys,json;print([f["detail"] for f in json.load(sys.stdin)["value"] if f["id"]=="folder-conflict"])')" "are the same folder"
+if [ -n "${CASED_ID:-}" ]; then
+  "$PY" - "$STORE" "$CASED_ID" "$SB/cased work" <<'PY'
+import json, sys
+f, pid, folder = sys.argv[1:]
+d = json.load(open(f))
+for p in d["profiles"]:
+    if p["id"] == pid:
+        p["directories"] = [folder]
+json.dump(d, open(f, "w"))
+PY
+  pinvoke apply_git_config '{}' >/dev/null
+  ok "a folder stored in another letter case still gets its profile once git's rules are written: the disk's spelling is written beside it" "$(git -C "$CASED/repo" config user.email)" "cased@example.test"
+  DOC=$(pinvoke doctor_check_profiles '{}')
+  ok "Doctor names a folder spelled otherwise than the disk does" "$(printf '%s' "$DOC" | "$PY" -c 'import sys,json;print([(f["detail"], f["fix"]) for f in json.load(sys.stdin)["value"] if f["id"]=="folder-spelling"])')" "is $SB/Cased Work on disk"
+  printf '{"id":"%s","directories":["%s"]}' "$CASED_ID" "$SB/cased work" > "$SB/pfix.json"
+  OUT=$(probe profile_update "$SB" "$SB/pfix.json")
+  ok "  and its fix, saving the profile again, stores the disk's spelling" "$(printf '%s' "$OUT" | jqf directories)" "[\"$CASED\"]"
+  ok "  so git gives the repositories there that profile" "$(git -C "$CASED/repo" config user.email)" "cased@example.test"
+  ok "  and Doctor has nothing more to say about it" "$(pinvoke doctor_check_profiles '{}' | "$PY" -c 'import sys,json;print(len([f for f in json.load(sys.stdin)["value"] if f["id"]=="folder-spelling"]))')" "0"
+fi
+
+section "The identity guard follows the profile's email"
+G="$WORKDIR/guarded"; git init -q "$G"
+printf '#!/bin/sh\necho "FOREIGN HOOK RAN" >&2\nexit 0\n' > "$G/.git/hooks/pre-commit"; chmod +x "$G/.git/hooks/pre-commit"
+probe guard_install "$G" "$EMAIL2" >/dev/null
+ok "(the guard expects the Work profile's email)" "$(probe guard_email "$G")" "$EMAIL2"
+printf '{"id":"%s","git_email":"work2@example.test"}' "$WID" > "$SB/pemail.json"
+OUT=$(probe profile_update "$SB" "$SB/pemail.json")
+C=$(git -C "$G" commit --allow-empty -m "after the email changed" 2>&1)
+ok "a guarded repository still commits after its profile's email changes" "$(git -C "$G" log -1 --format=%ae 2>/dev/null || echo "refused: $C")" "work2@example.test"
+ok "  the guard expects the new email" "$(probe guard_email "$G")" "work2@example.test"
+ok "  the hook that was there before still runs" "$C" "FOREIGN HOOK RAN"
+ST=$(pinvoke changes_repo_status "$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1]}))' "$G")")
+ok "  and the Changes page reads the guard's email" "$(printf '%s' "$ST" | jqf value.identity.guard_email)" "work2@example.test"
 
 verify_result

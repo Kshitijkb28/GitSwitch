@@ -86,6 +86,19 @@ fn norm_dir(d: &str) -> String {
     crate::paths::norm(d)
 }
 
+/// The folders as they are stored: `~` expanded, each spelled as the disk
+/// spells it (git matches folder rules letter for letter), each once.
+fn stored_folders(dirs: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for d in dirs {
+        let d = crate::paths::disk_spelling(&expand_tilde(d));
+        if !out.iter().any(|o| norm_dir(o) == norm_dir(&d)) {
+            out.push(d);
+        }
+    }
+    out
+}
+
 /// Expand a leading `~/` to the home directory so stored paths always compare
 /// equal to absolute paths (scanners and pickers produce absolute paths).
 fn expand_tilde(dir: &str) -> String {
@@ -189,14 +202,19 @@ fn ensure_default_can_push(is_default: bool, allow_push: bool) -> Result<(), App
 
 /// Remove `dirs` from every profile EXCEPT `keep_id`, so a folder can belong to
 /// only one profile at a time (git's includeIf is "last match wins", which would
-/// otherwise let a stale mapping silently override the intended one).
+/// otherwise let a stale mapping silently override the intended one). A folder
+/// is the same folder however it is named: in another letter case, or through
+/// a symbolic link.
 fn dedupe_directories(store: &mut ProfileStore, keep_id: &str, dirs: &[String]) {
-    let claimed: Vec<String> = dirs.iter().map(|d| norm_dir(d)).collect();
+    let claimed: Vec<crate::paths::FolderId> = dirs.iter().map(|d| crate::paths::FolderId::of(d)).collect();
     for p in store.profiles.iter_mut() {
         if p.id == keep_id {
             continue;
         }
-        p.directories.retain(|d| !claimed.contains(&norm_dir(d)));
+        p.directories.retain(|d| {
+            let id = crate::paths::FolderId::of(d);
+            !claimed.iter().any(|c| c.same(&id))
+        });
     }
 }
 
@@ -247,7 +265,7 @@ pub fn create_profile(
     // Normalize "" to None so an empty picker never stores an empty path, and
     // expand `~` here as for folders, so Doctor can check the file exists.
     let ssh_key_path = ssh_key_path.filter(|k| !k.is_empty()).map(|k| expand_tilde(&k));
-    let directories: Vec<String> = directories.iter().map(|d| expand_tilde(d)).collect();
+    let directories = stored_folders(&directories);
     let (name, git_name, git_email) = (name.trim().to_string(), git_name.trim().to_string(), git_email.trim().to_string());
     validate_fields(&name, &git_name, &git_email, ssh_key_path.as_deref(), &directories)?;
     let remote_patterns = normalize_remote_patterns(&remote_patterns)?;
@@ -311,7 +329,7 @@ pub fn update_profile(
         profile.ssh_key_path = if k.is_empty() { None } else { Some(expand_tilde(&k)) };
     }
     if let Some(d) = directories {
-        profile.directories = d.iter().map(|dir| expand_tilde(dir)).collect();
+        profile.directories = stored_folders(&d);
     }
     if let Some(ap) = allow_push {
         ensure_default_can_push(profile.is_default, ap)?;
@@ -454,6 +472,43 @@ mod tests {
         assert_eq!(a.directories, vec!["/x/other".to_string()]);
         let b = store.profiles.iter().find(|p| p.id == "B").unwrap();
         assert_eq!(b.directories, vec!["/x/foo".to_string()]);
+    }
+
+    #[test]
+    fn a_folder_named_another_way_moves_to_the_profile_that_claims_it() {
+        let root = std::env::temp_dir().join(format!("gitswitch-moves-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Work")).expect("dirs");
+        let root = std::fs::canonicalize(&root).expect("canonical");
+        let work = root.join("Work").to_string_lossy().to_string();
+        let shouted = root.join("WORK").to_string_lossy().to_string();
+        if std::path::Path::new(&shouted).exists() {
+            // A disk that ignores letter case: one folder, stored as the disk spells it, once.
+            assert_eq!(stored_folders(&[shouted.clone(), work.clone()]), vec![work.clone()]);
+            let mut store = ProfileStore { profiles: vec![mk("A", &[&work]), mk("B", &[])] };
+            dedupe_directories(&mut store, "B", std::slice::from_ref(&shouted));
+            assert!(store.profiles[0].directories.is_empty(), "{:?}", store.profiles[0].directories);
+        }
+        #[cfg(unix)]
+        {
+            let link = root.join("link").to_string_lossy().to_string();
+            std::os::unix::fs::symlink(root.join("Work"), &link).expect("symlink");
+            // Named through a link: the folder moves, it is never shared.
+            let mut store = ProfileStore { profiles: vec![mk("A", &[&link]), mk("B", &[])] };
+            dedupe_directories(&mut store, "B", std::slice::from_ref(&work));
+            assert!(store.profiles[0].directories.is_empty());
+            let mut store = ProfileStore { profiles: vec![mk("A", &[&work]), mk("B", &[])] };
+            dedupe_directories(&mut store, "B", std::slice::from_ref(&link));
+            assert!(store.profiles[0].directories.is_empty());
+            // The link keeps its name in the store.
+            assert_eq!(stored_folders(std::slice::from_ref(&link)), vec![link]);
+        }
+        // A neighbour is a different folder.
+        std::fs::create_dir_all(root.join("Workshop")).expect("neighbour");
+        let mut store = ProfileStore { profiles: vec![mk("A", &[&root.join("Workshop").to_string_lossy()]), mk("B", &[])] };
+        dedupe_directories(&mut store, "B", &[work]);
+        assert_eq!(store.profiles[0].directories.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
