@@ -511,6 +511,21 @@ OUT=$(probe push_mode "$SUP/lib2" "allowed")
 ok "(lib2 unlocked from inside it)" "$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib2\"}" | jqf value.lock.locked)" "False"
 OUT=$(pinvoke changes_repair_push_lock "{\"repoPath\":\"$SUP\"}")
 ok "Repair locks it again, and its own log says Repair did it, for which superproject" "$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib2\"}" | "$PY" -c 'import sys,json;l=json.load(sys.stdin)["value"]["lock"];print(l["locked"], l["recent_events"][0]["detail"])')" "True locked by Repair with its superproject super-cover"
+# Read while the submodules' pieces are re-applied (a lock job's last step, a
+# Repair), in one process as in the app: each repository's measurements and
+# writes take turns, so this finishes — and calls nothing sound broken.
+OUT=$(probe coverage_while_covering "$SUP" 12)
+ok "coverage read while the submodules' pieces are re-applied finishes, and calls no sound lock broken" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin);print(len(v["flagged"]), len(v["notes"]), v["flagged"][:1])')" "0 0 []"
+inode() { case "$PLAT" in macos) stat -f %i "$1";; *) stat -c %i "$1";; esac; }
+CFG="$(git -C "$SUP/lib" rev-parse --path-format=absolute --git-path config)"
+BEFORE=$(inode "$CFG")
+OUT=$(pinvoke changes_repair_push_lock "{\"repoPath\":\"$SUP\"}")
+ok "  re-applying a complete block leaves a submodule's config file as it was" "$(printf '%s' "$OUT" | jqf value.outcome):$([ "$(inode "$CFG")" = "$BEFORE" ] && echo untouched || echo rewritten)" "applied:untouched"
+KEY='url.gitswitch-push-blocked://.pushInsteadOf'
+WANT=$(git -C "$SUP/lib" config --local --get-all "$KEY" | sort | tr '\n' ' ')
+git -C "$SUP/lib" config --local --add "$KEY" "git@github.com:"; git -C "$SUP/lib" config --local --add "$KEY" "ssh://stale.example/"
+OUT=$(pinvoke changes_repair_push_lock "{\"repoPath\":\"$SUP\"}")
+ok "  a copy and a prefix no remote needs, left by an older apply, are cleaned up" "$(git -C "$SUP/lib" config --local --get-all "$KEY" | sort | tr '\n' ' ')" "$WANT"
 OUT=$(probe push_mode "$SUP" "allowed")
 ok "unlocking the superproject unlocks them all" "$(printf '%s' "$OUT" | jqf outcome):$(for sub in lib lib/inner lib2; do pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}" | jqf value.lock.locked; done | tr '\n' ',')" "applied:False,False,False,"
 ok "  and nothing of the block is left in them" "$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked || echo unset):$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked || echo unset)" "unset:unset"
@@ -543,6 +558,18 @@ fi
 section "A submodule downloaded under a lock gets the lock itself, in one job"
 OUT=$(probe push_mode "$SUP" "locked")
 ok "(the superproject is locked)" "$(printf '%s' "$OUT" | jqf outcome)" "applied"
+# A submodule whose own settings cannot be written back: Repair says so and
+# names it — never "Everything is in place." — and does it once it can.
+GD="$(git -C "$SUP/lib2" rev-parse --absolute-git-dir)"
+git -C "$SUP/lib2" config --local --unset gitswitch.pushBlocked
+chmod 555 "$GD"
+OUT=$(pinvoke changes_repair_push_lock "{\"repoPath\":\"$SUP\"}")
+COV=$(cov)
+chmod 755 "$GD"
+ok "a submodule Repair cannot write back is named as not covered, and why — not called in place" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];m=v["message"];print(v["outcome"], "lib2 (" in m, "Everything is in place" in m, "Could not write: lib2" in m)')" "incomplete True False True"
+ok "  the card's Repair for it promises no administrator prompt (none is needed)" "$(printf '%s' "$COV" | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"];print(c["needs_repair"], c["needs_elevation"], [s["drift"] for s in c["submodules"] if s["path"]=="lib2"])')" "True False [['mirror-flag']]"
+OUT=$(pinvoke changes_repair_push_lock "{\"repoPath\":\"$SUP\"}")
+ok "  and once it can be written, Repair puts it back" "$(printf '%s' "$OUT" | jqf value.outcome):$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked)" "applied:true"
 git init -q --bare "$SB/cover-lib3.git"; git clone -q "$SB/cover-lib3.git" "$SB/cover-author-lib3" 2>/dev/null
 printf 'lib3 v1\n' > "$SB/cover-author-lib3/lib3.txt"; git -C "$SB/cover-author-lib3" add -A >/dev/null; git -C "$SB/cover-author-lib3" commit -qm "lib3: initial"; git -C "$SB/cover-author-lib3" push -q origin main 2>/dev/null
 ( cd "$SB/cover-author" && git submodule add -q "$SB/cover-lib3.git" lib3 2>/dev/null ); git -C "$SB/cover-author" commit -qam "super: add lib3" >/dev/null; git -C "$SB/cover-author" push -q origin main 2>/dev/null

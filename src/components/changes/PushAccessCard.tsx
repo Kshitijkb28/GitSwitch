@@ -72,6 +72,7 @@ export function promptSentence(platform: string | null): string {
 
 const OUTCOME_STYLE: Record<JobOutcomeKind, string> = {
   applied: "bg-emerald-500/10 border-emerald-500/30 text-emerald-200/90",
+  incomplete: "bg-amber-500/10 border-amber-500/30 text-amber-200/90",
   cancelled: "bg-zinc-700/40 border-zinc-600/50 text-zinc-300",
   denied: "bg-amber-500/10 border-amber-500/30 text-amber-200/90",
   "no-agent": "bg-amber-500/10 border-amber-500/30 text-amber-200/90",
@@ -81,6 +82,15 @@ const OUTCOME_STYLE: Record<JobOutcomeKind, string> = {
   refused: "bg-red-500/10 border-red-500/30 text-red-200/90",
   unsupported: "bg-zinc-700/40 border-zinc-600/50 text-zinc-300",
 };
+
+/** The coverage line's hover text: why submodules count, and what was measured where the lock is not whole. */
+function coverageTitle(coverage: PushCoverage): string {
+  const base = "Submodules are repositories of their own: a push can start inside one, so the block or lock is extended to each of them";
+  const measured = (Array.isArray(coverage.submodules) ? coverage.submodules : [])
+    .filter((s) => !s.covered && (s.drift?.length ?? 0) > 0)
+    .map((s) => `${s.path}: ${(s.drift ?? []).join(", ")}`);
+  return measured.length ? `${base}\n\nMeasured:\n${measured.join("\n")}` : base;
+}
 
 /**
  * Three states, not a checkbox: the guard-rail is the user's own setting, the
@@ -188,8 +198,12 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
   const [result, setResult] = useState<PushModeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   // How far the block or lock reaches into the submodules — where the code
-  // lives. Re-read whenever the repository's own state changes.
+  // lives. Re-read whenever the repository's own state changes, and after
+  // anything done here: a Repair can leave this repository exactly as it was
+  // and still change its submodules.
   const [coverage, setCoverage] = useState<PushCoverage | null>(null);
+  const [coverageTick, setCoverageTick] = useState(0);
+  const reReadCoverage = () => setCoverageTick((t) => t + 1);
   useEffect(() => {
     let stale = false;
     api
@@ -202,7 +216,7 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
     // Re-read when the repository's own state changes — not on every status
     // object the page re-reads after a stage or a commit.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [repoPath, refreshKey, push.blocked, push.repo_blocked, push.lock.locked, push.needs_repair, push.lock.needs_elevation]);
+  }, [repoPath, refreshKey, coverageTick, push.blocked, push.repo_blocked, push.lock.locked, push.needs_repair, push.lock.needs_elevation]);
 
   const mode = currentMode(push);
   const lock = push.lock;
@@ -237,13 +251,15 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
       setBusy(false);
       setWaiting(false);
       setPending(null);
+      reReadCoverage();
     }
   };
 
   const repairLock = async () => {
     setBusy(true);
-    // The repository's own layers, or a submodule's: either way the prompt.
-    setWaiting(lock.needs_elevation || (coverage?.needs_repair ?? false));
+    // The prompt comes for the repository's own layers or a submodule's lock;
+    // a submodule's own settings are put back without one.
+    setWaiting(lock.needs_elevation || (coverage?.needs_elevation ?? false));
     setError(null);
     try {
       const r = await api.changesRepairPushLock(repoPath);
@@ -254,6 +270,7 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
     } finally {
       setBusy(false);
       setWaiting(false);
+      reReadCoverage();
     }
   };
 
@@ -266,6 +283,7 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
       setError(String(e));
     } finally {
       setBusy(false);
+      reReadCoverage();
     }
   };
 
@@ -280,6 +298,7 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
       setError(String(e));
     } finally {
       setBusy(false);
+      reReadCoverage();
     }
   };
 
@@ -313,13 +332,13 @@ export function PushAccessCard({ repoPath, push, onChanged, refreshKey }: Props)
         <div className={`flex items-start gap-2 ${coverage.needs_repair ? "rounded-lg bg-amber-500/10 border border-amber-500/30 px-2.5 py-2" : ""}`}>
           {coverage.needs_repair && <AlertTriangle size={13} className="shrink-0 mt-0.5 text-amber-400" />}
           <div className="min-w-0 flex-1">
-            <p className={`text-xs leading-relaxed ${coverage.needs_repair ? "text-amber-200/90" : "text-zinc-500"}`} title="Submodules are repositories of their own: a push can start inside one, so the block or lock is extended to each of them">
+            <p className={`text-xs leading-relaxed ${coverage.needs_repair ? "text-amber-200/90" : "text-zinc-500"}`} title={coverageTitle(coverage)}>
               {coverage.summary}
             </p>
             {coverage.needs_repair && (
               <Button size="sm" variant="secondary" className="mt-1.5" disabled={busy} onClick={() => void (mode === "locked" ? repairLock() : repairGuardrail())}>
                 <Wrench size={12} />
-                {mode === "locked" ? "Repair — cover them too (administrator prompt)" : "Repair — cover them too"}
+                {mode === "locked" && coverage.needs_elevation ? "Repair — cover them too (administrator prompt)" : "Repair — cover them too"}
               </Button>
             )}
           </div>

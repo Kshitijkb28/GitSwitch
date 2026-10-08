@@ -91,7 +91,8 @@ pub struct MirrorFacts {
 
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct JobOutcome {
-    /// applied | cancelled | denied | no-agent | manual-required | busy | failed | refused | unsupported
+    /// applied | incomplete | cancelled | denied | no-agent | manual-required | busy | failed | refused | unsupported
+    /// (`incomplete`: what could be done was done, and something is still not covered.)
     pub outcome: String,
     pub message: String,
     /// For `manual-required`: the exact command to run as an administrator.
@@ -1317,9 +1318,10 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
             let sub_ops = submodule_lock_ops(repo_path).await;
             let sub_repos = op_repos(&sub_ops);
             if before.lock.locked && !before.lock.needs_elevation && sub_ops.is_empty() {
-                let state = push_guard::repair(repo_path, &hooks, profile.as_deref()).await?;
+                let (state, notes) = push_guard::repair_noting(repo_path, &hooks, profile.as_deref()).await?;
                 claim(repo_path).await;
-                return Ok(result_with_state(JobOutcome::simple("applied", "Already locked."), Some(state)));
+                let out = as_measured(repo_path, &state, JobOutcome::simple("applied", "Already locked."), &notes).await;
+                return Ok(result_with_state(out, Some(state)));
             }
             let mut ops = Vec::new();
             if !before.lock.locked {
@@ -1400,13 +1402,16 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
 pub async fn repair_lock(repo_path: &str) -> Result<PushModeResult, AppError> {
     let hooks = crate::git_status::git_paths(Path::new(repo_path)).await?.hooks;
     let profile = crate::git_status::owning_profile_id(repo_path);
-    let state = push_guard::repair(repo_path, &hooks, profile.as_deref()).await?;
+    let (state, mut notes) = push_guard::repair_noting(repo_path, &hooks, profile.as_deref()).await?;
     if !state.lock.locked {
         return Ok(result_with_state(JobOutcome::simple("applied", "This repository is not locked; the guard-rail was re-applied."), Some(state)));
     }
     let sub_ops = submodule_lock_ops(repo_path).await;
     if !state.lock.needs_elevation && state.lock.helper != "outdated" && sub_ops.is_empty() {
-        return Ok(result_with_state(JobOutcome::simple("applied", "Everything is in place."), Some(state)));
+        // Nothing for the administrator: what needed no password was put back
+        // above. Said as measured — never "in place" while a submodule is not.
+        let out = as_measured(repo_path, &state, JobOutcome::simple("applied", "Everything is in place."), &notes).await;
+        return Ok(result_with_state(out, Some(state)));
     }
     let sub_repos = op_repos(&sub_ops);
     let mut ops = vec![lock_op_for(repo_path).await?, Op::RepairSystem, Op::InstallRemoteHelper];
@@ -1418,13 +1423,40 @@ pub async fn repair_lock(repo_path: &str) -> Result<PushModeResult, AppError> {
     }
     let out = run_job(ops).await;
     if out.applied() {
-        push_guard::cover_submodules(repo_path, None).await;
+        notes = push_guard::cover_submodules(repo_path, None).await;
         let me = canonical(Path::new(repo_path));
         log_event(&me, "repaired", &out.message, true);
         log_submodule_events(&sub_repos, &me, "locked", "locked by Repair");
     }
     let state = if out.outcome == "manual-required" { None } else { Some(crate::git_status::push_state_for(repo_path).await?) };
+    let out = match &state {
+        Some(s) => as_measured(repo_path, s, out, &notes).await,
+        None => out,
+    };
     Ok(result_with_state(out, state))
+}
+
+/// An outcome that says "applied", checked against the submodules afterwards:
+/// it stays "applied" only when every one is covered; otherwise it is
+/// "incomplete" and names what is still not, and why.
+async fn as_measured(repo_path: &str, state: &push_guard::PushState, out: JobOutcome, notes: &[String]) -> JobOutcome {
+    if !out.applied() {
+        return out;
+    }
+    let cov = push_guard::coverage(repo_path, state).await;
+    if cov.uncovered.is_empty() {
+        return out;
+    }
+    let lead = if out.message == "Everything is in place." || out.message == "Already locked." {
+        "This repository is locked; nothing else needed the administrator password, so there was no prompt.".to_string()
+    } else {
+        out.message.clone()
+    };
+    let mut message = format!("{} {}", lead, cov.summary);
+    if !notes.is_empty() {
+        message.push_str(&format!(" Could not write: {}.", notes.join("; ")));
+    }
+    JobOutcome { outcome: "incomplete".into(), message, ..out }
 }
 
 /// An upgrade from the bundled sidecar: signed when a `.sig` ships next to it,

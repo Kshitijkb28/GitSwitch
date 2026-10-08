@@ -989,6 +989,8 @@ export interface SubCoverage {
   why: string;
   /** Its block is the repository's doing: the repository's "Allowed" takes it away (with the prompt when it is a lock). */
   by_superproject?: boolean;
+  /** When its lock is not whole: what was measured, in the lock's own terms. */
+  drift?: string[];
 }
 
 /** How far the repository's push block or lock reaches into its submodules — where the code lives. */
@@ -997,13 +999,18 @@ export interface PushCoverage {
   submodules: SubCoverage[];
   /** Submodules with less than the repository has: a push from inside them is not stopped. */
   uncovered: string[];
+  /** Repair can do something about what is uncovered. */
   needs_repair: boolean;
+  /** ...and part of it is the administrator's: Repair shows the prompt. */
+  needs_elevation?: boolean;
   /** One sentence for the card; empty when there is nothing to say. */
   summary: string;
 }
 
 export type JobOutcomeKind =
   | "applied"
+  /** What could be done was done; something is still not covered (the message says what). */
+  | "incomplete"
   | "cancelled"
   | "denied"
   | "no-agent"

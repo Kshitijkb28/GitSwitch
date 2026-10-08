@@ -428,6 +428,28 @@ pub(crate) mod tests {
                 Err(e) => emit_err(e),
             },
             "lock_fix" => emit(&crate::push_lock::fix(first).await),
+            // Coverage read while the submodules' pieces are re-applied (a lock
+            // job's last step, a Repair), in one process as in the app,
+            // PROBE_ARGS rounds times: the readings that called a sound lock or
+            // block broken, and what the re-applying could not write.
+            "coverage_while_covering" => {
+                let rounds: usize = first.parse().unwrap_or(10);
+                let path = repo();
+                let mut flagged: Vec<String> = Vec::new();
+                let mut notes: Vec<String> = Vec::new();
+                for _ in 0..rounds {
+                    let state = match git_status::push_state_for(&path).await {
+                        Ok(s) => s,
+                        Err(e) => return emit_err(e),
+                    };
+                    let (cov, n) = tokio::join!(crate::push_guard::coverage(&path, &state), crate::push_guard::cover_submodules(&path, None));
+                    if !cov.uncovered.is_empty() {
+                        flagged.push(cov.summary);
+                    }
+                    notes.extend(n);
+                }
+                emit(&serde_json::json!({ "rounds": rounds, "flagged": flagged, "notes": notes }));
+            }
             "lock_helper_status" => emit(&crate::push_lock::helper_status().await),
             "lock_uninstall" => emit(&crate::push_lock::uninstall_all().await),
             "doctor_locks" => match crate::doctor::check_push_locks().await {

@@ -57,6 +57,8 @@ async function openPage(browser, server, scenario, opts = {}) {
     pushState: opts.pushState ?? null,
     /** How far the block reaches into the submodules; null → none to speak of. */
     pushCoverage: opts.pushCoverage ?? null,
+    /** What Repair (locked) answers; null → "Everything is in place." */
+    repairLockResult: opts.repairLockResult ?? null,
     pushResult: opts.pushResult ?? null,
     subPushResult: opts.subPushResult ?? null,
     consoleEntries: opts.consoleEntries ?? [],
@@ -379,6 +381,7 @@ async function openPage(browser, server, scenario, opts = {}) {
               });
             }
             case "changes_repair_push_lock":
+              if (cfg.repairLockResult) return Promise.resolve({ command: null, job_nonce: null, state: window.__SCENARIO__.push, ...cfg.repairLockResult });
               return Promise.resolve({
                 outcome: "applied",
                 message: "Everything is in place.",
@@ -896,6 +899,45 @@ try {
     await page2.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_repair_push_block"), { timeout: 4000 }).catch(() => null);
     ok("  which re-applies the block to the repository and its submodules", await page2.evaluate(() => window.__CALLS__.some((c) => c.cmd === "changes_repair_push_block" && c.args.repoPath === "/repos/gitswitch")));
     await page2.close();
+  }
+  {
+    // Locked, and a submodule's own settings lost part of the block: Repair
+    // needs no password there, so it promises no prompt; afterwards the
+    // coverage is read again, though this repository's own state is the same.
+    const why = "it is locked, but its own settings lost part of the block; Repair puts it back without a password";
+    const cov = { mode: "locked", submodules: [{ path: "stock", blocked: true, locked: true, needs_repair: false, covered: false, why, by_superproject: true, drift: ["mirror-rewrite"] }], uncovered: ["stock"], needs_repair: true, needs_elevation: false, summary: `Not covering 1 of 1 submodule: stock (${why}).` };
+    const page = await open(SCENARIOS.locked, { pushCoverage: cov });
+    await page.waitForFunction(() => document.body.innerText.includes("Not covering"), { timeout: 4000 }).catch(() => null);
+    const labels = await page.evaluate(() => [...document.querySelectorAll("button")].map((b) => b.innerText.trim()));
+    ok("a submodule whose own settings lost part of the lock's block is offered Repair, promising no prompt", labels.includes("Repair — cover them too") && !labels.some((l) => l.includes("cover them too (administrator prompt)")), JSON.stringify(labels.filter((l) => l.startsWith("Repair"))));
+    const title = await page.evaluate(() => [...document.querySelectorAll("p")].find((p) => p.innerText.startsWith("Not covering"))?.title ?? "");
+    ok("  and the line's hover says what was measured", title.includes("stock: mirror-rewrite"), title);
+    const reads = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push_coverage").length);
+    const before = await reads();
+    await (await button(page, "Repair — cover them too"))?.click();
+    await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "changes_push_coverage").length > n, { timeout: 4000 }, before).catch(() => null);
+    ok("  after Repair the coverage is read again, though this repository's own state is unchanged", (await reads()) > before, `${before} -> ${await reads()}`);
+    await page.close();
+  }
+  {
+    // A submodule's lock layers drifted: Repair does need the administrator, and says so.
+    const cov = { mode: "locked", submodules: [{ path: "stock", blocked: true, locked: true, needs_repair: false, covered: false, why: "its lock needs repair", by_superproject: true, drift: ["stanza-stale"] }], uncovered: ["stock"], needs_repair: true, needs_elevation: true, summary: "Not covering 1 of 1 submodule: stock (its lock needs repair)." };
+    const page = await open(SCENARIOS.locked, { pushCoverage: cov });
+    await page.waitForFunction(() => document.body.innerText.includes("Not covering"), { timeout: 4000 }).catch(() => null);
+    ok("a submodule whose lock layers drifted is offered Repair with the administrator prompt named", await page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Repair — cover them too (administrator prompt)")));
+    await page.close();
+  }
+  {
+    // Repair that could not cover everything says so in amber, never a green "in place".
+    const cov = { mode: "locked", submodules: [{ path: "stock", blocked: true, locked: true, needs_repair: false, covered: false, why: "its lock needs repair", by_superproject: true, drift: ["stanza-stale"] }], uncovered: ["stock"], needs_repair: true, needs_elevation: true, summary: "Not covering 1 of 1 submodule: stock (its lock needs repair)." };
+    const message = "Repaired 1 repository. Not covering 1 of 1 submodule: stock (its lock needs repair).";
+    const page = await open(SCENARIOS.locked, { pushCoverage: cov, repairLockResult: { outcome: "incomplete", message } });
+    await page.waitForFunction(() => document.body.innerText.includes("Not covering"), { timeout: 4000 }).catch(() => null);
+    await (await button(page, "Repair — cover them too"))?.click();
+    await page.waitForFunction((m) => document.body.innerText.includes(m), { timeout: 4000 }, message).catch(() => null);
+    const box = await page.evaluate((m) => [...document.querySelectorAll("div")].reverse().find((d) => d.innerText.trim().startsWith(m.slice(0, 20)) && d.className.includes("rounded-lg border"))?.className ?? "", message);
+    ok("a Repair that left a submodule uncovered says so in amber, not as done", box.includes("amber") && !box.includes("emerald"), box);
+    await page.close();
   }
   {
     const page = await open(SCENARIOS.blocked);
