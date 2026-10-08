@@ -8,7 +8,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace]
-members = ["lock-core", "lock-helper", "git-shim"]
+members = ["lock-core", "lock-helper", "git-shim", "sidecars"]
 default-members = [".", "lock-core", "lock-helper", "git-shim"]
 
 [lib]
@@ -36,6 +36,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-deep-link = "2"
 gitswitch-lock-core = { path = "lock-core" }
 
 # A real terminal needs a real pty: wezterm's crate wraps unix ptys and
@@ -44,6 +45,11 @@ portable-pty = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# A second launch (a gitswitch:// link opened while the app runs) hands its
+# link to the running app instead of starting another.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

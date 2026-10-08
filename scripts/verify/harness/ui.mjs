@@ -90,7 +90,9 @@ async function openPage(browser, server, scenario, opts = {}) {
     /** {[cmd]: {code, message, guidance}} — that command answers with a refusal. */
     refuse: opts.refuse ?? {},
     autostash: opts.autostash ?? false,
-    treeReset: TREE_RESET_OUTCOME,
+    treeReset: opts.treeReset ?? TREE_RESET_OUTCOME,
+    /** The tree outcome changes_create_branch answers with (null: none). */
+    createBranchTree: opts.createBranchTree ?? null,
     stashDrop: STASH_DROP_OUTCOME,
     branchDelete: BRANCH_DELETE_OUTCOME,
     latency: Number(opts.latency ?? process.env.UI_LATENCY ?? 0) || 0,
@@ -190,6 +192,8 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(cfg.stashDetail);
             case "changes_reset":
               return done("Reset main to origin/main.", args.repoPath).then((r) => ({ ...r, tree: cfg.treeReset }));
+            case "changes_create_branch":
+              return done("create_branch ok", args.repoPath).then((r) => (cfg.createBranchTree ? { ...r, tree: cfg.createBranchTree } : r));
             case "changes_stash_drop":
               return done("Dropped stash@{0}.", args.repoPath).then((r) => ({ ...r, stash: cfg.stashDrop }));
             case "changes_delete_branch":
@@ -256,6 +260,7 @@ async function openPage(browser, server, scenario, opts = {}) {
               if (cfg.subPushResult && args.repoPath !== window.__SCENARIO__.path) return Promise.resolve({ ...cfg.subPushResult, status: statusFor(args.repoPath) });
               return done("Done.");
             case "changes_submodule_update":
+            case "changes_submodule_align":
             case "changes_lfs_pull":
             case "changes_lfs_pull_paths":
               if (cfg.hang) return new Promise(() => {}); // never settles
@@ -312,7 +317,6 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "changes_discard":
             case "changes_abort":
             case "changes_switch_branch":
-            case "changes_create_branch":
             case "changes_rename_branch":
             case "changes_undo_commit":
             case "changes_resolve_side":
@@ -395,6 +399,14 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve({ ...window.__SCENARIO__.push, needs_repair: false });
             case "history_fetch":
               return Promise.resolve({ ok: true, message: "fetched" });
+            case "doctor_check_environment":
+            case "doctor_check_profiles":
+            case "doctor_check_repos":
+            case "doctor_check_keys":
+            case "doctor_check_push_locks":
+              return Promise.resolve([]);
+            case "doctor_check_repo_access":
+              return Promise.resolve([{ id: "remote-not-reachable:/work/app", severity: "warning", title: "@octo cannot see acme/app", detail: "GitHub answered for @octo: not found, with the repo scope.", fix: null, fix_label: null }]);
             default:
               return Promise.resolve(null);
           }
@@ -1723,7 +1735,7 @@ try {
     ok("a capped untracked count is shown as a floor", s.includes("2000+ untracked files"));
     ok("a clean submodule says it is up to date", s.includes("up to date with what this repo records"));
     ok("recorded and checked-out commits are both shown", s.includes("dceaf0b") && s.includes("d9b93c5"));
-    ok("uninitialised ones are grouped, not listed 27 times", s.includes("27 not downloaded yet"));
+    ok("gitlinks with no address in .gitmodules are not called missing — no clone can download them", !s.includes("not downloaded yet") && s.includes("27 other submodule entries have no address in .gitmodules"));
     ok("  and it says git cannot fetch them", s.includes("fetch them"));
     await clickInRow(page, "trinity", { text: "Show what changed" });
     await sleep(300);
@@ -1795,7 +1807,9 @@ try {
   {
     // A detached submodule offers a branch at its checkout, named by the person; a recorded commit no remote has is marked on the row.
     const detached = sub({ path: "trinity", name: "trinity", own_branch: null, own_upstream: null, own_unpushed: 2, recorded_on_remote: false, summary: "up to date with what this repo records; detached" });
-    const page = await open(SCENARIOS.submodules, { submodules: [detached], subInner: SUB_INNER });
+    // The switch leaves a submodule nested in trinity elsewhere: the result is trinity's.
+    const createBranchTree = { ...TREE_RESET_OUTCOME, op: "create-branch", dropped: [], dropped_total: 0, backup: null, stash: null, recovery: null, submodule_mismatch: ["inner"] };
+    const page = await open(SCENARIOS.submodules, { submodules: [detached], subInner: SUB_INNER, createBranchTree });
     await page.waitForFunction(() => document.body.innerText.includes("Start a branch here"), { timeout: 4000 });
     const s = await text(page);
     ok("a detached submodule's row offers Start a branch here", s.includes("Start a branch here"));
@@ -1807,6 +1821,11 @@ try {
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_branch"), { timeout: 4000 });
     const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_branch").args);
     ok("  Enter creates the branch at the submodule's checkout and switches to it", call.repoPath === "/repos/gitswitch/trinity" && call.name === "fix/pointer" && call.from === null && call.switchTo === true, JSON.stringify(call));
+    await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Align submodules"), { timeout: 4000 }).catch(() => null);
+    await (await button(page, "Align submodules"))?.click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_align"), { timeout: 4000 }).catch(() => null);
+    const al = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_align").at(-1)?.args ?? null);
+    ok("  a submodule left elsewhere inside it is aligned there, not in the page's repository", al?.repoPath === "/repos/gitswitch/trinity" && JSON.stringify(al?.paths) === '["inner"]', JSON.stringify(al));
     await page.close();
   }
   {
@@ -1898,6 +1917,36 @@ try {
     await page.close();
   }
   {
+    // A submodule on a branch of its own with no upstream: its commits rebased onto its remote's latest.
+    const own = sub({ path: "solo", name: "solo", own_branch: "mine", own_upstream: null, latest_ref: "origin/main", summary: "on mine" });
+    const page = await open(SCENARIOS.submodules, { submodules: [...SUBMODULES, own], subInner: SUB_INNER });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    ok("a submodule on a branch without that upstream offers Rebase onto <remote>/<branch>", await clickInRow(page, "solo", { text: "Rebase onto origin/main" }));
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_pull"), { timeout: 4000 }).catch(() => null);
+    const pl = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_pull").at(-1)?.args ?? null);
+    ok("  which rebases inside the submodule onto that branch", pl?.repoPath === "/repos/gitswitch/solo" && pl?.mode === "rebase" && pl?.source === "origin/main", JSON.stringify(pl));
+    await page.close();
+  }
+  {
+    // A checkout ahead of the record — a go-back left it there — can be put back on it.
+    const lagging = sub({ path: "lagging", name: "lagging", ahead: 0, behind: 3, state: "moved", actual: "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0", actual_short: "a0a0a0a", summary: "sits 3 commits behind what this repo records; on main" });
+    const page = await open(SCENARIOS.submodules, { submodules: [...SUBMODULES, lagging], subInner: SUB_INNER });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    const rowButtons = (path) =>
+      page.evaluate((p) => {
+        const row = [...document.querySelectorAll("li")].find((r) => r.innerText.includes(p));
+        return row ? [...row.querySelectorAll("button")].map((b) => b.innerText.trim()) : null;
+      }, path);
+    ok("the card's row ahead of the record also offers Check out <recorded>", (await rowButtons("trinity"))?.includes("Check out dceaf0b") === true, JSON.stringify(await rowButtons("trinity")));
+    ok("  one behind it offers Update to instead", !(await rowButtons("lagging"))?.some((b) => b.startsWith("Check out")), JSON.stringify(await rowButtons("lagging")));
+    ok("  one at the record offers neither", !(await rowButtons("delivery"))?.some((b) => b.startsWith("Check out")), JSON.stringify(await rowButtons("delivery")));
+    ok("Check out on trinity", await clickInRow(page, "trinity", { text: "Check out dceaf0b" }));
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_align"), { timeout: 4000 }).catch(() => null);
+    const al = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_align").at(-1)?.args ?? null);
+    ok("  checks out that one path, in the repository", al?.repoPath === "/repos/gitswitch" && JSON.stringify(al?.paths) === '["trinity"]', JSON.stringify(al));
+    await page.close();
+  }
+  {
     const page = await open(SCENARIOS.submodules, { submodules: SUBMODULES, subInner: SUB_INNER });
     await page.waitForFunction(() => document.body.innerText.includes("2000+"), { timeout: 4000 });
     await clickInRow(page, "staging", { text: "Show what changed" });
@@ -1953,7 +2002,9 @@ try {
     const trinity = await rowButtons("trinity");
     ok("a submodule behind its own upstream offers Pull inside with the count", trinity?.includes("Pull inside (11)") === true, JSON.stringify(trinity));
     ok("  but not Update to: its checkout is ahead of the record", !trinity?.some((b) => b.startsWith("Update to")));
+    ok("  nor Rebase onto: its branch already follows origin/main", !trinity?.some((b) => b.startsWith("Rebase onto")), JSON.stringify(trinity));
     ok("  so it offers Record this pointer instead", trinity?.includes("Record this pointer") === true, JSON.stringify(trinity));
+    ok("  and Check out <recorded>, the way back to what the repository records", trinity?.includes("Check out dceaf0b") === true, JSON.stringify(trinity));
     const lag = await rowButtons("lagging");
     ok("a submodule behind the record offers Update to <recorded>", lag?.includes("Update to dceaf0b") === true, JSON.stringify(lag));
     ok("  and not Record this pointer: there is nothing ahead to record", !lag?.includes("Record this pointer"), JSON.stringify(lag));
@@ -1982,6 +2033,17 @@ try {
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_update"), { timeout: 4000 });
     const upd = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_update").at(-1).args);
     ok("  asks for that one path only, in the repository", upd.repoPath === "/repos/gitswitch" && JSON.stringify(upd.paths) === '["lagging"]', JSON.stringify(upd));
+    // The row's buttons are disabled while the update above settles.
+    await page.waitForFunction(() => {
+      const row = [...document.querySelectorAll("tr")].find((r) => r.innerText.includes("trinity"));
+      const b = row && [...row.querySelectorAll("button")].find((x) => x.innerText.trim() === "Check out dceaf0b");
+      return !!b && !b.disabled;
+    }, { timeout: 4000 }).catch(() => null);
+    ok("Check out on trinity", await clickInTr("trinity", "Check out dceaf0b"));
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_align"), { timeout: 4000 }).catch(() => null);
+    const al = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_align").at(-1)?.args ?? null);
+    ok("  checks out that one path, in the repository (never inside the submodule)", al?.repoPath === "/repos/gitswitch" && JSON.stringify(al?.paths) === '["trinity"]', JSON.stringify(al));
+    await page.waitForFunction(() => ![...document.querySelectorAll("button")].some((b) => b.disabled && b.innerText.trim() === "Work inside"), { timeout: 4000 }).catch(() => null);
     ok("Work inside on delivery", await clickInTr("delivery", "Work inside"));
     await sleep(400);
     ok("  makes it the scope and opens Changes", (await scope()) === "delivery" && (await page.evaluate(() => location.pathname)) === "/repo/changes", `${await scope()} ${await page.evaluate(() => location.pathname)}`);
@@ -3367,6 +3429,49 @@ try {
     await page.close();
   }
 
+  section("Doctor: the GitHub access check");
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Doctor"))?.click());
+    await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Check now"), { timeout: 4000 }).catch(() => null);
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Check now")?.click());
+    await page.waitForFunction(() => document.body.innerText.includes("@octo cannot see acme/app"), { timeout: 4000 }).catch(() => null);
+    ok("Doctor's access check lists what it found", (await text(page)).includes("@octo cannot see acme/app"));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Run checks")?.click());
+    await sleep(700);
+    ok("  a re-run of the other checks keeps it", (await text(page)).includes("@octo cannot see acme/app"));
+    ok("  and the access check can be run again", (await page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Check again"))) === true);
+    await page.close();
+  }
+
+  section("A gitswitch:// link that started the app");
+  {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
+    await page.evaluateOnNewDocument(() => {
+      window.__CALLS__ = [];
+      localStorage.clear();
+      window.__TAURI_INTERNALS__ = {
+        transformCallback: () => 1,
+        invoke: async (cmd, args) => {
+          window.__CALLS__.push({ cmd, args });
+          if (cmd === "plugin:event|listen") return 1;
+          // The link came before the page listened: the backend kept it.
+          if (cmd === "deep_link_take") return "/doctor";
+          if (cmd === "get_profiles" || cmd.startsWith("doctor_check")) return [];
+          return null;
+        },
+      };
+    });
+    await page.goto(`${server.url}/`, { waitUntil: "networkidle0" });
+    await page.waitForFunction(() => location.pathname === "/doctor", { timeout: 4000 }).catch(() => null);
+    const where = await page.evaluate(() => location.pathname);
+    ok("a link that started the app opens the page it names", where === "/doctor", where);
+    const order = await page.evaluate(() => window.__CALLS__.map((c) => c.cmd).filter((c) => c === "plugin:event|listen" || c === "deep_link_take"));
+    ok("  collected once the page listens, so a link after that is not missed either", order.join(",") === "plugin:event|listen,deep_link_take", order.join(","));
+    await page.close();
+  }
+
   section("Clone page: Git LFS option");
   const CLONED_LFS = {
     path: "/repos/big-data",
@@ -3771,6 +3876,21 @@ try {
     await page.close();
   }
   {
+    // A hard go-back that leaves a submodule ahead of the record offers to put it back.
+    const page = await open(SCENARIOS.diverged, { treeReset: { ...TREE_RESET_OUTCOME, submodule_mismatch: ["trinity"] } });
+    await (await button(page, "Reset to origin/main…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Reset to origin/main?"), { timeout: 4000 });
+    await (await button(page, "Reset")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Align submodules checks out"), { timeout: 4000 }).catch(() => null);
+    ok("a go-back that leaves a submodule elsewhere names it and says what Align submodules does", (await text(page)).includes("trinity sits at a commit other than what this repository records. Align submodules checks out the commit it records"));
+    ok("  and offers the button", (await buttonState(page, "Align submodules"))?.disabled === false);
+    await (await button(page, "Align submodules")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_align"), { timeout: 4000 }).catch(() => null);
+    const al = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_align").at(-1)?.args ?? null);
+    ok("  which checks out the named submodules, in the repository", al?.repoPath === "/repos/gitswitch" && JSON.stringify(al?.paths) === '["trinity"]', JSON.stringify(al));
+    await page.close();
+  }
+  {
     const page = await open({ ...SCENARIOS.diverged, entries: SCENARIOS.dirty.entries, staged_count: 2, unstaged_count: 3, untracked_count: 1 });
     await (await button(page, "Reset to origin/main…")).click();
     await page.waitForFunction(() => document.body.innerText.includes("Reset to origin/main?"), { timeout: 4000 });
@@ -4098,7 +4218,27 @@ try {
   {
     const page = await open(SCENARIOS.syncPausedInSub);
     const row = await rowWith(page, "both modified");
-    ok("a conflicted gitlink row has no side buttons (the sync finishes it)", row !== null && !row.buttons.some((b) => b.title.startsWith("Keep mine") || b.title.startsWith("Take theirs")));
+    ok("a conflicted gitlink row with no commit named for either side has no side buttons", row !== null && !row.buttons.some((b) => b.title.startsWith("Keep mine") || b.title.startsWith("Take theirs")));
+    await page.close();
+  }
+  {
+    // A conflicted submodule pointer whose sides the status names: Keep mine / Take theirs move it there.
+    const pointer = {
+      ...SCENARIOS.conflicted.entries[0],
+      path: "vendor/lib",
+      is_submodule: true,
+      stage_modes: ["160000", "160000", "160000"],
+      stage_oids: ["a".repeat(40), "b".repeat(40), "c".repeat(40)],
+      pointer_mine: "b".repeat(40),
+      pointer_theirs: "c".repeat(40),
+    };
+    const page = await open({ ...SCENARIOS.conflicted, entries: [...SCENARIOS.conflicted.entries, pointer], conflicted_count: 2 });
+    const row = await rowWith(page, "vendor/lib");
+    ok("a conflicted submodule pointer offers Keep mine and Take theirs, naming the commit each records", row !== null && row.buttons.some((b) => b.title.startsWith("Keep mine (main): vendor/lib at bbbbbbb")) && row.buttons.some((b) => b.title.startsWith("Take theirs (the branch being merged in): vendor/lib at ccccccc")), JSON.stringify(row?.buttons));
+    await clickInRow(page, "vendor/lib", { text: "Take theirs" });
+    await sleep(300);
+    const th = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_resolve_side").at(-1));
+    ok("  Take theirs resolves that pointer with theirs", th?.args?.paths?.length === 1 && th.args.paths[0] === "vendor/lib" && th.args.side === "theirs", JSON.stringify(th?.args));
     await page.close();
   }
   {

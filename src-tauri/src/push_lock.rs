@@ -1121,9 +1121,20 @@ async fn lock_op_for(repo_path: &str) -> Result<Op, AppError> {
 /// locked yet — the lock reaches the repositories the code lives in. One
 /// whose path the helper cannot carry is left out (coverage names it).
 async fn submodule_lock_ops(repo_path: &str) -> Vec<Op> {
+    submodule_lock_ops_in(repo_path, None).await
+}
+
+/// The lock ops for the populated submodules — all of them, or only the
+/// named ones and what is nested under them.
+async fn submodule_lock_ops_in(repo_path: &str, only: Option<&[String]>) -> Vec<Op> {
     let repo = Path::new(repo_path);
     let mut ops = Vec::new();
     for rel in push_guard::populated_submodules(repo).await {
+        if let Some(only) = only {
+            if !only.iter().any(|p| rel == *p || rel.starts_with(&format!("{}/", p))) {
+                continue;
+            }
+        }
         let dir = repo.join(&rel);
         let dir_s = dir.to_string_lossy().to_string();
         if lc::validate_path(&canonical(&dir)).is_err() {
@@ -1139,6 +1150,54 @@ async fn submodule_lock_ops(repo_path: &str) -> Vec<Op> {
         }
     }
     ops
+}
+
+/// Every populated submodule among `only` (and those nested in them) already
+/// locked, with nothing for the helper to repair — and at least one of them.
+async fn every_lock_kept(repo_path: &str, only: &[String]) -> bool {
+    let repo = Path::new(repo_path);
+    let mut seen = 0;
+    for rel in push_guard::populated_submodules(repo).await {
+        if !only.iter().any(|p| rel == *p || rel.starts_with(&format!("{}/", p))) {
+            continue;
+        }
+        seen += 1;
+        match crate::git_status::push_state_for(&repo.join(&rel).to_string_lossy()).await {
+            Ok(s) if s.lock.locked && !s.lock.needs_elevation => {}
+            _ => return false,
+        }
+    }
+    seen > 0
+}
+
+/// A submodule downloaded under a locked repository gets the lock itself —
+/// one job, one administrator prompt, nested ones included — so it cannot be
+/// unblocked from a terminal without the password either. Its guard-rail and
+/// the superproject's mark come first (cover_submodules); this adds the lock.
+pub async fn lock_downloaded_submodules(repo_path: &str, fresh: &[String]) -> JobOutcome {
+    let ops = submodule_lock_ops_in(repo_path, Some(fresh)).await;
+    if ops.is_empty() {
+        // Nothing to do because each of them already carries the lock (its
+        // module directory kept it from an earlier download): they are locked.
+        if every_lock_kept(repo_path, fresh).await {
+            return JobOutcome::simple("applied", "already locked");
+        }
+        return JobOutcome::simple("skipped", "the lock cannot carry these paths");
+    }
+    let repos = op_repos(&ops);
+    let out = run_job(ops).await;
+    if out.applied() {
+        log_submodule_events(&repos, &canonical(Path::new(repo_path)), "locked", "locked when downloaded");
+    } else if out.outcome == "manual-required" {
+        // Nothing on this path can say "I ran it": the job is dropped, and
+        // Repair hands over its own command.
+        if let (Some(dir), Some(nonce)) = (jobs_dir(), out.job_nonce.as_deref()) {
+            let job = dir.join(format!("{}.json", nonce));
+            let _ = fs::remove_file(result_path_for(&job));
+            let _ = fs::remove_file(&job);
+        }
+    }
+    out
 }
 
 /// The repositories of a job's lock ops — the submodules a superproject's job

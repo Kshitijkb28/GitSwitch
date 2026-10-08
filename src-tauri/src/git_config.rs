@@ -248,7 +248,28 @@ fn push_block_section() -> &'static str {
 
 /// Everything one folder profile's include file says. Pure, so a test can
 /// hand it to `git config -f` and check git reads back what was meant.
-fn profile_gitconfig_content(profile: &Profile) -> String {
+/// The default profile's part of ~/.gitconfig: identity, key, and signing —
+/// signing applies wherever no folder or remote-rule profile does.
+fn default_section(p: &Profile) -> String {
+    let mut s = user_section(p);
+    s.push('\n');
+    if let Some(ref key_path) = p.ssh_key_path {
+        s.push_str(&format!("[core]\n\tsshCommand = {}\n\n", config_value(&ssh_command_for(key_path))));
+    }
+    if let Some(block) = crate::signing::signing_config_block(p) {
+        s.push_str(&block);
+        s.push('\n');
+    }
+    s
+}
+
+/// Whether the default profile signs: a profile that does not then has to
+/// say so, or its commits would be signed with the default's key.
+fn default_signs(profiles: &[Profile]) -> bool {
+    profiles.iter().any(|p| p.is_default && crate::signing::signing_config_block(p).is_some())
+}
+
+fn profile_gitconfig_content(profile: &Profile, default_signs: bool) -> String {
     let mut content = user_section(profile);
 
     if let Some(ref key_path) = profile.ssh_key_path {
@@ -262,19 +283,25 @@ fn profile_gitconfig_content(profile: &Profile) -> String {
         content.push_str(push_block_section());
     }
 
-    if let Some(block) = crate::signing::signing_config_block(profile) {
-        content.push_str(&block);
+    match crate::signing::signing_config_block(profile) {
+        Some(block) => content.push_str(&block),
+        // Not signing here, while the default does everywhere else: its
+        // signing off, and git's own signing format back (openpgp), so a
+        // repository that signs with its own GPG key still can, and a stray
+        // `-S` fails loudly instead of signing with the default's key.
+        None if default_signs => content.push_str("[gpg]\n\tformat = openpgp\n[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n"),
+        None => {}
     }
     content
 }
 
-fn write_profile_gitconfig(profile: &Profile) -> Result<(), AppError> {
+fn write_profile_gitconfig(profile: &Profile, default_signs: bool) -> Result<(), AppError> {
     let data_dir = dirs::data_dir().ok_or(AppError::Config("Cannot find data dir".into()))?;
     let config_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
     fs::create_dir_all(&config_dir)?;
 
     let path = config_dir.join(format!("{}.gitconfig", profile.id));
-    fs::write(&path, profile_gitconfig_content(profile))?;
+    fs::write(&path, profile_gitconfig_content(profile, default_signs))?;
     Ok(())
 }
 
@@ -284,9 +311,10 @@ fn write_profile_gitconfig(profile: &Profile) -> Result<(), AppError> {
 /// being saved again. ~/.gitconfig itself is not touched.
 pub fn refresh_profile_includes() -> Result<(), AppError> {
     let store = load_profiles()?;
+    let signs = default_signs(&store.profiles);
     for profile in &store.profiles {
         if !profile.directories.is_empty() || !profile.remote_patterns.is_empty() {
-            write_profile_gitconfig(profile)?;
+            write_profile_gitconfig(profile, signs)?;
         }
     }
     Ok(())
@@ -314,15 +342,7 @@ pub fn apply_git_config() -> Result<(), AppError> {
     new_content.push_str("\n# >>> GitSwitch managed (DO NOT EDIT) >>>\n");
 
     if let Some(default_profile) = store.profiles.iter().find(|p| p.is_default) {
-        new_content.push_str(&user_section(default_profile));
-        new_content.push('\n');
-
-        if let Some(ref key_path) = default_profile.ssh_key_path {
-            new_content.push_str(&format!(
-                "[core]\n\tsshCommand = {}\n\n",
-                config_value(&ssh_command_for(key_path))
-            ));
-        }
+        new_content.push_str(&default_section(default_profile));
 
         // Intentionally NO push-block here: a block in the main config would
         // apply to every folder, and a folder profile could only undo it with a
@@ -330,9 +350,10 @@ pub fn apply_git_config() -> Result<(), AppError> {
         // profile always allows pushes.
     }
 
+    let signs = default_signs(&store.profiles);
     for profile in &store.profiles {
         if !profile.directories.is_empty() || !profile.remote_patterns.is_empty() {
-            write_profile_gitconfig(profile)?;
+            write_profile_gitconfig(profile, signs)?;
         }
     }
     new_content.push_str(&build_includeif_blocks(&store.profiles));
@@ -535,7 +556,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gitswitch-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("p.gitconfig");
-        std::fs::write(&file, profile_gitconfig_content(&p)).unwrap();
+        std::fs::write(&file, profile_gitconfig_content(&p, false)).unwrap();
 
         assert_eq!(git_reads(&file, "user.name").as_deref(), Some(p.git_name.as_str()));
         assert_eq!(git_reads(&file, "user.email").as_deref(), Some(p.git_email.as_str()));
@@ -609,5 +630,47 @@ mod tests {
         assert!(s.contains("\tpushInsteadOf = \"\"\n"));
         // …but never fetches (a plain insteadOf would break pull/clone).
         assert!(!s.contains("\tinsteadOf"));
+    }
+}
+
+#[cfg(test)]
+mod default_signing_tests {
+    use super::*;
+
+    fn prof(id: &str, default: bool, signs: bool, key: Option<&str>) -> Profile {
+        use chrono::Utc;
+        Profile {
+            id: id.into(),
+            name: id.into(),
+            git_name: "n".into(),
+            git_email: "e@x.test".into(),
+            ssh_key_path: key.map(String::from),
+            is_default: default,
+            allow_push: true,
+            signing_enabled: signs,
+            remote_patterns: Vec::new(),
+            github_login: None,
+            directories: vec!["/w".into()],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_signing_default_signs_where_no_other_profile_applies() {
+        let d = prof("d", true, true, Some("/k/id"));
+        let s = default_section(&d);
+        assert!(s.contains("gpgsign = true") && s.contains("format = ssh") && s.contains("/k/id.pub"), "{s}");
+        assert!(default_signs(&[d]));
+    }
+
+    #[test]
+    fn a_profile_that_does_not_sign_says_so_only_under_a_signing_default() {
+        let p = prof("p", false, false, None);
+        assert!(profile_gitconfig_content(&p, true).contains("gpgsign = false"));
+        assert!(profile_gitconfig_content(&p, true).contains("[gpg]\n\tformat = openpgp"), "a non-signing profile takes git's own signing format back");
+        assert!(!profile_gitconfig_content(&p, false).contains("gpgsign"));
+        let signer = prof("s", false, true, Some("/k/s"));
+        assert!(profile_gitconfig_content(&signer, true).contains("gpgsign = true"));
     }
 }

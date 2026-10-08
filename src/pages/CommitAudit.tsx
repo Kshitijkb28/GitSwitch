@@ -196,12 +196,11 @@ export function CommitAudit() {
                   </>
                 )}
               </Button>
-              {a.unpushed_count > 0 && (
+              {a.unpushed_count > 0 && !a.fix_blocker && (
                 <Button
                   size="sm"
                   onClick={() => setConfirmFix(a)}
-                  disabled={busy !== null || a.dirty}
-                  title={a.dirty ? "Commit or stash your changes first" : undefined}
+                  disabled={busy !== null}
                 >
                   {busy === a.path ? (
                     <>
@@ -231,11 +230,13 @@ export function CommitAudit() {
                 >
                   {c.author_email}
                 </span>
-                <span className="shrink-0">
+                <span className="shrink-0 inline-flex items-center gap-1">
                   {c.pushed ? (
                     <Badge variant="default">pushed</Badge>
-                  ) : (
+                  ) : c.on_head ? (
                     <Badge variant="warning">local</Badge>
+                  ) : (
+                    <Badge variant="warning">on {c.branches?.[0] ?? "another branch"}</Badge>
                   )}
                 </span>
               </div>
@@ -247,6 +248,33 @@ export function CommitAudit() {
             )}
           </div>
 
+          {a.unpushed_count > 0 && a.fix_blocker && (
+            <div className="mt-3 flex items-start gap-2 flex-wrap">
+              <p className="text-xs text-amber-300/90 break-words flex-1 min-w-0">{a.fix_blocker}</p>
+              {a.fix_blocker.includes("user.email") && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={async () => {
+                    try {
+                      await api.doctorUnsetLocal(a.path, "user.email");
+                      await scan();
+                    } catch (e) {
+                      setError(String(e));
+                    }
+                  }}
+                >
+                  Remove this repository's user.email
+                </Button>
+              )}
+            </div>
+          )}
+          {a.other_branch_count > 0 && (
+            <p className="text-xs text-zinc-500 mt-3">
+              {a.other_branch_count} of these {a.other_branch_count === 1 ? "is" : "are"} on another
+              branch — check it out to fix {a.other_branch_count === 1 ? "it" : "them"} there.
+            </p>
+          )}
           {a.pushed_count > 0 && (
             <p className="text-xs text-zinc-600 mt-3">
               {a.pushed_count} of these {a.pushed_count === 1 ? "is" : "are"} already

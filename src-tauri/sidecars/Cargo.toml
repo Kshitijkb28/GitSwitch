@@ -1,0 +1,8 @@
+[package]
+name = "gitswitch-sidecars"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Builds GitSwitch's sidecar binaries where Tauri expects them, on every OS and shell"
+
+[dependencies]

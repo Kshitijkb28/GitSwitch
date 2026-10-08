@@ -607,9 +607,10 @@ export function Repo() {
         }}
         onInitialise={(paths) => runHere((a) => a.initialise(sel.effectivePath, paths))}
         onRecordPointers={() => runHere((a) => a.recordPointers(sel.effectivePath))}
-        onPullInside={(s) => runHere((a) => a.pullInside(sel.effectivePath, s))}
+        onPullInside={(s, source) => runHere((a) => a.pullInside(sel.effectivePath, s, source))}
         onUpdateOne={(p) => runHere((a) => a.updateOne(sel.effectivePath, p))}
         onRecordOne={(p) => runHere((a) => a.recordOne(sel.effectivePath, p))}
+        onAlignOne={(p) => runHere((a) => a.alignOne(sel.effectivePath, p))}
         onStartBranch={(p, name) => runHere((a) => a.startBranch(sel.effectivePath, p, name))}
         onPreview={() => {
           // The whole repository is what updates; the drawer is opened for it

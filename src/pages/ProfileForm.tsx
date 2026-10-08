@@ -674,6 +674,7 @@ export function ProfileForm() {
                           <p className="text-zinc-500 font-mono break-all">
                             {r.changed ? r.new_url : r.note}
                           </p>
+                          {r.changed && <p className="text-zinc-600 break-words">{r.note}</p>}
                         </div>
                       </div>
                     ))
@@ -805,7 +806,8 @@ export function ProfileForm() {
               </span>
               <span className="block text-xs text-zinc-500 mt-0.5">
                 Sets <span className="font-mono">gpg.format=ssh</span> and{" "}
-                <span className="font-mono">commit.gpgsign</span> for these folders, and
+                <span className="font-mono">commit.gpgsign</span>{" "}
+                {isDefaultProfile ? "wherever no other profile's folder or remote rule applies" : "for these folders"}, and
                 keeps <span className="font-mono">~/.ssh/allowed_signers</span> in sync so
                 signatures verify locally too.
               </span>

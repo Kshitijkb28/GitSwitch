@@ -17,6 +17,11 @@ pub struct CommitInfo {
     pub subject: String,
     /// Already on the remote — rewriting it would need a force-push.
     pub pushed: bool,
+    /// The local branches holding it, when no remote-tracking branch does.
+    #[serde(default)]
+    pub branches: Vec<String>,
+    /// On the checked-out branch: what Fix rewrites.
+    pub on_head: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -34,6 +39,10 @@ pub struct RepoAudit {
     pub dirty: bool,
     /// "none" | "gitswitch" | "foreign"
     pub guard: String,
+    /// Wrong commits of yours on other local branches: check one out to fix them.
+    pub other_branch_count: usize,
+    /// Why Fix cannot run here right now, when it cannot.
+    pub fix_blocker: Option<String>,
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
@@ -67,6 +76,141 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn git_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
+    let started = std::time::Instant::now();
+    let mut cmd = crate::spawn::command("git");
+    cmd.arg("-C").arg(repo).args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().map_err(|e| format!("failed to run git: {}", e))?;
+    crate::cmdlog::record(
+        repo,
+        ["git", "-C", &repo.to_string_lossy()].iter().map(|a| a.to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
+        out.status.code().unwrap_or(-1),
+        started.elapsed(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    );
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// One commit's facts, as `log --format=%H%x1f%h%x1f%an%x1f%ae%x1f%ce%x1f%cI%x1f%s` gives them.
+struct Facts {
+    hash: String,
+    short: String,
+    author_name: String,
+    author_email: String,
+    committer_email: String,
+    date: String,
+    subject: String,
+}
+
+const FACTS_FORMAT: &str = "--format=%H%x1f%h%x1f%an%x1f%ae%x1f%ce%x1f%cI%x1f%s";
+
+fn parse_facts(out: &str) -> Vec<Facts> {
+    out.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split('\x1f').collect();
+            (f.len() >= 7).then(|| Facts {
+                hash: f[0].into(),
+                short: f[1].into(),
+                author_name: f[2].into(),
+                author_email: f[3].into(),
+                committer_email: f[4].into(),
+                date: f[5].into(),
+                subject: f[6..].join("\x1f"),
+            })
+        })
+        .collect()
+}
+
+/// The commits no remote-tracking branch has — on HEAD and on each local
+/// branch, 500 per ref at most — each with the local branches holding it and
+/// whether HEAD does, in HEAD's order first. With no remote-tracking ref at
+/// all, nothing has been published: every commit counts.
+fn local_only(repo: &Path) -> Vec<(String, Vec<String>, bool)> {
+    let mut out: Vec<(String, Vec<String>, bool)> = Vec::new();
+    // By full ref name — a short one can also be a file of the same name — and
+    // never GitSwitch's own backups: they keep what was there before a Fix, an
+    // Update or a reset, which is the point of them, not work to list again.
+    let branches: Vec<(String, String)> = git(repo, &["for-each-ref", "--format=%(refname)", "refs/heads"])
+        .map(|s| {
+            s.lines()
+                .filter_map(|full| full.strip_prefix("refs/heads/").map(|name| (full.to_string(), name.to_string())))
+                .filter(|(_, name)| !crate::git_history::is_safety_branch(name))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (rev, name) in std::iter::once(("HEAD".to_string(), String::new())).chain(branches) {
+        let Ok(list) = git(repo, &["rev-list", "-n", "500", &rev, "--not", "--remotes", "--"]) else { continue };
+        for h in list.lines().filter(|h| !h.is_empty()) {
+            let i = match out.iter().position(|(x, _, _)| x == h) {
+                Some(i) => i,
+                None => {
+                    out.push((h.to_string(), Vec::new(), false));
+                    out.len() - 1
+                }
+            };
+            if rev == "HEAD" {
+                out[i].2 = true;
+            } else if !out[i].1.contains(&name) {
+                out[i].1.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+fn details(repo: &Path, hashes: &[String]) -> Vec<Facts> {
+    let mut out = Vec::new();
+    for chunk in hashes.chunks(200) {
+        let mut args: Vec<&str> = vec!["log", "--no-walk=unsorted", FACTS_FORMAT];
+        args.extend(chunk.iter().map(String::as_str));
+        if let Ok(o) = git(repo, &args) {
+            out.extend(parse_facts(&o));
+        }
+    }
+    out
+}
+
+/// A local commit is yours, made under the wrong identity, when its author is
+/// not the profile's address and either the same person committed it (a
+/// commit made under a misconfigured identity) or the author is one of your
+/// profiles' addresses. A teammate's commit cherry-picked or merged here has
+/// the teammate as author and someone else as committer: never yours.
+/// `made`: the commits created in this repository (see `made_here`) — the
+/// same person as author and committer is yours only if you made it here: a
+/// contributor's commits fetched straight into a branch (a pull request
+/// checked out) have that shape too.
+fn own_wrong(f: &Facts, expected: &str, own_emails: &[String], made: &std::collections::HashSet<String>) -> bool {
+    !f.author_email.eq_ignore_ascii_case(expected)
+        && ((f.author_email.eq_ignore_ascii_case(&f.committer_email) && made.contains(&f.hash)) || own_emails.iter().any(|e| e.eq_ignore_ascii_case(&f.author_email)))
+}
+
+/// The commits created in this repository — by a commit, an amend, a merge, a
+/// cherry-pick, a revert, an am, or a rebase's replay — read from its
+/// reflogs. A commit that only arrived (fetched, checked out, fast-forwarded,
+/// reset to) is not among them.
+fn made_here(repo: &Path) -> std::collections::HashSet<String> {
+    git(repo, &["log", "-g", "--all", "--format=%H%x1f%gs"])
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once('\x1f'))
+        .filter(|(_, gs)| {
+            gs.starts_with("commit")
+                || gs.starts_with("cherry-pick")
+                || gs.starts_with("revert")
+                || gs.starts_with("am:")
+                || ((gs.starts_with("rebase") || gs.starts_with("pull")) && ["(pick)", "(reword)", "(edit)", "(squash)", "(fixup)"].iter().any(|k| gs.contains(k)))
+        })
+        .map(|(h, _)| h.to_string())
+        .collect()
 }
 
 /// The profile that owns a repo path — longest matching directory wins, which
@@ -135,56 +279,47 @@ fn audit_repo(
     let repo = PathBuf::from(repo_path);
     let profile = owning_profile(repo_path, profs)?;
     let expected_email = profile.git_email.trim().to_string();
-
-    // Which commits haven't been pushed yet? Those are always safe to rewrite.
     let has_upstream = git(&repo, &["rev-parse", "--abbrev-ref", "@{upstream}"]).is_ok();
-    let unpushed: Vec<String> = if has_upstream {
-        git(&repo, &["log", "@{upstream}..HEAD", "--format=%H"])
-            .map(|s| s.lines().map(str::to_string).collect())
-            .unwrap_or_default()
-    } else {
-        // No upstream: nothing has been published from this branch.
-        git(&repo, &["log", "--format=%H", "-n", "500"])
-            .map(|s| s.lines().map(str::to_string).collect())
-            .unwrap_or_default()
-    };
-
-    let log = git(
-        &repo,
-        &[
-            "log",
-            &format!("-n{}", MAX_COMMITS_PER_REPO),
-            "--format=%H\x1f%h\x1f%an\x1f%ae\x1f%cI\x1f%s",
-        ],
-    )
-    .ok()?;
 
     let mut mismatched = Vec::new();
-    for line in log.lines() {
-        let f: Vec<&str> = line.split('\x1f').collect();
-        if f.len() < 6 {
+    // Not on any remote: the wrong commits of yours, wherever they are.
+    let local = local_only(&repo);
+    let hashes: Vec<String> = local.iter().map(|(h, _, _)| h.clone()).collect();
+    let made = made_here(&repo);
+    for f in details(&repo, &hashes) {
+        if !own_wrong(&f, &expected_email, own_emails, &made) {
             continue;
         }
-        let (hash, short, an, ae, date, subject) = (f[0], f[1], f[2], f[3], f[4], f[5]);
-        if ae.eq_ignore_ascii_case(&expected_email) {
-            continue;
-        }
-        let is_unpushed = unpushed.iter().any(|h| h == hash);
-        // Only flag commits that are plausibly OURS: either not yet published,
-        // or authored with an email belonging to one of the user's profiles.
-        // Otherwise every teammate's commit would look like a mismatch.
-        let ours = is_unpushed || own_emails.iter().any(|e| e.eq_ignore_ascii_case(ae));
-        if !ours {
+        let (_, branches, on_head) = local.iter().find(|(h, _, _)| *h == f.hash).cloned().unwrap_or_default();
+        mismatched.push(CommitInfo {
+            hash: f.hash,
+            short: f.short,
+            author_name: f.author_name,
+            author_email: f.author_email,
+            date: f.date,
+            subject: f.subject,
+            pushed: false,
+            branches,
+            on_head,
+        });
+    }
+    // Already published: only commits authored with one of your profiles'
+    // addresses, among the checked-out branch's newest (a teammate's never).
+    let recent = git(&repo, &["log", &format!("-n{}", MAX_COMMITS_PER_REPO), FACTS_FORMAT]).unwrap_or_default();
+    for f in parse_facts(&recent) {
+        if hashes.contains(&f.hash) || f.author_email.eq_ignore_ascii_case(&expected_email) || !own_emails.iter().any(|e| e.eq_ignore_ascii_case(&f.author_email)) {
             continue;
         }
         mismatched.push(CommitInfo {
-            hash: hash.to_string(),
-            short: short.to_string(),
-            author_name: an.to_string(),
-            author_email: ae.to_string(),
-            date: date.to_string(),
-            subject: subject.to_string(),
-            pushed: !is_unpushed,
+            hash: f.hash,
+            short: f.short,
+            author_name: f.author_name,
+            author_email: f.author_email,
+            date: f.date,
+            subject: f.subject,
+            pushed: true,
+            branches: Vec::new(),
+            on_head: true,
         });
     }
 
@@ -195,6 +330,8 @@ fn audit_repo(
     let dirty = !git(&repo, &["status", "--porcelain"])
         .unwrap_or_default()
         .is_empty();
+    let unpushed_count = mismatched.iter().filter(|c| !c.pushed && c.on_head).count();
+    let fix_blocker = if unpushed_count > 0 { fix_plan(&repo, profile, own_emails).err() } else { None };
 
     Some(RepoAudit {
         repo_name: crate::paths::base_name(repo_path),
@@ -202,13 +339,105 @@ fn audit_repo(
         profile_name: profile.name.clone(),
         expected_name: profile.git_name.clone(),
         expected_email,
-        unpushed_count: mismatched.iter().filter(|c| !c.pushed).count(),
+        unpushed_count,
         pushed_count: mismatched.iter().filter(|c| c.pushed).count(),
+        other_branch_count: mismatched.iter().filter(|c| !c.pushed && !c.on_head).count(),
         mismatched,
         has_upstream,
         dirty,
         guard: guard_state(&repo),
+        fix_blocker,
     })
+}
+
+/// What a fix would rewrite: from `base` (None = the root) up to HEAD, the
+/// commits whose author is one of `wrong` re-authored, the rest replayed as
+/// they are.
+struct FixPlan {
+    base: Option<String>,
+    wrong: Vec<String>,
+    count: usize,
+}
+
+/// Whether the checked-out branch's wrong commits of yours can be rewritten
+/// now, and from where. Refused, with the reason in words: something in
+/// progress, uncommitted changes, git committing here as someone other than
+/// the profile (the fix would write that again), or a merge among them.
+fn fix_plan(repo: &Path, profile: &profiles::Profile, own_emails: &[String]) -> Result<FixPlan, String> {
+    for (marker, what) in [("rebase-merge", "a rebase"), ("rebase-apply", "a rebase"), ("MERGE_HEAD", "a merge"), ("CHERRY_PICK_HEAD", "a cherry-pick"), ("REVERT_HEAD", "a revert")] {
+        if let Ok(p) = git(repo, &["rev-parse", "--git-path", marker]) {
+            let p = if Path::new(&p).is_absolute() { PathBuf::from(&p) } else { repo.join(&p) };
+            if p.exists() {
+                return Err(format!("{} is in progress here — finish or abort it first.", what));
+            }
+        }
+    }
+    if !git(repo, &["status", "--porcelain"]).map_err(|e| e.to_string())?.is_empty() {
+        return Err("This repo has uncommitted changes. Commit or stash them first — rewriting history needs a clean working tree.".into());
+    }
+    let ident = git(repo, &["var", "GIT_COMMITTER_IDENT"]).unwrap_or_default();
+    let committing_as = ident.split_once('<').and_then(|(_, r)| r.split_once('>')).map(|(e, _)| e.trim().to_string()).unwrap_or_default();
+    if !committing_as.eq_ignore_ascii_case(profile.git_email.trim()) {
+        return Err(format!(
+            "git here commits as {}, not {}: re-authoring now would write {} again. Remove this repository's own user.email (Doctor: Remove the local setting) or fix the folder's profile, then try again.",
+            if committing_as.is_empty() { "nobody" } else { &committing_as },
+            profile.git_email.trim(),
+            if committing_as.is_empty() { "nothing" } else { &committing_as }
+        ));
+    }
+    // A branch that tracks one the remote has, with no remote-tracking branch
+    // for it here (a single-branch clone, a narrowed fetch): what the remote
+    // already has cannot be told, and a commit it has is never rewritten.
+    if let Ok(b) = git(repo, &["symbolic-ref", "-q", "--short", "HEAD"]) {
+        if git(repo, &["config", "--get", &format!("branch.{}.merge", b.trim())]).is_ok() && git(repo, &["rev-parse", "--verify", "-q", "@{upstream}"]).is_err() {
+            return Err("This branch's upstream has no remote-tracking branch here, so GitSwitch can't tell which commits the remote already has — fetch it (or widen remote.<name>.fetch) first.".into());
+        }
+    }
+    let local = local_only(repo);
+    let on_head: Vec<String> = local.iter().filter(|(_, _, h)| *h).map(|(h, _, _)| h.clone()).collect();
+    let made = made_here(repo);
+    let mut wrong_left: Vec<String> = details(repo, &on_head)
+        .into_iter()
+        .filter(|f| own_wrong(f, profile.git_email.trim(), own_emails, &made))
+        .map(|f| f.hash)
+        .collect();
+    if wrong_left.is_empty() {
+        return Err("Nothing to fix: no wrong commit of yours is on this branch.".into());
+    }
+    let count = wrong_left.len();
+    let wrong_emails: Vec<String> = {
+        let mut v: Vec<String> = details(repo, &wrong_left).into_iter().map(|f| f.author_email).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    // Newest to oldest along the first-parent line: the base is the parent of
+    // the oldest wrong commit; a merge met before then cannot be replayed.
+    let chain: Vec<String> = git(repo, &["rev-list", "--first-parent", "HEAD", "--not", "--remotes"])
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    let mut parents: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for chunk in chain.chunks(200) {
+        let mut args: Vec<&str> = vec!["log", "--no-walk=unsorted", "--format=%H %P"];
+        args.extend(chunk.iter().map(String::as_str));
+        for l in git(repo, &args).unwrap_or_default().lines() {
+            let mut w = l.split_whitespace();
+            if let Some(h) = w.next() {
+                parents.insert(h.to_string(), w.map(str::to_string).collect());
+            }
+        }
+    }
+    for c in &chain {
+        let ps = parents.get(c).cloned().unwrap_or_default();
+        if ps.len() > 1 {
+            return Err("A merge sits among the commits to rewrite; GitSwitch rewrites a straight line only. Rewrite them by hand, or undo the merge first.".into());
+        }
+        wrong_left.retain(|w| w != c);
+        if wrong_left.is_empty() {
+            return Ok(FixPlan { base: ps.first().cloned(), wrong: wrong_emails, count });
+        }
+    }
+    Err("Some of the wrong commits sit on a merged side branch; GitSwitch rewrites a straight line only.".into())
 }
 
 /// Find commits across all profile folders that carry the wrong identity.
@@ -243,46 +472,33 @@ pub async fn audit_all() -> Result<Vec<RepoAudit>, AppError> {
     .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
 }
 
-/// Rewrite the author/committer of UNPUSHED commits to the folder's identity.
-/// Pushed commits are never touched — that would require a force-push.
+/// Re-author the checked-out branch's wrong commits of yours with the
+/// folder's identity. Nothing a remote has is touched; teammates' commits
+/// among them keep their author; author dates are kept; the old history is
+/// kept on a backup branch.
 pub fn fix_unpushed(repo_path: &str) -> Result<String, AppError> {
     let repo = PathBuf::from(repo_path);
-
-    if !git(&repo, &["status", "--porcelain"])
-        .map_err(AppError::Command)?
-        .is_empty()
-    {
-        return Err(AppError::Config(
-            "This repo has uncommitted changes. Commit or stash them first — rewriting history needs a clean working tree.".into(),
-        ));
-    }
-
-    // Determine the range of local-only commits.
-    let base = match git(&repo, &["rev-parse", "@{upstream}"]) {
-        Ok(up) => up,
-        Err(_) => {
-            return Err(AppError::Config(
-                "This branch has no upstream, so GitSwitch can't tell which commits are unpublished. Push the branch first, or amend manually.".into(),
-            ))
-        }
+    let store = profiles::load_profiles()?;
+    let own_emails: Vec<String> = store.profiles.iter().map(|p| p.git_email.clone()).collect();
+    let Some(profile) = profile_for_repo(&repo, &store.profiles) else {
+        return Err(AppError::Config("No profile owns this repository, so there is no identity to re-author with.".into()));
     };
-
-    let count = git(&repo, &["rev-list", "--count", &format!("{}..HEAD", base)])
-        .map_err(AppError::Command)?
-        .parse::<usize>()
-        .unwrap_or(0);
-    if count == 0 {
-        return Err(AppError::Config("No unpushed commits to fix.".into()));
-    }
+    let plan = fix_plan(&repo, profile, &own_emails).map_err(AppError::Config)?;
 
     // Safety net: a ref pointing at the pre-rewrite history.
     let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
     let backup = format!("gitswitch-backup-{}", stamp);
     git(&repo, &["branch", &backup]).map_err(AppError::Command)?;
 
-    // --reset-author rewrites author AND committer to the identity git resolves
-    // for this directory, which is exactly what the profile sets.
-    let res = git(
+    // Only commits by one of the wrong addresses are amended — with
+    // --author, which keeps their author dates; the rest are replayed as
+    // they are. Nothing from here is put into the script: it reads both
+    // from the environment.
+    let wrong: String = plan.wrong.iter().map(|e| format!("<{}>", e)).collect();
+    let author = format!("{} <{}>", profile.git_name.trim(), profile.git_email.trim());
+    let script = r#"ae=$(git -c log.showSignature=false log -1 --format=%ae); case "$GITSWITCH_FIX_WRONG" in *"<$ae>"*) git commit --amend --no-edit --allow-empty --author="$GITSWITCH_FIX_AUTHOR";; esac"#;
+    let base = plan.base.clone().unwrap_or_else(|| "--root".into());
+    let res = git_env(
         &repo,
         &[
             "-c",
@@ -291,22 +507,27 @@ pub fn fix_unpushed(repo_path: &str) -> Result<String, AppError> {
             // along with the rewrite — the one thing it exists not to do.
             "-c",
             "rebase.updateRefs=false",
+            "-c",
+            "rebase.autoSquash=false",
             "rebase",
+            "--no-autosquash",
             "--empty=keep",
             &base,
             "--exec",
-            "git commit --amend --reset-author --no-edit --allow-empty",
+            script,
         ],
+        &[("GITSWITCH_FIX_WRONG", &wrong), ("GITSWITCH_FIX_AUTHOR", &author)],
     );
 
     match res {
         Ok(_) => Ok(format!(
-            "Rewrote {} unpushed commit{}. Previous history kept on branch {}.",
-            count,
-            if count == 1 { "" } else { "s" },
+            "Re-authored {} commit{}. Previous history kept on branch {}.",
+            plan.count,
+            if plan.count == 1 { "" } else { "s" },
             backup
         )),
         Err(e) => {
+            // Nothing else was in progress (fix_plan refused that): the rebase is ours.
             let _ = git(&repo, &["rebase", "--abort"]);
             Err(AppError::Command(format!(
                 "Rewrite failed and was rolled back ({}). Your history is unchanged; branch {} still points at it.",

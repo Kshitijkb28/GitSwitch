@@ -100,6 +100,26 @@ pub struct SubmoduleInfo {
     /// has; `None` when it has none to compare with.
     #[serde(default)]
     pub own_unpushed: Option<usize>,
+    /// `<remote>/<branch>` a clone would follow — the .gitmodules branch
+    /// (`.`: the superproject's own), else the remote's default — when that
+    /// remote-tracking branch is here. Read locally, never fetched.
+    #[serde(default)]
+    pub latest_ref: Option<String>,
+}
+
+/// See `SubmoduleInfo::latest_ref`.
+async fn latest_ref(sub_dir: &Path, remote: &str, configured: Option<&str>, superproject: &Path) -> Option<String> {
+    let branch = match configured.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(".") => GitCmd::at(superproject).args(["symbolic-ref", "-q", "--short", "HEAD"]).ok_text().await?.trim().to_string(),
+        Some(b) => b.to_string(),
+        None => {
+            let full = GitCmd::at(sub_dir).args(["symbolic-ref", "-q", &format!("refs/remotes/{}/HEAD", remote)]).ok_text().await?;
+            full.trim().strip_prefix(&format!("refs/remotes/{}/", remote))?.to_string()
+        }
+    };
+    let r = format!("{}/{}", remote, branch);
+    GitCmd::at(sub_dir).args(["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{}", r)]).ok_text().await.filter(|s| !s.is_empty())?;
+    Some(r)
 }
 
 const MAX_MOVED: usize = 10;
@@ -507,25 +527,30 @@ pub async fn list_submodules(repo_path: &str) -> Result<Vec<SubmoduleInfo>, AppE
             upstream_remote: None,
             recorded_on_remote: None,
             own_unpushed: None,
+            latest_ref: None,
         };
 
+        let mut never = false;
         if initialised {
-            info.gitdir_valid = GitCmd::at(&sub_dir)
-                .args(["rev-parse", "--git-dir"])
-                .ok_text()
-                .await
-                .is_some();
+            let git_dir = GitCmd::at(&sub_dir).args(["rev-parse", "--absolute-git-dir"]).ok_text().await.filter(|s| !s.trim().is_empty());
+            info.gitdir_valid = git_dir.is_some();
             info.actual = GitCmd::at(&sub_dir)
                 .args(["rev-parse", "HEAD"])
                 .ok_text()
                 .await
                 .filter(|s| !s.is_empty());
+            if let (Some(gd), Some(_)) = (&git_dir, &info.actual) {
+                never = never_checked_out(&sub_dir, Path::new(gd.trim())).await;
+            }
             info.actual_short = info.actual.as_deref().map(short);
             if info.gitdir_valid {
                 // Against the remote-tracking branches of the remote a clone
                 // would fetch from: with none, nothing here is known to be
                 // pushed and the row says nothing of it.
                 let which = clone_remote(&sub_dir, module.and_then(|m| m.url.as_deref()), super_url.as_deref()).await;
+                if let Some(r) = &which {
+                    info.latest_ref = latest_ref(&sub_dir, r, info.configured_branch.as_deref(), &repo).await;
+                }
                 let scope = remote_scope(which.as_deref());
                 let remote_refs = GitCmd::at(&sub_dir)
                     .args(["for-each-ref", "--count=1", "--format=%(refname)", &scope])
@@ -629,7 +654,9 @@ pub async fn list_submodules(repo_path: &str) -> Result<Vec<SubmoduleInfo>, AppE
         // A download that was interrupted (a stall, a crash, a reboot): the
         // folder has a .git entry but nothing is checked out. Not populated —
         // Download finishes it.
-        if info.initialised && (info.actual.is_none() || !info.gitdir_valid) {
+        // So is one stopped after its transfer and before its checkout: a
+        // commit, but no index — every file would read as a staged deletion.
+        if info.initialised && (info.actual.is_none() || !info.gitdir_valid || never) {
             info.state = "incomplete".into();
         }
         info.summary = summarise(
@@ -866,6 +893,16 @@ pub struct SubmoduleStatus {
 /// `list_submodules` (never `git submodule status`, which aborts on the first
 /// unmapped gitlink): uninitialised gitlinks cost one `exists()` each, nested
 /// submodules are not descended, and the statuses are read four at a time.
+/// A download stopped after the transfer and before the checkout: HEAD is
+/// there, the index is not, and HEAD has files to check out. The ls-tree runs
+/// only when the index file is missing, so an ordinary listing costs nothing.
+async fn never_checked_out(sub_dir: &Path, git_dir: &Path) -> bool {
+    if git_dir.join("index").exists() {
+        return false;
+    }
+    GitCmd::at(sub_dir).args(["ls-tree", "--name-only", "HEAD"]).ok_text().await.is_some_and(|s| !s.trim().is_empty())
+}
+
 pub async fn submodule_statuses(repo_path: &str) -> Result<Vec<SubmoduleStatus>, AppError> {
     let repo = PathBuf::from(repo_path);
     if !repo.is_dir() {
@@ -885,7 +922,11 @@ pub async fn submodule_statuses(repo_path: &str) -> Result<Vec<SubmoduleStatus>,
         if !sub_dir.join(".git").exists() {
             continue;
         }
-        if GitCmd::at(&sub_dir).args(["rev-parse", "--git-dir"]).ok_text().await.is_none() {
+        let Some(git_dir) = GitCmd::at(&sub_dir).args(["rev-parse", "--absolute-git-dir"]).ok_text().await.filter(|s| !s.trim().is_empty()) else {
+            continue;
+        };
+        // Never checked out: nothing of its own to show, Download finishes it.
+        if never_checked_out(&sub_dir, Path::new(git_dir.trim())).await {
             continue;
         }
         let module = cfg.get(&path);

@@ -47,6 +47,8 @@ type Props = {
   /** Runs one git operation; the page owns busy state, toasts, the result card and reloads. */
   onAction: (key: string, fn: () => Promise<OpResult>) => Promise<OpResult | undefined>;
   onResolve: (hash: string) => Promise<CommitTarget | null>;
+  /** Opens another commit in this panel (a parent). */
+  onOpenCommit?: (hash: string) => void;
 };
 
 type Mode = null | "goback" | "branch";
@@ -113,6 +115,7 @@ export function CommitDetailPanel({
   onClose,
   onAction,
   onResolve,
+  onOpenCommit,
 }: Props) {
   const toast = useToast();
   const job = useGitJob(repoPath);
@@ -478,9 +481,15 @@ export function CommitDetailPanel({
             {detail.parents.length === 0 && (
               <p className="text-zinc-400">none (root commit)</p>
             )}
-            {detail.parents.map((p) => (
-              <p key={p} className="text-zinc-300 font-mono truncate">{p.slice(0, 12)}</p>
-            ))}
+            {detail.parents.map((p) =>
+              onOpenCommit ? (
+                <button key={p} type="button" onClick={() => onOpenCommit(p)} className="block text-left text-zinc-300 hover:text-white font-mono truncate cursor-pointer" title={`Open ${p}`}>
+                  {p.slice(0, 12)}
+                </button>
+              ) : (
+                <p key={p} className="text-zinc-300 font-mono truncate">{p.slice(0, 12)}</p>
+              )
+            )}
           </div>
         </div>
 

@@ -14,8 +14,11 @@ dist-ssr
 
 # Tauri/Rust
 src-tauri/target
-# The lock-helper sidecar, built by scripts/build-lock-helper.sh
-src-tauri/binaries
+# The sidecars (the lock helper, the git guard), built by src-tauri/sidecars.
+# The folder itself is kept, so the dev container's volume mounts onto it
+# instead of creating it, owned by root, in the checkout.
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
 
 # VS Code extension build output
 vscode-extension/out

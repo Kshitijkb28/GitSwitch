@@ -162,7 +162,7 @@ git -C "$W" branch oldsub "$BEFORE_BUMP"
 OUT=$(probe tree_branch_switch "$W" "oldsub")
 ok "the switch succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
 ok "  and names the mismatched submodule" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch)" "vendor/sub"
-ok "  in words" "$(printf '%s' "$OUT" | jqf detail)" "Update submodules to align them"
+ok "  in words" "$(printf '%s' "$OUT" | jqf detail)" "Align submodules checks out the commits it records"
 ok "  git shows the gitlink modified" "$(git -C "$W" status --porcelain -- vendor/sub)" " M vendor/sub"
 OUT=$(probe tree_branch_switch "$W" "main")
 ok "back on main nothing mismatches" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch)" "[]"
@@ -422,11 +422,22 @@ git -C "$W/vendor/sub" reset -q --hard HEAD~1; printf 'B\n' > "$W/vendor/sub/b.t
 git -C "$W" add vendor/sub >/dev/null; git -C "$W" commit -qm "record B"
 git -C "$W" merge -q subA >/dev/null 2>&1
 ok "a gitlink conflict" "$(git -C "$W" status --porcelain -- vendor/sub)" "UU vendor/sub"
-OUT=$(probe tree_resolve_side "$W" "mine,vendor/sub")
-ok "is not resolved by taking a side" "$(printf '%s' "$OUT" | jqf refusal.code)" "submodule-conflict"
+SUB_A="$(git -C "$W" rev-parse subA:vendor/sub)"; SUB_B="$(git -C "$W" rev-parse HEAD:vendor/sub)"
+OUT=$(probe status "$W")
+ok "  its row names the commit each side would record" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;e=[e for e in json.load(sys.stdin)['entries'] if e['path']=='vendor/sub'][0];print(e.get('pointer_mine'), e.get('pointer_theirs'))")" "$SUB_B $SUB_A"
+printf 'x\n' >> "$W/vendor/sub/b.txt"
+OUT=$(probe tree_resolve_side "$W" "theirs,vendor/sub")
+ok "taking a side over changes inside the submodule is refused" "$(printf '%s' "$OUT" | jqf refusal.code):$(git -C "$W/vendor/sub" rev-parse HEAD)" "submodule-changes:$SUB_B"
+git -C "$W/vendor/sub" checkout -q -- b.txt
+OUT=$(probe tree_resolve_side "$W" "theirs,vendor/sub")
+ok "Take theirs checks the submodule out at the other side's commit and records it" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/vendor/sub" rev-parse HEAD):$(git -C "$W" ls-files -s -- vendor/sub | awk '{print $2"/"$3}')" "True:$SUB_A:$SUB_A/0"
+ok "  the conflict is gone" "$(git -C "$W" diff --name-only --diff-filter=U | wc -l | tr -d ' ')" "0"
+ok "  the submodule's branch kept its own commit" "$(git -C "$W/vendor/sub" rev-parse main)" "$SUB_B"
+ok "  and the result names what it recorded" "$(printf '%s' "$OUT" | jqf detail)" "vendor/sub now records ${SUB_A:0:7}"
 OUT=$(probe tree_resolve_side "$W" "mine")
 ok "no paths is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-paths"
 probe abort "$W" >/dev/null
+git -C "$W/vendor/sub" switch -q main
 ok "  the merge is aborted" "$(porcelain "$W")" "clean"
 
 section "Discard everything"
@@ -630,5 +641,122 @@ git -C "$RB4" checkout -q --ours -- f.txt 2>/dev/null || git -C "$RB4" show othe
 ok "an apply-backend stop, resolved to what is already there" "$([ -d "$RB4/.git/rebase-apply" ] && echo apply || echo other):$(git -C "$RB4" diff --cached --quiet HEAD && echo empty || echo staged)" "apply:empty"
 OUT=$(probe continue "$RB4")
 ok "  is skipped by Continue, and said so" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf detail):$(git -C "$RB4" log --format=%s other..HEAD | tr '\n' '|')" "True:The stopped commit had nothing left to apply after the resolution, so it was skipped.:B more|"
+
+section "Going back across a submodule pointer bump: a hard reset offers to align, soft and mixed keep the pointer change"
+AL="$SB/align"
+git init -q "$AL"; printf 'a\n' > "$AL/a.txt"; git -C "$AL" add -A >/dev/null; git -C "$AL" commit -qm "a"
+git -C "$AL" submodule add -q "$SB/sub.git" s 2>/dev/null; git -C "$AL" commit -qm "add s"
+S_OLD="$(git -C "$AL" rev-parse HEAD:s)"
+printf 'two\n' >> "$AL/s/file.txt"; git -C "$AL/s" commit -qam "s two"; S_NEW="$(git -C "$AL/s" rev-parse HEAD)"
+git -C "$AL" add s; git -C "$AL" commit -qm "bump s"; BUMP="$(git -C "$AL" rev-parse HEAD)"
+OUT=$(probe tree_reset "$AL" "HEAD~1,mixed")
+ok "a mixed reset back over the bump keeps the pointer change, unstaged" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch):$(git -C "$AL" status --porcelain -- s)" "[]: M s"
+ok "  and says so instead of offering to align it away" "$(printf '%s' "$OUT" | jqf detail)" "The submodule pointer change for s is kept with the other changes."
+git -C "$AL" reset -q --hard "$BUMP"
+OUT=$(probe tree_reset "$AL" "HEAD~1,soft")
+ok "a soft reset keeps it staged" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch):$(git -C "$AL" status --porcelain -- s)" "[]:M  s"
+ok "  and says so too" "$(printf '%s' "$OUT" | jqf detail)" "The submodule pointer change for s is kept with the other changes."
+git -C "$AL" reset -q --hard "$BUMP"
+OUT=$(probe tree_reset "$AL" "HEAD~1,hard")
+ok "a hard reset back over the bump names the submodule it left ahead" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch)" '["s"]'
+ok "  and offers to align it" "$(printf '%s' "$OUT" | jqf detail)" "Align submodules checks out the commits it records"
+ok "  git agrees s sits elsewhere" "$(git -C "$AL" status --porcelain -- s)" " M s"
+printf 'edit\n' >> "$AL/s/file.txt"
+OUT=$(probe tree_sub_align "$AL" "s")
+ok "aligning a submodule with changes inside is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "submodule-changes"
+ok "  and nothing moved" "$(git -C "$AL/s" rev-parse HEAD)" "$S_NEW"
+git -C "$AL/s" checkout -q -- file.txt
+git -C "$AL/s" switch -q --detach; git -C "$AL/s" commit -q --allow-empty -m "loose in s"; LOOSE="$(git -C "$AL/s" rev-parse HEAD)"
+OUT=$(probe tree_sub_align "$AL" "s")
+ok "aligning a submodule whose detached HEAD holds a commit no branch has is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "submodule-detached-commits"
+ok "  with the count" "$(printf '%s' "$OUT" | jqf refusal.message)" "1 commit(s) at s's checkout"
+ok "  and nothing moved" "$(git -C "$AL/s" rev-parse HEAD)" "$LOOSE"
+git -C "$AL/s" switch -q main 2>/dev/null
+OUT=$(probe tree_sub_align "$AL" "s")
+ok "Align checks out the commit the repository records" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$AL/s" rev-parse HEAD)" "True:$S_OLD"
+ok "  the repository is clean again" "$(porcelain "$AL")" "clean"
+ok "  the submodule's branch kept its commit" "$(git -C "$AL/s" rev-parse main)" "$S_NEW"
+ok "  and the result says so" "$(printf '%s' "$OUT" | jqf detail)" "main still holds"
+ok "  nothing mismatches any more" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch)" "[]"
+REC="$(printf '%s' "$OUT" | jqf tree.recovery)"
+ok "  its undo puts the submodule back on its branch" "$( (cd "$AL" && sh -c "$REC" >/dev/null 2>&1); echo "rc=$?"):$(git -C "$AL/s" symbolic-ref -q --short HEAD)" "rc=0:main"
+git -C "$AL/s" checkout -q --detach "$S_OLD"
+OUT=$(probe tree_sub_align "$AL" "s")
+ok "a submodule already at the recorded commit is left alone" "$(printf '%s' "$OUT" | jqf headline)" "already at the commit this repository records"
+OUT=$(probe tree_sub_align "$AL" "a.txt")
+ok "a path that is no submodule is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "not-a-submodule"
+OUT=$(probe tree_sub_align "$AL" "s,a.txt")
+ok "one already aligned and one refused is a refusal, not a green \"every one is aligned\"" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf refusal.message)" "False:a.txt isn't a submodule of this repository. Already at the recorded commit: s."
+# Update to <recorded>: checked out whatever the configuration says, never over what it would lose.
+git -C "$AL" reset -q --hard "$BUMP"
+git -C "$AL" config submodule.s.update none
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$AL\",\"paths\":[\"s\"]}")
+ok "Update to <recorded> checks it out even where submodule.<name>.update says none" "$(printf '%s' "$OUT" | jqf value.ok):$(git -C "$AL/s" rev-parse HEAD)" "True:$S_NEW"
+git -C "$AL" config --unset submodule.s.update
+git -C "$AL/s" checkout -q --detach "$S_OLD"; git -C "$AL/s" commit -q --allow-empty -m "loose again"; LOOSE2="$(git -C "$AL/s" rev-parse HEAD)"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$AL\",\"paths\":[\"s\"]}")
+ok "Update to over a commit only a detached HEAD holds is refused" "$(printf '%s' "$OUT" | jqf value.refusal.code)" "submodule-detached-commits"
+ok "  and nothing moved" "$(git -C "$AL/s" rev-parse HEAD)" "$LOOSE2"
+git -C "$AL/s" checkout -q --detach "$S_OLD"; printf 'edit\n' >> "$AL/s/file.txt"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$AL\",\"paths\":[\"s\"]}")
+ok "Update to over changes inside is refused" "$(printf '%s' "$OUT" | jqf value.refusal.code)" "submodule-changes"
+ok "  and the change is still there" "$(git -C "$AL/s" status --porcelain)" " M file.txt"
+git -C "$AL/s" checkout -q -- file.txt
+# A nested submodule's loose commit stops it too: --recursive moves nested ones.
+git -C "$AL/s" switch -q main 2>/dev/null
+git -C "$AL/s" submodule add -q "$SB/orphan.git" n 2>/dev/null; git -C "$AL/s" commit -qm "s: add n"
+git -C "$AL/s/n" switch -q --detach; git -C "$AL/s/n" commit -q --allow-empty -m "loose in n"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$AL\",\"paths\":[\"s\"]}")
+ok "Update to over a commit only a nested submodule's detached HEAD holds is refused" "$(printf '%s' "$OUT" | jqf value.refusal.code):$(printf '%s' "$OUT" | jqf value.refusal.message)" "submodule-detached-commits:1 commit(s) at s/n's checkout"
+git -C "$AL/s/n" switch -q main 2>/dev/null
+# A nested record its submodule never fetched (s moved on, n did not): nothing of n would be lost.
+git -C "$AL/s" update-index --cacheinfo "160000,1111111111111111111111111111111111111111,n"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$AL\",\"paths\":[\"s\"]}")
+ok "a nested record its submodule has not fetched does not make Update to refuse" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print("refused: " + v["refusal"]["message"] if v.get("refusal") else "ran")')" "ran"
+
+section "A backup branch is marked as one, and never named as containing a branch"
+git init -q "$SB/bk"; printf '1\n' > "$SB/bk/f"; git -C "$SB/bk" add -A >/dev/null; git -C "$SB/bk" commit -qm one
+printf '2\n' > "$SB/bk/f"; git -C "$SB/bk" commit -qam two
+git -C "$SB/bk" branch topic HEAD~1
+probe tree_reset "$SB/bk" "HEAD~1,hard" >/dev/null
+BK_NAME="$(git -C "$SB/bk" for-each-ref --format='%(refname:short)' 'refs/heads/gitswitch-before-reset-*' | head -1)"
+ok "(the reset kept a backup branch)" "$BK_NAME" "gitswitch-before-reset-"
+OUT=$(probe branches "$SB/bk")
+ok "the branch list marks it as a backup, and only it" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(sorted((b["name"].split("-20")[0], b["is_backup"]) for b in json.load(sys.stdin) if not b["is_remote"]))')" "[('gitswitch-before-reset', True), ('main', False), ('topic', False)]"
+OUT=$(probe merge_info "$SB/bk" "topic")
+ok "a branch's \"already contained in\" never names a backup" "$(printf '%s' "$OUT" | jqf merged_into)" '["main"]'
+
+section "History's graph: lanes carry on across pages, a filtered list joins what it shows, and how a branch got in"
+HG="$SB/hgraph"; git init -q "$HG"
+for i in $(seq 1 60); do
+  if [ $((i % 2)) -eq 0 ]; then who="Other <other@example.test>"; else who="Me <me@example.test>"; fi
+  git -C "$HG" -c user.name="${who%% <*}" -c user.email="$(printf '%s' "$who" | sed 's/.*<\(.*\)>/\1/')" commit -q --allow-empty -m "c$i"
+done
+OUT=$(pinvoke history_page "{\"repoPath\":\"$HG\",\"rev\":\"HEAD\",\"offset\":50,\"limit\":50}")
+ok "page 2 carries the line on from page 1: its first row is no tip" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"]["commits"];print(len(c), c[0].get("from_above"), c[0]["lane"])')" "10 True 0"
+OUT=$(pinvoke history_page "{\"repoPath\":\"$HG\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":50}")
+ok "  and the newest commit is one" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["commits"][0].get("from_above"))')" "False"
+OUT=$(pinvoke history_page "{\"repoPath\":\"$HG\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":50,\"authors\":[\"me@example.test\"]}")
+ok "a list filtered by a person joins only the commits it shows: one lane, not one more per row" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["total"], v["max_lane"])')" "30 0"
+OUT=$(pinvoke history_page "{\"repoPath\":\"$HG\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":50,\"search\":\"c1\"}")
+ok "  and so does one filtered by words" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["total"], v["max_lane"])')" "11 0"
+# How a branch got into main: a fast-forward, then a merge commit.
+git -C "$HG" switch -q -c ff; git -C "$HG" commit -q --allow-empty -m "ff work"; git -C "$HG" switch -q main 2>/dev/null || git -C "$HG" switch -q master
+git -C "$HG" merge -q --ff-only ff
+git -C "$HG" switch -q -c topic HEAD~3; git -C "$HG" commit -q --allow-empty -m "topic work"; git -C "$HG" switch -q -
+git -C "$HG" merge -q --no-ff -m "merge topic" topic
+OUT=$(pinvoke history_branch_merges "{\"repoPath\":\"$HG\",\"branch\":\"topic\"}")
+ok "a branch merged with a merge commit names that commit" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print([(m["how"], (m["commit"] or {}).get("subject")) for m in v["merged_by"]])')" "('merge', 'merge topic')"
+OUT=$(pinvoke history_branch_merges "{\"repoPath\":\"$HG\",\"branch\":\"ff\"}")
+ok "  one taken in by a fast-forward says so" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print([m["how"] for m in v["merged_by"]])')" "fast-forward"
+OUT=$(pinvoke history_branch_merges "{\"repoPath\":\"$HG\",\"branch\":\"HEAD\"}")
+ok "  and the merges are counted, not capped silently" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["merges_total"], v["merges_truncated"])')" "1 False"
+# A range hides commits too: its graph joins only what it lists.
+R2="$SB/hrange"; git init -q "$R2"
+git -C "$R2" commit -q --allow-empty -m c1; git -C "$R2" commit -q --allow-empty -m c2
+git -C "$R2" switch -q -c side HEAD~1; git -C "$R2" commit -q --allow-empty -m s1; git -C "$R2" switch -q -
+git -C "$R2" merge -q --no-ff -m m1 side
+OUT=$(pinvoke history_page "{\"repoPath\":\"$R2\",\"rev\":\"HEAD~1..HEAD\",\"offset\":0,\"limit\":50}")
+ok "a range joins only the commits it lists: no lane runs off to one it leaves out" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["total"], v["max_lane"])')" "2 0"
 
 verify_result

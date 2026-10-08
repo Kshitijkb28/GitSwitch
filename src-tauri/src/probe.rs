@@ -143,6 +143,10 @@ pub(crate) mod tests {
         match cmd.as_str() {
             // profiles / repositories
             "get_profiles" => reply(c::get_profiles()),
+            "doctor_apply_fix" => forward!(c::doctor_apply_fix, args, fix),
+            "doctor_check_repo_access" => forward!(c::doctor_check_repo_access, args),
+            "audit_commits" => forward!(c::audit_commits, args),
+            "fix_unpushed_commits" => forward!(c::fix_unpushed_commits, args, repo_path),
             "verify_github_token" => forward!(c::verify_github_token, args, token),
             "gh_list_accounts" => forward!(c::gh_list_accounts, args),
             "gh_logout" => forward!(c::gh_logout, args, account),
@@ -159,6 +163,7 @@ pub(crate) mod tests {
             "changes_submodule_statuses" => forward!(c::changes_submodule_statuses, args, repo_path),
             "changes_lfs_status" => forward!(c::changes_lfs_status, args, repo_path),
             "lfs_available" => forward_plain!(c::lfs_available, args),
+            "convert_repos_to_ssh" => forward!(c::convert_repos_to_ssh, args, directory),
             // Changes page: operations
             "changes_stage" => forward!(c::changes_stage, args, repo_path, paths, allow_markers),
             "changes_stage_all" => forward!(c::changes_stage_all, args, repo_path),
@@ -166,8 +171,9 @@ pub(crate) mod tests {
             "changes_discard" => forward!(c::changes_discard, args, repo_path, paths),
             "changes_commit" => forward!(c::changes_commit, args, repo_path, message, amend),
             "changes_push" => forward!(c::changes_push, args, repo_path, set_upstream, allow_unpushed_submodules),
-            "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash),
+            "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash, source),
             "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path, paths),
+            "changes_submodule_align" => forward!(c::changes_submodule_align, args, repo_path, paths),
             "changes_lfs_pull" => forward!(c::changes_lfs_pull, args, repo_path),
             "changes_lfs_files" => forward!(c::changes_lfs_files, args, repo_path),
             "changes_lfs_pull_paths" => forward!(c::changes_lfs_pull_paths, args, repo_path, paths),
@@ -233,6 +239,8 @@ pub(crate) mod tests {
             "history_peek" => forward!(c::history_peek, args, repo_path),
             "history_commit_file_diff" => forward!(c::history_commit_file_diff, args, repo_path, hash, path),
             "history_resolve" => forward!(c::history_resolve, args, repo_path, text),
+            // No link started the probe: there is never a page waiting.
+            "deep_link_take" => reply(Ok::<Option<&str>, crate::error::AppError>(None)),
             // These take a `tauri::AppHandle` (tray label updates) and cannot run outside the app.
             "create_profile" | "update_profile" | "delete_profile" | "set_default_profile" | "sparse_clone"
             | "full_clone" => reply_err(format!(
@@ -283,6 +291,19 @@ pub(crate) mod tests {
                 Ok(()) => emit(&"refreshed"),
                 Err(e) => emit_err(e),
             },
+            // A clone running into DEST (PROBE_ARGS "<dest>,<url>"): what the
+            // local index and the Repository page's picker say meanwhile, and
+            // after it is over.
+            "local_clones_while_cloning" => {
+                let dest = a.first().cloned().unwrap_or_default();
+                let url = a.get(1).cloned().unwrap_or_default();
+                let guard = crate::sparse::CloneGuard::hold(std::path::Path::new(&dest), &url);
+                let during = crate::remote_repos::local_clones().await.ok();
+                let picker: Vec<String> = crate::git_history::list_repos().await.map(|v| v.into_iter().map(|r| r.path).collect()).unwrap_or_default();
+                drop(guard);
+                let after = crate::remote_repos::local_clones().await.ok();
+                emit(&serde_json::json!({ "during": during, "picker": picker, "after": after }));
+            }
             // Saves a profile with the folders and email given, as the app's
             // update_profile command does (which also updates the tray, and
             // that needs the app) — Doctor's "Save it as the disk spells it",
@@ -292,7 +313,9 @@ pub(crate) mod tests {
                 let v: serde_json::Value = serde_json::from_str(&text).expect("profile json");
                 let dirs: Option<Vec<String>> = v["directories"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect());
                 let email = v["git_email"].as_str().map(String::from);
-                match crate::commands::update_profile_core(v["id"].as_str().unwrap_or_default().to_string(), None, None, email, None, dirs, None, None, None, None).await {
+                let key = v["ssh_key_path"].as_str().map(String::from);
+                let signs = v["signing_enabled"].as_bool();
+                match crate::commands::update_profile_core(v["id"].as_str().unwrap_or_default().to_string(), None, None, email, key, dirs, None, signs, None, None).await {
                     Ok(p) => emit(&p),
                     Err(e) => emit_err(e),
                 }
@@ -324,7 +347,7 @@ pub(crate) mod tests {
             "pull" => {
                 let with_lfs = a.iter().skip(1).any(|s| s == "lfs");
                 let autostash = a.iter().skip(1).any(|s| s == "autostash");
-                show(git_ops::pull(&repo(), PullMode::parse(first).unwrap(), with_lfs, autostash).await)
+                show(git_ops::pull(&repo(), PullMode::parse(first).unwrap(), with_lfs, autostash, None).await)
             }
             // The History page's Fetch, on a blocking thread as the command runs it.
             "history_fetch" => {

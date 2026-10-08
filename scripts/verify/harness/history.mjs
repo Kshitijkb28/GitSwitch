@@ -1002,6 +1002,20 @@ try {
     await page.close();
   }
   {
+    // GitSwitch's backups sit under a closed "Backups (n)", not among the branches.
+    const backup = { ...BRANCHES[1], name: "gitswitch-before-update-20261008-120000", is_backup: true, last_subject: "Tidy the settings page" };
+    const page = await open({ branches: [...BRANCHES, backup] });
+    await page.waitForFunction(() => document.querySelectorAll('button[title="feature/lfs"]').length > 0, { timeout: 4000 }).catch(() => null);
+    const inList = () => page.evaluate(() => [...document.querySelectorAll('button[title^="gitswitch-before-update-"]')].filter((b) => !b.closest("details")).length);
+    const inBackups = () => page.evaluate(() => [...document.querySelectorAll('details button[title^="gitswitch-before-update-"]')].length);
+    ok("a backup branch is not listed among the branches", (await inList()) === 0, String(await inList()));
+    ok("  it sits under a closed Backups (1)", (await inBackups()) === 1 && (await text(page)).includes("Backups (1)") && (await page.evaluate(() => [...document.querySelectorAll("details")].find((d) => d.querySelector("summary")?.innerText.startsWith("Backups"))?.open === false)), String(await inBackups()));
+    await page.evaluate(() => document.querySelector('details button[title^="gitswitch-before-update-"]').click());
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "history_page" && c.args.rev?.startsWith("gitswitch-before-update-")), { timeout: 4000 }).catch(() => null);
+    ok("  and opens when chosen", (await calls(page, "history_page")).some((c) => c.args.rev?.startsWith("gitswitch-before-update-")));
+    await page.close();
+  }
+  {
     const files = Array.from({ length: 500 }, (_, i) => ({ path: `vendor/lib/file-${i}.js`, added: "1", removed: "0", status: "M" }));
     const page = await open({ detail: { ...COMMIT_DETAIL, files } });
     await openPanel(page, C2);
@@ -1010,6 +1024,29 @@ try {
     await (await button(page, "Show all 500 files")).click();
     await sleep(300);
     ok("  which shows them all", (await fileRows()) === 500, String(await fileRows()));
+    await page.close();
+  }
+
+  section("The graph: many lanes stay inside it");
+  {
+    // Fifty lines open at once ("All branches" in a busy repository): every
+    // commit's dot is drawn inside the graph, the last lane's too.
+    const lanes = Array.from({ length: 50 }, (_, i) => i);
+    const at = [0, 25, 49];
+    const wide = {
+      ...HISTORY_PAGE,
+      max_lane: 49,
+      commits: HISTORY_PAGE.commits.map((c, i) => ({ ...c, is_merge: false, lane: at[i], parent_lanes: [at[i]], active_lanes: lanes })),
+    };
+    const page = await open({ historyPage: wide });
+    await page.waitForFunction(() => document.querySelectorAll("svg.overflow-hidden circle").length >= 3, { timeout: 4000 }).catch(() => null);
+    const dots = await page.evaluate(() =>
+      [...document.querySelectorAll("svg.overflow-hidden")].map((s) => {
+        const c = s.querySelector("circle");
+        return { width: Number(s.getAttribute("width")), right: Number(c?.getAttribute("cx")) + Number(c?.getAttribute("r")) };
+      }),
+    );
+    ok("with fifty lanes open every commit's dot is drawn inside the graph, which keeps to 176 px", dots.length === 3 && dots.every((d) => d.width <= 176 && d.right <= d.width), JSON.stringify(dots));
     await page.close();
   }
 

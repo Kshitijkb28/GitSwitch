@@ -37,6 +37,7 @@ function commit(hash, subject, over = {}) {
     lane: 0,
     parent_lanes: [0],
     active_lanes: [0],
+    from_above: true,
     ...over,
   };
 }

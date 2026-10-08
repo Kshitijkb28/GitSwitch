@@ -365,6 +365,12 @@ ok "a bare leftover does not take the repository's status down" "$(probe status 
 OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W2\",\"paths\":[\"lib\"]}")
 ok "  and Download clears it and finishes the download" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["cleared"])'):$(git -C "$W2/lib" rev-parse HEAD 2>/dev/null)" "True ['lib']:$(git -C "$W2" rev-parse HEAD:lib)"
 
+# A download stopped after its transfer and before its checkout: HEAD is there, the index is not.
+rm -f "$(git -C "$W/lib" rev-parse --absolute-git-dir)/index"; find "$W/lib" -mindepth 1 ! -name .git -delete
+ok "a submodule whose commit arrived but was never checked out is incomplete, not a submodule full of deletions" "$(probe submodules_list "$W" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["state"])'):$(probe sub_statuses "$W" | "$PY" -c 'import sys,json;print(len(json.load(sys.stdin)))')" "incomplete:0"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W\",\"paths\":[\"lib\"]}")
+ok "  and Download finishes it, keeping what arrived" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["cleared"], v["submodules"]["downloaded"])'):$(cat "$W/lib/lib.txt" 2>/dev/null):$(probe submodules_list "$W" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["state"])')" "True [] 1:lib v1:clean"
+
 section "A download that takes a while says how long is left"
 # A submodule big enough to watch, behind a remote that sends it slowly: the
 # pack goes through a hook that trickles it out. (git honours that hook from
@@ -492,5 +498,33 @@ OUT=$(GITSWITCH_GITHUB_API="$API" pinvoke changes_submodule_update "{\"repoPath\
 ok "a shallow submodule is not asked about — it downloads one commit, not the history the host weighs" "$(cat "$SB/api-work/shal/shal.txt" 2>/dev/null || echo MISSING):$(grep -c '^/repos/acme/shal ' "$SB/api.log")" "shal:0"
 { kill "$API_PID" && wait "$API_PID"; } 2>/dev/null
 for r in widget shal; do git config --global --unset "url.file://$SB/$r.git.insteadOf"; done
+
+section "A submodule's own commits rebased onto its remote's latest, from its row"
+LR="$SB/latest"; mkdir -p "$LR"
+git init -q --bare "$LR/lib.git"; git clone -q "$LR/lib.git" "$LR/lib-author" 2>/dev/null
+printf 'v1\n' > "$LR/lib-author/f.txt"; git -C "$LR/lib-author" add -A >/dev/null; git -C "$LR/lib-author" commit -qm "lib: v1"; git -C "$LR/lib-author" push -q origin main 2>/dev/null
+git init -q --bare "$LR/super.git"; git clone -q "$LR/super.git" "$LR/author" 2>/dev/null
+( cd "$LR/author" && git submodule add -q "$LR/lib.git" lib 2>/dev/null ); git -C "$LR/author" commit -qm "super: add lib" >/dev/null; git -C "$LR/author" push -q origin main 2>/dev/null
+git clone -q --recurse-submodules "$LR/super.git" "$LR/w" 2>/dev/null
+# "Start a branch here" on the detached submodule: a branch with no upstream, and a commit of mine on it.
+git -C "$LR/w/lib" switch -q -c mine; printf 'mine\n' > "$LR/w/lib/mine.txt"; git -C "$LR/w/lib" add -A >/dev/null; git -C "$LR/w/lib" commit -qm "lib: mine"
+printf 'v2\n' > "$LR/lib-author/f.txt"; git -C "$LR/lib-author" commit -qam "lib: v2"; git -C "$LR/lib-author" push -q origin main 2>/dev/null
+git -C "$LR/w/lib" fetch -q origin 2>/dev/null
+OUT=$(probe submodules_list "$LR/w")
+ok "the row knows the branch a clone would follow, read locally" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;s=json.load(sys.stdin)[0];print(s.get("latest_ref"), s.get("own_branch"), s.get("own_upstream"))')" "origin/main mine None"
+OUT=$(pinvoke changes_pull "{\"repoPath\":\"$LR/w/lib\",\"mode\":\"rebase\",\"withLfs\":false,\"autostash\":false,\"source\":\"origin/main\"}")
+ok "Rebase onto origin/main puts my commit on top of the remote's latest" "$(printf '%s' "$OUT" | jqf value.ok):$(git -C "$LR/w/lib" log --format=%s -2 | tr '\n' '|')" "True:lib: mine|lib: v2|"
+ok "  on my branch, which still has no upstream" "$(git -C "$LR/w/lib" symbolic-ref -q --short HEAD):$(git -C "$LR/w/lib" rev-parse --abbrev-ref '@{u}' 2>/dev/null || echo none)" "mine:none"
+# Once my commit is on a remote branch, a rebase would re-write it: refused.
+git -C "$LR/w/lib" push -q origin mine 2>/dev/null
+printf 'v3\n' > "$LR/lib-author/f.txt"; git -C "$LR/lib-author" commit -qam "lib: v3"; git -C "$LR/lib-author" push -q origin main 2>/dev/null
+git -C "$LR/w/lib" fetch -q origin 2>/dev/null
+HEAD_NOW="$(git -C "$LR/w/lib" rev-parse HEAD)"
+OUT=$(pinvoke changes_pull "{\"repoPath\":\"$LR/w/lib\",\"mode\":\"rebase\",\"withLfs\":false,\"autostash\":false,\"source\":\"origin/main\"}")
+ok "a rebase that would re-write a pushed commit is refused" "$(printf '%s' "$OUT" | jqf value.refusal.code):$(git -C "$LR/w/lib" rev-parse HEAD)" "would-rewrite-pushed:$HEAD_NOW"
+OUT=$(pinvoke changes_pull "{\"repoPath\":\"$LR/w/lib\",\"mode\":\"rebase\",\"withLfs\":false,\"autostash\":false,\"source\":\"origin/nowhere\"}")
+ok "a branch the remote does not have is refused by name" "$(printf '%s' "$OUT" | jqf value.refusal.code)" "no-such-remote-branch"
+OUT=$(pinvoke changes_pull "{\"repoPath\":\"$LR/w/lib\",\"mode\":\"rebase\",\"withLfs\":false,\"autostash\":false,\"source\":\"elsewhere/main\"}")
+ok "  and so is a remote it does not have" "$(printf '%s' "$OUT" | jqf value.refusal.code)" "no-such-remote"
 
 verify_result

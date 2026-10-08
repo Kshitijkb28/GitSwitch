@@ -190,25 +190,31 @@ pub async fn check_environment() -> Result<Vec<Finding>, AppError> {
                     } else {
                         refresh
                     };
-                    out.push(Finding::new(
-                        &format!("gh-token-scopes:{}", a.login),
-                        "info",
-                        format!("gh's token for @{} lacks {}", a.login, names.join(", ")),
-                        format!(
-                            "Its scopes: {}. It needs {}. In a terminal: {}",
-                            if scopes.is_empty() { "none".to_string() } else { scopes.join(", ") },
-                            why.join("; "),
-                            command
-                        ),
-                    ));
+                    out.push(
+                        Finding::new(
+                            &format!("gh-token-scopes:{}", a.login),
+                            "info",
+                            format!("gh's token for @{} lacks {}", a.login, names.join(", ")),
+                            format!(
+                                "Its scopes: {}. It needs {}. In a terminal: {}",
+                                if scopes.is_empty() { "none".to_string() } else { scopes.join(", ") },
+                                why.join("; "),
+                                command
+                            ),
+                        )
+                        .with_fix(format!("copy:{}", command), "Copy the command"),
+                    );
                 }
             }
-            _ => out.push(Finding::new(
-                "gh-not-authenticated",
-                "info",
-                "GitHub CLI has no signed-in accounts",
-                "Run `gh auth login` so GitSwitch can verify repo access and register keys.",
-            )),
+            _ => out.push(
+                Finding::new(
+                    "gh-not-authenticated",
+                    "info",
+                    "GitHub CLI has no signed-in accounts",
+                    "Run `gh auth login` in a terminal so GitSwitch can verify repo access and register keys.",
+                )
+                .with_fix("copy:gh auth login", "Copy the command"),
+            ),
         }
     }
 
@@ -265,68 +271,89 @@ pub async fn check_profiles() -> Result<Vec<Finding>, AppError> {
     let mut out = Vec::new();
 
     if store.profiles.is_empty() {
-        out.push(Finding::new(
-            "no-profiles",
-            "info",
-            "No profiles yet",
-            "Create a profile and assign it a folder so git picks the right identity automatically.",
-        ));
+        out.push(
+            Finding::new(
+                "no-profiles",
+                "info",
+                "No profiles yet",
+                "Create a profile and assign it a folder so git picks the right identity automatically.",
+            )
+            .with_fix("nav:/profile/new", "Create a profile"),
+        );
         return Ok(out);
     }
 
     if !store.profiles.iter().any(|p| p.is_default) {
-        out.push(Finding::new(
-            "no-default",
-            "warning",
-            "No default profile",
-            "Folders that aren't covered by any profile will fall back to whatever is in your global git config.",
-        ));
+        out.push(
+            Finding::new(
+                "no-default",
+                "warning",
+                "No default profile",
+                "Folders that aren't covered by any profile will fall back to whatever is in your global git config.",
+            )
+            .with_fix("nav:/", "Open Profiles"),
+        );
     }
 
     for p in &store.profiles {
         match &p.ssh_key_path {
-            None => out.push(Finding::new(
-                "profile-no-key",
-                "warning",
-                format!("Profile \"{}\" has no SSH key", p.name),
-                "Without a key, repos in this profile's folders push using whatever key ssh picks — which is how commits end up on the wrong account.",
-            )),
+            None => out.push(
+                Finding::new(
+                    "profile-no-key",
+                    "warning",
+                    format!("Profile \"{}\" has no SSH key", p.name),
+                    "Without a key, repos in this profile's folders push using whatever key ssh picks — which is how commits end up on the wrong account.",
+                )
+                .with_fix(format!("nav:/profile/{}/edit", p.id), "Edit profile"),
+            ),
             Some(key) => {
                 if !PathBuf::from(key).exists() {
-                    out.push(Finding::new(
-                        "key-missing",
-                        "error",
-                        format!("Profile \"{}\" points at a missing key", p.name),
-                        format!("{} no longer exists on disk. Generate a new key or pick an existing one.", key),
-                    ));
+                    out.push(
+                        Finding::new(
+                            "key-missing",
+                            "error",
+                            format!("Profile \"{}\" points at a missing key", p.name),
+                            format!("{} no longer exists on disk. Generate a new key or pick an existing one.", key),
+                        )
+                        .with_fix(format!("nav:/profile/{}/edit", p.id), "Edit profile"),
+                    );
                 } else if ssh_keys::key_has_passphrase(key) {
-                    out.push(Finding::new(
-                        "key-passphrase",
-                        "warning",
-                        format!("Profile \"{}\" uses a passphrase-protected key", p.name),
-                        format!("{} needs a passphrase, so pushes prompt (or fail in scripts) unless the key is loaded in ssh-agent. Run `ssh-add {}` or use a passphrase-free key for automation.", key, key),
-                    ));
+                    out.push(
+                        Finding::new(
+                            "key-passphrase",
+                            "warning",
+                            format!("Profile \"{}\" uses a passphrase-protected key", p.name),
+                            format!("{} needs a passphrase, so pushes prompt (or fail in scripts) unless the key is loaded in ssh-agent. Run `ssh-add {}` or use a passphrase-free key for automation.", key, crate::paths::shell_quote(key)),
+                        )
+                        .with_fix(format!("copy:ssh-add {}", crate::paths::shell_quote(key)), "Copy the command"),
+                    );
                 }
             }
         }
 
         if p.directories.is_empty() && !p.is_default {
-            out.push(Finding::new(
-                "profile-no-folders",
-                "info",
-                format!("Profile \"{}\" has no folders", p.name),
-                "It will never apply to anything. Assign a folder, or make it the default profile.",
-            ));
+            out.push(
+                Finding::new(
+                    "profile-no-folders",
+                    "info",
+                    format!("Profile \"{}\" has no folders", p.name),
+                    "It will never apply to anything. Assign a folder, or make it the default profile.",
+                )
+                .with_fix(format!("nav:/profile/{}/edit", p.id), "Edit profile"),
+            );
         }
 
         for dir in &p.directories {
             if !PathBuf::from(dir).is_dir() {
-                out.push(Finding::new(
-                    "folder-missing",
-                    "warning",
-                    format!("Folder assigned to \"{}\" doesn't exist", p.name),
-                    format!("{} is not a directory (moved or deleted?). The rule is inert until it exists.", dir),
-                ));
+                out.push(
+                    Finding::new(
+                        "folder-missing",
+                        "warning",
+                        format!("Folder assigned to \"{}\" doesn't exist", p.name),
+                        format!("{} is not a directory (moved or deleted?). The rule is inert until it exists.", dir),
+                    )
+                    .with_fix(format!("drop-folder:{}:{}", p.id, dir), "Remove it from this profile"),
+                );
                 continue;
             }
             // Saved before folders were stored as the disk spells them, or
@@ -359,22 +386,248 @@ pub async fn check_profiles() -> Result<Vec<Finding>, AppError> {
             let id = crate::paths::FolderId::of(d);
             if let Some((_, other, other_dir, _)) = seen.iter().find(|(pid, _, _, s)| *pid != p.id && s.same(&id)) {
                 let (a, b) = (crate::paths::norm(other_dir), crate::paths::norm(d));
-                out.push(Finding::new(
-                    "folder-conflict",
-                    "error",
-                    "A folder is claimed by two profiles",
-                    if a == b {
-                        format!("{} is listed in both \"{}\" and \"{}\". Remove it from one of them.", b, other, p.name)
-                    } else {
-                        format!("{} in \"{}\" and {} in \"{}\" are the same folder. Remove it from one of them.", a, other, b, p.name)
-                    },
-                ));
+                out.push(
+                    Finding::new(
+                        "folder-conflict",
+                        "error",
+                        "A folder is claimed by two profiles",
+                        if a == b {
+                            format!("{} is listed in both \"{}\" and \"{}\". Remove it from one of them.", b, other, p.name)
+                        } else {
+                            format!("{} in \"{}\" and {} in \"{}\" are the same folder. Remove it from one of them.", a, other, b, p.name)
+                        },
+                    )
+                    .with_fix(format!("drop-folder:{}:{}", p.id, d), format!("Remove it from \"{}\"", p.name)),
+                );
             }
             seen.push((p.id.as_str(), p.name.as_str(), d.as_str(), id));
         }
     }
 
     Ok(out)
+}
+
+/// One account's view of one repository, asked once per check: tokens and
+/// answers are kept for the rest of the run. Ok(None) when gh has no token.
+async fn access_for(
+    acct: &str,
+    owner: &str,
+    name: &str,
+    tokens: &mut std::collections::HashMap<String, Option<String>>,
+    seen: &mut std::collections::HashMap<(String, String), crate::github::RepoAccess>,
+) -> Result<Option<crate::github::RepoAccess>, AppError> {
+    let key = (acct.to_lowercase(), format!("{}/{}", owner, name).to_lowercase());
+    if let Some(a) = seen.get(&key) {
+        return Ok(Some(a.clone()));
+    }
+    if !tokens.contains_key(acct) {
+        tokens.insert(acct.to_string(), gh_cli::gh_get_token(acct).await.ok());
+    }
+    let Some(Some(token)) = tokens.get(acct).cloned() else { return Ok(None) };
+    let a = crate::github::repo_access(&token, owner, name).await?;
+    seen.insert(key, a.clone());
+    Ok(Some(a))
+}
+
+/// Whether the account each repository in a profile folder pushes as can
+/// see it on GitHub: the "Repository not found" a fetch would meet, found
+/// before it. Asks GitHub with the GitHub CLI's tokens, so it runs when asked,
+/// not with the other checks.
+pub async fn check_repo_access() -> Result<Vec<Finding>, AppError> {
+    use crate::github::RepoAccess;
+    use std::collections::HashMap;
+    let mut out = Vec::new();
+    let accounts = gh_cli::gh_list_accounts().await.unwrap_or_default();
+    if accounts.is_empty() {
+        out.push(
+            Finding::new(
+                "access-unchecked",
+                "info",
+                "Repository access wasn't checked",
+                "The GitHub CLI has no signed-in account to ask GitHub with. Run `gh auth login`, then check again.",
+            )
+            .with_fix("copy:gh auth login", "Copy the command"),
+        );
+        return Ok(out);
+    }
+    let store = profiles::load_profiles()?;
+    let mut repos: Vec<repo_scan::ScannedRepo> = Vec::new();
+    for p in &store.profiles {
+        for dir in &p.directories {
+            if !PathBuf::from(dir).is_dir() {
+                continue;
+            }
+            for r in repo_scan::scan_repos(dir.clone()).await.unwrap_or_default() {
+                if !repos.iter().any(|x| x.path == r.path) {
+                    repos.push(r);
+                }
+            }
+        }
+    }
+    let gh = |l: &str| accounts.iter().find(|a| a.eq_ignore_ascii_case(l.trim().trim_start_matches('@'))).cloned();
+    let mut tokens: HashMap<String, Option<String>> = HashMap::new();
+    let mut seen: HashMap<(String, String), RepoAccess> = HashMap::new();
+    let mut not_in_gh: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for r in repos.iter().filter(|r| !r.owner.is_empty() && !r.name.is_empty()) {
+        let Some(owner) = crate::commit_audit::owning_profile(&r.path, &store.profiles) else { continue };
+        let ident = crate::push_identity::push_identity(&r.path, false).await.ok();
+        // Over SSH the profile's key decides the account; over HTTPS the
+        // credential helper does, whatever profile the folder has.
+        let over_ssh = ident.as_ref().is_some_and(|i| i.via == "ssh-key" || i.via == "ssh-agent");
+        let over_https = ident.as_ref().is_some_and(|i| i.via == "https-credential");
+        let pushes_as = ident.and_then(|i| i.login).or_else(|| owner.github_login.clone());
+        let Some(login) = pushes_as else { continue };
+        let Some(gh_login) = gh(&login) else {
+            if !not_in_gh.contains(&login) {
+                not_in_gh.push(login);
+            }
+            continue;
+        };
+        let slug = format!("{}/{}", r.owner, r.name);
+        let access = match access_for(&gh_login, &r.owner, &r.name, &mut tokens, &mut seen).await {
+            Ok(Some(a)) => a,
+            Ok(None) => continue,
+            Err(_) => {
+                out.push(Finding::new("access-unreachable", "info", "GitHub could not be reached", "Repository access was not checked; try again when GitHub answers."));
+                return Ok(out);
+            }
+        };
+        match access {
+            RepoAccess::Visible(_) => {}
+            RepoAccess::Unknown(why) => unknown.push(format!("{} ({})", slug, why)),
+            RepoAccess::Invisible => {
+                let mut f = Finding::new(
+                    &format!("remote-not-reachable:{}", r.path),
+                    "error",
+                    format!("@{} cannot see {}", gh_login, slug),
+                    format!(
+                        "Fetch, pull and push in {} authenticate as @{} (profile \"{}\"), and GitHub answers \"Repository not found\" to that account.",
+                        r.path, gh_login, owner.name
+                    ),
+                );
+                // Over HTTPS moving the repository changes nothing: converting
+                // it to SSH is what puts a profile's account in charge.
+                if over_https && crate::git_remote::https_to_ssh(&r.remote_url).is_some() {
+                    f = f.with_fix(format!("convert-ssh:{}", r.path), "Convert to SSH");
+                }
+                // Over SSH a profile whose own account can push there takes it
+                // in one click — its key is what will authenticate.
+                for other in store.profiles.iter().filter(|o| over_ssh && o.id != owner.id && o.ssh_key_path.is_some()) {
+                    let Some(ol) = other.github_login.as_deref().and_then(gh) else { continue };
+                    if let Ok(Some(RepoAccess::Visible(p))) = access_for(&ol, &r.owner, &r.name, &mut tokens, &mut seen).await {
+                        if p.push {
+                            f = f.with_fix(format!("assign:{}:{}", other.id, r.path), format!("Move it to \"{}\" (@{})", other.name, ol));
+                            break;
+                        }
+                    }
+                }
+                out.push(f);
+            }
+        }
+    }
+    if !not_in_gh.is_empty() {
+        out.push(Finding::new(
+            "access-account-not-in-gh",
+            "info",
+            "Some repositories push as an account the GitHub CLI is not signed in to",
+            format!("{} — sign in to it with `gh auth login` to check those repositories too.", not_in_gh.join(", ")),
+        ));
+    }
+    if !unknown.is_empty() {
+        out.push(Finding::new(
+            "access-unknown",
+            "info",
+            format!("Access to {} repositor{} could not be told", unknown.len(), if unknown.len() == 1 { "y" } else { "ies" }),
+            unknown.into_iter().take(5).collect::<Vec<_>>().join("; "),
+        ));
+    }
+    Ok(out)
+}
+
+/// A Doctor repair the app performs itself, from its fix id.
+#[derive(Debug, PartialEq)]
+enum DoctorFix {
+    DropFolder { profile_id: String, dir: String },
+    RegisterKey { profile_id: String },
+    RegisterSigning { login: String, profile_id: String },
+    Assign { profile_id: String, path: String },
+}
+
+/// Profile ids are UUIDs and logins hold no ':', so the folder can come last
+/// and keep a drive letter's colon (`C:/Users/me/work`).
+fn parse_fix(fix: &str) -> Option<DoctorFix> {
+    if let Some(rest) = fix.strip_prefix("drop-folder:") {
+        let (id, dir) = rest.split_once(':')?;
+        return (!id.is_empty() && !dir.is_empty()).then(|| DoctorFix::DropFolder { profile_id: id.into(), dir: dir.into() });
+    }
+    if let Some(id) = fix.strip_prefix("register-key:") {
+        return (!id.is_empty()).then(|| DoctorFix::RegisterKey { profile_id: id.into() });
+    }
+    if let Some(rest) = fix.strip_prefix("assign:") {
+        let (id, path) = rest.split_once(':')?;
+        return (!id.is_empty() && !path.is_empty()).then(|| DoctorFix::Assign { profile_id: id.into(), path: path.into() });
+    }
+    if let Some(rest) = fix.strip_prefix("register-signing:") {
+        let (login, id) = rest.split_once(':')?;
+        return (!login.is_empty() && !id.is_empty()).then(|| DoctorFix::RegisterSigning { login: login.into(), profile_id: id.into() });
+    }
+    None
+}
+
+/// Run one of Doctor's own repairs. Each re-reads what it acts on and refuses
+/// anything its finding would not have offered.
+pub async fn apply_fix(fix: &str) -> Result<String, AppError> {
+    let Some(f) = parse_fix(fix) else { return Err(AppError::Config(format!("Unknown repair: {}", fix))) };
+    let store = profiles::load_profiles()?;
+    let find = |id: &str| store.profiles.iter().find(|p| p.id == id).cloned();
+    match f {
+        DoctorFix::DropFolder { profile_id, dir } => {
+            let Some(p) = find(&profile_id) else { return Err(AppError::NotFound("That profile no longer exists.".into())) };
+            let target = crate::paths::FolderId::of(&dir);
+            let missing = !PathBuf::from(&dir).is_dir();
+            let claimed_elsewhere = store.profiles.iter().any(|o| o.id != p.id && o.directories.iter().any(|d| crate::paths::FolderId::of(d).same(&target)));
+            if !missing && !claimed_elsewhere {
+                return Err(AppError::Config(format!("{} exists and no other profile lists it: there is nothing to repair.", dir)));
+            }
+            let keep: Vec<String> = p.directories.iter().filter(|d| crate::paths::norm(d) != crate::paths::norm(&dir)).cloned().collect();
+            // As the profile form saves: git's rules rewritten, and the commit
+            // guards in the folder refreshed — the repositories there now
+            // belong to the other profile, and a guard still expecting this
+            // one's address would refuse every commit.
+            crate::commands::update_profile_core(p.id.clone(), None, None, None, None, Some(keep), None, None, None, None).await?;
+            Ok(format!("Removed {} from \"{}\"", dir, p.name))
+        }
+        DoctorFix::RegisterKey { profile_id } => {
+            let Some(p) = find(&profile_id) else { return Err(AppError::NotFound("That profile no longer exists.".into())) };
+            let key = p.ssh_key_path.clone().ok_or_else(|| AppError::Config(format!("\"{}\" has no SSH key.", p.name)))?;
+            let login = p.github_login.clone().map(|l| l.trim().trim_start_matches('@').to_string()).filter(|l| !l.is_empty()).ok_or_else(|| AppError::Config(format!("\"{}\" names no GitHub account.", p.name)))?;
+            // gh finds its token by the login spelled as gh stores it.
+            let gh_login = gh_spelling(&gh_cli::gh_list_accounts().await.unwrap_or_default(), &login)
+                .ok_or_else(|| AppError::Config(format!("The GitHub CLI is not signed in to @{}.", login)))?;
+            crate::commands::gh_register_ssh_key(gh_login, key).await
+        }
+        DoctorFix::Assign { profile_id, path } => {
+            let Some(p) = find(&profile_id) else { return Err(AppError::NotFound("That profile no longer exists.".into())) };
+            if !PathBuf::from(&path).is_dir() {
+                return Err(AppError::NotFound(format!("{} no longer exists.", path)));
+            }
+            let mut dirs = p.directories.clone();
+            dirs.push(path.clone());
+            crate::commands::update_profile_core(p.id.clone(), None, None, None, None, Some(dirs), None, None, None, None).await?;
+            Ok(format!("{} now belongs to \"{}\"", path, p.name))
+        }
+        DoctorFix::RegisterSigning { login, profile_id } => {
+            let Some(p) = find(&profile_id) else { return Err(AppError::NotFound("That profile no longer exists.".into())) };
+            let key = p.ssh_key_path.clone().ok_or_else(|| AppError::Config(format!("\"{}\" has no SSH key.", p.name)))?;
+            crate::commands::register_signing_key(login, key).await
+        }
+    }
+}
+
+/// A login as gh spells it: GitHub logins ignore case, gh's keyring does not.
+fn gh_spelling(accounts: &[String], login: &str) -> Option<String> {
+    accounts.iter().find(|a| a.eq_ignore_ascii_case(login)).cloned()
 }
 
 /// Which GitHub account does each profile's key actually authenticate as?
@@ -399,12 +652,15 @@ pub async fn check_keys() -> Result<Vec<Finding>, AppError> {
                         )
                         .await
                         {
-                            Ok(false) => out.push(Finding::new(
-                                "signing-key-not-registered",
-                                "warning",
-                                format!("Profile \"{}\" signs commits, but the key isn't a GitHub signing key", p.name),
-                                "GitHub treats authentication keys and signing keys as different types. Until this key is registered as a SIGNING key, commits stay Unverified. Add it from the profile's Commit Signing section.",
-                            )),
+                            Ok(false) => out.push(
+                                Finding::new(
+                                    "signing-key-not-registered",
+                                    "warning",
+                                    format!("Profile \"{}\" signs commits, but the key isn't a GitHub signing key", p.name),
+                                    "GitHub treats authentication keys and signing keys as different types. Until this key is registered as a SIGNING key, commits stay Unverified.",
+                                )
+                                .with_fix(format!("register-signing:{}:{}", login, p.id), format!("Register as signing key on @{}", login)),
+                            ),
                             Ok(true) => {}
                             Err(e) => out.push(Finding::new(
                                 "signing-key-check-failed",
@@ -428,36 +684,55 @@ pub async fn check_keys() -> Result<Vec<Finding>, AppError> {
                         .iter()
                         .any(|a| a.eq_ignore_ascii_case(p.git_name.trim()));
                     let sev = if looks_like_login { "warning" } else { "info" };
-                    out.push(Finding::new(
-                        "key-account-mismatch",
-                        sev,
-                        format!("Profile \"{}\" pushes as {}", p.name, login),
-                        format!(
-                            "Its key authenticates as GitHub user {}, but the profile's git username is \"{}\". Commits in these folders will be attributed to {}.",
-                            login, p.git_name, login
-                        ),
-                    ));
+                    out.push(
+                        Finding::new(
+                            "key-account-mismatch",
+                            sev,
+                            format!("Profile \"{}\" pushes as {}", p.name, login),
+                            format!(
+                                "Its key authenticates as GitHub user {}, but the profile's git username is \"{}\". Commits in these folders will be attributed to {}.",
+                                login, p.git_name, login
+                            ),
+                        )
+                        .with_fix(format!("nav:/profile/{}/edit", p.id), "Edit profile"),
+                    );
                 }
             }
-            Ok(None) if ssh_keys::rejected_because_locked(ssh_keys::key_has_passphrase(key), ssh_keys::agent_holds_key(key).await) => out.push(Finding::new(
-                "key-locked",
-                "info",
-                format!("Couldn't verify profile \"{}\"'s key: it needs its passphrase", p.name),
-                format!(
-                    "{} is passphrase-protected and not loaded in ssh-agent, so GitSwitch could not unlock it to ask github.com which account it belongs to. Pushes may still work: ssh can unlock it through your ssh config or keychain. Load it with `ssh-add {}` and run the checks again for a definite answer.",
-                    key,
-                    crate::paths::shell_quote(key)
-                ),
-            )),
-            Ok(None) => out.push(Finding::new(
-                "key-not-registered",
-                "error",
-                format!("Profile \"{}\"'s key isn't on any GitHub account", p.name),
-                format!(
-                    "{} was rejected by github.com. Register its .pub on the right account (SSH Keys → Register), or pushes from these folders will fail.",
-                    key
-                ),
-            )),
+            Ok(None) if ssh_keys::rejected_because_locked(ssh_keys::key_has_passphrase(key), ssh_keys::agent_holds_key(key).await) => out.push(
+                Finding::new(
+                    "key-locked",
+                    "info",
+                    format!("Couldn't verify profile \"{}\"'s key: it needs its passphrase", p.name),
+                    format!(
+                        "{} is passphrase-protected and not loaded in ssh-agent, so GitSwitch could not unlock it to ask github.com which account it belongs to. Pushes may still work: ssh can unlock it through your ssh config or keychain. Load it with `ssh-add {}` and run the checks again for a definite answer.",
+                        key,
+                        crate::paths::shell_quote(key)
+                    ),
+                )
+                .with_fix(format!("copy:ssh-add {}", crate::paths::shell_quote(key)), "Copy the command"),
+            ),
+            Ok(None) => {
+                // The profile's own GitHub account, when gh is signed in to it,
+                // can take the key in one click; otherwise the SSH Keys page.
+                let account = p
+                    .github_login
+                    .as_deref()
+                    .map(|l| l.trim().trim_start_matches('@'))
+                    .and_then(|l| known_accounts.iter().find(|a| a.eq_ignore_ascii_case(l)).cloned());
+                let finding = Finding::new(
+                    "key-not-registered",
+                    "error",
+                    format!("Profile \"{}\"'s key isn't on any GitHub account", p.name),
+                    format!(
+                        "{} was rejected by github.com. Register its .pub on the right account, or pushes from these folders will fail.",
+                        key
+                    ),
+                );
+                out.push(match account {
+                    Some(a) => finding.with_fix(format!("register-key:{}", p.id), format!("Register on @{}", a)),
+                    None => finding.with_fix("nav:/ssh", "Open SSH Keys"),
+                });
+            }
             Err(e) => out.push(Finding::new(
                 "key-check-failed",
                 "info",
@@ -520,34 +795,55 @@ pub async fn check_repos() -> Result<Vec<Finding>, AppError> {
                 if r.remote_url.is_empty() {
                     continue; // no origin — nothing to push to yet
                 }
+                // origin's own push URL, when it has one: pushes go there, so a
+                // token or an HTTPS address in it matters as much.
+                if let Some(pu) = &r.push_url {
+                    if pu.contains("***@") || pu.starts_with("https://") || pu.starts_with("http://") {
+                        let token = pu.contains("***@");
+                        let f = Finding::new(
+                            if token { "remote-push-embedded-token" } else { "remote-push-https" },
+                            if token { "error" } else { "warning" },
+                            format!("{} pushes to {}", name, if token { "a URL with a token in it" } else { "an HTTPS address" }),
+                            format!(
+                                "{} fetches from {} but pushes to {} (remote.origin.pushurl).{}",
+                                r.path,
+                                r.remote_url,
+                                pu,
+                                if token { " The credential sits in plaintext in .git/config." } else { " HTTPS pushes authenticate through a credential helper, not your profile's SSH key." }
+                            ),
+                        );
+                        out.push(if crate::git_remote::https_to_ssh(pu).is_some() { f.with_fix(format!("convert-ssh:{}", r.path), "Convert to SSH") } else { f });
+                    }
+                }
+                // Converting is offered only where there is a GitHub address
+                // to convert to: a gist's own, or github.com's — never another
+                // host's, nor one that merely contains "github.com".
+                let convertible = crate::git_remote::https_to_ssh(&r.remote_url).is_some();
                 // scan_repos masks credentials as `***@`, so this detects an
                 // embedded token without ever surfacing the secret.
                 if r.remote_url.contains("***@") {
-                    out.push(
-                        Finding::new(
-                            "remote-embedded-token",
-                            "error",
-                            format!("{} has a token embedded in its remote URL", name),
-                            format!(
-                                "{} stores a credential in plaintext in .git/config, and pushes bypass your profile's SSH key entirely. Converting to SSH removes the token.",
-                                r.path
-                            ),
-                        )
-                        .with_fix(format!("convert-ssh:{}", r.path), "Convert to SSH"),
+                    let f = Finding::new(
+                        "remote-embedded-token",
+                        "error",
+                        format!("{} has a token embedded in its remote URL", name),
+                        format!(
+                            "{} stores a credential in plaintext in .git/config, and pushes bypass your profile's SSH key entirely. {}",
+                            r.path,
+                            if convertible { "Converting to SSH removes the token." } else { "Remove it from the address (git remote set-url origin <the address without it>)." }
+                        ),
                     );
+                    out.push(if convertible { f.with_fix(format!("convert-ssh:{}", r.path), "Convert to SSH") } else { f });
                 } else if r.remote_url.starts_with("https://") || r.remote_url.starts_with("http://") {
-                    out.push(
-                        Finding::new(
-                            "remote-https",
-                            "warning",
-                            format!("{} uses an HTTPS remote", name),
-                            format!(
-                                "{} → {}\nHTTPS pushes authenticate through a credential helper, not your profile's SSH key, so GitSwitch can't control which account they land on.",
-                                r.path, r.remote_url
-                            ),
-                        )
-                        .with_fix(format!("convert-ssh:{}", r.path), "Convert to SSH"),
+                    let f = Finding::new(
+                        "remote-https",
+                        "warning",
+                        format!("{} uses an HTTPS remote", name),
+                        format!(
+                            "{} → {}\nHTTPS pushes authenticate through a credential helper, not your profile's SSH key, so GitSwitch can't control which account they land on.",
+                            r.path, r.remote_url
+                        ),
                     );
+                    out.push(if convertible { f.with_fix(format!("convert-ssh:{}", r.path), "Convert to SSH") } else { f });
                 } else if let Some(sr) = crate::ssh_config::ssh_host_of_url(&r.remote_url) {
                     // `git@gh-work:…` or `git@github.com-work:…` is an ssh alias:
                     // which host and which key it means is in ~/.ssh/config, and
@@ -978,6 +1274,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_login_is_handed_to_gh_as_gh_spells_it() {
+        let accounts = vec!["Kshitij-Example".to_string(), "other".to_string()];
+        assert_eq!(gh_spelling(&accounts, "kshitij-example").as_deref(), Some("Kshitij-Example"));
+        assert_eq!(gh_spelling(&accounts, "nobody"), None);
+    }
+
+    #[test]
     fn glob_matches_ssh_host_patterns() {
         assert!(pattern_matches("github.com", "github.com"));
         assert!(pattern_matches("*", "github.com"));
@@ -1028,5 +1331,22 @@ Host other\n    User bob\n";
         assert_eq!(manual.len(), 2);
         assert!(manual[0].contains("/a/"));
         assert!(manual[1].contains("/c/"));
+    }
+}
+
+#[cfg(test)]
+mod fix_tests {
+    use super::*;
+
+    #[test]
+    fn a_fix_id_names_its_repair_and_keeps_a_drive_letter() {
+        assert_eq!(
+            parse_fix("drop-folder:0f8a1c2e-1111-2222-3333-444455556666:C:/Users/me/work"),
+            Some(DoctorFix::DropFolder { profile_id: "0f8a1c2e-1111-2222-3333-444455556666".into(), dir: "C:/Users/me/work".into() })
+        );
+        assert_eq!(parse_fix("register-signing:octo:abc"), Some(DoctorFix::RegisterSigning { login: "octo".into(), profile_id: "abc".into() }));
+        assert_eq!(parse_fix("register-key:abc"), Some(DoctorFix::RegisterKey { profile_id: "abc".into() }));
+        assert_eq!(parse_fix("nav:/ssh"), None);
+        assert_eq!(parse_fix("drop-folder:"), None);
     }
 }

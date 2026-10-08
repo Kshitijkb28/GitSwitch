@@ -9,15 +9,21 @@ codebase builds installers for **Windows, macOS, and Linux**.
 # Run the full app from source (dev, hot-reload) ...... npm run tauri dev   [native]
 # Build a production app for THIS machine's OS ........ npm run tauri build [native]
 # Build Linux installers on any machine ............... docker compose run --rm builder
+# Run the app in Docker (any machine), in a browser ... docker compose up app   -> localhost:6080
+# Run `tauri dev` in Docker on this checkout .......... docker compose up dev   -> localhost:6080
 # Build ALL three OSes' installers .................... git tag vX.Y.Z && git push --tags  (CI)
 ```
 
-> To **run** GitSwitch from the codebase, use `npm run tauri dev` — Docker is a
-> *build* tool here, not a run tool (a container has no display for a GUI app).
+> To **run** GitSwitch from the codebase, use `npm run tauri dev` — or, with
+> nothing but Docker installed, `docker compose up dev`.
 
-> **Docker note:** Docker cannot *run* GitSwitch — a container has no display,
-> and this is a GUI app. Docker is only used here to **build the Linux
-> installer** reproducibly. See [Linux via Docker](#linux-via-docker).
+> **Docker note:** a container has no display of its own, so Docker runs
+> GitSwitch on a virtual one and shows it in your browser: `docker compose up
+> app` (the built app — the image needs no checkout, so it runs on any Docker
+> host) or `docker compose up dev` (`tauri dev` on this checkout), then open
+> http://localhost:6080/vnc.html. The screen is served on localhost only. The
+> app in a container uses the container's git, keys and folders — mount the
+> folders you want it to manage. See [Linux via Docker](#linux-via-docker).
 
 ---
 
@@ -85,7 +91,10 @@ npm run tauri build -- --target universal-apple-darwin
 npm install
 npm run tauri build         # -> src-tauri\target\release\bundle\{msi,nsis}\
 ```
-(Needs the "Desktop development with C++" workload from Visual Studio Build Tools.)
+(Needs the "Desktop development with C++" workload from Visual Studio Build Tools.
+No bash is needed: the sidecars are built by `cargo run -p gitswitch-sidecars`,
+which `npm run tauri dev` and `npm run tauri build` run themselves, from
+PowerShell or cmd alike.)
 
 ### Linux (native)
 ```bash

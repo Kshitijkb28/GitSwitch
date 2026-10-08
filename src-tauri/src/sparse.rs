@@ -216,6 +216,65 @@ fn ask_size(url: &str, accounts: Option<Vec<String>>) -> (EstimateCell, Option<t
     (cell, Some(task))
 }
 
+type RunningClones = std::collections::HashMap<String, String>;
+fn running_clones() -> &'static std::sync::Mutex<RunningClones> {
+    static R: std::sync::OnceLock<std::sync::Mutex<RunningClones>> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// While a clone writes into its folder — git, then its submodules, then its
+/// large files — the folder is not a repository yet, though git wrote `.git`
+/// and an origin before downloading anything. Held for the whole clone;
+/// dropped however it ends.
+pub(crate) struct CloneGuard(Vec<String>);
+
+impl CloneGuard {
+    pub(crate) fn hold(dest: &Path, url: &str) -> Self {
+        let mut keys = vec![crate::paths::norm(&dest.to_string_lossy())];
+        // And as the disk spells it (the folder itself may not exist yet).
+        if let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) {
+            if let Some(r) = crate::paths::real_form(&parent.to_string_lossy()) {
+                keys.push(crate::paths::norm(&format!("{}/{}", r, name.to_string_lossy())));
+            }
+        }
+        keys.dedup();
+        if let Ok(mut m) = running_clones().lock() {
+            for k in &keys {
+                m.insert(k.clone(), url.to_string());
+            }
+        }
+        CloneGuard(keys)
+    }
+}
+
+impl Drop for CloneGuard {
+    fn drop(&mut self) {
+        if let Ok(mut m) = running_clones().lock() {
+            for k in &self.0 {
+                m.remove(k);
+            }
+        }
+    }
+}
+
+/// Is a clone still writing this folder?
+pub(crate) fn clone_running_at(path: &str) -> bool {
+    let Ok(m) = running_clones().lock() else { return false };
+    if m.is_empty() {
+        return false;
+    }
+    let mut keys = vec![crate::paths::norm(path)];
+    if let Some(r) = crate::paths::real_form(path) {
+        keys.push(crate::paths::norm(&r));
+    }
+    keys.iter().any(|k| m.contains_key(k))
+}
+
+/// Every clone still running: (destination, address).
+pub(crate) fn running_clone_list() -> Vec<(String, String)> {
+    running_clones().lock().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default()
+}
+
 type ProgressMap = std::collections::HashMap<String, CloneProgress>;
 fn progress_map() -> &'static std::sync::Mutex<ProgressMap> {
     static M: std::sync::OnceLock<std::sync::Mutex<ProgressMap>> = std::sync::OnceLock::new();
@@ -762,6 +821,34 @@ pub struct CloneResult {
     /// download was requested, so the result can say what state the large
     /// files are in either way.
     pub lfs: Option<LfsReport>,
+    /// The same for each populated submodule that uses Git LFS.
+    pub submodule_lfs: Vec<SubmoduleLfs>,
+}
+
+/// One submodule's large files after a clone or a download.
+#[derive(Debug, Serialize, Clone)]
+pub struct SubmoduleLfs {
+    pub path: String,
+    pub report: LfsReport,
+}
+
+/// The large files of the populated submodules — all of them, or only the
+/// named ones and those nested in them — handled as `lfs_after_checkout`
+/// handles the repository's own: downloaded when asked and possible, said
+/// either way.
+pub(crate) async fn lfs_in_submodules(repo: &Path, only: Option<&[String]>, requested: bool, progress_for: Option<&str>) -> Vec<SubmoduleLfs> {
+    let mut out = Vec::new();
+    for rel in crate::push_guard::populated_submodules(repo).await {
+        if let Some(only) = only {
+            if !only.iter().any(|p| rel == *p || rel.starts_with(&format!("{}/", p))) {
+                continue;
+            }
+        }
+        if let Some(report) = Box::pin(lfs_after_checkout(&repo.join(&rel), requested, progress_for)).await {
+            out.push(SubmoduleLfs { path: rel, report });
+        }
+    }
+    out
 }
 
 /// What happened to the large files after a checkout. Measured by counting
@@ -902,11 +989,12 @@ pub struct SubmoduleReport {
 /// either: it aborts on the first entry with no address in .gitmodules —
 /// some repos have dozens — and downloads nothing.)
 /// `only`: restrict the update to these .gitmodules paths. The Changes page
-/// passes the submodules that were never initialised, so `submodule update
-/// --init --recursive` is never run on a populated submodule from the app —
-/// under `update = merge` that command writes a merge commit inside it, which
-/// is exactly the tangle a superproject with CI pointer bumps keeps producing.
-/// The clone path passes `None` (a fresh clone has nothing populated).
+/// passes the submodules it downloads, and a row's "Update to <commit>" one
+/// that is populated: that one is checked out at its record whatever
+/// `submodule.<name>.update` says (`--checkout` — under `update = merge` the
+/// plain command writes a merge commit inside it, the tangle a superproject
+/// with CI pointer bumps keeps producing), and a nested one set to merge can
+/// only fast-forward. The clone path passes `None` (nothing is populated).
 /// `progress_for` is the path whose progress line should name each submodule
 /// as it is fetched ("Submodules · 3 of 8 · libs/sub") — this same `repo`:
 /// the clone's destination while a clone is in flight, or the repository the
@@ -1067,7 +1155,21 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
                     Some(sha) => have_recorded(sha.clone()).await,
                     None => false,
                 };
-                run_git_streaming(Some(repo), &cfg, &["submodule", "update", "--init", "--recursive", "--progress", "--", path], Some(submodule_stall()), !nothing_to_fetch, &on_progress).await
+                // Already here: what is recorded is checked out whatever
+                // `submodule.<name>.update` says — merge, rebase or none
+                // would make "Update to" a merge commit inside it, a rebase,
+                // or nothing at all.
+                let mut update = vec!["submodule", "update", "--init", "--recursive", "--progress"];
+                let mut update_cfg = cfg.clone();
+                if downloaded {
+                    update.push("--checkout");
+                    // And a nested one set to `update = merge` can only
+                    // fast-forward: one with commits of its own fails with
+                    // git's words instead of getting a merge commit.
+                    update_cfg.push("merge.ff=only".into());
+                }
+                update.extend(["--", path.as_str()]);
+                run_git_streaming(Some(repo), &update_cfg, &update, Some(submodule_stall()), !nothing_to_fetch, &on_progress).await
             }
         };
         if let Some(t) = asking {
@@ -1195,7 +1297,7 @@ async fn clear_incomplete(repo: &Path, name: &str, path: &str) -> Option<String>
 
 /// The folder is a repository of its own — never the superproject above it,
 /// which git finds when the folder has no `.git` of its own.
-async fn own_repository(dir: &Path) -> bool {
+pub(crate) async fn own_repository(dir: &Path) -> bool {
     if !dir.join(".git").exists() {
         return false;
     }
@@ -1208,7 +1310,7 @@ fn is_stall(e: &AppError) -> bool {
     matches!(e, AppError::Command(m) if m.contains("made no progress for"))
 }
 
-async fn is_checked_out(dir: &Path) -> bool {
+pub(crate) async fn is_checked_out(dir: &Path) -> bool {
     if !dir.join(".git").exists() || run_git(Some(dir), &["rev-parse", "--verify", "HEAD"]).await.is_err() {
         return false;
     }
@@ -1539,6 +1641,7 @@ async fn clone_as_profile(
 
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let _progress = ProgressGuard(crate::paths::norm(&dest_str));
+    let _running = CloneGuard::hold(Path::new(&dest_str), url.trim());
     set_progress(&dest_str, CloneProgress::phase("Connecting"));
     let progress_key = crate::paths::norm(&dest_str);
     // The host's size is for a whole repository: a partial clone downloads a
@@ -1573,6 +1676,13 @@ async fn clone_as_profile(
         set_progress(&dest_str, CloneProgress::phase("Large files"));
         lfs_after_checkout(&dest, with_lfs, Some(&dest_str)).await
     };
+    // The submodules' large files, the same way: a submodule's own are as much
+    // the clone as the repository's.
+    let submodule_lfs = if with_submodules && !extra_args.contains(&"--no-checkout") {
+        Box::pin(lfs_in_submodules(&dest, None, with_lfs, Some(&dest_str))).await
+    } else {
+        Vec::new()
+    };
 
     let mut mapped_to = None;
     if let Some(p) = chosen.as_ref() {
@@ -1598,6 +1708,7 @@ async fn clone_as_profile(
         mapped_to,
         submodules,
         lfs,
+        submodule_lfs,
     })
 }
 

@@ -95,6 +95,39 @@ product = conf.get("productName", "")
 names = [f"{product}_x.y.z_amd64.deb", f"{product}_x.y.z_amd64.AppImage", f"{product}-x.y.z-1.x86_64.rpm", f"{product}_x.y.z_x64-setup.exe"]
 missing = [n for n in names if n not in section1]
 ok("  and names the installers the bundler writes", not missing, f"missing {missing}")
+# --- Docker runs the app -----------------------------------------------------------
+docker = read(f"{ROOT}/Dockerfile")
+stages = re.findall(r"^FROM \S+ AS (\S+)", docker, re.M)
+ok("the Dockerfile builds the installers by default and runs the app and tauri dev", stages[-1:] == ["builder"] and {"app", "dev"} <= set(stages), f"stages: {stages}")
+compose = read(f"{ROOT}/docker-compose.yml")
+ok("  compose names each target, and serves the screen on localhost only", all(f"target: {t}" in compose for t in ("builder", "app", "dev")) and compose.count('"127.0.0.1:6080:6080"') == 2 and "0.0.0.0" not in compose)
+scripts = [f"{ROOT}/scripts/docker/{n}" for n in ("display.sh", "app.sh", "dev.sh")]
+ok("  its scripts exist, are executable and have LF endings", all(os.path.exists(s) and os.access(s, os.X_OK) and b"\r" not in open(s, "rb").read() for s in scripts))
+ignore = read(f"{ROOT}/.dockerignore").split("\n")
+ok("  the build context leaves out local scratch and host binaries", all(x in ignore for x in (".claude", "src-tauri/binaries", "**/node_modules")), str(ignore))
+display = read(f"{ROOT}/scripts/docker/display.sh")
+clear_at, xvfb_at = display.find("rm -f /tmp/.X99-lock /tmp/.X11-unix/X99"), display.find("Xvfb :99")
+ok("  a restarted container clears the killed display's lock and socket, then waits for its own server", 0 <= clear_at < xvfb_at and "-S /tmp/.X11-unix/X99" in display and 'kill -0 "$xvfb"' in display)
+dev_sh = read(f"{ROOT}/scripts/docker/dev.sh")
+ok("  tauri dev installs node_modules again when the lockfile changed", "sha256sum package-lock.json" in dev_sh and "node_modules/.lock-sha256" in dev_sh)
+gitignore = read(f"{ROOT}/.gitignore").split("\n")
+ok("  dev builds its Linux sidecars into a volume, over a folder the checkout keeps (never one root creates)", "gitswitch-sidecars:/app/src-tauri/binaries" in compose and os.path.exists(f"{ROOT}/src-tauri/binaries/.gitkeep") and "!src-tauri/binaries/.gitkeep" in gitignore and "src-tauri/binaries" not in gitignore)
+
+# --- The sidecars build without a shell ------------------------------------------
+before = [conf.get("build", {}).get("beforeDevCommand", ""), conf.get("build", {}).get("beforeBuildCommand", "")]
+ok("Tauri's before-commands build the sidecars with cargo, not bash (cmd and PowerShell have none)", all("-p gitswitch-sidecars" in c and "bash" not in c for c in before), str(before))
+ws = read(f"{ROOT}/src-tauri/Cargo.toml")
+ok("  the sidecars crate is a workspace member, outside the default build", '"sidecars"' in ws.split("default-members")[0] and '"sidecars"' not in ws.split("default-members")[1].split("\n")[0], "")
+
+# --- gitswitch:// opens the app -------------------------------------------------
+schemes = conf.get("plugins", {}).get("deep-link", {}).get("desktop", {}).get("schemes", [])
+ok("the app registers the gitswitch:// scheme in every bundle", "gitswitch" in schemes, f"schemes: {schemes}")
+cargo = read(f"{ROOT}/src-tauri/Cargo.toml")
+ok("  with the deep-link plugin, and a second launch hands its link to the running app", "tauri-plugin-deep-link" in cargo and 'tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }' in cargo)
+ext_src = read(f"{EXT}/src/extension.ts")
+deep = read(f"{ROOT}/src-tauri/src/deep_link.rs")
+pages = re.findall(r'gitswitch://([a-z]+)', ext_src)
+ok("  the extension opens only pages the app's link allowlist names", bool(pages) and all(f'"{p}"' in deep for p in pages), f"extension opens {pages}")
 readme = read(f"{ROOT}/README.md")
 ok("README points to the first-open steps", "BUILD.md#first-open-on-macos" in readme)
 ok("  and to the extension's .vsix on the release", "gitswitch-<version>.vsix" in readme)

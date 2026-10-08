@@ -2,6 +2,7 @@
 // scrolls. `<main>` has overflow-y-auto, so it scrolls horizontally on its own
 // and documentElement never reports overflow — measuring the wrong element once
 // hid a page that was visibly clipped.
+import fs from "node:fs";
 import { launch, serve, DIST_OK } from "./browser.mjs";
 import { REPOS, SCENARIOS, DIFF_TEXT, SUB_STATUSES, STASHES, SUBMODULES } from "./fixtures.mjs";
 
@@ -27,14 +28,33 @@ const status = {
 };
 const PAGES = ["Profiles", "SSH Keys", "GitHub Auth", "Repositories", "Clone", "Repository", "Auto Assign", "Doctor", "Commit Audit", "Settings"];
 
-const server = await serve();
+// The app's own content-security policy, served with the page: anything the
+// built app does that the policy forbids shows up here as a violation.
+const security = JSON.parse(fs.readFileSync(new URL("../../../src-tauri/tauri.conf.json", import.meta.url), "utf8")).app?.security ?? {};
+const csp = typeof security.csp === "string" ? security.csp : security.csp ? Object.entries(security.csp).map(([k, v]) => `${k} ${Array.isArray(v) ? v.join(" ") : v}`).join("; ") : null;
+if (!csp) {
+  console.error("the app declares no content-security policy");
+  process.exit(1);
+}
+const server = await serve({ headers: { "Content-Security-Policy": csp } });
 const browser = await launch();
 let bad = 0;
+/** Violations recorded since the last look, reported and counted. */
+const cspCheck = async (page, where) => {
+  const v = await page.evaluate(() => (window.__CSP__ || []).splice(0));
+  if (v.length) {
+    bad++;
+    console.log(`  \x1b[31mCSP     \x1b[0m ${where.padEnd(14)} ${[...new Set(v)].join(" | ")}`);
+  }
+};
 try {
   for (const width of [700, 900]) {
     console.log(`\n\x1b[1m${width}px (half screen)\x1b[0m`);
     const page = await browser.newPage();
     await page.setViewport({ width, height: 900 });
+    await page.evaluateOnNewDocument(() => {
+      document.addEventListener("securitypolicyviolation", (e) => (window.__CSP__ = window.__CSP__ || []).push(`${e.violatedDirective} ${e.blockedURI}`));
+    });
     await page.evaluateOnNewDocument((repos, st, d1, subs, stashes, submods) => {
       localStorage.clear();
       // The Clone page takes its readings only once it has a URL and a folder.
@@ -52,8 +72,8 @@ try {
       ];
       const audit = [{
         path: "/repos/argos", repo_name: "argos", profile_name: "Long", expected_name: "Long Address", expected_email: window.__LONG_EMAIL__,
-        mismatched: [{ hash: "a".repeat(40), short: "aaaaaaa", author_name: "Someone", author_email: window.__LONG_EMAIL__, date: "2026-01-01T00:00:00Z", subject: "a commit", pushed: false }],
-        unpushed_count: 1, pushed_count: 0, has_upstream: true, dirty: false, guard: "none",
+        mismatched: [{ hash: "a".repeat(40), short: "aaaaaaa", author_name: "Someone", author_email: window.__LONG_EMAIL__, date: "2026-01-01T00:00:00Z", subject: "a commit", pushed: false, branches: ["main"], on_head: true }],
+        unpushed_count: 1, pushed_count: 0, has_upstream: true, dirty: false, guard: "none", other_branch_count: 0, fix_blocker: null,
       }];
       // Auto Assign's scan, only once a test turns it on (window.__AUTO__): the
       // page loop's Refresh-parity readings stay what they were.
@@ -118,6 +138,20 @@ try {
     }, REPOS, status, DIFF_TEXT, SUB_STATUSES, STASHES, SUBMODULES);
     // Start off a page that is not swept, so the first stop (Profiles, at "/") mounts fresh on its click.
     await page.goto(`${server.url}/profile/new`, { waitUntil: "networkidle0" });
+    // The check itself must see a violation when there is one: an inline script is one.
+    if (width === 700) {
+      await page.evaluate(() => {
+        const s = document.createElement("script");
+        s.textContent = "window.__INLINE_RAN__ = true";
+        document.body.appendChild(s);
+      });
+      await new Promise((r) => setTimeout(r, 200));
+      const seen = await page.evaluate(() => ({ v: (window.__CSP__ || []).splice(0), ran: window.__INLINE_RAN__ === true }));
+      const works = !seen.ran && seen.v.some((x) => x.startsWith("script-src"));
+      if (!works) bad++;
+      console.log(`  ${works ? "\x1b[32mok      \x1b[0m" : "\x1b[31mCSP     \x1b[0m"} ${"CSP check".padEnd(14)} ${works ? "the policy is served, and an inline script is blocked and reported" : `the policy did not block an inline script (${JSON.stringify(seen)})`}`);
+    }
+    await cspCheck(page, "first load");
 
     // The Repository page's other tabs are swept as pages of their own.
     const STOPS = PAGES.flatMap((n) => (n === "Repository" ? [n, "tab:History", "tab:Submodules"] : [n]));
@@ -133,6 +167,7 @@ try {
       }, name, stop.startsWith("tab:"));
       if (!clicked) { console.log(`  ${name}: link not found`); bad++; continue; }
       await new Promise((r) => setTimeout(r, 450));
+      await cspCheck(page, name);
       const r = await page.evaluate(() => {
         const m = document.querySelector("main");
         const culprits = [];
@@ -227,6 +262,7 @@ try {
           errored: el.innerText.includes("Tauri runtime not available") || el.innerText.includes("transformCallback"),
         };
       });
+      await cspCheck(page, "Terminal");
       if (!d) {
         console.log("  Terminal: drawer never appeared");
         bad++;
@@ -318,6 +354,7 @@ try {
       return p !== null && p.a > 0 && p.r < 64 && p.g < 64 && p.b < 64;
     });
     if (!dark) bad++;
+    await cspCheck(page, "the rest");
     console.log(`  ${dark ? "\x1b[32mok      \x1b[0m" : "\x1b[31mWHITE   \x1b[0m"} ${"Document".padEnd(14)} html/body background ${bg.join(" / ")}`);
     await page.close();
   }

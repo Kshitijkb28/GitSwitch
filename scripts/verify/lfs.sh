@@ -300,6 +300,66 @@ ok "everything else arrives" "$(printf '%s' "$OUT" | jqf lfs.pointers)" "0"
 ok "  including the file in the folder that was skipped before" "$(wc -c < "$SB/browse/media/audio/tone.bin" | tr -d ' ')" "1536"
 ok "  no progress file is left behind" "$(probe lfs_progress "$SB/browse")" "null"
 
+section "A git-lfs error that leaves no file missing is a note, not a failure"
+# git-lfs stopped after it wrote the last file (or failing on an object whose
+# file is already here) exits with an error although nothing is missing. A
+# git-lfs that does the whole pull and then exits 2 is exactly that case.
+LFS_REAL="$(command -v git-lfs)"; mkdir -p "$SB/lfs-stops"
+cat > "$SB/lfs-stops/git-lfs" <<WRAP
+#!/bin/sh
+if [ "\$1" = "pull" ]; then
+  "$LFS_REAL" "\$@"
+  echo "error: git-lfs was stopped after writing the last file" >&2
+  exit 2
+fi
+exec "$LFS_REAL" "\$@"
+WRAP
+chmod +x "$SB/lfs-stops/git-lfs"
+cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" warn 2>/dev/null
+git -C "$SB/warn" lfs install --local >/dev/null 2>&1
+OUT=$(PATH="$SB/lfs-stops:$PATH" probe lfs_pull "$SB/warn")
+ok "(git-lfs itself exits with an error here)" "$(printf '%s' "$OUT" | jqf advice.git_said)" "stopped after writing the last file"
+ok "a git-lfs error that leaves no stub behind is not a failure" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf lfs.pointers)" "True:0"
+ok "  and the result still says git-lfs reported an error" "$(printf '%s' "$OUT" | jqf detail)" "git-lfs still exited with an error, but no file is missing"
+# The same git-lfs where a stub is left: then it is a failure, as before.
+cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" warn-left 2>/dev/null
+git -C "$SB/warn-left" lfs install --local >/dev/null 2>&1
+cat > "$SB/lfs-stops/git-lfs" <<WRAP
+#!/bin/sh
+if [ "\$1" = "pull" ]; then
+  echo "error: git-lfs was stopped before writing anything" >&2
+  exit 2
+fi
+exec "$LFS_REAL" "\$@"
+WRAP
+OUT=$(PATH="$SB/lfs-stops:$PATH" probe lfs_pull "$SB/warn-left")
+ok "  while one that leaves stubs is still a failure" "$(printf '%s' "$OUT" | jqf ok):$([ "$(printf '%s' "$OUT" | jqf lfs.pointers)" -gt 0 ] && echo stubs-left)" "False:stubs-left"
+
+section "The large files of submodules: a clone and a Download bring them as the repository's own"
+# A superproject with a large file of its own and a submodule with another.
+git init -q --bare "$SB/slfs-lib.git"; git clone -q "$SB/slfs-lib.git" "$SB/slfs-lib-author" 2>/dev/null
+( cd "$SB/slfs-lib-author" && git lfs install --local >/dev/null 2>&1 && git lfs track "*.bin" >/dev/null && head -c 2222 /dev/urandom > lib.bin && git add -A >/dev/null && git commit -qm "lib: a large file" && git push -q origin main 2>/dev/null )
+git init -q --bare "$SB/slfs.git"; git clone -q "$SB/slfs.git" "$SB/slfs-author" 2>/dev/null
+( cd "$SB/slfs-author" && git lfs install --local >/dev/null 2>&1 && git lfs track "*.bin" >/dev/null && head -c 1111 /dev/urandom > own.bin \
+  && GIT_LFS_SKIP_SMUDGE=1 git submodule add -q "$SB/slfs-lib.git" lib 2>/dev/null && git add -A >/dev/null && git commit -qm "super: own large file, and lib" && git push -q origin main 2>/dev/null )
+OUT=$(probe clone "" "$SB/slfs.git,$SB/clones,slfs-clone,submodules,lfs")
+ok "a clone with submodules and large files brings the submodule's large files too" "$(wc -c < "$SB/clones/slfs-clone/lib/lib.bin" | tr -d ' ')" "2222"
+ok "  and its result names them, by submodule" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print([(s["path"], s["report"]["pointers_left"]) for s in json.load(sys.stdin)["submodule_lfs"]])')" "[('lib', 0)]"
+OUT=$(probe clone "" "$SB/slfs.git,$SB/clones,slfs-nolfs,submodules")
+ok "without the option the submodule's stubs are named, not left silent" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print([(s["path"], s["report"]["pointers_left"] > 0) for s in json.load(sys.stdin)["submodule_lfs"]])')" "[('lib', True)]"
+# A clone without its submodules, its own large files all here; then Download.
+probe clone "" "$SB/slfs.git,$SB/clones,slfs-later,nosub,lfs" >/dev/null
+OUT=$(invoke_json changes_submodule_update "{\"repoPath\":\"$SB/clones/slfs-later\",\"paths\":[\"lib\"]}")
+ok "a submodule downloaded later brings its large files when the repository's own are all here" "$(wc -c < "$SB/clones/slfs-later/lib/lib.bin" | tr -d ' ')" "2222"
+ok "  and says so" "$(printf '%s' "$OUT" | jqf value.detail)" "Git LFS in lib:"
+# Under a push block the submodule's large files still arrive: git-lfs is set
+# up before the block's hook goes in, and the block chains git-lfs's own.
+probe clone "" "$SB/slfs.git,$SB/clones,slfs-blocked,nosub,lfs" >/dev/null
+probe push_mode "$SB/clones/slfs-blocked" "guardrail" >/dev/null
+OUT=$(invoke_json changes_submodule_update "{\"repoPath\":\"$SB/clones/slfs-blocked\",\"paths\":[\"lib\"]}")
+ok "under a push block a downloaded submodule's large files still arrive, and it is blocked too" "$(wc -c < "$SB/clones/slfs-blocked/lib/lib.bin" | tr -d ' '):$(git -C "$SB/clones/slfs-blocked/lib" config --local --get gitswitch.pushBlockedBy)" "2222:superproject"
+ok "  git-lfs's own push hook is kept, behind the block's" "$(ls "$(git -C "$SB/clones/slfs-blocked/lib" rev-parse --path-format=absolute --git-path hooks)" | grep -c '^pre-push.gitswitch-saved$')" "1"
+
 section "Objects missing from the server"
 cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" work2 2>/dev/null
 rm -rf "$SB/remote.git/lfs/objects"

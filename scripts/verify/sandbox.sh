@@ -549,15 +549,17 @@ ok "  and the commit is still here, unpushed" "$(git -C "$SB/net-stuck" log -1 -
 cat > "$SB/slow-receive.sh" <<'SLOWRCV'
 #!/bin/sh
 # What `git push` runs on the far side, with its input slowed down.
-perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.1); }' | git receive-pack "$@"
+perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.15); }' | git receive-pack "$@"
 SLOWRCV
 chmod +x "$SB/slow-receive.sh"
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/net-work/mine$i.bin"; done
 git -C "$SB/net-work" add -A >/dev/null; git -C "$SB/net-work" commit -qm "about 3 MiB of mine"
 git -C "$SB/net-work" config remote.origin.receivepack "$SB/slow-receive.sh"
-T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=3 probe push "$SB/net-work" ""); T1=$(date +%s)
+# A 5 s window: long enough that a busy machine starting git on both sides is
+# not mistaken for silence, still well under the push's own length.
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=5 probe push "$SB/net-work" ""); T1=$(date +%s)
 git -C "$SB/net-work" config --unset remote.origin.receivepack
 ok "a push that takes longer than the silence allowed, but keeps going, is not stopped" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$SB/net.git" rev-parse main)" "True:$(git -C "$SB/net-work" rev-parse HEAD)"
-ok "  it really was slower than the window (3 s)" "$([ $((T1-T0)) -ge 5 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
+ok "  it really was slower than the window (5 s)" "$([ $((T1-T0)) -ge 8 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
 
 verify_result

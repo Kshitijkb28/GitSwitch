@@ -12,6 +12,11 @@ export async function getProfiles(): Promise<Profile[]> {
   return invoke("get_profiles");
 }
 
+/** The page a gitswitch:// link asked for before the page listened (the link that started the app). */
+export async function deepLinkTake(): Promise<string | null> {
+  return invoke("deep_link_take");
+}
+
 export async function createProfile(params: {
   name: string;
   gitName: string;
@@ -153,6 +158,8 @@ export interface BranchInfo {
   last_author: string;
   last_date: string;
   last_subject: string;
+  /** One of GitSwitch's own backup branches (before an update, a reset, a rewrite). */
+  is_backup?: boolean;
 }
 
 export interface HistoryCommit {
@@ -176,6 +183,8 @@ export interface HistoryCommit {
   lane: number;
   parent_lanes: number[];
   active_lanes: number[];
+  /** A lane was waiting for it: its line comes from above (false for a tip). */
+  from_above?: boolean;
 }
 
 export interface HistoryPage {
@@ -293,6 +302,17 @@ export async function historySyncStatus(
 export interface MergeInfo {
   merged_into: string[];
   merges: HistoryCommit[];
+  /** How the branch got into the first few branches that contain it. */
+  merged_by?: MergedBy[];
+  merges_total?: number;
+  merges_truncated?: boolean;
+}
+
+export interface MergedBy {
+  branch: string;
+  /** merge | fast-forward | same-commit */
+  how: string;
+  commit: { hash: string; short: string; subject: string; author_name: string; date: string; parents: string[] } | null;
 }
 
 export async function historyListRepos(): Promise<RepoRef[]> {
@@ -347,6 +367,10 @@ export interface CommitInfo {
   date: string;
   subject: string;
   pushed: boolean;
+  /** The local branches holding it, when no remote-tracking branch does. */
+  branches: string[];
+  /** On the checked-out branch: what Fix rewrites. */
+  on_head: boolean;
 }
 
 export interface RepoAudit {
@@ -361,6 +385,10 @@ export interface RepoAudit {
   has_upstream: boolean;
   dirty: boolean;
   guard: "none" | "gitswitch" | "foreign";
+  /** Wrong commits of yours on other local branches. */
+  other_branch_count: number;
+  /** Why Fix cannot run here now, when it cannot. */
+  fix_blocker: string | null;
 }
 
 export async function auditCommits(): Promise<RepoAudit[]> {
@@ -408,6 +436,16 @@ export async function doctorCheckRepos(): Promise<Finding[]> {
 }
 
 /** Doctor's repair for a repository-local identity override. */
+/** Doctor, on request: can the account each repository pushes as see it on GitHub? */
+export async function doctorCheckRepoAccess(): Promise<Finding[]> {
+  return invoke("doctor_check_repo_access");
+}
+
+/** One of Doctor's own repairs, by its finding's fix id. */
+export async function doctorApplyFix(fix: string): Promise<string> {
+  return invoke("doctor_apply_fix", { fix });
+}
+
 export async function doctorUnsetLocal(repoPath: string, key: string): Promise<string> {
   return invoke("doctor_unset_local", { repoPath, key });
 }
@@ -419,6 +457,8 @@ export async function doctorFixSshConfig(): Promise<string> {
 export interface ScannedRepo {
   path: string;
   remote_url: string;
+  /** origin's own push URL, when set and different from remote_url (masked). */
+  push_url?: string;
   owner: string;
   name: string;
 }
@@ -490,6 +530,8 @@ export interface CloneResult {
   mapped_to: string | null;
   submodules: SubmoduleReport | null;
   lfs: LfsReport | null;
+  /** The same for each populated submodule that uses Git LFS. */
+  submodule_lfs?: { path: string; report: LfsReport }[];
 }
 
 export interface SparseSetResult {
@@ -603,6 +645,8 @@ export interface LocalClones {
   owner_profiles: Record<string, string>;
   /** owner (lowercase) -> "org-<id>" SSH user seen locally */
   org_ssh_users: Record<string, string>;
+  /** "owner/name" (lowercase) -> the folder a clone is still writing it into */
+  cloning?: Record<string, string>;
 }
 
 /** Which repos are on this machine right now — local disk only, no network. */
@@ -802,6 +846,9 @@ export interface ChangeEntry {
   /** Conflicted entries only: modes and oids of index stages 1, 2, 3 (base, ours, theirs). */
   stage_modes?: string[];
   stage_oids?: string[];
+  /** A conflicted submodule pointer: the commit Keep mine / Take theirs records (sides already mapped). */
+  pointer_mine?: string;
+  pointer_theirs?: string;
   staged_added: number | null;
   staged_removed: number | null;
   unstaged_added: number | null;
@@ -1107,6 +1154,8 @@ export interface SubmoduleInfo {
   recorded_on_remote: boolean | null;
   /** Commits at its checkout that no remote-tracking branch has; `null` without one to compare with. */
   own_unpushed: number | null;
+  /** `<remote>/<branch>` a clone would follow, when that remote-tracking branch is here. */
+  latest_ref?: string | null;
 }
 
 export interface LfsStatus {
@@ -1330,7 +1379,7 @@ export interface StashRef {
 }
 
 export interface TreeOutcome {
-  /** switch | create-branch | delete-branch | rename-branch | undo-commit | reset | detach | revert | cherry-pick | resolve-side | discard-all */
+  /** switch | create-branch | delete-branch | rename-branch | undo-commit | reset | detach | revert | cherry-pick | resolve-side | discard-all | align-submodules */
   op: string;
   head_before: string | null;
   head_after: string | null;
@@ -1844,14 +1893,21 @@ export async function changesPull(
   repoPath: string,
   mode: PullMode,
   withLfs: boolean,
-  autostash: boolean
+  autostash: boolean,
+  /** A remote-tracking branch to integrate instead of the upstream ("origin/main"). */
+  source: string | null = null
 ): Promise<OpResult> {
-  return invoke("changes_pull", { repoPath, mode, withLfs, autostash });
+  return invoke("changes_pull", { repoPath, mode, withLfs, autostash, source });
 }
 
 /** `paths`: only these submodules (the never-initialised ones); null = every listed one. */
 export async function changesSubmoduleUpdate(repoPath: string, paths: string[] | null = null): Promise<OpResult> {
   return invoke("changes_submodule_update", { repoPath, paths });
+}
+
+/** Checks out, in these submodules, the commit the repository records for each. Local only. */
+export async function changesSubmoduleAlign(repoPath: string, paths: string[]): Promise<OpResult> {
+  return invoke("changes_submodule_align", { repoPath, paths });
 }
 
 export async function changesContinue(repoPath: string, allowMarkers = false): Promise<OpResult> {

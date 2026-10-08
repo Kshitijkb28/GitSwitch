@@ -7,6 +7,10 @@ pub struct ScannedRepo {
     pub path: String,
     /// origin URL with any embedded token masked.
     pub remote_url: String,
+    /// origin's own push URL (`remote.origin.pushurl`), masked the same way —
+    /// only when it is set and differs from `remote_url`: pushes go there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_url: Option<String>,
     /// GitHub owner/name when the remote is a GitHub URL; empty otherwise.
     pub owner: String,
     pub name: String,
@@ -125,6 +129,10 @@ fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
 
     while let Some((dir, depth)) = stack.pop() {
         if dir.join(".git").exists() {
+            // A clone still writing this folder: not a repository yet.
+            if crate::sparse::clone_running_at(&dir.to_string_lossy()) {
+                continue;
+            }
             let (remote_url, owner, name) = match get_origin(&dir) {
                 Some(url) => {
                     let (o, n) = parse_github_owner_name(&url).unwrap_or_default();
@@ -132,9 +140,12 @@ fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
                 }
                 None => (String::new(), String::new(), String::new()),
             };
+            // The raw value: `get-url --push` would apply a push block's rewrite.
+            let push_url = git_text(&dir, &["config", "--get", "remote.origin.pushurl"]).map(|u| mask_token(&u)).filter(|u| *u != remote_url);
             repos.push(ScannedRepo {
                 path: dir.to_string_lossy().to_string(),
                 remote_url,
+                push_url,
                 owner,
                 name,
             });

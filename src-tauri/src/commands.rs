@@ -241,6 +241,18 @@ pub async fn changes_push_identity(repo_path: String, refresh: bool) -> Result<c
     crate::push_identity::push_identity(&repo_path, refresh).await
 }
 
+/// Doctor, on request: can the account each repository pushes as see it on GitHub?
+#[tauri::command]
+pub async fn doctor_check_repo_access() -> Result<Vec<Finding>, AppError> {
+    doctor::check_repo_access().await
+}
+
+/// One of Doctor's own repairs, by the fix id its finding carries.
+#[tauri::command]
+pub async fn doctor_apply_fix(fix: String) -> Result<String, AppError> {
+    doctor::apply_fix(&fix).await
+}
+
 /// Doctor's repair for a `local-override` finding.
 #[tauri::command]
 pub async fn doctor_unset_local(repo_path: String, key: String) -> Result<String, AppError> {
@@ -566,6 +578,13 @@ pub async fn history_authors(repo_path: String, rev: String) -> Result<Vec<git_h
         .map_err(|e| AppError::Command(format!("task failed: {}", e)))?
 }
 
+/// The page a gitswitch:// link asked for before the page listened (the link
+/// that started the app); the page asks once, as soon as it listens.
+#[tauri::command]
+pub fn deep_link_take(pending: tauri::State<'_, crate::deep_link::Pending>) -> Option<&'static str> {
+    pending.take()
+}
+
 /// Live progress of a clone into `dest_path`, while it runs.
 #[tauri::command]
 pub async fn clone_progress(dest_path: String) -> Option<sparse::CloneProgress> {
@@ -770,9 +789,10 @@ pub async fn changes_pull(
     mode: String,
     with_lfs: bool,
     autostash: bool,
+    source: Option<String>,
 ) -> Result<OpResult, AppError> {
     let mode = git_ops::PullMode::parse(&mode)?;
-    git_ops::pull(&repo_path, mode, with_lfs, autostash).await
+    git_ops::pull(&repo_path, mode, with_lfs, autostash, source.as_deref()).await
 }
 
 /// Every gitlink in the repo with its real state — where it moved, what is
@@ -785,6 +805,14 @@ pub async fn changes_submodules(repo_path: String) -> Result<Vec<SubmoduleInfo>,
 #[tauri::command]
 pub async fn changes_submodule_update(repo_path: String, paths: Option<Vec<String>>) -> Result<OpResult, AppError> {
     git_ops::submodule_update(&repo_path, paths).await
+}
+
+/// Check out, in the named submodules, the commit this repository records for
+/// each — a go-back's "Align submodules" and a row's "Check out <commit>".
+/// Local only.
+#[tauri::command]
+pub async fn changes_submodule_align(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
+    Box::pin(crate::tree::align_submodules(&repo_path, paths)).await
 }
 
 /// Are this repo's large files really here, or still LFS pointer stubs?

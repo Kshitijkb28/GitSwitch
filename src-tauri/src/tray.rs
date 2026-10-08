@@ -29,6 +29,15 @@ pub fn update_active_label(app: &AppHandle) {
     }
 }
 
+/// The main window brought forward: shown, restored, focused.
+pub fn show_main(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
 pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let show_item = MenuItem::with_id(app, "show", "Show GitSwitch", true, None::<&str>)?;
     let active_item = MenuItem::with_id(
@@ -52,12 +61,7 @@ pub fn setup_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .menu(&menu)
         .tooltip("GitSwitch")
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            }
+            "show" => show_main(app),
             "quit" => {
                 app.exit(0);
             }

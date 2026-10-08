@@ -37,7 +37,6 @@ const LANE_COLORS = [
   "#a78bfa", "#22d3ee", "#fb7185", "#4ade80",
 ];
 const laneColor = (l: number) => LANE_COLORS[l % LANE_COLORS.length];
-const laneX = (l: number) => l * LANE_W + 10;
 
 /** How stale the ahead/behind numbers are — they're only as good as the last fetch. */
 function fetchAgo(secs: number | null): string {
@@ -51,12 +50,17 @@ function fetchAgo(secs: number | null): string {
 /** One row of the commit graph: rails passing through, the dot, and the
  *  connectors that fan out to a merge's parents. Mirrors `git log --graph`. */
 function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
-  const width = (maxLane + 1) * LANE_W + 10;
+  // Many lanes narrow, never push the subject away: the graph keeps to 176 px.
+  // Fractional widths: the last lane always lands inside the 176 px, however many there are.
+  const laneW = Math.min(LANE_W, 166 / (maxLane + 1));
+  const laneX = (l: number) => l * laneW + 8;
+  const width = Math.min((maxLane + 1) * laneW + 10, 176);
   const mid = ROW_H / 2;
   const continues = c.parent_lanes.includes(c.lane);
+  const dot = Math.max(2.5, Math.min(4, laneW / 4));
 
   return (
-    <svg width={width} height={ROW_H} className="shrink-0 overflow-visible">
+    <svg width={width} height={ROW_H} className="shrink-0 overflow-hidden">
       {c.active_lanes
         .filter((l) => l !== c.lane)
         .map((l) => (
@@ -66,11 +70,13 @@ function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
             stroke={laneColor(l)} strokeWidth={2} opacity={0.55}
           />
         ))}
-      {/* own lane: always comes from above; continues below only if a parent keeps it */}
-      <line
-        x1={laneX(c.lane)} y1={0} x2={laneX(c.lane)} y2={mid}
-        stroke={laneColor(c.lane)} strokeWidth={2} opacity={0.55}
-      />
+      {/* own lane: from above unless this is a tip; continues below only if a parent keeps it */}
+      {c.from_above !== false && (
+        <line
+          x1={laneX(c.lane)} y1={0} x2={laneX(c.lane)} y2={mid}
+          stroke={laneColor(c.lane)} strokeWidth={2} opacity={0.55}
+        />
+      )}
       {continues && (
         <line
           x1={laneX(c.lane)} y1={mid} x2={laneX(c.lane)} y2={ROW_H}
@@ -88,7 +94,7 @@ function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
           />
         ))}
       <circle
-        cx={laneX(c.lane)} cy={mid} r={c.is_merge ? 5.5 : 4}
+        cx={laneX(c.lane)} cy={mid} r={c.is_merge ? dot + 1.5 : dot}
         fill={c.is_merge ? "#18181b" : laneColor(c.lane)}
         stroke={laneColor(c.lane)} strokeWidth={2}
       />
@@ -465,7 +471,10 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
     await loadMergeInfo(repo, name);
   }
 
-  const visibleBranches = branches.filter((b) => b.is_remote === showRemote);
+  // GitSwitch's own backup branches are a safety net, not work: they sit
+  // under a closed "Backups (n)" — unless one is the branch being viewed.
+  const visibleBranches = branches.filter((b) => b.is_remote === showRemote && (!b.is_backup || rev === b.name));
+  const backupBranches = showRemote ? [] : branches.filter((b) => !b.is_remote && b.is_backup && rev !== b.name);
   // A repository can have hundreds of branches: a filter, and the list grows
   // fifty at a time as it is scrolled — as every long list in the app does.
   const [branchQuery, setBranchQuery] = useState("");
@@ -493,6 +502,7 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
           result={result}
           busy={busyKey !== null}
           onDismiss={() => setResult(null)}
+          onAlignSubmodules={(paths) => void onAction("align", () => api.changesSubmoduleAlign(repo, paths))}
           extraAction={{
             label: "Open in Changes",
             onClick: onOpenChanges,
@@ -678,6 +688,29 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                       Showing {branchShown} of {filteredBranches.length}. Keep scrolling, or type to narrow it down.
                     </p>
                   )}
+                  {backupBranches.length > 0 && (
+                    <details className="pt-1">
+                      <summary
+                        className="text-xs text-zinc-500 cursor-pointer hover:text-zinc-400 select-none"
+                        title="Branches GitSwitch made before an update, a reset or a rewrite, so nothing is lost. Nothing deletes them by itself."
+                      >
+                        Backups ({backupBranches.length})
+                      </summary>
+                      <div className="space-y-1 mt-1">
+                        {backupBranches.map((b) => (
+                          <button
+                            key={b.name}
+                            onClick={() => selectBranch(b.name)}
+                            title={b.name}
+                            className="w-full text-left px-3 py-1.5 rounded-lg bg-zinc-900/60 border border-zinc-800 hover:border-zinc-600 cursor-pointer min-w-0"
+                          >
+                            <span className="block text-xs text-zinc-400 font-mono truncate">{b.name}</span>
+                            <span className="block text-[11px] text-zinc-600 truncate">{b.last_subject}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
             </Card>
@@ -693,10 +726,37 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                     <p className="text-xs text-zinc-500 mb-2">
                       This branch is already contained in:
                     </p>
+                    {(mergeInfo.merged_by ?? []).length > 0 && (
+                      <div className="space-y-1 mb-2">
+                        {(mergeInfo.merged_by ?? []).map((m) =>
+                          m.how === "merge" && m.commit ? (
+                            <button
+                              key={m.branch}
+                              type="button"
+                              onClick={() => m.commit && openCommit(m.commit.hash)}
+                              className="block w-full text-left text-[11px] text-zinc-300 hover:text-white truncate cursor-pointer"
+                              title={`${m.commit.subject} — ${m.commit.author_name}, ${m.commit.date}`}
+                            >
+                              into <span className="font-mono">{m.branch}</span> by <span className="font-mono text-zinc-500">{m.commit.short}</span> {m.commit.subject}
+                            </button>
+                          ) : (
+                            <p key={m.branch} className="text-[11px] text-zinc-400 truncate">
+                              {m.how === "fast-forward" ? (
+                                <>into <span className="font-mono">{m.branch}</span> — fast-forward, no merge commit</>
+                              ) : (
+                                <><span className="font-mono">{m.branch}</span> — at the same commit</>
+                              )}
+                            </p>
+                          )
+                        )}
+                      </div>
+                    )}
                     <div className="flex flex-wrap gap-1.5">
-                      {mergeInfo.merged_into.map((b) => (
-                        <Badge key={b} variant="success">{b}</Badge>
-                      ))}
+                      {mergeInfo.merged_into
+                        .filter((b) => !(mergeInfo.merged_by ?? []).some((m) => m.branch === b))
+                        .map((b) => (
+                          <Badge key={b} variant="success">{b}</Badge>
+                        ))}
                     </div>
                   </>
                 ) : (
@@ -707,13 +767,22 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                 {mergeInfo.merges.length > 0 && (
                   <>
                     <p className="text-xs text-zinc-500 mt-3 mb-1.5">
-                      Merge commits on this branch ({mergeInfo.merges.length}):
+                      Merges in this branch's history:{" "}
+                      {mergeInfo.merges_truncated
+                        ? `newest ${mergeInfo.merges.length} of ${mergeInfo.merges_total ?? mergeInfo.merges.length}`
+                        : mergeInfo.merges.length}
                     </p>
                     <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
                       {mergeInfo.merges.map((m) => (
-                        <p key={m.hash} className="text-[11px] text-zinc-400 truncate" title={m.subject}>
+                        <button
+                          key={m.hash}
+                          type="button"
+                          onClick={() => openCommit(m.hash)}
+                          className="block w-full text-left text-[11px] text-zinc-400 hover:text-zinc-200 truncate cursor-pointer"
+                          title={m.subject}
+                        >
                           <span className="font-mono text-zinc-600">{m.short}</span> {m.subject}
-                        </p>
+                        </button>
                       ))}
                     </div>
                   </>
@@ -922,11 +991,19 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
                         not pushed
                       </span>
                     )}
-                    <span className="hidden xl:flex items-center gap-1 shrink-0 max-w-[26%] overflow-hidden">
-                      {c.refs.slice(0, 2).map((r) => (
-                        <Badge key={r} variant="default">{r}</Badge>
-                      ))}
-                    </span>
+                    {c.refs.length > 0 && (
+                      // The first branch at every width; all of them in the title.
+                      <span className="flex items-center gap-1 shrink-0 max-w-[26%] overflow-hidden" title={c.refs.join(", ")}>
+                        <span className="min-w-0 max-w-[9rem] truncate">
+                          <Badge variant="default">{c.refs[0]}</Badge>
+                        </span>
+                        {c.refs[1] && (
+                          <span className="hidden xl:inline-flex min-w-0">
+                            <Badge variant="default">{c.refs[1]}</Badge>
+                          </span>
+                        )}
+                      </span>
+                    )}
                     <span className="hidden md:inline text-xs text-zinc-500 truncate min-w-0 max-w-[18%]">
                       {c.author_name}
                     </span>
@@ -982,6 +1059,7 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
           onClose={closePanel}
           onAction={onAction}
           onResolve={resolveCommit}
+          onOpenCommit={(h) => void openCommit(h)}
         />
       )}
     </div>

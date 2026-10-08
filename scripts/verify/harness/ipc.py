@@ -20,6 +20,8 @@ lib_rs = open(f"{ROOT}/src-tauri/src/lib.rs").read()
 api_ts = open(f"{ROOT}/src/lib/api.ts").read()
 
 INJECTED = {"app"}  # tauri injects these, the frontend never sends them
+# ...as it does any parameter of a type it supplies itself, whatever its name.
+INJECTED_TYPE = re.compile(r"^(?:tauri::)?(?:(?:AppHandle|Window|WebviewWindow|Webview)\b|State\s*<)")
 
 
 def camel(name: str) -> str:
@@ -68,8 +70,9 @@ for m in re.finditer(
     name, params = m.group(1), balanced_params(commands_rs, m.end() - 1)
     args = set()
     for p in split_params(params):
-        pname = p.split(":")[0].strip()
-        if pname and pname not in INJECTED:
+        pname, _, ptype = p.partition(":")
+        pname, ptype = pname.strip(), ptype.strip()
+        if pname and pname not in INJECTED and not INJECTED_TYPE.match(ptype):
             args.add(camel(pname))
     rust[name] = args
 

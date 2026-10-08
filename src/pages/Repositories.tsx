@@ -151,6 +151,15 @@ export function Repositories() {
   /** Fresh local answers win over whatever the listing said when it was fetched. */
   const localPathOf = (r: api.RemoteRepo) =>
     local ? local.clones[r.full_name.toLowerCase()] ?? null : r.local_path;
+  /** The folder a clone of this repository is still being written into. */
+  const cloningPathOf = (r: api.RemoteRepo) => local?.cloning?.[r.full_name.toLowerCase()] ?? null;
+  // While a clone runs, the list is read again until it is done.
+  const anyCloning = Object.keys(local?.cloning ?? {}).length > 0;
+  useEffect(() => {
+    if (!anyCloning) return;
+    const id = window.setInterval(refreshLocal, 5000);
+    return () => window.clearInterval(id);
+  }, [anyCloning, refreshLocal]);
   const cloneUrlOf = (r: api.RemoteRepo) => {
     const orgUser = local?.org_ssh_users[r.owner.toLowerCase()];
     return orgUser ? `${orgUser}@github.com:${r.owner}/${r.name}.git` : r.clone_url;
@@ -494,6 +503,7 @@ export function Repositories() {
             {visible.map((r) => {
               const suggestion = profileName(suggestionFor(r));
               const localPath = localPathOf(r);
+              const cloningPath = localPath ? null : cloningPathOf(r);
               return (
                 <div key={r.full_name} className="flex items-start gap-3 py-3 min-w-0">
                   <span className="mt-0.5 shrink-0 text-zinc-500" title={r.private ? "Private" : "Public"}>
@@ -521,6 +531,10 @@ export function Repositories() {
                         <span className="text-emerald-400/80" title={localPath}>
                           {" "}· cloned at {shortPath(localPath)}
                         </span>
+                      ) : cloningPath ? (
+                        <span className="text-sky-300/80" title={cloningPath}>
+                          {" "}· cloning into {shortPath(cloningPath)}…
+                        </span>
                       ) : (
                         suggestion && <> · clones as {suggestion}</>
                       )}
@@ -539,6 +553,11 @@ export function Repositories() {
                       <Button size="sm" variant="secondary" onClick={() => openInHistory(localPath)}>
                         <FolderOpen size={14} />
                         Open
+                      </Button>
+                    ) : cloningPath ? (
+                      <Button size="sm" variant="secondary" onClick={() => navigate("/sparse")} title="The Clone page shows its progress">
+                        <Loader2 size={14} className="animate-spin" />
+                        Cloning…
                       </Button>
                     ) : (
                       <Button size="sm" onClick={() => cloneRepo(r)}>

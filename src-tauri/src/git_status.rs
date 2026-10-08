@@ -45,6 +45,13 @@ pub struct ChangeEntry {
     pub stage_modes: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub stage_oids: Vec<String>,
+    /// A conflicted submodule pointer: the commit "Keep mine" records and the
+    /// one "Take theirs" records, the rebase's swap already applied. None for
+    /// a side that has no submodule there (added or removed on one side).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pointer_mine: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pointer_theirs: Option<String>,
     pub staged_added: Option<u64>,
     pub staged_removed: Option<u64>,
     pub unstaged_added: Option<u64>,
@@ -431,6 +438,8 @@ fn blank_entry(path: String) -> ChangeEntry {
         recorded_oid: None,
         stage_modes: Vec::new(),
         stage_oids: Vec::new(),
+        pointer_mine: None,
+        pointer_theirs: None,
         staged_added: None,
         staged_removed: None,
         unstaged_added: None,
@@ -1151,6 +1160,20 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
 
     let name = crate::paths::base_name(repo_path);
 
+    // A conflicted submodule pointer, in the person's words: which commit
+    // "Keep mine" and "Take theirs" record — a rebase swaps git's sides.
+    let op_kind = operation.as_ref().map(|o| o.kind.clone());
+    let mut entries = parsed.entries;
+    for e in entries.iter_mut().filter(|e| e.kind == "conflicted" && e.stage_modes.iter().any(|m| m == "160000")) {
+        let pick = |side: crate::tree::Side| {
+            let i = if crate::tree::side_flag(op_kind.as_deref(), side) == "--ours" { 1 } else { 2 };
+            (e.stage_modes.get(i).map(String::as_str) == Some("160000")).then(|| e.stage_oids.get(i).cloned()).flatten()
+        };
+        let (mine, theirs) = (pick(crate::tree::Side::Mine), pick(crate::tree::Side::Theirs));
+        e.pointer_mine = mine;
+        e.pointer_theirs = theirs;
+    }
+
     Ok(RepoStatus {
         path: crate::paths::norm(repo_path),
         name,
@@ -1162,7 +1185,7 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         ahead: parsed.ahead,
         behind: parsed.behind,
         last_fetch_secs: seconds_since(&paths.fetch_head),
-        entries: parsed.entries,
+        entries,
         staged_count,
         unstaged_count,
         untracked_count,

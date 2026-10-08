@@ -1606,4 +1606,83 @@ ok "  and Abort refuses it rather than undoing the finished work" "$(probe sync_
 git -C "$L/up" rebase --abort 2>/dev/null; rm -f "$STATE_FILE"
 fi
 
+section "Large files: each repository of an update is decided alone"
+# One submodule whose large files are pointer stubs (a clone that never fetched
+# them) does not send the superproject's own large files back into its rebase,
+# where an LFS server that does not answer stops the whole update.
+LS="$SB/lfsub"; mkdir -p "$LS"
+git init -q --bare "$LS/lib.git"; git clone -q "$LS/lib.git" "$LS/lib-author" 2>/dev/null
+( cd "$LS/lib-author" && git lfs install --local >/dev/null 2>&1 && git lfs track "*.bin" >/dev/null )
+head -c 2000 /dev/urandom > "$LS/lib-author/lib.bin"; git -C "$LS/lib-author" add -A >/dev/null; git -C "$LS/lib-author" commit -qm "lib: initial"; git -C "$LS/lib-author" push -q origin main 2>/dev/null
+git init -q --bare "$LS/super.git"; git clone -q "$LS/super.git" "$LS/author" 2>/dev/null
+( cd "$LS/author" && git lfs install --local >/dev/null 2>&1 && git lfs track "*.bin" >/dev/null )
+head -c 4096 /dev/urandom > "$LS/author/model.bin"; head -c 3000 /dev/urandom > "$LS/author/other.bin"
+( cd "$LS/author" && GIT_LFS_SKIP_SMUDGE=1 git submodule add -q "$LS/lib.git" lib 2>/dev/null )
+git -C "$LS/author" add -A >/dev/null; git -C "$LS/author" commit -qm "super: initial"; git -C "$LS/author" push -q origin main 2>/dev/null
+( cd "$LS" && GIT_LFS_SKIP_SMUDGE=1 git clone -q --recurse-submodules "$LS/super.git" w 2>/dev/null )
+probe lfs_pull "$LS/w" >/dev/null
+printf 'w\n' > "$LS/w/mine.txt"; git -C "$LS/w" add mine.txt >/dev/null; git -C "$LS/w" commit -qm "mine: w"
+ok "(the superproject's large files are all here; the submodule's are pointer stubs)" "$(probe lfs_status "$LS/w" | jqf pointers):$(probe lfs_status "$LS/w/lib" | jqf pointers)" "0:1"
+head -c 5120 /dev/urandom > "$LS/author/model.bin"; git -C "$LS/author" commit -qam "upstream: a new model"; git -C "$LS/author" push -q origin main 2>/dev/null
+mv "$LS/super.git/lfs" "$LS/lfs-away"
+probe sync_plan "$LS/w" >/dev/null; OUT=$(probe sync_run "$LS/w")
+ok "with the LFS server away the update still updates: the submodule's stubs do not make the superproject's rebase download" "$(printf '%s' "$OUT" | jqf ok):$([ -d "$(git -C "$LS/w" rev-parse --git-path rebase-merge)" ] && echo rebasing || echo none)" "True:none"
+ok "  the new large file is a pointer stub for now" "$([ "$(wc -c < "$LS/w/model.bin" | tr -d ' ')" -lt 200 ] && echo stub || echo content)" "stub"
+ok "  and the result says so" "$(printf '%s' "$OUT" | jqf detail)" "The large files here didn't download"
+ok "  and names the submodule's stubs too" "$(printf '%s' "$OUT" | jqf detail)" "1 LFS file in lib is still a pointer stub"
+rm -rf "$LS/super.git/lfs"; mv "$LS/lfs-away" "$LS/super.git/lfs"
+# A repository whose LFS filter runs although filter.lfs.required is not set
+# is decided like any other: stubbed in the rebase, downloaded afterwards.
+( cd "$LS" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$LS/super.git" r 2>/dev/null ); probe lfs_pull "$LS/r" >/dev/null
+git -C "$LS/r" config --unset filter.lfs.required
+printf 'r\n' > "$LS/r/mine.txt"; git -C "$LS/r" add mine.txt >/dev/null; git -C "$LS/r" commit -qm "mine: r"
+head -c 4500 /dev/urandom > "$LS/author/model.bin"; git -C "$LS/author" commit -qam "upstream: a model for r"; git -C "$LS/author" push -q origin main 2>/dev/null
+probe sync_plan "$LS/r" >/dev/null; OUT=$(probe sync_run "$LS/r")
+ok "a repository whose LFS filter runs without filter.lfs.required set is stubbed and downloaded afterwards, like any other" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf detail)" "Downloaded 1 LFS file here."
+ok "  and its large file is content" "$(wc -c < "$LS/r/model.bin" | tr -d ' ')" "4500"
+# Where git does download inside a rewrite (a large file among your own
+# uncommitted changes), it does so on the large-file clock, with git-lfs's
+# progress in the file the page reads — seen by the git-lfs git runs.
+LFS_BIN="$(command -v git-lfs)"; mkdir -p "$LS/wrap"
+cat > "$LS/wrap/git-lfs" <<WRAP
+#!/bin/sh
+if [ "\$1" = "filter-process" ]; then
+  case "\$(ps -o args= -p \$PPID 2>/dev/null)" in
+    *" rebase "*) echo "rebase progress=\${GIT_LFS_PROGRESS:-none}" >> "$LS/lfs-env.log" ;;
+  esac
+fi
+exec "$LFS_BIN" "\$@"
+WRAP
+chmod +x "$LS/wrap/git-lfs"
+( cd "$LS" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$LS/super.git" d 2>/dev/null ); probe lfs_pull "$LS/d" >/dev/null
+printf 'd\n' > "$LS/d/mine.txt"; git -C "$LS/d" add mine.txt >/dev/null; git -C "$LS/d" commit -qm "mine: d"
+head -c 6000 /dev/urandom > "$LS/d/other.bin"
+head -c 5500 /dev/urandom > "$LS/author/model.bin"; git -C "$LS/author" commit -qam "upstream: another model"; git -C "$LS/author" push -q origin main 2>/dev/null
+rm -f "$LS/lfs-env.log"
+probe sync_plan "$LS/d" >/dev/null; OUT=$(PATH="$LS/wrap:$PATH" probe sync_run "$LS/d")
+ok "(an uncommitted large file: git downloads inside the rebase, and the update still finishes)" "$(printf '%s' "$OUT" | jqf ok)" "True"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) echo "  SKIP the git-lfs inside the rebase writes its progress where the page reads it (Git Bash's ps cannot name the caller)" ;;
+  *) ok "  the git-lfs inside the rebase writes its progress where the page reads it" "$(sort -u "$LS/lfs-env.log" 2>/dev/null | tr '\\' '/' | tr '\n' '|')" "rebase progress=$LS/d/.git/gitswitch-lfs.progress|" ;;
+esac
+ok "  and upstream's new large file arrived as content" "$(wc -c < "$LS/d/model.bin" | tr -d ' ')" "5500"
+
+section "Two pointer commits of mine that upstream's own pointer has passed are left out by git, not blocked"
+mini sp A
+W="$SB/sp"
+for n in one two; do printf '%s\n' "$n" >> "$W/local/A/A.txt"; git -C "$W/local/A" commit -qam "A: my $n"; git -C "$W/local" add A >/dev/null; git -C "$W/local" commit -qm "bump A to $n"; done
+# A's commits reach its remote, and upstream bumps A to a commit past both.
+git -C "$W/local/A" push -q origin main 2>/dev/null
+git -C "$W/upstream/A" pull -q --ff-only origin main 2>/dev/null
+printf 'three\n' > "$W/upstream/A/three.txt"; git -C "$W/upstream/A" add -A >/dev/null; git -C "$W/upstream/A" commit -qm "A: three"; git -C "$W/upstream/A" push -q origin main 2>/dev/null
+git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: bump A to three"; git -C "$W/upstream" push -q origin main 2>/dev/null
+THREE="$(head_of "$W/upstream/A")"
+OUT=$(probe sync_plan "$W/local")
+ok "the preview does not block: both of my pointers are behind upstream's" "$(printf '%s' "$OUT" | jqf can_run):$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['action'], s['remedy']) for s in d['submodules']])")" "True:[('fast-forward', None)]"
+ok "  it foresees git leaving both pointer commits out" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print(sum(1 for c in d['superproject']['own_commits'] if c['already_upstream']))"):$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print(d['submodules'][0]['notes'])")" "2:"
+ok "  and says so" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print(d['submodules'][0]['notes'])")" "2 pointer commits of yours point at commits upstream's pointer already contains; git leaves them out"
+OUT=$(probe sync_run "$W/local")
+ok "the update finishes: A at upstream's pointer, nothing of mine left to replay" "$(printf '%s' "$OUT" | jqf ok):$(head_of "$W/local/A"):$(subjects "$W/local" origin/main..HEAD)" "True:$THREE:"
+ok "  nothing is off its recorded commit" "$(git -C "$W/local" submodule status | grep -c '^[+-]' || true)" "0"
+
 verify_result

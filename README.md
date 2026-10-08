@@ -295,6 +295,7 @@ and the CI workflow that produces macOS/Windows/Linux installers from a git tag.
 ```bash
 npm run tauri build                    # installer for this machine's OS
 docker compose run --rm builder        # Linux .deb/.AppImage/.rpm from any machine
+docker compose up app                  # the app in Docker, shown at http://localhost:6080/vnc.html
 ```
 
 ## Testing

@@ -1,6 +1,8 @@
-import { useEffect } from "react";
-import { Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
+import { useEffect, useRef } from "react";
+import { Routes, Route, NavLink, Navigate, useLocation, useNavigate } from "react-router-dom";
+import { listen } from "@tauri-apps/api/event";
 import { readPersisted, writePersisted } from "./lib/persist";
+import { deepLinkTake } from "./lib/api";
 import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequestArrow, SquareTerminal } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
@@ -27,6 +29,32 @@ function rememberedRepoTab(): string {
 
 function App() {
   const location = useLocation();
+  const navigate = useNavigate();
+  // A gitswitch:// link (the VS Code extension's "Open GitSwitch") names a
+  // page. Listened for once: `navigate` changes with every page, the listener
+  // need not. The link that started the app came before anyone listened: it
+  // is collected once the listener is in place.
+  const navigateRef = useRef(navigate);
+  useEffect(() => {
+    navigateRef.current = navigate;
+  }, [navigate]);
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let gone = false;
+    listen<string>("navigate", (e) => navigateRef.current(e.payload))
+      .then((f) => {
+        if (gone) return f();
+        stop = f;
+        return deepLinkTake().then((page) => {
+          if (!gone && typeof page === "string" && page.startsWith("/")) navigateRef.current(page);
+        });
+      })
+      .catch(() => {});
+    return () => {
+      gone = true;
+      stop?.();
+    };
+  }, []);
   // The tab on screen is remembered, so the sidebar's Repository and /repo
   // bring the person back to it after another page.
   const repoTabHere = /^\/repo\/(changes|history|submodules)\/?$/.exec(location.pathname)?.[1] ?? null;

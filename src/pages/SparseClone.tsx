@@ -880,6 +880,20 @@ export function SparseClone() {
                   Git LFS: {cloned.lfs.note}
                 </p>
               )}
+              {(cloned.submodule_lfs ?? []).map((s) => (
+                <p
+                  key={s.path}
+                  className={`text-xs mt-0.5 break-words ${
+                    s.report.error || (s.report.pointers_left > 0 && !s.report.installed)
+                      ? "text-amber-300/90"
+                      : s.report.pointers_left > 0
+                        ? "text-zinc-400"
+                        : "text-emerald-400/90"
+                  }`}
+                >
+                  Git LFS in {s.path}: {s.report.note}
+                </p>
+              ))}
               {cloned.lfs && cloned.lfs.pointers_left > 0 && cloned.lfs.installed && (
                 <Button size="sm" variant="secondary" className="mt-2" onClick={() => openInChanges(cloned.path)}>
                   <Download size={12} />

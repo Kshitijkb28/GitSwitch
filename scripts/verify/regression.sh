@@ -312,4 +312,46 @@ ok "the second page is the next fifty in order" "$(printf '%s' "$P2" | "$PY" -c 
 NR="$SB/noremote"; git init -q "$NR"; printf 'x\n' > "$NR/x.txt"; git -C "$NR" add -A >/dev/null; git -C "$NR" commit -qm "alone"
 ok "without a remote-tracking branch nothing is marked, and the page says there is none to compare with" "$(hp "$NR" HEAD false | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(d["remote_refs"], [c["unpushed"] for c in d["commits"]])')" "False [False]"
 
+section "A folder a clone is still writing is listed as cloning, not as on this Mac"
+# Last: the profile made here becomes the default, which every later commit would carry.
+mkdir -p "$SB/profiled"
+"$PY" - "$SB/pprof.json" "$SB/profiled" <<'JSONPY'
+import json, sys
+json.dump({"name": "Profiled", "git_name": "P", "git_email": "p@example.test", "directories": [sys.argv[2]]}, open(sys.argv[1], "w"))
+JSONPY
+probe profile_apply "$SB" "$SB/pprof.json" >/dev/null
+git init -q "$SB/profiled/wip"; git -C "$SB/profiled/wip" remote add origin git@github.com:someone/wip.git
+git init -q "$SB/profiled/existing"; git -C "$SB/profiled/existing" remote add origin git@github.com:someone/existing.git
+OUT=$(probe local_clones_while_cloning "" "$SB/profiled/wip,git@github.com:someone/wip.git")
+ok "a folder a clone is still writing is listed as cloning, not as on this Mac" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["during"];print("someone/wip" in d["cloning"], "someone/wip" in d["clones"])')" "True False"
+ok "  and the Repository page's picker does not offer it — though it offers the one beside it" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;ps=[p.replace("\\","/") for p in json.load(sys.stdin)["picker"]];print(any(p.endswith("/wip") for p in ps), any(p.endswith("/existing") for p in ps))')" "False True"
+ok "  the repository beside it is listed as usual" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print("someone/existing" in json.load(sys.stdin)["during"]["clones"])')" "True"
+ok "once the clone is over it is on this Mac" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["after"];print("someone/wip" in d["clones"], len(d["cloning"]))')" "True 0"
+# A profile folder stored in another letter case than the disk spells it
+# (where the file system ignores case): the clone running into it is still
+# listed as cloning.
+mkdir -p "$SB/Case-Probe"
+if [ -d "$SB/case-probe" ]; then
+  mkdir -p "$SB/CasedClones"
+  "$PY" - "$SB/pcasedclones.json" "$SB/casedclones" <<'JSONPY'
+import json, sys
+json.dump({"name": "CasedClones", "git_name": "C", "git_email": "c@example.test", "directories": [sys.argv[2]]}, open(sys.argv[1], "w"))
+JSONPY
+  probe profile_apply "$SB" "$SB/pcasedclones.json" >/dev/null
+  # Stored exactly as typed (an older build, or a hand edit): the app itself
+  # now saves the disk's spelling.
+  STORE_R="$("$PY" -c 'import os;h=os.environ["HOME"];c=[os.path.join(h,"Library/Application Support/com.gitswitch.app/profiles.json"),os.path.join(h,".local/share/com.gitswitch.app/profiles.json")];print(next((p for p in c if os.path.exists(p)),"MISSING"))')"
+  "$PY" - "$STORE_R" "$SB/casedclones" <<'STOREPY'
+import json, sys
+f, folder = sys.argv[1:]
+d = json.load(open(f))
+for p in d["profiles"]:
+    if p["name"] == "CasedClones":
+        p["directories"] = [folder]
+json.dump(d, open(f, "w"))
+STOREPY
+  OUT=$(probe local_clones_while_cloning "" "$SB/CasedClones/wip2,git@github.com:someone/wip2.git")
+  ok "a clone into a folder stored in another letter case is still listed as cloning" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print("someone/wip2" in json.load(sys.stdin)["during"]["cloning"])')" "True"
+fi
+
 verify_result

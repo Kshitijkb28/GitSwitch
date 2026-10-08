@@ -540,6 +540,38 @@ ok "  but not the one the person locked on their own" "$(pinvoke changes_push_st
 OUT=$(probe push_mode "$SUP/lib2" "allowed")
 fi
 
+section "A submodule downloaded under a lock gets the lock itself, in one job"
+OUT=$(probe push_mode "$SUP" "locked")
+ok "(the superproject is locked)" "$(printf '%s' "$OUT" | jqf outcome)" "applied"
+git init -q --bare "$SB/cover-lib3.git"; git clone -q "$SB/cover-lib3.git" "$SB/cover-author-lib3" 2>/dev/null
+printf 'lib3 v1\n' > "$SB/cover-author-lib3/lib3.txt"; git -C "$SB/cover-author-lib3" add -A >/dev/null; git -C "$SB/cover-author-lib3" commit -qm "lib3: initial"; git -C "$SB/cover-author-lib3" push -q origin main 2>/dev/null
+( cd "$SB/cover-author" && git submodule add -q "$SB/cover-lib3.git" lib3 2>/dev/null ); git -C "$SB/cover-author" commit -qam "super: add lib3" >/dev/null; git -C "$SB/cover-author" push -q origin main 2>/dev/null
+git -C "$SUP" pull -q --ff-only origin main 2>/dev/null
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$SUP\",\"paths\":[\"lib3\"]}")
+ST=$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib3\"}")
+ok "a submodule downloaded under the lock is locked at once, and the result says so" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], "were locked too" in v["detail"], "needs Repair" in v["detail"])'):$(printf '%s' "$ST" | jqf value.lock.locked)" "True True False:True"
+ok "  marked as the superproject's doing" "$(git -C "$SUP/lib3" config --local --get gitswitch.pushBlockedBy)" "superproject"
+ok "  and its own log says so" "$(printf '%s' "$ST" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["lock"]["recent_events"][0]["detail"])')" "locked when downloaded"
+# Its module directory keeps the lock: downloaded again after a deinit, it is still locked — and said to be.
+git -C "$SUP" submodule deinit -q -f lib3 2>/dev/null
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$SUP\",\"paths\":[\"lib3\"]}")
+ok "a submodule downloaded again into a module directory that kept the lock is said to be locked" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], "were locked too" in v["detail"], "not the lock" in v["detail"])'):$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib3\"}" | jqf value.lock.locked)" "True True False:True"
+OUT=$(probe push_mode "$SUP" "allowed")
+ok "unlocking the superproject unlocks it too" "$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/lib3\"}" | jqf value.lock.locked)" "False"
+# An interrupted download under a blocked superproject: Download clears the
+# leftovers and fetches it again — and the fresh copy gets the guard-rail.
+OUT=$(probe push_mode "$SUP" "guardrail")
+ok "(the superproject's pushes are blocked)" "$(printf '%s' "$OUT" | jqf outcome)" "applied"
+git init -q --bare "$SB/cover-lib4.git"; git clone -q "$SB/cover-lib4.git" "$SB/cover-author-lib4" 2>/dev/null
+printf 'lib4 v1\n' > "$SB/cover-author-lib4/lib4.txt"; git -C "$SB/cover-author-lib4" add -A >/dev/null; git -C "$SB/cover-author-lib4" commit -qm "lib4: initial"; git -C "$SB/cover-author-lib4" push -q origin main 2>/dev/null
+( cd "$SB/cover-author" && git submodule add -q "$SB/cover-lib4.git" lib4 2>/dev/null ); git -C "$SB/cover-author" commit -qam "super: add lib4" >/dev/null; git -C "$SB/cover-author" push -q origin main 2>/dev/null
+git -C "$SUP" pull -q --ff-only origin main 2>/dev/null
+# What a crash mid-download leaves: the gitfile and a module directory with no commit.
+mkdir -p "$SUP/.git/modules"; git init -q --separate-git-dir "$SUP/.git/modules/lib4" "$SUP/lib4" 2>/dev/null
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$SUP\",\"paths\":[\"lib4\"]}")
+ok "an interrupted download finished under a block gets the block too" "$(printf '%s' "$OUT" | jqf value.ok):$(git -C "$SUP/lib4" config --local --get gitswitch.pushBlockedBy)" "True:superproject"
+OUT=$(probe push_mode "$SUP" "allowed")
+
 section "The run ends with the helper uninstalled, as it began"
 OUT=$(probe lock_uninstall "$APP")
 ok "uninstall applies" "$(printf '%s' "$OUT" | jqf outcome)" "applied"

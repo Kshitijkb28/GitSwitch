@@ -112,6 +112,9 @@ pub struct LocalClones {
     pub owner_profiles: HashMap<String, String>,
     /// owner (lowercase) -> "org-<id>" SSH user seen in local remotes
     pub org_ssh_users: HashMap<String, String>,
+    /// "owner/name" (lowercase) -> the folder a clone is still writing it into
+    #[serde(default)]
+    pub cloning: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,10 +305,35 @@ pub(crate) async fn token_for(account: &str) -> Result<String, AppError> {
 }
 
 /// Re-read only the local side of the picture: no GitHub call, no token.
+/// The clones still running into one of the profiles' folders, by "owner/name".
+fn cloning_now(profs: &[profiles::Profile]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (dest, url) in crate::sparse::running_clone_list() {
+        // A folder as stored or as the disk spells it: the registry holds the
+        // clone under both forms too.
+        if !profs.iter().any(|p| p.directories.iter().any(|d| crate::paths::is_within(&dest, d) || crate::paths::real_form(d).is_some_and(|r| crate::paths::is_within(&dest, &r)))) {
+            continue;
+        }
+        if let Some((o, n)) = crate::repo_scan::parse_github_owner_name(&url) {
+            out.insert(format!("{}/{}", o, n).to_lowercase(), dest);
+        }
+    }
+    out
+}
+
 pub async fn local_clones() -> Result<LocalClones, AppError> {
     let store = profiles::load_profiles()?;
+    // Read before the scan and after it: a clone that ends while the scan
+    // runs was skipped by it, and must still be reported (as cloning) for the
+    // page to read once more, rather than in neither list.
+    let before = cloning_now(&store.profiles);
     let idx = local_index(&store.profiles, true).await;
+    let mut cloning = cloning_now(&store.profiles);
+    for (k, v) in before {
+        cloning.entry(k).or_insert(v);
+    }
     Ok(LocalClones {
+        cloning,
         clones: idx.clones,
         owner_profiles: idx
             .owner_profiles

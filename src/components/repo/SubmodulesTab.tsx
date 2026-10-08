@@ -6,7 +6,10 @@ import * as api from "../../lib/api";
 import type { SubmoduleInfo } from "../../lib/api";
 import {
   StartBranchForm,
+  canCheckOutRecorded,
   canPullInside,
+  canRebaseLatest,
+  rebaseLatestTitle,
   canRecord,
   canStartBranch,
   canUpdate,
@@ -16,6 +19,7 @@ import {
   recordedUnpushedTitle,
   startBranchTitle,
   updateTitle,
+  checkOutRecordedTitle,
 } from "../changes/SubmodulesCard";
 
 interface Props {
@@ -31,12 +35,14 @@ interface Props {
   onOpenHistory: (sub: string) => void;
   onInitialise: (paths: string[]) => void;
   onRecordPointers: () => void;
-  /** `git pull` inside one submodule, on its own branch. */
-  onPullInside: (sub: SubmoduleInfo) => void;
+  /** `git pull` inside one submodule, on its own branch — or, with `source`, a rebase onto that remote-tracking branch. */
+  onPullInside: (sub: SubmoduleInfo, source?: string) => void;
   /** `git submodule update -- <path>`: check out the commit this repository records. */
   onUpdateOne: (path: string) => void;
   /** One commit in the repository recording where that submodule is checked out now. */
   onRecordOne: (path: string) => void;
+  /** Checks out the commit the repository records, inside that submodule (local, its branches untouched). */
+  onAlignOne: (path: string) => void;
   /** A branch at a detached submodule's checkout, named by the person. */
   onStartBranch: (path: string, name: string) => void;
   /** Opens the Update drawer for the repository: the latest below, your work on top, every submodule aligned. */
@@ -85,7 +91,7 @@ function stateClass(s: SubmoduleInfo): string {
  * upstream is a stream of pointer bumps, this is where the person's work
  * actually lives.
  */
-export function SubmodulesTab({ repoPath, scope, visible, busy, refreshKey, onWorkInside, onOpenHistory, onInitialise, onRecordPointers, onPullInside, onUpdateOne, onRecordOne, onStartBranch, onPreview }: Props) {
+export function SubmodulesTab({ repoPath, scope, visible, busy, refreshKey, onWorkInside, onOpenHistory, onInitialise, onRecordPointers, onPullInside, onUpdateOne, onRecordOne, onAlignOne, onStartBranch, onPreview }: Props) {
   // The row whose branch is being named — never one of another repository's.
   const [branchingFor, setBranchingFor] = useState<string | null>(null);
   useEffect(() => {
@@ -242,6 +248,12 @@ export function SubmodulesTab({ repoPath, scope, visible, busy, refreshKey, onWo
                             Pull inside{s.own_behind > 0 ? ` (${s.own_behind})` : ""}
                           </Button>
                         )}
+                        {canRebaseLatest(s) && (
+                          <Button size="sm" variant="ghost" disabled={busy} onClick={() => onPullInside(s, s.latest_ref ?? undefined)} title={rebaseLatestTitle(s)} className="px-2">
+                            <Download size={13} />
+                            Rebase onto {s.latest_ref}
+                          </Button>
+                        )}
                         {canUpdate(s) && (
                           <Button size="sm" variant="secondary" disabled={busy} onClick={() => onUpdateOne(s.path)} title={updateTitle(s)} className="px-2">
                             <GitCommitHorizontal size={13} />
@@ -252,6 +264,12 @@ export function SubmodulesTab({ repoPath, scope, visible, busy, refreshKey, onWo
                           <Button size="sm" variant="secondary" disabled={busy} onClick={() => onRecordOne(s.path)} title={recordTitle(s)} className="px-2">
                             <GitCommitHorizontal size={13} />
                             Record this pointer
+                          </Button>
+                        )}
+                        {canCheckOutRecorded(s) && (
+                          <Button size="sm" variant="secondary" disabled={busy} onClick={() => onAlignOne(s.path)} title={checkOutRecordedTitle(s)} className="px-2">
+                            <GitCommitHorizontal size={13} />
+                            Check out {s.recorded_short}
                           </Button>
                         )}
                         {canStartBranch(s) && branchingFor !== s.path && (

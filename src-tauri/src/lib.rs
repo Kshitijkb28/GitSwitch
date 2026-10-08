@@ -42,6 +42,7 @@ mod sync;
 mod tree;
 mod signing;
 mod ssh_keys;
+mod deep_link;
 mod tray;
 
 /// macOS/Linux GUI apps launched from Finder/the dock inherit a minimal PATH that
@@ -78,11 +79,19 @@ fn fix_path_env() {}
 pub fn run() {
     fix_path_env();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // First of all: a second launch — a gitswitch:// link opened while the
+    // app runs — hands its link over (the deep-link plugin routes it) and
+    // brings this window forward instead of starting another app.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| tray::show_main(app)));
+    builder
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(deep_link::Pending::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_profiles,
             commands::create_profile,
@@ -114,6 +123,7 @@ pub fn run() {
             commands::changes_pull,
             commands::changes_submodules,
             commands::changes_submodule_update,
+            commands::changes_submodule_align,
             commands::changes_lfs_status,
             commands::changes_lfs_pull,
             commands::changes_lfs_files,
@@ -189,6 +199,8 @@ pub fn run() {
             commands::doctor_check_repos,
             commands::doctor_fix_ssh_config,
             commands::doctor_unset_local,
+            commands::doctor_apply_fix,
+            commands::doctor_check_repo_access,
             commands::changes_push_identity,
             commands::scan_repos,
             commands::check_repo_access,
@@ -214,9 +226,30 @@ pub fn run() {
             commands::list_github_ssh_keys,
             commands::github_device_code,
             commands::github_poll_token,
+            commands::deep_link_take,
         ])
         .setup(|app| {
             tray::setup_tray(app.handle())?;
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        deep_link::open(&handle, url.as_str());
+                    }
+                });
+                // Started by a link: the page it names.
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    for url in urls {
+                        deep_link::open(app.handle(), url.as_str());
+                    }
+                }
+                // An AppImage is not installed: it registers the scheme itself.
+                #[cfg(target_os = "linux")]
+                if std::env::var_os("APPIMAGE").is_some() {
+                    let _ = app.deep_link().register_all();
+                }
+            }
             if let Err(e) = git_config::refresh_profile_includes() {
                 eprintln!("GitSwitch: the profiles' git config files could not be refreshed: {}", e);
             }

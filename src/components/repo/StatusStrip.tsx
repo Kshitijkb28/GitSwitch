@@ -26,10 +26,13 @@ export type StripActions = {
 export type RepoActions = StripActions & {
   initialise: (repo: string, paths: string[]) => Promise<unknown>;
   updateOne: (repo: string, sub: string) => Promise<unknown>;
-  pullInside: (repo: string, sub: SubmoduleInfo) => Promise<unknown>;
+  /** `git pull` inside `sub` — or, with `source`, a rebase onto that remote-tracking branch. */
+  pullInside: (repo: string, sub: SubmoduleInfo, source?: string) => Promise<unknown>;
   recordPointers: (repo: string) => Promise<unknown>;
   /** One commit in `repo` recording where the submodule `sub` is checked out now (a row's "Record this pointer"). */
   recordOne: (repo: string, sub: string) => Promise<unknown>;
+  /** Checks out, inside `sub`, the commit `repo` records for it (a row's "Check out <commit>"). */
+  alignOne: (repo: string, sub: string) => Promise<unknown>;
   /** A branch at a detached submodule's checkout, so its commits can be kept and pushed. */
   startBranch: (repo: string, sub: string, name: string) => Promise<unknown>;
   /** Runs an assessed plan (the Update drawer's "Update now"). */

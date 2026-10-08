@@ -339,7 +339,9 @@ export function ChangesTab({
       // updated; the toast below says what happened either way.
       const stillHere = repoRef.current === forRepo;
       if (!quiet && stillHere) {
-        setResult(r);
+        // A result from inside a submodule is that submodule's: its paths and
+        // codes are relative to it, and no action keyed on them may run here.
+        setResult(target && target !== forRepo ? { ...r, inside: target } : r);
         setMarkersRetry(!r.ok && r.refusal?.code === "conflict-markers" && opts?.markers ? opts.markers : null);
       }
       if (r.status && stillHere) {
@@ -412,13 +414,15 @@ export function ChangesTab({
    * target): the result carries the submodule's status, never the parent's,
    * and the parent is re-read because its gitlink row moves.
    */
-  const pullInside = (repo: string, s: SubmoduleInfo) => {
+  const pullInside = (repo: string, s: SubmoduleInfo, source?: string) => {
     const abs = `${repo.replace(/\/+$/, "")}/${s.path}`;
+    // With a source: a rebase onto it ("Rebase onto origin/main"), whatever the page's pull mode.
+    const mode = source ? "rebase" : pullMode;
     return apply(
       `pull:${s.path}`,
       // The page's option, as it is: whether LFS is used is the submodule's own
       // matter, which the backend reads there (nothing to do where it is not).
-      () => api.changesPull(abs, pullMode, pullLfs, pullMode === "rebase" && pullAutostash),
+      () => api.changesPull(abs, mode, pullLfs, mode === "rebase" && pullAutostash, source ?? null),
       abs
     );
   };
@@ -480,6 +484,7 @@ export function ChangesTab({
       pullInside,
       recordPointers: (repo) => apply("record", () => api.changesRecordPointers(repo)),
       recordOne: (repo, sub) => apply(`record:${sub}`, () => api.changesRecordPointers(repo, [sub])),
+      alignOne: (repo, sub) => runLongIn(repo, "submodules", `Checking out ${sub}'s recorded commit…`, () => api.changesSubmoduleAlign(repo, [sub])),
       startBranch: (repo, sub, name) => startBranch(repo, sub, name),
       // The page's large-file choice, as Pull takes it: the backend decides
       // which repositories of the update use LFS.
@@ -505,7 +510,7 @@ export function ChangesTab({
         primary: true,
       }
     : null;
-  const movedAction = result?.pull && (result.pull.submodules_moved ?? 0) > 0 ? { label: "Update…", onClick: onPreview, primary: true } : null;
+  const movedAction = result?.pull && !result.inside && (result.pull.submodules_moved ?? 0) > 0 ? { label: "Update…", onClick: onPreview, primary: true } : null;
   // A file staged with its conflict markers still in it: the refusal names
   // the lines, and whoever meant it (a file that really contains "<<<<<<<")
   // says so once.
@@ -545,9 +550,9 @@ export function ChangesTab({
     return apply(`branch:${sub}`, () => api.changesCreateBranch(inside, name, null, true), inside);
   };
 
-  // A result that belongs to a submodule (a push chained from here) carries
-  // its codes for the submodule, not for this repository: no action keyed on
-  // them is offered for it.
+  // A result that belongs to a submodule (a push chained from here, or any
+  // operation run inside one) carries its codes for the submodule, not for
+  // this repository: no action keyed on them is offered for it.
   const refusalCode = result?.inside ? undefined : result?.refusal?.code;
   // The submodule whose branch form the card should open (a nonce, then the path).
   const [branchFormFor, setBranchFormFor] = useState<string | null>(null);
@@ -734,6 +739,12 @@ export function ChangesTab({
                 clearJob(repoPath);
               }}
               onRecordPointers={() => apply("record", () => api.changesRecordPointers(repoPath))}
+              // A result from inside a submodule names paths inside it: aligned there.
+              onAlignSubmodules={(paths) => {
+                const inside = result.inside;
+                if (inside) void apply("align", () => api.changesSubmoduleAlign(inside, paths), inside);
+                else void runLong("submodules", `Checking out the recorded commit${paths.length === 1 ? "" : "s"}…`, () => api.changesSubmoduleAlign(repoPath, paths));
+              }}
               extraAction={markersAction ?? syncHandOff ?? movedAction ?? historyAction ?? publishAction}
               extraActions={subPushActions}
             />
@@ -837,9 +848,10 @@ export function ChangesTab({
                     api.changesSubmoduleUpdate(repoPath, paths)
                   )
                 }
-                onPullInside={(s) => void pullInside(repoPath, s)}
+                onPullInside={(s, source) => void pullInside(repoPath, s, source)}
                 onUpdateOne={(p) => void runLong("submodules", `Updating ${p}…`, () => api.changesSubmoduleUpdate(repoPath, [p]))}
                 onRecordOne={(p) => void apply(`record:${p}`, () => api.changesRecordPointers(repoPath, [p]))}
+                onAlignOne={(p) => void runLong("submodules", `Checking out ${p}'s recorded commit…`, () => api.changesSubmoduleAlign(repoPath, [p]))}
                 onStartBranch={(p, name) => void startBranch(repoPath, p, name)}
                 openBranchFormFor={branchFormFor}
                 sectionPaths={sectionPaths}
