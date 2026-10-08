@@ -126,7 +126,6 @@ pub async fn update_profile(
 #[tauri::command]
 pub async fn delete_profile(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
     let dirs = profiles::load_profiles()?.profiles.into_iter().find(|p| p.id == id).map(|p| p.directories).unwrap_or_default();
-    credentials::delete_token(&id).ok();
     profiles::delete_profile(id)?;
     git_config::apply_git_config()?;
     // A parent folder's profile may own these repositories now.
@@ -188,14 +187,28 @@ pub async fn gh_logout(account: String) -> Result<String, AppError> {
     gh_cli::gh_logout(&account).await
 }
 
-/// Automate "Step 2": register a local key's public half on a specific gh account.
+/// Automate "Step 2": register a local key's public half on a specific
+/// account — a gh login, or a sign-in kept here ("signin:<login>").
 /// `key_path` is the PRIVATE key path; we read `<key_path>.pub`.
 #[tauri::command]
 pub async fn gh_register_ssh_key(account: String, key_path: String) -> Result<String, AppError> {
-    let token = gh_cli::gh_get_token(&account).await?;
+    let signin = credentials::signin_login(&account).map(str::to_string);
+    let token = match &signin {
+        Some(login) => credentials::signin_token(login)?.ok_or_else(|| AppError::NotFound(format!("The sign-in for {} is not kept on this computer any more — sign in again on the GitHub page.", login)))?,
+        None => gh_cli::gh_get_token(&account).await?,
+    };
+    let account = signin.clone().unwrap_or(account);
     let public_key = ssh_keys::get_public_key(&key_path)?;
     let title = ssh_keys::key_title(ssh_keys::computer_name().as_deref());
     let (status, body, scope) = github::post_ssh_key(&token, &title, &public_key).await?;
+    // A kept sign-in is renewed on the GitHub page, not with gh.
+    if signin.is_some() {
+        match status {
+            401 => return Err(AppError::Command(format!("GitHub no longer accepts the sign-in kept for {} — sign in again on the GitHub page.", account))),
+            403 | 404 => return Err(AppError::Command(format!("The sign-in kept for {} may not add SSH keys — sign in again on the GitHub page, which asks GitHub for that.", account))),
+            _ => {}
+        }
+    }
     // "Already in use" is a success only when THIS account holds the key:
     // otherwise it is the wrong-account case the whole flow exists for.
     let (mine, holder) = if status == 422 {
@@ -387,14 +400,28 @@ pub async fn convert_repos_to_ssh(directory: String) -> Result<Vec<RemoteChange>
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
 }
 
+/// Keep a "Sign in with GitHub": its token in the system's credential store,
+/// its login in GitSwitch's list. Asked of GitHub first: the login kept is
+/// the one GitHub names for the token, never one the page passes.
 #[tauri::command]
-pub fn store_github_token(profile_id: String, token: String) -> Result<(), AppError> {
-    credentials::store_token(&profile_id, &token)
+pub async fn github_signin_keep(token: String) -> Result<GitHubUser, AppError> {
+    let user = github::verify_token(&token).await?;
+    credentials::keep_signin_token(&user.login, &token)?;
+    credentials::remember_signin(&user.login, user.id)?;
+    Ok(user)
 }
 
+/// Forget a kept sign-in: the token and the login.
 #[tauri::command]
-pub fn get_github_token(profile_id: String) -> Result<Option<String>, AppError> {
-    credentials::get_token(&profile_id)
+pub fn github_signin_forget(login: String) -> Result<(), AppError> {
+    credentials::forget_signin_token(&login)?;
+    credentials::forget_signin(&login)
+}
+
+/// The sign-ins kept here, newest first (no token is read to list them).
+#[tauri::command]
+pub fn github_signins() -> Vec<credentials::KeptSignIn> {
+    credentials::kept_signins()
 }
 
 #[tauri::command]

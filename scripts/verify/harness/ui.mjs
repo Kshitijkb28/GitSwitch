@@ -598,6 +598,9 @@ async function openAuthPage(browser, server, opts = {}) {
     verifies: opts.verifies ?? [],
     logoutError: opts.logoutError ?? null,
     keepStorage: opts.keepStorage ?? false,
+    /** Logins whose sign-in the backend keeps; keepError: what keeping one answers. */
+    kept: opts.kept ?? [],
+    keepError: opts.keepError ?? null,
   };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
@@ -635,6 +638,12 @@ async function openAuthPage(browser, server, opts = {}) {
             return reply(cmd, cfg.polls[polls++], () => Promise.reject("Command execution error: authorization_pending"));
           case "verify_github_token":
             return reply(cmd, cfg.verifies[verifies++], () => Promise.reject("Command execution error: nothing scripted"));
+          case "github_signins":
+            return Promise.resolve(cfg.kept.map((login, i) => ({ login, id: i + 1 })));
+          case "github_signin_keep":
+            return cfg.keepError ? Promise.reject(cfg.keepError) : Promise.resolve(null);
+          case "github_signin_forget":
+            return Promise.resolve(null);
           case "get_profiles":
           case "list_ssh_keys":
             return Promise.resolve([]);
@@ -654,6 +663,8 @@ async function openSshPage(browser, server, opts = {}) {
   const cfg = {
     register: opts.register ?? { resolve: "Registered on alice" },
     noClipboard: opts.noClipboard ?? false,
+    /** Sign-ins kept here: they register keys too. */
+    kept: opts.kept ?? [],
   };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
@@ -672,6 +683,8 @@ async function openSshPage(browser, server, opts = {}) {
             return Promise.resolve(["/home/me/.ssh/id_ed25519_gitswitch_work"]);
           case "gh_list_accounts":
             return Promise.resolve(["alice", "bob"]);
+          case "github_signins":
+            return Promise.resolve(cfg.kept.map((login, i) => ({ login, id: i + 1 })));
           case "get_public_key":
             return Promise.resolve("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGitSwitchTestKey me@example.test");
           case "gh_register_ssh_key":
@@ -3305,6 +3318,7 @@ try {
     const user = { id: 4242, login: "octo-signin", name: "Octo Signin", email: null, avatar_url: "" };
     const page = await openAuthPage(browser, server, {
       keepStorage: true,
+      kept: ["octo-signin"],
       polls: [{ resolve: { access_token: "gho_test", token_type: "bearer", scope: "read:user" } }],
       verifies: [{ resolve: user }],
     });
@@ -3312,6 +3326,8 @@ try {
       page.evaluate((l) => [...document.querySelectorAll("label")].find((x) => x.innerText.trim() === l)?.parentElement.querySelector("input")?.value ?? null, label);
     await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
     await page.waitForFunction(() => document.body.innerText.includes("Connected!"), { timeout: 8000 });
+    ok("the sign-in itself is kept — through the backend, with the token GitHub granted", await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "github_signin_keep" && c.args?.token === "gho_test")));
+    ok("  and the Connected screen says what that gives", (await text(page)).includes("keeps the sign-in in this computer's keychain"));
     await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Create Profile from GitHub")?.click());
     await page.waitForFunction(() => [...document.querySelectorAll("label")].some((l) => l.innerText.trim() === "Git Email"), { timeout: 4000 });
     await sleep(300);
@@ -3334,11 +3350,29 @@ try {
     await page.goto(`${server.url}/github`, { waitUntil: "networkidle0" });
     await page.waitForFunction(() => document.body.innerText.includes("Signed in with GitHub on this computer"), { timeout: 4000 }).catch(() => null);
     ok("the sign-in is listed on the GitHub page after a reload", (await text(page)).includes("Signed in with GitHub on this computer") && (await text(page)).includes("octo-signin"));
+    ok("  as kept in the keychain", (await text(page)).includes("Sign-in kept in the keychain"));
     await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Forget")?.click());
     await sleep(300);
+    ok("  Forget forgets the kept sign-in as well", await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "github_signin_forget" && c.args?.login === "octo-signin")));
     await page.goto(`${server.url}/profile/new`, { waitUntil: "networkidle0" });
     await sleep(400);
     ok("  and once forgotten, the form no longer offers it", !(await text(page)).toLowerCase().includes("autofill from github"));
+    await page.close();
+  }
+
+  {
+    // A credential store that refuses: the sign-in still connects, and says
+    // what is missing without it.
+    const user = { id: 4242, login: "octo-signin", name: "Octo Signin", email: null, avatar_url: "" };
+    const page = await openAuthPage(browser, server, {
+      keepError: "Command execution error: The system's credential store refused it: no keychain",
+      polls: [{ resolve: { access_token: "gho_test", token_type: "bearer", scope: "read:user" } }],
+      verifies: [{ resolve: user }],
+    });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
+    await page.waitForFunction(() => document.body.innerText.includes("Connected!"), { timeout: 8000 }).catch(() => null);
+    const s = await text(page);
+    ok("a sign-in the keychain refused still connects, and says repositories and keys need gh for it", s.includes("Connected!") && s.includes("could not be kept on this computer") && s.includes("no keychain"));
     await page.close();
   }
 
@@ -3413,6 +3447,26 @@ try {
       const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "gh_register_ssh_key")?.args ?? null);
       ok("a key from an earlier visit is registered from its row", call?.keyPath === "/home/me/.ssh/id_ed25519_gitswitch_work" && call?.account === "alice", JSON.stringify(call));
       ok("  and the row says which account it authenticates as", (await text(page)).includes("authenticates as") && (await text(page)).includes("alice"));
+      await page.close();
+    }
+    {
+      // A sign-in kept here registers keys as well as a gh login does.
+      const page = await openSshPage(browser, server, { kept: ["octo-kept"], register: { resolve: "Registered on octo-kept" } });
+      await clickText(page, "Register");
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Select an account…"))?.click());
+      await sleep(250);
+      const offered = await page.evaluate(() => [...document.querySelectorAll(".absolute button")].map((b) => b.innerText.trim()));
+      ok("a sign-in kept here is offered for registering a key, beside the gh logins", offered.includes("octo-kept (signed in here)") && offered.includes("alice"), JSON.stringify(offered));
+      await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === "octo-kept (signed in here)")?.click());
+      await sleep(200);
+      await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Register" && !b.disabled);
+        buttons[buttons.length - 1]?.click();
+      });
+      await sleep(600);
+      const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "gh_register_ssh_key")?.args ?? null);
+      ok("  and registering with it names that sign-in", call?.account === "signin:octo-kept", JSON.stringify(call));
       await page.close();
     }
     {

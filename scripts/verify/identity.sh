@@ -433,6 +433,19 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
         self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers()
         self.wfile.write(body)
+    def do_POST(self):
+        auth = self.headers.get("Authorization", "")
+        self.rfile.read(int(self.headers.get("Content-Length", "0") or 0))
+        with open(log, "a") as f:
+            f.write("POST " + self.path + " " + auth.split(" ")[-1] + "\n")
+        if self.path == "/user/keys" and auth.endswith("t-scoped"):
+            body = json.dumps({"id": 1, "key": "ssh-ed25519 AAAA", "title": "kept"}).encode()
+            self.send_response(201)
+        else:
+            body = json.dumps({"message": "Bad credentials"}).encode()
+            self.send_response(401)
+        self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers()
+        self.wfile.write(body)
     def log_message(self, *a): pass
 srv = http.server.HTTPServer(("127.0.0.1", 0), H)
 print(srv.server_address[1], flush=True)
@@ -448,6 +461,26 @@ ok "  with every verified address and no unverified one" "$(printf '%s' "$OUT" |
 OUT=$(GITSWITCH_GITHUB_API="$EAPI" pinvoke verify_github_token '{"token":"t-plain"}')
 ok "a token without user:email says so" "$(printf '%s' "$OUT" | jqf value.email_scope_missing)" "True"
 ok "  and spends no request on the addresses" "$(grep -c '^/user/emails' "$SB/emails-api.log" || true)" "0"
+
+# A "Sign in with GitHub" is kept: its token in the credential store (in the
+# suites a file store in the sandbox — never the real keychain), its login in
+# GitSwitch's list, under the login GitHub names for the token.
+OUT=$(GITSWITCH_GITHUB_API="$EAPI" pinvoke github_signin_keep '{"token":"t-scoped"}')
+ok "a sign-in is kept under the login GitHub names for its token" "$(printf '%s' "$OUT" | jqf value.login):$(cat "$GITSWITCH_TOKEN_DIR/github_octo-home" 2>/dev/null)" "octo-home:t-scoped"
+ok "  listed as kept, with no token in the list" "$(pinvoke github_signins '{}' | jqf value):$(grep -c t-scoped "$GITSWITCH_TOKEN_DIR/github-signins.json" || true)" '[{"id": 42, "login": "octo-home"}]:0'
+ok "  and offered on the Repositories page as an account" "$(pinvoke repo_accounts '{}' | "$PY" -c 'import sys,json;print([a["key"] for a in json.load(sys.stdin)["value"] if a["key"].startswith("signin:")])')" "['signin:octo-home']"
+if command -v ssh-keygen >/dev/null 2>&1; then
+  ssh-keygen -q -t ed25519 -N '' -C kept -f "$SB/kept_key" </dev/null
+  OUT=$(GITSWITCH_GITHUB_API="$EAPI" pinvoke gh_register_ssh_key "{\"account\":\"signin:octo-home\",\"keyPath\":\"$SB/kept_key\"}")
+  ok "a key is registered with the kept sign-in's own token, no gh involved" "$(printf '%s' "$OUT" | jqf value):$(grep -c 'POST /user/keys t-scoped' "$SB/emails-api.log")" "Registered on octo-home:1"
+  GITSWITCH_GITHUB_API="$EAPI" pinvoke github_signin_keep '{"token":"t-plain"}' >/dev/null
+  OUT=$(GITSWITCH_GITHUB_API="$EAPI" pinvoke gh_register_ssh_key "{\"account\":\"signin:octo-home\",\"keyPath\":\"$SB/kept_key\"}")
+  ok "  a kept sign-in GitHub no longer accepts says to sign in again on the GitHub page, not with gh" "$(printf '%s' "$OUT" | jqf error)" "sign in again on the GitHub page"
+fi
+pinvoke github_signin_forget '{"login":"Octo-Home"}' >/dev/null
+ok "Forget removes the token and the login, whatever the letter case" "$([ -e "$GITSWITCH_TOKEN_DIR/github_octo-home" ] && echo kept || echo gone):$(pinvoke github_signins '{}' | jqf value)" "gone:[]"
+OUT=$(pinvoke repo_accounts '{}' | "$PY" -c 'import sys,json;print([a["key"] for a in json.load(sys.stdin)["value"] if a["key"].startswith("signin:")])')
+ok "  and it is no longer offered" "$OUT" "[]"
 { kill "$EMAILS_PID" && wait "$EMAILS_PID"; } 2>/dev/null
 
 section "Doctor names the gh token scopes an account lacks"

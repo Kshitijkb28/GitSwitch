@@ -27,6 +27,9 @@ verify_init() {
   if command -v cygpath >/dev/null 2>&1; then SB="$(cygpath -m -l "$SB")"; fi
   export HOME="$SB/home"            # FIRST — before any line that writes a gitconfig
   export GIT_CONFIG_NOSYSTEM=1
+  # Tokens (a kept "Sign in with GitHub") go to files here, never the real
+  # keychain: the debug build honours this, a release build ignores it.
+  export GITSWITCH_TOKEN_DIR="$SB/tokens"
   cat > "$HOME/.gitconfig" <<EOF
 [user]
 	name = ${2:-Verify User}

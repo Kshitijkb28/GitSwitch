@@ -34,6 +34,16 @@ export function GitHubAuth() {
   const [removeError, setRemoveError] = useState<string | null>(null);
   const [removing, setRemoving] = useState(false);
   const [signins, setSignins] = useState<SignIn[]>(rememberedSignIns);
+  /** The sign-ins whose token the backend keeps (lower-case logins). */
+  const [kept, setKept] = useState<Set<string>>(new Set());
+  const loadKept = () =>
+    api
+      .githubSignins()
+      .then((l) => setKept(new Set((Array.isArray(l) ? l : []).map((s) => s.login.toLowerCase()))))
+      .catch(() => setKept(new Set()));
+  /** Said on the Connected screen when the sign-in could not be kept. */
+  const [keepNote, setKeepNote] = useState<string | null>(null);
+  const [forgetError, setForgetError] = useState<string | null>(null);
   const pollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollGenRef = useRef(0);
 
@@ -51,6 +61,7 @@ export function GitHubAuth() {
   async function refreshGhAccounts() {
     setGhRefreshing(true);
     setSignins(rememberedSignIns());
+    void loadKept();
     try {
       const accts = await api.ghListAccounts();
       setGhAccounts(accts);
@@ -64,6 +75,7 @@ export function GitHubAuth() {
   useEffect(() => {
     // Best-effort: populate accounts from the local gh CLI if it's available.
     loadGhAccounts();
+    void loadKept();
     return () => {
       // Leaving the page ends the sign-in: a check in flight, or a code
       // that arrives late, must start nothing more.
@@ -200,6 +212,15 @@ export function GitHubAuth() {
         if (pollGenRef.current !== myGen) return;
         rememberSignIn(ghUser);
         setSignins(rememberedSignIns());
+        // The token itself, in the system's credential store: with it this
+        // account lists its repositories and registers keys like a gh login.
+        try {
+          await api.githubSigninKeep(granted);
+          setKeepNote(null);
+        } catch (e) {
+          setKeepNote(`The sign-in could not be kept on this computer (${String(e)}): its name and email fill profiles, but listing its repositories and registering keys need the GitHub CLI.`);
+        }
+        void loadKept();
         setRetryNote(null);
         setUser(ghUser);
         setVia("device");
@@ -305,19 +326,34 @@ export function GitHubAuth() {
           <Card>
             <h3 className="text-sm font-medium text-zinc-200 mb-1">Signed in with GitHub on this computer</h3>
             <p className="text-xs text-zinc-500 mb-3">
-              Their name and email fill a profile from "Autofill from GitHub". Only those are kept, not
-              the sign-in: listing repositories and registering keys use the GitHub CLI's logins.
+              Their name and email fill a profile from "Autofill from GitHub", and a sign-in kept in this
+              computer's keychain lists the account's repositories and registers SSH keys, like a GitHub
+              CLI login. Forget removes both.
             </p>
+            {forgetError && <p className="text-xs text-red-300/90 mb-2 break-words">{forgetError}</p>}
             <div className="space-y-1.5">
               {signins.map((s) => (
                 <div key={s.login} className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-zinc-800/70 border border-zinc-700/50">
-                  <span className="text-sm text-zinc-200 font-mono truncate min-w-0">{s.login}</span>
+                  <span className="min-w-0">
+                    <span className="block text-sm text-zinc-200 font-mono truncate">{s.login}</span>
+                    <span className="block text-[11px] text-zinc-500">
+                      {kept.has(s.login.toLowerCase()) ? "Sign-in kept in the keychain" : "Name and email only — sign in again to list its repositories here"}
+                    </span>
+                  </span>
                   <Button
                     size="sm"
                     variant="ghost"
-                    onClick={() => {
+                    onClick={async () => {
+                      setForgetError(null);
+                      try {
+                        await api.githubSigninForget(s.login);
+                      } catch (e) {
+                        setForgetError(`The keychain kept the sign-in for ${s.login}: ${String(e)}`);
+                        return;
+                      }
                       forgetSignIn(s.login);
                       setSignins(rememberedSignIns());
+                      void loadKept();
                     }}
                   >
                     Forget
@@ -574,10 +610,12 @@ export function GitHubAuth() {
           {via === "device" && (
             <p className="text-xs text-zinc-500 mb-5">
               GitSwitch remembers this account's name and email for "Autofill from GitHub" when you
-              create or edit a profile. The sign-in itself is not kept: listing repositories and
-              registering keys use the GitHub CLI's logins.
+              create or edit a profile, and keeps the sign-in in this computer's keychain: the
+              account lists its repositories on the Repositories page and registers SSH keys, like a
+              GitHub CLI login. Forget on this page removes both.
             </p>
           )}
+          {via === "device" && keepNote && <p className="text-xs text-amber-300/80 mb-5 break-words">{keepNote}</p>}
 
           <div className="flex gap-3 flex-wrap">
             <Button onClick={handleCreateProfile}>

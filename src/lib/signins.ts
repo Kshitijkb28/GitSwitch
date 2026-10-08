@@ -2,10 +2,11 @@ import { readPersisted, writePersisted } from "./persist";
 
 /**
  * GitHub accounts signed in to with "Sign in with GitHub" (the device flow),
- * remembered by their public facts only — login, id, name, email, avatar —
+ * remembered here by their public facts — login, id, name, email, avatar —
  * so the profile form can fill an identity from them later, as it does from
- * a gh login. The sign-in's token is never kept: listing repositories and
- * registering keys go through the GitHub CLI's own logins.
+ * a gh login. The sign-in's token is kept by the backend, in the system's
+ * credential store (never here): with it the account lists its repositories
+ * and registers keys, like a gh login.
  */
 export type SignIn = {
   id: number;

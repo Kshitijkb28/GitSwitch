@@ -279,16 +279,12 @@ pub async fn accounts() -> Vec<RepoAccount> {
             });
         }
     }
-    if let Ok(store) = profiles::load_profiles() {
-        for p in store.profiles {
-            if matches!(crate::credentials::get_token(&p.id), Ok(Some(_))) {
-                out.push(RepoAccount {
-                    key: format!("profile:{}", p.id),
-                    label: format!("{} (GitSwitch sign-in)", p.name),
-                    source: "GitSwitch sign-in".into(),
-                });
-            }
-        }
+    for s in crate::credentials::kept_signins() {
+        out.push(RepoAccount {
+            key: format!("signin:{}", s.login),
+            label: s.login,
+            source: "Sign in with GitHub".into(),
+        });
     }
     out
 }
@@ -297,9 +293,9 @@ pub(crate) async fn token_for(account: &str) -> Result<String, AppError> {
     if let Some(name) = account.strip_prefix("gh:") {
         return crate::gh_cli::gh_get_token(name).await;
     }
-    if let Some(id) = account.strip_prefix("profile:") {
-        return crate::credentials::get_token(id)?
-            .ok_or_else(|| AppError::NotFound("This profile has no saved GitHub sign-in.".into()));
+    if let Some(login) = crate::credentials::signin_login(account) {
+        return crate::credentials::signin_token(login)?
+            .ok_or_else(|| AppError::NotFound(format!("The sign-in for {} is not kept on this computer any more — sign in again on the GitHub page.", login)));
     }
     Err(AppError::Config(format!("Unknown account \"{}\"", account)))
 }

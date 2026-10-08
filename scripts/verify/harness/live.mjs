@@ -87,6 +87,8 @@ function probeInvoke(cmd, args) {
         ...process.env,
         HOME: ENV.home,
         GIT_CONFIG_NOSYSTEM: "1",
+        // Never the real keychain: the debug build keeps tokens here instead.
+        GITSWITCH_TOKEN_DIR: `${ENV.home}/tokens`,
         PROBE_OP: "invoke",
         PROBE_CMD: cmd,
         PROBE_JSON: JSON.stringify(args ?? {}),

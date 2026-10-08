@@ -18,6 +18,7 @@ import { baseName } from "../lib/paths";
 import { useRefreshOnFocus } from "../lib/focus";
 import { copyText } from "../lib/clipboard";
 import * as api from "../lib/api";
+import { SIGNIN_PREFIX } from "../lib/signins";
 import { RefreshButton } from "../components/RefreshButton";
 
 /**
@@ -63,8 +64,8 @@ function RegisterKey({ keyPath, accounts }: { keyPath: string; accounts: string[
   if (accounts.length === 0) {
     return (
       <p className="text-xs text-zinc-500">
-        No <span className="font-mono">gh</span> account is signed in — sign in with{" "}
-        <span className="font-mono">gh auth login</span> (see GitHub Auth), then Refresh.
+        No GitHub account is signed in here — sign in on the GitHub page (with GitHub, or the
+        GitHub CLI's <span className="font-mono">gh auth login</span>), then Refresh.
       </p>
     );
   }
@@ -76,7 +77,7 @@ function RegisterKey({ keyPath, accounts }: { keyPath: string; accounts: string[
           onChange={setAccount}
           placeholder="Select an account…"
           optionIcon={<GitHubIcon size={14} />}
-          options={accounts.map((a) => ({ value: a, label: a }))}
+          options={accounts.map((a) => ({ value: a, label: a.startsWith(SIGNIN_PREFIX) ? `${a.slice(SIGNIN_PREFIX.length)} (signed in here)` : a }))}
           className="flex-1 min-w-0"
         />
         <Button type="button" onClick={register} disabled={!account || busy}>
@@ -125,6 +126,14 @@ export function SSHWizard() {
   const [keyToDelete, setKeyToDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [ghAccounts, setGhAccounts] = useState<string[]>([]);
+  // Sign-ins kept here register keys too ("signin:<login>").
+  const [keptSignins, setKeptSignins] = useState<string[]>([]);
+  const loadKeptSignins = () =>
+    api
+      .githubSignins()
+      .then((l) => setKeptSignins((Array.isArray(l) ? l : []).map((s) => SIGNIN_PREFIX + s.login)))
+      .catch(() => setKeptSignins([]));
+  const keyAccounts = [...ghAccounts, ...keptSignins];
   const [copyFailed, setCopyFailed] = useState(false);
   /** The existing key whose row is opened for registering. */
   const [openRow, setOpenRow] = useState<string | null>(null);
@@ -141,6 +150,7 @@ export function SSHWizard() {
     Promise.all([
       api.listSshKeys().then(setExistingKeys).catch(() => {}),
       api.ghListAccounts().then(setGhAccounts).catch(() => setGhAccounts([])),
+      loadKeptSignins(),
     ]).finally(() => setReloading(false));
   }
 
@@ -150,6 +160,7 @@ export function SSHWizard() {
   useEffect(() => {
     loadKeys();
     api.ghListAccounts().then(setGhAccounts).catch(() => setGhAccounts([]));
+    void loadKeptSignins();
   }, []);
 
   /** A row's public key to the clipboard, saying so when the webview refuses. */
@@ -366,7 +377,7 @@ export function SSHWizard() {
               Uses your local <span className="font-mono">gh</span> login — no
               copy-paste needed. A key can belong to only one account.
             </p>
-            <RegisterKey keyPath={privateKeyPath} accounts={ghAccounts} />
+            <RegisterKey keyPath={privateKeyPath} accounts={keyAccounts} />
           </div>
 
           <div className="flex justify-end mt-4">
@@ -501,7 +512,7 @@ export function SSHWizard() {
                 {rowNote[k] && <p className="px-3 pb-2 text-xs text-zinc-400 break-words">{rowNote[k]}</p>}
                 {openRow === k && (
                   <div className="px-3 pb-3">
-                    <RegisterKey keyPath={k} accounts={ghAccounts} />
+                    <RegisterKey keyPath={k} accounts={keyAccounts} />
                   </div>
                 )}
               </div>

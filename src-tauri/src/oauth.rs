@@ -62,7 +62,7 @@ async fn request_device_code_at(base: &str, client_id: Option<&str>) -> Result<D
         .header("User-Agent", "GitSwitch/0.1.0")
         .form(&[
             ("client_id", cid),
-            ("scope", "read:user user:email admin:public_key"),
+            ("scope", "read:user user:email admin:public_key repo read:org"),
         ])
         .send()
         .await

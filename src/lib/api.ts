@@ -608,7 +608,7 @@ export async function fullClone(
 }
 
 export interface RepoAccount {
-  /** "gh:<account>" or "profile:<profile id>" */
+  /** "gh:<login>" (a GitHub CLI login) or "signin:<login>" (a sign-in kept here) */
   key: string;
   label: string;
   source: string;
@@ -740,17 +740,25 @@ export async function sparseAdd(
   return invoke("sparse_add", { repoPath, dirs });
 }
 
-export async function storeGithubToken(
-  profileId: string,
-  token: string
-): Promise<void> {
-  return invoke("store_github_token", { profileId, token });
+/** A login signed in with "Sign in with GitHub" and kept here; its token is in the system's credential store. */
+export interface KeptSignIn {
+  login: string;
+  id: number;
 }
 
-export async function getGithubToken(
-  profileId: string
-): Promise<string | null> {
-  return invoke("get_github_token", { profileId });
+/** Keep a "Sign in with GitHub": GitHub is asked whose token it is, and the token goes to the system's credential store. */
+export async function githubSigninKeep(token: string): Promise<GitHubUser> {
+  return invoke("github_signin_keep", { token });
+}
+
+/** Forget a kept sign-in: its token and its login. */
+export async function githubSigninForget(login: string): Promise<void> {
+  return invoke("github_signin_forget", { login });
+}
+
+/** The sign-ins kept here, newest first. */
+export async function githubSignins(): Promise<KeptSignIn[]> {
+  return invoke("github_signins");
 }
 
 export async function applyGitConfig(): Promise<void> {
