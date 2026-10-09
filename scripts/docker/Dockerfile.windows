@@ -7,9 +7,23 @@
 #   docker run --rm -v "$PWD/dist-windows:/out" gitswitch-win
 FROM rust:1-bookworm
 
+# libayatana-appindicator3: the Windows bundle never uses it, but Tauri's CLI
+# looks for it on the HOST after every build (the tray feature's Linux check)
+# and stops without it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    clang llvm lld nsis nsis-pluginapi curl ca-certificates file \
+    clang llvm lld nsis nsis-pluginapi curl ca-certificates file unzip \
+    libayatana-appindicator3-dev \
  && rm -rf /var/lib/apt/lists/*
+
+# Debian's nsis ships without the Win\*.nsh headers Tauri's installer script
+# includes (RestartManager.nsh among them); the official NSIS release has
+# them. Only those headers are taken from it.
+RUN set -e; cd /tmp \
+ && curl -fsSL -o nsis.zip https://sourceforge.net/projects/nsis/files/NSIS%203/3.11/nsis-3.11.zip/download \
+ && mkdir -p nsis && cd nsis && unzip -q ../nsis.zip \
+ && cp -r nsis-3.11/Include/Win /usr/share/nsis/Include/ \
+ && ls /usr/share/nsis/Include/Win/RestartManager.nsh \
+ && cd / && rm -rf /tmp/nsis /tmp/nsis.zip
 
 # Node.js 20 (the Vite frontend build)
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
@@ -33,9 +47,12 @@ RUN npm ci
 
 COPY . .
 
-# Tauri's before-build runs `cargo run -p gitswitch-sidecars`; that program
-# reads TAURI_ENV_TARGET_TRIPLE and builds the two sidecars for Windows with
-# the cargo it is handed — cargo-xwin, so they link through the Windows SDK
-# like the app itself. The frontend is built first, on its own.
-ENV TAURI_ENV_TARGET_TRIPLE=x86_64-pc-windows-msvc
-CMD ["bash", "-c", "set -e; npm run build; CARGO=\"$(command -v cargo-xwin)\" cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis --config '{\"build\":{\"beforeBuildCommand\":\"cargo run --quiet --manifest-path src-tauri/Cargo.toml -p gitswitch-sidecars -- release\"}}'; mkdir -p /out; cp -v src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe /out/; echo 'Windows installer copied to ./dist-windows'"]
+# The sidecars are built by Tauri's before-build (`cargo run -p
+# gitswitch-sidecars`), which reads TAURI_ENV_TARGET_TRIPLE and builds them
+# with the cargo GITSWITCH_CARGO_RUNNER names — cargo-xwin, which links with
+# the Windows SDK's lld-link instead of looking for Microsoft's link.exe. The
+# app itself is built the same way, through Tauri's `--runner`. The frontend
+# is built first, on its own.
+ENV TAURI_ENV_TARGET_TRIPLE=x86_64-pc-windows-msvc \
+    GITSWITCH_CARGO_RUNNER=cargo-xwin
+CMD ["bash", "-c", "set -e; npm run build; cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis --config '{\"build\":{\"beforeBuildCommand\":\"cargo run --quiet --manifest-path src-tauri/Cargo.toml -p gitswitch-sidecars -- release\"}}'; mkdir -p /out; cp -v src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe /out/; echo 'Windows installer copied to ./dist-windows'"]
