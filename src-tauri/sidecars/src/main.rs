@@ -8,7 +8,10 @@
 //! machine needs no bash. Usage: `cargo run -p gitswitch-sidecars -- [release|debug]`.
 //! Tauri sets `TAURI_ENV_TARGET_TRIPLE` for before-commands;
 //! `universal-apple-darwin` is built for both Apple architectures and joined
-//! with lipo.
+//! with lipo. A cross-build that needs another linker (the Windows installer
+//! from a Linux or macOS Docker host, through cargo-xwin) names the cargo to
+//! build with in `GITSWITCH_CARGO_RUNNER`: `cargo run` itself always sets
+//! `CARGO` to the real toolchain binary, so that cannot carry it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,7 +35,11 @@ fn run() -> Result<(), String> {
     // not rebuild for that.
     let manifest = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     let src = manifest.parent().ok_or("this crate is not inside src-tauri")?.to_path_buf();
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let cargo = std::env::var("GITSWITCH_CARGO_RUNNER")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+        .or_else(|| std::env::var("CARGO").ok())
+        .unwrap_or_else(|| "cargo".into());
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let host = host_triple(&rustc)?;
     let triple = std::env::var("TAURI_ENV_TARGET_TRIPLE").ok().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| host.clone());
