@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { X, SquareTerminal, Info, ShieldAlert, Lock } from "lucide-react";
+import { X, SquareTerminal, Info, ShieldAlert, Lock, Maximize2, Minimize2 } from "lucide-react";
 import { Select } from "../Select";
 import { Badge } from "../Badge";
 import { ActivityView } from "./ActivityView";
@@ -17,6 +17,8 @@ import {
   setConsoleTab,
   setConsoleHeight,
   setConsoleRepo,
+  setConsoleSize,
+  sizeHeight,
   useConsole,
 } from "../../lib/console";
 import { baseName, isWithin, normPath } from "../../lib/paths";
@@ -109,6 +111,8 @@ export function ConsoleDrawer() {
   const [present, setPresent] = useState<{ path: string; exists: boolean } | null>(null);
   /** The folder that was gone, and the one the drawer opened instead. */
   const [gone, setGone] = useState<{ from: string; to: string } | null>(null);
+  /** The person read the "no longer on this Mac" note and closed it. */
+  const [goneSeen, setGoneSeen] = useState<string | null>(null);
   useEffect(() => {
     if (!started || !repo) return;
     let stale = false;
@@ -297,41 +301,89 @@ export function ConsoleDrawer() {
         <button
           type="button"
           aria-label="What this terminal guards"
+          aria-expanded={showNote}
           onClick={() => setShowNote((v) => !v)}
-          className="ml-auto flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-300 cursor-pointer"
+          className={`ml-auto flex items-center gap-1 text-[11px] cursor-pointer ${showNote ? "text-zinc-200" : "text-zinc-500 hover:text-zinc-300"}`}
         >
           <Info size={13} />
           What it guards
         </button>
+        {/* Half the window or all of it; the handle above still drags any size. */}
+        <div className="flex shrink-0 items-center gap-0.5 rounded-md bg-zinc-800/70 p-0.5" role="group" aria-label="Terminal size">
+          {(["half", "full"] as const).map((s) => {
+            const on = Math.abs(height - sizeHeight(s)) <= 2;
+            return (
+              <button
+                key={s}
+                type="button"
+                aria-label={s === "half" ? "Half the window" : "Full window"}
+                aria-pressed={on}
+                title={s === "half" ? "Half the window" : "Full window"}
+                onClick={() => {
+                  setConsoleSize(s);
+                  setSizeKey((n) => n + 1);
+                }}
+                className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] transition-colors cursor-pointer ${
+                  on ? "bg-zinc-700 text-zinc-100" : "text-zinc-400 hover:text-zinc-200"
+                }`}
+              >
+                {s === "half" ? <Minimize2 size={11} /> : <Maximize2 size={11} />}
+                {s === "half" ? "Half" : "Full"}
+              </button>
+            );
+          })}
+        </div>
         <button
           type="button"
           aria-label="Close the terminal"
+          title="Close the terminal (the shell keeps running)"
           onClick={closeConsole}
-          className="shrink-0 rounded p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 cursor-pointer"
+          className="flex shrink-0 items-center gap-1 rounded border border-zinc-700/70 px-1.5 py-0.5 text-[11px] text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 cursor-pointer"
         >
-          <X size={15} />
+          <X size={13} />
+          Close
         </button>
       </div>
 
       {showNote && (
-        <p className="shrink-0 border-b border-zinc-800 bg-zinc-800/40 px-3 py-2 text-[11px] leading-relaxed text-zinc-400">
-          This shell uses the same account, SSH key and push block as your own
-          terminal, because those live in your git config rather than in this
-          app. On top of that, <span className="text-zinc-200">git</span> here
-          refuses a force push, <span className="font-mono">--no-verify</span>,
-          and a push that would skip the system config where a push lock lives.
-          Those are guard-rails against a slip, not a barrier: an absolute path
-          to git or a changed PATH steps around them, and your own Terminal
-          always can.
-        </p>
+        <div className="flex shrink-0 items-start gap-2 border-b border-zinc-800 bg-zinc-800/40 px-3 py-2">
+          <p className="min-w-0 flex-1 text-[11px] leading-relaxed text-zinc-400">
+            This shell uses the same account, SSH key and push block as your own
+            terminal, because those live in your git config rather than in this
+            app. On top of that, <span className="text-zinc-200">git</span> here
+            refuses a force push, <span className="font-mono">--no-verify</span>,
+            and a push that would skip the system config where a push lock lives.
+            Those are guard-rails against a slip, not a barrier: an absolute path
+            to git or a changed PATH steps around them, and your own Terminal
+            always can.
+          </p>
+          <button
+            type="button"
+            aria-label="Close this note"
+            onClick={() => setShowNote(false)}
+            className="shrink-0 rounded p-0.5 text-zinc-500 hover:bg-zinc-700 hover:text-zinc-200 cursor-pointer"
+          >
+            <X size={13} />
+          </button>
+        </div>
       )}
 
       {/* Both panels stay mounted. Unmounting the terminal would close its pty,
           so the inactive one is hidden exactly as the drawer hides itself. */}
-      {gone && gone.to === repo && (
-        <p className="shrink-0 border-b border-zinc-800 px-3 py-1.5 text-[11px] text-amber-300/80 break-words" title={gone.from}>
-          {baseName(gone.from)} is no longer on this Mac, so the terminal opened in {baseName(repo)} instead.
-        </p>
+      {gone && gone.to === repo && goneSeen !== gone.from && (
+        <div className="flex shrink-0 items-start gap-2 border-b border-zinc-800 px-3 py-1.5" title={gone.from}>
+          <p className="min-w-0 flex-1 text-[11px] text-amber-300/80 break-words">
+            {baseName(gone.from)} is no longer on this Mac, so the terminal opened in {baseName(repo)} instead.
+          </p>
+          <button
+            type="button"
+            aria-label="Close this note"
+            onClick={() => setGoneSeen(gone.from)}
+            className="shrink-0 rounded p-0.5 text-amber-300/70 hover:bg-zinc-800 hover:text-amber-200 cursor-pointer"
+          >
+            <X size={13} />
+          </button>
+        </div>
       )}
       <div className={`min-h-0 flex-1 bg-zinc-900 px-2 py-1 ${tab === "terminal" ? "" : "hidden"}`}>
         {repo && ready ? (

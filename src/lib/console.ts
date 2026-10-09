@@ -30,8 +30,8 @@ export type ConsoleState = {
 
 const MIN_HEIGHT = 140;
 const MAX_HEIGHT = 900;
-/** The page keeps at least this much above the drawer: its own header stays usable. */
-const PAGE_ABOVE = 120;
+/** Even at "full" the page keeps this much above the drawer: its own header, so you see where you are. */
+const FULL_ABOVE = 56;
 
 let state: ConsoleState = {
   open: false, // never restored open: a shell should start when asked for
@@ -47,7 +47,14 @@ const listeners = new Set<() => void>();
 /** The tallest the drawer may be in this window — never past its top edge. */
 export function maxHeight(windowHeight: number = typeof window === "undefined" ? Infinity : window.innerHeight): number {
   if (!Number.isFinite(windowHeight) || windowHeight <= 0) return MAX_HEIGHT;
-  return Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, Math.floor(windowHeight - PAGE_ABOVE)));
+  return Math.max(MIN_HEIGHT, Math.floor(windowHeight - FULL_ABOVE));
+}
+
+/** Half the window, or (nearly) all of it: the two sizes the header offers. */
+export type ConsoleSize = "half" | "full";
+export function sizeHeight(size: ConsoleSize, windowHeight: number = typeof window === "undefined" ? 900 : window.innerHeight): number {
+  const h = Number.isFinite(windowHeight) && windowHeight > 0 ? windowHeight : 900;
+  return clampHeight(size === "full" ? h - FULL_ABOVE : Math.floor(h / 2), h);
 }
 
 /**
@@ -59,6 +66,11 @@ export function clampHeight(px: number, windowHeight?: number): number {
   const top = maxHeight(windowHeight);
   if (!Number.isFinite(px)) return Math.min(300, top);
   return Math.min(top, Math.max(MIN_HEIGHT, Math.round(px)));
+}
+
+/** Not above MAX_HEIGHT unless the person asked for full screen: a remembered or dragged height is kept sensible. */
+export function clampDragged(px: number): number {
+  return Math.min(MAX_HEIGHT, clampHeight(px));
 }
 
 function emit() {
@@ -156,7 +168,14 @@ export function notePushChanged() {
 }
 
 export function setConsoleHeight(px: number) {
-  const height = clampHeight(px);
+  const height = clampDragged(px);
+  writePersisted("console.height", height);
+  set({ height });
+}
+
+/** The header's Half / Full: sized to this window now, remembered as that size. */
+export function setConsoleSize(size: ConsoleSize) {
+  const height = sizeHeight(size);
   writePersisted("console.height", height);
   set({ height });
 }

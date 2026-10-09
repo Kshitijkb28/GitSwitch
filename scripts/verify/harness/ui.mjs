@@ -2345,6 +2345,24 @@ try {
     await sleep(300);
     g = await geo(page);
     ok("  and a window that shrinks under the open drawer brings it along", !!g && g.top >= 0 && g.closeTop >= 0 && g.height <= g.win, JSON.stringify(g));
+    // Half / Full in the header: sized to this window, header still on screen.
+    const clickLabel = (l) => page.evaluate((l) => document.querySelector(`[aria-label="${l}"]`)?.click(), l);
+    await clickLabel("Full window");
+    await sleep(250);
+    g = await geo(page);
+    ok("Full fills the window but for the page's header, with the drawer's header on screen", !!g && g.height >= g.win - 60 && g.height < g.win && g.closeTop >= 0, JSON.stringify(g));
+    await clickLabel("Half the window");
+    await sleep(250);
+    g = await geo(page);
+    ok("  Half is half of it", !!g && Math.abs(g.height - Math.floor(g.win / 2)) <= 2, JSON.stringify(g));
+    // The note has its own close; the drawer's Close stays what it says.
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("What it guards"))?.click());
+    await sleep(150);
+    ok("What it guards opens its note", (await text(page)).includes("not a barrier"));
+    await clickLabel("Close this note");
+    await sleep(150);
+    const t = await text(page);
+    ok("  the note's own × closes the note, not the terminal", !t.includes("not a barrier") && !!(await page.$('[aria-label="Terminal"]:not(.hidden)')) && t.includes("What it guards"));
     await page.close();
   }
 
@@ -2644,6 +2662,9 @@ try {
       const s = await text(page);
       ok("a folder deleted since the drawer listed it gets no shell", !(await opens(page)).includes(gone.path), JSON.stringify(await opens(page)));
       ok("  the drawer goes back to the page's folder, and says why", (await opens(page)).at(-1) === "/repos/gitswitch" && s.includes("gone-clone is no longer on this Mac"), JSON.stringify(await opens(page)));
+      await page.evaluate(() => document.querySelector('[aria-label="Close this note"]')?.click());
+      await sleep(150);
+      ok("  and that note can be closed, leaving the terminal open", !(await text(page)).includes("gone-clone is no longer on this Mac") && (await opens(page)).at(-1) === "/repos/gitswitch");
       ok("  and no error is left on screen", !s.includes("no longer exists on disk"));
       await page.close();
     }
