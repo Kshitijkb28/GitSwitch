@@ -51,3 +51,4 @@ dist-linux
 # Installers built locally (dist-linux is above)
 dist-mac
 dist-windows
+installers
