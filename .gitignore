@@ -47,3 +47,7 @@ dist-linux
 .claude/settings.local.json
 .claude/scratch/
 .claude/worktrees/
+
+# Installers built locally (dist-linux is above)
+dist-mac
+dist-windows
