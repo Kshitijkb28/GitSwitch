@@ -141,8 +141,9 @@ parallel. Two ways to trigger it:
 - **Manual:** Actions tab → "Build installers" → Run workflow → download the
   per-OS artifacts.
 
-This is the recommended path, because macOS installers can only be built on
-macOS and Windows installers on Windows.
+This is the recommended path: macOS installers can only be built on macOS,
+and CI builds all three at once. (The Windows installer can also be
+cross-built with Docker — see [Testing on Windows](#6-testing-on-windows).)
 
 ## 4. macOS: build + install in one step
 
@@ -169,9 +170,20 @@ To ship signed updates from CI:
 
 ## 6. Testing on Windows
 
-The `.exe` / `.msi` come from the CI workflow (Windows installers can only be
-built on Windows). Grab them from the draft Release, or from the run's
-artifacts if it was triggered manually.
+The `.exe` / `.msi` come from the CI workflow. Grab them from the draft
+Release, or from the run's artifacts if it was triggered manually.
+
+The `.exe` can also be cross-built from a Linux or macOS machine that has
+Docker (no Windows needed): the image brings the Windows SDK through
+cargo-xwin and packages the installer with NSIS.
+
+```bash
+docker build -f scripts/docker/Dockerfile.windows -t gitswitch-win .
+docker run --rm -v "$PWD/dist-windows:/out" gitswitch-win
+# -> dist-windows/GitSwitch_x.y.z_x64-setup.exe
+```
+
+The result is unsigned either way (SmartScreen asks once, see Installing).
 
 ### Installing
 
