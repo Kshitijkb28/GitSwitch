@@ -30,6 +30,8 @@ export type ConsoleState = {
 
 const MIN_HEIGHT = 140;
 const MAX_HEIGHT = 900;
+/** The page keeps at least this much above the drawer: its own header stays usable. */
+const PAGE_ABOVE = 120;
 
 let state: ConsoleState = {
   open: false, // never restored open: a shell should start when asked for
@@ -42,9 +44,21 @@ let state: ConsoleState = {
 
 const listeners = new Set<() => void>();
 
-export function clampHeight(px: number): number {
-  if (!Number.isFinite(px)) return 300;
-  return Math.min(MAX_HEIGHT, Math.max(MIN_HEIGHT, Math.round(px)));
+/** The tallest the drawer may be in this window — never past its top edge. */
+export function maxHeight(windowHeight: number = typeof window === "undefined" ? Infinity : window.innerHeight): number {
+  if (!Number.isFinite(windowHeight) || windowHeight <= 0) return MAX_HEIGHT;
+  return Math.max(MIN_HEIGHT, Math.min(MAX_HEIGHT, Math.floor(windowHeight - PAGE_ABOVE)));
+}
+
+/**
+ * A height that fits this window. A remembered height (or one dragged on
+ * a taller screen) past the window's top would carry the drawer's header,
+ * its pickers and its close button out of reach.
+ */
+export function clampHeight(px: number, windowHeight?: number): number {
+  const top = maxHeight(windowHeight);
+  if (!Number.isFinite(px)) return Math.min(300, top);
+  return Math.min(top, Math.max(MIN_HEIGHT, Math.round(px)));
 }
 
 function emit() {
@@ -145,4 +159,10 @@ export function setConsoleHeight(px: number) {
   const height = clampHeight(px);
   writePersisted("console.height", height);
   set({ height });
+}
+
+/** The window changed shape: a drawer now taller than fits is brought back in. */
+export function fitConsoleToWindow() {
+  const height = clampHeight(state.height);
+  if (height !== state.height) set({ height });
 }

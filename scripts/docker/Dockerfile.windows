@@ -1,0 +1,41 @@
+# Cross-compiles the Windows installer (x86_64, NSIS) on a Linux host — a Mac
+# running Docker included — without a Windows machine. cargo-xwin brings the
+# Windows SDK and lld-link; NSIS builds the setup .exe Tauri's bundler asks
+# for. The result lands in /out.
+#
+#   docker build -f scripts/docker/Dockerfile.windows -t gitswitch-win .
+#   docker run --rm -v "$PWD/dist-windows:/out" gitswitch-win
+FROM rust:1-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang llvm lld nsis nsis-pluginapi curl ca-certificates file \
+ && rm -rf /var/lib/apt/lists/*
+
+# Node.js 20 (the Vite frontend build)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get install -y nodejs \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-pc-windows-msvc \
+ && cargo install cargo-xwin --locked \
+ && cargo install tauri-cli --version "^2" --locked
+
+# The Windows SDK and CRT (from Microsoft's own CDN, under its EULA) — once,
+# into the image, so each build does not re-download it.
+RUN mkdir -p /xwin && cargo xwin --help >/dev/null 2>&1 || true
+ENV XWIN_CACHE_DIR=/xwin \
+    XWIN_ARCH=x86_64 \
+    CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
+
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+
+# Tauri's before-build runs `cargo run -p gitswitch-sidecars`; that program
+# reads TAURI_ENV_TARGET_TRIPLE and builds the two sidecars for Windows with
+# the cargo it is handed — cargo-xwin, so they link through the Windows SDK
+# like the app itself. The frontend is built first, on its own.
+ENV TAURI_ENV_TARGET_TRIPLE=x86_64-pc-windows-msvc
+CMD ["bash", "-c", "set -e; npm run build; CARGO=\"$(command -v cargo-xwin)\" cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis --config '{\"build\":{\"beforeBuildCommand\":\"cargo run --quiet --manifest-path src-tauri/Cargo.toml -p gitswitch-sidecars -- release\"}}'; mkdir -p /out; cp -v src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe /out/; echo 'Windows installer copied to ./dist-windows'"]

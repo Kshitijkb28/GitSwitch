@@ -12,6 +12,7 @@ const TerminalView = lazy(() =>
 import * as api from "../../lib/api";
 import {
   closeConsole,
+  fitConsoleToWindow,
   setConsoleAccount,
   setConsoleTab,
   setConsoleHeight,
@@ -201,9 +202,14 @@ export function ConsoleDrawer() {
     };
   }, [onDrag, stopDrag]);
 
-  // The window changing shape changes the shell's shape.
+  // The window changing shape changes the shell's shape — and a drawer that
+  // no longer fits is brought back inside the window, header and all.
   useEffect(() => {
-    const onResize = () => setSizeKey((n) => n + 1);
+    const onResize = () => {
+      fitConsoleToWindow();
+      setSizeKey((n) => n + 1);
+    };
+    onResize();
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);

@@ -2308,6 +2308,46 @@ try {
   }
 
   // -----------------------------------------------------------------
+  section("The terminal drawer never outgrows the window");
+  {
+    // A remembered 900 px drawer (dragged tall on a big screen) in a 600 px
+    // window: its header, pickers and close button were pushed above the
+    // window's top edge, so it could neither be closed nor shrunk.
+    const geo = (pg) =>
+      pg.evaluate(() => {
+        const d = document.querySelector('[aria-label="Terminal"]');
+        const r = d?.getBoundingClientRect();
+        const close = d?.querySelector('[aria-label="Close the terminal"]')?.getBoundingClientRect();
+        return r ? { top: Math.round(r.top), height: Math.round(r.height), closeTop: Math.round(close?.top ?? -1), win: window.innerHeight } : null;
+      });
+    const page = await open(SCENARIOS.clean, { storage: { "console.height": 900 } });
+    await page.setViewport({ width: 1280, height: 600 });
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal")?.click());
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
+    await sleep(300);
+    let g = await geo(page);
+    ok("a remembered height taller than the window is brought back inside it", !!g && g.top >= 0 && g.height <= g.win, JSON.stringify(g));
+    ok("  so the close button is on screen", !!g && g.closeTop >= 0 && g.closeTop < g.win, JSON.stringify(g));
+    // Dragging the handle to the very top cannot take the drawer past the window either.
+    const handle = await page.$('[aria-label="Resize the terminal"]');
+    const hb = await handle.boundingBox();
+    await page.mouse.move(hb.x + hb.width / 2, hb.y + hb.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(hb.x + hb.width / 2, 0, { steps: 5 });
+    await page.mouse.move(hb.x + hb.width / 2, -50, { steps: 2 });
+    await page.mouse.up();
+    await sleep(200);
+    g = await geo(page);
+    ok("  nor can a drag to the top edge", !!g && g.top >= 0 && g.closeTop >= 0, JSON.stringify(g));
+    // The window shrinks under an open drawer: it follows.
+    await page.setViewport({ width: 1280, height: 450 });
+    await sleep(300);
+    g = await geo(page);
+    ok("  and a window that shrinks under the open drawer brings it along", !!g && g.top >= 0 && g.closeTop >= 0 && g.height <= g.win, JSON.stringify(g));
+    await page.close();
+  }
+
   section("The terminal drawer");
   {
     const page = await open(SCENARIOS.clean);
