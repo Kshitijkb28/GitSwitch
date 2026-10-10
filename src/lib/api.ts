@@ -36,6 +36,13 @@ export interface ContainerRef {
   container_port: number | null;
 }
 
+/** "copy 2 of 2": which copy of its project a clone is, and the others' names. */
+export interface CopyRef {
+  rank: number;
+  of: number;
+  others: string[];
+}
+
 /** One listening port with everything the OS says about its holder. */
 export interface Listener {
   key: string;
@@ -53,6 +60,7 @@ export interface Listener {
   ours: boolean;
   workspace: string | null;
   clone: CloneRef | null;
+  copy: CopyRef | null;
   container: ContainerRef | null;
   killable: boolean;
   /** When not killable: why, in plain words. */
@@ -92,6 +100,65 @@ export async function portsKill(pid: number, force: boolean, name: string): Prom
 
 export async function portsContainerStop(id: string, project: string | null): Promise<ContainerStopOutcome> {
   return invoke("ports_container_stop", { id, project });
+}
+
+/** One checkout of a project among the copies of it on this machine. */
+export interface WorkspaceCopy {
+  path: string;
+  /** The folder name, with a parent prepended while two copies share one. */
+  label: string;
+  id: string;
+  offset: number;
+  kind: "clone" | "worktree";
+  is_this: boolean;
+  profile_name: string | null;
+  branch: string | null;
+  detached: boolean;
+  unborn: boolean;
+  /** Tracked files changed (untracked left out); null when unreadable. */
+  changed: number | null;
+}
+
+export interface WorkspaceNote {
+  level: "amber";
+  text: string;
+}
+
+/**
+ * What tells this checkout apart from another copy of the same project: its
+ * id, port offset and Compose project name (the drawer exports them), the
+ * other copies, and the note when two copies share a branch with changes.
+ */
+export interface WorkspaceInfo {
+  /** The workspace's top folder (a submodule resolves to its superproject's). */
+  path: string;
+  name: string;
+  id: string;
+  kind: "clone" | "worktree";
+  asked_path: string;
+  offset: number;
+  /** Set for every copy but the first; the first keeps Compose's own name. */
+  compose_project: string | null;
+  /** "owner/name" for GitHub, else the remote's address; null without a remote. */
+  remote: string | null;
+  /** Every copy, this one included; by offset, then path. */
+  copies: WorkspaceCopy[];
+  note: WorkspaceNote | null;
+  /** What the drawer exports, as [name, value]. */
+  env: [string, string][];
+  banner: string;
+  warnings: string[];
+  /** The sentence about what is left to the person. */
+  not_automated: string;
+}
+
+export async function workspaceInfo(path: string): Promise<WorkspaceInfo> {
+  return invoke("workspace_info", { path });
+}
+
+/** The person chose this checkout's port offset (0..60000); one another copy uses is refused. */
+export async function workspaceSetOffset(path: string, offset: number): Promise<WorkspaceInfo> {
+  return invoke("workspace_set_offset", { path, offset });
 }
 
 export async function createProfile(params: {
@@ -726,6 +793,8 @@ export interface LocalClones {
   org_ssh_users: Record<string, string>;
   /** "owner/name" (lowercase) -> the folder a clone is still writing it into */
   cloning?: Record<string, string>;
+  /** "owner/name" (lowercase) -> every local copy, for repositories cloned more than once */
+  copies?: Record<string, string[]>;
 }
 
 /** Which repos are on this machine right now — local disk only, no network. */

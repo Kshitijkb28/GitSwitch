@@ -56,6 +56,8 @@ export function Repo() {
   const [gitlinksFor, setGitlinksFor] = useState("");
   const gitlinks = gitlinkPaths.length;
   const [status, setStatus] = useState<RepoStatus | null>(null);
+  /** The other copies of this project on this machine, read with the repository and on Refresh. */
+  const [workspace, setWorkspace] = useState<api.WorkspaceInfo | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(false);
   const actionsRef = useRef<RepoActions | null>(null);
   const [peek, setPeek] = useState<api.RemotePeek | null>(null);
@@ -191,6 +193,27 @@ export function Repo() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sel.path, reloadKey]);
+
+  // The workspace: this checkout among the other copies of its project. A
+  // folder that is no repository (or was deleted) simply has none.
+  useEffect(() => {
+    if (!sel.path) {
+      setWorkspace(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .workspaceInfo(sel.path)
+      .then((w) => {
+        if (!cancelled) setWorkspace(w);
+      })
+      .catch(() => {
+        if (!cancelled) setWorkspace(null);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [sel.path, reloadKey]);
 
   // The Changes tab reads the status; the strip shows it, and the History tab
@@ -528,6 +551,7 @@ export function Repo() {
         onPeek={doPeek}
         onPeekDismiss={() => setPeek(null)}
         onPreview={() => setDrawerFor(sel.effectivePath)}
+        workspace={sel.sub ? null : workspace}
       />
 
       {sel.effectivePath && (

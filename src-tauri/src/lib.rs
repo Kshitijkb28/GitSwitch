@@ -44,6 +44,7 @@ mod signing;
 mod ssh_keys;
 mod deep_link;
 mod ports;
+mod workspace;
 mod tray;
 
 /// macOS/Linux GUI apps launched from Finder/the dock inherit a minimal PATH that
@@ -232,6 +233,8 @@ pub fn run() {
             commands::ports_list,
             commands::ports_kill,
             commands::ports_container_stop,
+            commands::workspace_info,
+            commands::workspace_set_offset,
         ])
         .setup(|app| {
             tray::setup_tray(app.handle())?;

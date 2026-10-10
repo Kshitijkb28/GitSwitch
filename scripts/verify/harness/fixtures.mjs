@@ -1030,3 +1030,27 @@ export const BRANCH_DELETE_OUTCOME = {
   stash: null,
   recovery: "git -C /repos/gitswitch branch feature/login abc1234abc1234abc1234abc1234abc1234abc12",
 };
+
+/** One checkout's workspace, as workspace_info answers: a repository cloned once. `over` replaces fields. */
+export function workspaceInfo(over = {}) {
+  return {
+    path: "/repos/gitswitch", name: "gitswitch", id: "a1b2c3d4", kind: "clone", asked_path: "/repos/gitswitch", offset: 0, compose_project: null, remote: "me/gitswitch",
+    copies: [{ path: "/repos/gitswitch", label: "gitswitch", id: "a1b2c3d4", offset: 0, kind: "clone", is_this: true, profile_name: "Kirmada", branch: "main", detached: false, unborn: false, changed: 0 }],
+    note: null,
+    env: [["GITSWITCH_WORKSPACE", "a1b2c3d4"], ["GITSWITCH_WORKSPACE_PATH", "/repos/gitswitch"], ["GITSWITCH_WORKSPACE_NAME", "gitswitch"], ["GITSWITCH_PORT_OFFSET", "0"]],
+    banner: "GitSwitch workspace #a1b2c3d4 · gitswitch · port offset 0 ($GITSWITCH_PORT_OFFSET)",
+    warnings: [],
+    not_automated: "GitSwitch only tells you about the other copy — it never switches a branch, edits a port in your project, or renames containers that are already running. Those are your decisions.",
+    ...over,
+  };
+}
+export const WORKSPACE_ONE = workspaceInfo();
+const COPY_THIS = { path: "/repos/gitswitch", label: "Argos_06-10-26_V1", id: "a1b2c3d4", offset: 0, kind: "clone", is_this: true, profile_name: "Kirmada", branch: "main", detached: false, unborn: false, changed: 3 };
+const COPY_OTHER = { path: "/Users/me/Documents/Acme/Argos_08-10-26", label: "Argos_08-10-26", id: "2f9c1a7b", offset: 100, kind: "clone", is_this: false, profile_name: "Kirmada", branch: "main", detached: false, unborn: false, changed: 0 };
+/** Two copies of acme/argos, the other one clean. */
+export const WORKSPACE_TWO = workspaceInfo({ name: "Argos_06-10-26_V1", remote: "acme/argos", copies: [COPY_THIS, COPY_OTHER] });
+/** Two copies on main with changes in both: the amber note. */
+export const WORKSPACE_TWO_DIRTY = workspaceInfo({
+  name: "Argos_06-10-26_V1", remote: "acme/argos", copies: [COPY_THIS, { ...COPY_OTHER, changed: 1 }],
+  note: { level: "amber", text: "Both copies have main checked out with uncommitted changes (Argos_06-10-26_V1: 3 files, Argos_08-10-26: 1 file). Commits made in both will diverge and the second push will be refused — work on a branch per copy." },
+});

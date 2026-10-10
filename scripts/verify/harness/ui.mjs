@@ -34,7 +34,7 @@ import {
   SUBMODULE_A,
   TREE_RESET_OUTCOME,
   STASH_DROP_OUTCOME,
-  BRANCH_DELETE_OUTCOME, sub, PULL_MOVED_OUTCOME, CONFLICT_VIEW } from "./fixtures.mjs";
+  BRANCH_DELETE_OUTCOME, sub, PULL_MOVED_OUTCOME, CONFLICT_VIEW, WORKSPACE_ONE, WORKSPACE_TWO, WORKSPACE_TWO_DIRTY } from "./fixtures.mjs";
 
 if (!DIST_OK) {
   console.error("dist/ is missing — run `npm run build` first");
@@ -111,6 +111,8 @@ async function openPage(browser, server, scenario, opts = {}) {
     terminalOpenDelayMs: opts.terminalOpenDelayMs ?? 0,
     /** More remembered settings (gitswitch:* keys, without the prefix). */
     storage: opts.storage ?? null,
+    /** What workspace_info answers: by default a repository cloned once. */
+    workspace: opts.workspace ?? WORKSPACE_ONE,
   };
   // Named, so another engine can be handed the very same bridge (webkit.sh).
   const bridge = (
@@ -227,6 +229,10 @@ async function openPage(browser, server, scenario, opts = {}) {
               );
             case "changes_submodules":
               return Promise.resolve(cfg.submodules);
+            case "workspace_info":
+              return Promise.resolve(cfg.workspace);
+            case "workspace_set_offset":
+              return Promise.resolve({ ...cfg.workspace, offset: args.offset });
             case "changes_lfs_status":
               return Promise.resolve(cfg.lfs);
             case "changes_lfs_files":
@@ -484,7 +490,12 @@ async function buttonState(page, label) {
 
 /** The Repositories page with its own mock bridge: two accounts, page-by-page listings. */
 async function openReposPage(browser, server, opts = {}) {
-  const cfg = { firstDelayBob: opts.firstDelayBob ?? 700, restDelay: opts.restDelay ?? 400 };
+  const cfg = {
+    firstDelayBob: opts.firstDelayBob ?? 700,
+    restDelay: opts.restDelay ?? 400,
+    /** What local_clone_index answers: by default nothing is cloned. */
+    local: opts.local ?? { clones: {}, owner_profiles: {}, org_ssh_users: {} },
+  };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
   await page.evaluateOnNewDocument((cfg) => {
@@ -507,7 +518,7 @@ async function openReposPage(browser, server, opts = {}) {
           case "get_profiles":
             return [];
           case "local_clone_index":
-            return { clones: {}, owner_profiles: {}, org_ssh_users: {} };
+            return cfg.local;
           case "path_exists":
             return true;
           case "list_remote_repos_page": {
@@ -3839,6 +3850,66 @@ try {
     await page.close();
   }
 
+  section("Two copies of one repository");
+  {
+    const page = await open(SCENARIOS.clean, { workspace: WORKSPACE_TWO });
+    await page.waitForFunction(() => document.body.innerText.includes("copies of"), { timeout: 4000 }).catch(() => null);
+    const s = await text(page);
+    const at = s.indexOf("copies of");
+    ok("the strip names both copies — this one first — each with its branch and changes", s.includes("2 copies of acme/argos among your repositories: Argos_06-10-26_V1 (this one, main, 3 changed) · Argos_08-10-26 (main, clean)"), s.slice(Math.max(0, at - 2), at + 140));
+    ok("  no amber note while one copy is clean", !s.includes("Commits made in both will diverge"));
+    const title = await page.evaluate(() => document.querySelector('[aria-label="Copies of this repository"]')?.getAttribute("title") ?? "");
+    ok("  the row's title says what is left to the person", title.includes("never switches a branch, edits a port in your project, or renames containers"), title);
+    const asked = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "workspace_info").map((c) => c.args.path));
+    const before = (await asked()).length;
+    ok("  it was read for the repository on screen", before >= 1 && (await asked()).every((p) => p === "/repos/gitswitch"), JSON.stringify(await asked()));
+    await (await button(page, "Refresh")).click();
+    await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "workspace_info").length > n, { timeout: 4000 }, before).catch(() => null);
+    ok("  Refresh reads the copies again", (await asked()).length > before);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.dirty, { workspace: WORKSPACE_TWO_DIRTY });
+    await page.waitForFunction(() => document.body.innerText.includes("Both copies have"), { timeout: 4000 }).catch(() => null);
+    const s = await text(page);
+    ok("the same branch with changes in both → the amber note, verbatim from the backend", s.includes("Both copies have main checked out with uncommitted changes (Argos_06-10-26_V1: 3 files, Argos_08-10-26: 1 file). Commits made in both will diverge and the second push will be refused — work on a branch per copy."));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    const s = await text(page);
+    ok("a repository cloned once has no copies row", !s.includes("among your repositories"));
+    await page.close();
+  }
+  {
+    // Inside a submodule scope the copies are the superproject's business: the row is hidden.
+    const page = await open(SCENARIOS.submodules, { submodules: SUBMODULES, subInner: SUB_INNER, workspace: WORKSPACE_TWO, storage: { "repo.sub": "trinity" } });
+    await sleep(400);
+    const s = await text(page);
+    ok("inside a submodule scope the row is hidden", !s.includes("among your repositories"));
+    await page.close();
+  }
+  {
+    const page = await openReposPage(browser, server, { local: { clones: { "alice/a-1": "/w/a-1" }, owner_profiles: {}, org_ssh_users: {}, copies: { "alice/a-1": ["/w/a-1", "/w/other/a-1"] } } });
+    await page.waitForFunction(() => document.body.innerText.includes("cloned ×2"), { timeout: 5000 }).catch(() => null);
+    const s = await text(page);
+    ok("the Repositories page marks a repository cloned twice", s.includes("cloned ×2"), s.slice(s.indexOf("a-1"), s.indexOf("a-1") + 80));
+    const title = await page.evaluate(() => [...document.querySelectorAll("span[title]")].map((e) => e.title).find((t) => t.includes("/w/other/a-1")) ?? "");
+    ok("  and names both folders", title.includes("/w/a-1") && title.includes("/w/other/a-1"), title);
+    await page.close();
+  }
+  {
+    const rows = [{ ...PORT_ROWS[0], copy: { rank: 2, of: 2, others: ["Argos_06-10-26_V1"] } }];
+    const page = await openPortsPage(browser, server, { rows });
+    await page.waitForFunction(() => document.body.innerText.includes("copy 2 of 2"), { timeout: 4000 }).catch(() => null);
+    const s = await text(page);
+    ok("a Ports row from a copy says which copy it is", s.includes("copy 2 of 2"));
+    const title = await page.evaluate(() => [...document.querySelectorAll("span[title]")].map((e) => e.title).find((t) => t.startsWith("The other copy")) ?? "");
+    ok("  and names the other one", title.includes("Argos_06-10-26_V1"), title);
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
   section("A gitswitch:// link that started the app");
   {
     const page = await browser.newPage();

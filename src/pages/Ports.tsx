@@ -244,9 +244,19 @@ export function Ports() {
                     </div>
                     <div className="min-w-0 hidden md:block">
                       {row.clone ? (
-                        <Badge variant="success">
-                          {row.clone.name} · {row.clone.profile_name}
-                        </Badge>
+                        <span className="inline-flex items-center gap-1.5 flex-wrap min-w-0">
+                          <Badge variant="success">
+                            {row.clone.name} · {row.clone.profile_name}
+                          </Badge>
+                          {row.copy && (
+                            <span
+                              className="text-[11px] text-zinc-500 whitespace-nowrap"
+                              title={`The other ${row.copy.of === 2 ? "copy" : "copies"} of this project: ${row.copy.others.join(", ")}`}
+                            >
+                              copy {row.copy.rank} of {row.copy.of}
+                            </span>
+                          )}
+                        </span>
                       ) : row.container ? (
                         <Badge>
                           {row.container.name}

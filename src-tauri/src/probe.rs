@@ -277,6 +277,8 @@ pub(crate) mod tests {
             "ports_list" => forward!(c::ports_list, args),
             "ports_kill" => forward!(c::ports_kill, args, pid, force, name),
             "ports_container_stop" => forward!(c::ports_container_stop, args, id, project),
+            "workspace_info" => forward!(c::workspace_info, args, path),
+            "workspace_set_offset" => forward!(c::workspace_set_offset, args, path, offset),
             // These take a `tauri::AppHandle` (tray label updates) and cannot run outside the app.
             "create_profile" | "update_profile" | "delete_profile" | "set_default_profile" | "sparse_clone"
             | "full_clone" => reply_err(format!(
@@ -482,6 +484,17 @@ pub(crate) mod tests {
                 let err = crate::ports::kill(pid, false, "").await.err().map(|e| e.to_string());
                 crate::terminal::close(&id);
                 emit(&err);
+            }
+            // What the drawer would export in this folder, and its banner — no shell started.
+            "workspace_env" => emit(&crate::workspace::env_for(&repo())),
+            // term_run, and also what the shell showed before the line was
+            // typed: the workspace banner must be the first thing on screen.
+            "term_run_prelude" => {
+                let line = a.join(",");
+                match crate::terminal::run_once_with_prelude(&repo(), &line, std::time::Duration::from_secs(20)) {
+                    Ok((prelude, out)) => emit(&serde_json::json!({ "prelude": prelude, "output": out })),
+                    Err(e) => emit_err(e),
+                }
             }
             "lock_helper_status" => emit(&crate::push_lock::helper_status().await),
             "lock_uninstall" => emit(&crate::push_lock::uninstall_all().await),

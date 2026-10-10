@@ -77,6 +77,8 @@ pub struct Listener {
     /// The GITSWITCH_WORKSPACE id in its environment, when one is.
     pub workspace: Option<String>,
     pub clone: Option<CloneRef>,
+    /// Which copy of its project the clone is, when the project is cloned more than once.
+    pub copy: Option<CopyRef>,
     pub container: Option<ContainerRef>,
     pub killable: bool,
     /// When not killable: why, in the person's words.
@@ -89,6 +91,15 @@ pub struct CloneRef {
     pub path: String,
     pub name: String,
     pub profile_name: String,
+}
+
+/// "copy 2 of 2": the clone's rank among the copies of its project (by port
+/// offset), how many there are, and the others' names.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct CopyRef {
+    pub rank: usize,
+    pub of: usize,
+    pub others: Vec<String>,
 }
 
 /// The container a port is published by, and its Compose project when it has one.
@@ -814,6 +825,7 @@ pub(crate) fn assemble(g: &Gathered, profs: &[crate::profiles::Profile]) -> Vec<
             ours: marks.terminal,
             workspace: marks.workspace,
             clone,
+            copy: None,
             container,
             killable: false,
             why_not: None,
@@ -847,6 +859,7 @@ pub(crate) fn assemble(g: &Gathered, profs: &[crate::profiles::Profile]) -> Vec<
                 ours: false,
                 workspace: None,
                 clone,
+                copy: None,
                 container: Some(ContainerRef {
                     id: c.id.clone(),
                     name: c.name.clone(),
@@ -1114,9 +1127,21 @@ pub async fn list() -> Result<PortsReport, AppError> {
         notes.push(n);
     }
     let profs = crate::profiles::load_profiles().map(|s| s.profiles).unwrap_or_default();
-    let rows = tokio::task::spawn_blocking(move || assemble(&g, &profs))
+    let mut rows = tokio::task::spawn_blocking(move || assemble(&g, &profs))
         .await
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?;
+    // A row from a project cloned more than once says which copy it is. The
+    // copies come from the clone index as it stands — never a scan per tick.
+    if rows.iter().any(|r| r.clone.is_some()) {
+        let groups = crate::workspace::groups().await;
+        if !groups.is_empty() {
+            for row in rows.iter_mut() {
+                if let Some(c) = &row.clone {
+                    row.copy = crate::workspace::copy_of(&c.path, &groups).map(|(rank, of, others)| CopyRef { rank, of, others });
+                }
+            }
+        }
+    }
     Ok(PortsReport { os: g_os(), rows, notes, docker: docker.into(), took_ms: started.elapsed().as_millis() as u64 })
 }
 
@@ -1578,7 +1603,7 @@ tcp   LISTEN 0      4096                               0.0.0.0:80         0.0.0.
     fn killable_matrix_texts() {
         let mut g = gathered();
         let base = |pid: Option<u32>, name: &str, exe: Option<&str>| Listener {
-            key: "k".into(), proto: "tcp".into(), port: 1, addresses: vec![], scope: "all".into(), pid, name: Some(name.into()), exe: exe.map(String::from), cwd: None, started_at: None, user: None, ours: false, workspace: None, clone: None, container: None, killable: false, why_not: None,
+            key: "k".into(), proto: "tcp".into(), port: 1, addresses: vec![], scope: "all".into(), pid, name: Some(name.into()), exe: exe.map(String::from), cwd: None, started_at: None, user: None, ours: false, workspace: None, clone: None, copy: None, container: None, killable: false, why_not: None,
         };
         assert_eq!(why_not_killable(&base(None, "x", None), &g).unwrap(), "Another user's process — the system shows no process id without an administrator.");
         assert_eq!(why_not_killable(&base(Some(99999), "x", None), &g).unwrap(), "This is GitSwitch itself.");

@@ -115,6 +115,9 @@ pub struct LocalClones {
     /// "owner/name" (lowercase) -> the folder a clone is still writing it into
     #[serde(default)]
     pub cloning: HashMap<String, String>,
+    /// "owner/name" (lowercase) -> every local copy, for repositories cloned more than once
+    #[serde(default)]
+    pub copies: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,15 +197,28 @@ fn majority(counts: &HashMap<String, usize>) -> Option<String> {
 // Local knowledge: what's already cloned, and as which profile
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-#[derive(Clone)]
-struct LocalIndex {
+#[derive(Default, Clone)]
+pub(crate) struct LocalIndex {
     /// "owner/name" (lowercase) -> local path
     clones: HashMap<String, String>,
     /// owner (lowercase) -> profile id -> number of local repos
     owner_profiles: HashMap<String, HashMap<String, usize>>,
     /// owner (lowercase) -> "org-<id>" SSH user seen in local remotes
     org_ssh_users: HashMap<String, String>,
+    /// The remote (`github:owner/name`, else `url:<address>`) -> every
+    /// checkout of it, in scan order: the copies a workspace is told apart from.
+    pub(crate) by_remote: HashMap<String, Vec<String>>,
+}
+
+type IndexCache = std::sync::Mutex<Option<(std::time::Instant, String, LocalIndex)>>;
+
+fn index_cache() -> &'static IndexCache {
+    static CACHE: std::sync::OnceLock<IndexCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn index_key(profs: &[Profile]) -> String {
+    profs.iter().flat_map(|p| std::iter::once(p.id.as_str()).chain(p.directories.iter().map(String::as_str))).collect::<Vec<_>>().join("\0")
 }
 
 /// The local index for these profiles. Building it walks every profile
@@ -210,38 +226,72 @@ struct LocalIndex {
 /// share it for a minute (`fresh = false`). A read of what is on this Mac
 /// (`fresh = true`) always scans again — a clone deleted, moved or made
 /// behind the app's back shows at once — and leaves its result for the pages.
-async fn local_index(profs: &[Profile], fresh: bool) -> LocalIndex {
-    use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
-    static CACHE: OnceLock<Mutex<Option<(Instant, String, LocalIndex)>>> = OnceLock::new();
-    let key: String = profs.iter().flat_map(|p| std::iter::once(p.id.as_str()).chain(p.directories.iter().map(String::as_str))).collect::<Vec<_>>().join("\0");
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
+pub(crate) async fn local_index(profs: &[Profile], fresh: bool) -> LocalIndex {
+    let key = index_key(profs);
     if !fresh {
-        if let Ok(slot) = cache.lock() {
+        if let Ok(slot) = index_cache().lock() {
             if let Some((at, k, idx)) = slot.as_ref() {
-                if *k == key && at.elapsed() < Duration::from_secs(60) {
+                if *k == key && at.elapsed() < std::time::Duration::from_secs(60) {
                     return idx.clone();
                 }
             }
         }
     }
     let idx = build_local_index(profs).await;
-    if let Ok(mut slot) = cache.lock() {
-        *slot = Some((Instant::now(), key, idx.clone()));
+    if let Ok(mut slot) = index_cache().lock() {
+        *slot = Some((std::time::Instant::now(), key, idx.clone()));
     }
     idx
+}
+
+/// The index as it stands, whatever its age — and, when it is older than a
+/// minute, a rebuild in the background for the next reader. For a page that
+/// must never wait for a scan (the Ports page reads every five seconds).
+pub(crate) async fn local_index_stale_ok(profs: &[Profile]) -> LocalIndex {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REFRESHING: AtomicBool = AtomicBool::new(false);
+    let key = index_key(profs);
+    let cached = index_cache()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().filter(|(_, k, _)| *k == key).map(|(at, _, idx)| (*at, idx.clone())));
+    match cached {
+        Some((at, idx)) => {
+            if at.elapsed() >= std::time::Duration::from_secs(60) && !REFRESHING.swap(true, Ordering::SeqCst) {
+                let profs = profs.to_vec();
+                tokio::spawn(async move {
+                    let _ = local_index(&profs, true).await;
+                    REFRESHING.store(false, Ordering::SeqCst);
+                });
+            }
+            idx
+        }
+        None => local_index(profs, true).await,
+    }
 }
 
 async fn build_local_index(profs: &[Profile]) -> LocalIndex {
     let mut idx = LocalIndex::default();
     let mut seen = std::collections::HashSet::new();
+    let mut seen_real: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for p in profs {
         for dir in &p.directories {
             if !std::path::Path::new(dir).is_dir() {
                 continue;
             }
             for r in crate::repo_scan::scan_repos(dir.clone()).await.unwrap_or_default() {
-                if !seen.insert(r.path.clone()) || r.owner.is_empty() {
+                if !seen.insert(r.path.clone()) {
+                    continue;
+                }
+                // Every checkout of a remote, GitHub or not. One folder reached
+                // through two profile directories (a link) counts once.
+                if let Some(key) = crate::workspace::remote_key(&r.remote_url, &r.owner, &r.name) {
+                    let real = crate::paths::real_form(&r.path).unwrap_or_else(|| crate::paths::norm(&r.path));
+                    if seen_real.insert((key.clone(), real)) {
+                        idx.by_remote.entry(key).or_default().push(r.path.clone());
+                    }
+                }
+                if r.owner.is_empty() {
                     continue;
                 }
                 let key = format!("{}/{}", r.owner, r.name).to_ascii_lowercase();
@@ -330,6 +380,12 @@ pub async fn local_clones() -> Result<LocalClones, AppError> {
     }
     Ok(LocalClones {
         cloning,
+        copies: idx
+            .by_remote
+            .iter()
+            .filter(|(_, v)| v.len() >= 2)
+            .filter_map(|(k, v)| k.strip_prefix("github:").map(|name| (name.to_string(), v.clone())))
+            .collect(),
         clones: idx.clones,
         owner_profiles: idx
             .owner_profiles

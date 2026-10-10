@@ -87,6 +87,7 @@ jobs:
           bash scripts/verify/tree.sh
           bash scripts/verify/stash.sh
           bash scripts/verify/ports.sh
+          bash scripts/verify/workspace.sh
       # The same suites under Git Bash. Informational until they have been seen
       # green there: a failure is reported in the log and the step is marked,
       # but does not fail the run.
@@ -117,6 +118,7 @@ jobs:
         run: |
           powershell -NoProfile -NonInteractive -Command "Get-NetTCPConnection -State Listen | Select-Object -First 5 LocalAddress,LocalPort,OwningProcess | ConvertTo-Json -Compress"
           bash scripts/verify/ports.sh
+          bash scripts/verify/workspace.sh
       # A real shell in a real pty, through the real git shim. Kept separate so
       # a failure here is attributed to the terminal rather than to git.
       # The shell is pinned per platform: runners set SHELL=/bin/bash even on
