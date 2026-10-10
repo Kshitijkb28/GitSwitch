@@ -6,6 +6,7 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { Select } from "../components/Select";
 import { StatusStrip, type RepoActions, type StripActions } from "../components/repo/StatusStrip";
+import { WorkspaceLine } from "../components/repo/WorkspaceLine";
 import { ChangesTab } from "../components/repo/ChangesTab";
 import { HistoryTab } from "../components/repo/HistoryTab";
 import { SubmodulesTab } from "../components/repo/SubmodulesTab";
@@ -58,6 +59,8 @@ export function Repo() {
   const [status, setStatus] = useState<RepoStatus | null>(null);
   /** The other copies of this project on this machine, read with the repository and on Refresh. */
   const [workspace, setWorkspace] = useState<api.WorkspaceInfo | null>(null);
+  /** Every listener on this machine, for the workspace line's count; null while unread. */
+  const [listeners, setListeners] = useState<api.Listener[] | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(false);
   const actionsRef = useRef<RepoActions | null>(null);
   const [peek, setPeek] = useState<api.RemotePeek | null>(null);
@@ -210,6 +213,27 @@ export function Repo() {
       })
       .catch(() => {
         if (!cancelled) setWorkspace(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sel.path, reloadKey]);
+
+  // What listens from this checkout, for the workspace line — the same listing
+  // the Ports page shows. Unreadable (or not a repository) means unread, not zero.
+  useEffect(() => {
+    if (!sel.path) {
+      setListeners(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .portsList()
+      .then((r) => {
+        if (!cancelled) setListeners(r ? r.rows : null);
+      })
+      .catch(() => {
+        if (!cancelled) setListeners(null);
       });
     return () => {
       cancelled = true;
@@ -553,6 +577,8 @@ export function Repo() {
         onPreview={() => setDrawerFor(sel.effectivePath)}
         workspace={sel.sub ? null : workspace}
       />
+
+      {sel.path && !sel.sub && <WorkspaceLine repoPath={sel.path} info={workspace} listeners={listeners} onChanged={setWorkspace} />}
 
       {sel.effectivePath && (
         <div role="tablist" aria-label="Repository tabs" className="flex flex-wrap items-center gap-1 border-b border-zinc-800">

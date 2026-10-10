@@ -1054,3 +1054,10 @@ export const WORKSPACE_TWO_DIRTY = workspaceInfo({
   name: "Argos_06-10-26_V1", remote: "acme/argos", copies: [COPY_THIS, { ...COPY_OTHER, changed: 1 }],
   note: { level: "amber", text: "Both copies have main checked out with uncommitted changes (Argos_06-10-26_V1: 3 files, Argos_08-10-26: 1 file). Commits made in both will diverge and the second push will be refused — work on a branch per copy." },
 });
+/** This checkout is the second copy: offset 100 and a Compose project of its own. */
+export const WORKSPACE_TWO_OFFSET = workspaceInfo({
+  name: "Argos_08-10-26", id: "2f9c1a7b", offset: 100, compose_project: "argos_08-10-26-2f9c1a7b", remote: "acme/argos",
+  copies: [{ ...COPY_THIS, path: "/Users/me/Documents/Acme/Argos_06-10-26_V1", is_this: false, changed: 0 }, { ...COPY_OTHER, path: "/repos/gitswitch", is_this: true }],
+  env: [["GITSWITCH_WORKSPACE", "2f9c1a7b"], ["GITSWITCH_WORKSPACE_PATH", "/repos/gitswitch"], ["GITSWITCH_WORKSPACE_NAME", "Argos_08-10-26"], ["GITSWITCH_PORT_OFFSET", "100"], ["COMPOSE_PROJECT_NAME", "argos_08-10-26-2f9c1a7b"]],
+  banner: "GitSwitch workspace #2f9c1a7b · Argos_08-10-26 · port offset 100 ($GITSWITCH_PORT_OFFSET) · Compose project argos_08-10-26-2f9c1a7b (this copy's own)",
+});

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { Loader2, Square, Container as ContainerIcon, Zap } from "lucide-react";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
@@ -38,6 +39,7 @@ function matches(row: api.Listener, needle: string): boolean {
     row.name ?? "",
     row.cwd ?? "",
     row.clone?.name ?? "",
+    row.clone?.path ?? "",
     row.clone?.profile_name ?? "",
     row.container?.name ?? "",
     row.container?.project ?? "",
@@ -67,6 +69,17 @@ export function Ports() {
   const [failedKeys, setFailedKeys] = useState<Set<string>>(new Set());
   const runSeq = useRef(0);
   const inFlight = useRef(false);
+
+  // Opened from a repository's workspace line: "?clone=<folder>" becomes the
+  // filter, once, and the address is left clean.
+  const [params, setParams] = useSearchParams();
+  useEffect(() => {
+    const clone = params.get("clone");
+    if (!clone) return;
+    setFilter(clone);
+    setParams({}, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function load() {
     // One listing at a time: a slow answer skips ticks instead of stacking them.

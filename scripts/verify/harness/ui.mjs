@@ -34,7 +34,7 @@ import {
   SUBMODULE_A,
   TREE_RESET_OUTCOME,
   STASH_DROP_OUTCOME,
-  BRANCH_DELETE_OUTCOME, sub, PULL_MOVED_OUTCOME, CONFLICT_VIEW, WORKSPACE_ONE, WORKSPACE_TWO, WORKSPACE_TWO_DIRTY } from "./fixtures.mjs";
+  BRANCH_DELETE_OUTCOME, sub, PULL_MOVED_OUTCOME, CONFLICT_VIEW, WORKSPACE_ONE, WORKSPACE_TWO, WORKSPACE_TWO_DIRTY, WORKSPACE_TWO_OFFSET } from "./fixtures.mjs";
 
 if (!DIST_OK) {
   console.error("dist/ is missing — run `npm run build` first");
@@ -113,6 +113,10 @@ async function openPage(browser, server, scenario, opts = {}) {
     storage: opts.storage ?? null,
     /** What workspace_info answers: by default a repository cloned once. */
     workspace: opts.workspace ?? WORKSPACE_ONE,
+    /** What ports_list answers on the Repository page; null → the listing is unread. */
+    ports: opts.ports ?? null,
+    /** workspace_set_offset refuses with this message (a clash with another copy). */
+    offsetRefusal: opts.offsetRefusal ?? null,
   };
   // Named, so another engine can be handed the very same bridge (webkit.sh).
   const bridge = (
@@ -232,7 +236,10 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "workspace_info":
               return Promise.resolve(cfg.workspace);
             case "workspace_set_offset":
+              if (cfg.offsetRefusal) return Promise.reject(`Configuration error: ${cfg.offsetRefusal}`);
               return Promise.resolve({ ...cfg.workspace, offset: args.offset });
+            case "ports_list":
+              return Promise.resolve(cfg.ports);
             case "changes_lfs_status":
               return Promise.resolve(cfg.lfs);
             case "changes_lfs_files":
@@ -730,6 +737,8 @@ async function openPortsPage(browser, server, opts = {}) {
     killResult: opts.killResult ?? null,
     latency: opts.latency ?? 0,
     storage: opts.storage ?? {},
+    /** The address's query, as a repository's workspace line opens the page ("?clone=…"). */
+    query: opts.query ?? "",
   };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
@@ -755,7 +764,7 @@ async function openPortsPage(browser, server, opts = {}) {
       },
     };
   }, cfg);
-  await page.goto(`${server.url}/ports`, { waitUntil: "networkidle0" });
+  await page.goto(`${server.url}/ports${cfg.query}`, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => document.body.innerText.includes("Every listener on this"), { timeout: 5000 });
   return page;
 }
@@ -3906,6 +3915,70 @@ try {
     ok("a Ports row from a copy says which copy it is", s.includes("copy 2 of 2"));
     const title = await page.evaluate(() => [...document.querySelectorAll("span[title]")].map((e) => e.title).find((t) => t.startsWith("The other copy")) ?? "");
     ok("  and names the other one", title.includes("Argos_06-10-26_V1"), title);
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("The workspace line");
+  {
+    const ports = { os: "macos", docker: "ok", took_ms: 1, notes: [], rows: [
+      { ...PORT_ROWS[0], key: "tcp:3000:800", port: 3000, pid: 800, cwd: "/repos/gitswitch/apps/web", clone: { path: "/repos/gitswitch", name: "gitswitch", profile_name: "Kirmada" } },
+      { ...PORT_ROWS[2], container: { ...PORT_ROWS[2].container, project: "argos_08-10-26-2f9c1a7b" } },
+      PORT_ROWS[1],
+    ] };
+    const page = await open(SCENARIOS.clean, { workspace: WORKSPACE_TWO_OFFSET, ports });
+    await page.waitForFunction(() => document.body.innerText.includes("Workspace #"), { timeout: 4000 }).catch(() => null);
+    let s = await text(page);
+    const at = s.indexOf("Workspace #");
+    ok("the line names the workspace, its Compose project and its offset", s.includes("Workspace #2f9c1a7b") && s.includes("Compose project argos_08-10-26-2f9c1a7b") && s.includes("port offset 100"), s.slice(Math.max(0, at), at + 160));
+    ok("  and counts the listeners from this checkout — a process in its folder and a container of its Compose project, not the rest", s.includes("2 listeners"), s.slice(Math.max(0, at), at + 160));
+    const href = await page.evaluate(() => document.querySelector('a[title^="The Ports page"]')?.getAttribute("href") ?? "");
+    ok("  (view) opens the Ports page filtered to this folder", href === "/ports?clone=%2Frepos%2Fgitswitch", href);
+    const exportTitle = await page.evaluate(() => [...document.querySelectorAll("button[title]")].map((b) => b.title).find((t) => t.startsWith("export ")) ?? "");
+    ok("  the export line carries the offset and the Compose project", exportTitle.startsWith("export GITSWITCH_PORT_OFFSET=100 COMPOSE_PROJECT_NAME=argos_08-10-26-2f9c1a7b"), exportTitle);
+    // Changing the offset.
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "change")?.click());
+    await page.waitForSelector('[aria-label="Port offset"]', { timeout: 3000 }).catch(() => null);
+    await page.click('[aria-label="Port offset"]', { clickCount: 3 });
+    await page.type('[aria-label="Port offset"]', "300");
+    await (await button(page, "Save")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "workspace_set_offset"), { timeout: 4000 }).catch(() => null);
+    const call = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "workspace_set_offset").at(-1)?.args ?? null);
+    ok("Save stores the chosen offset for this repository", JSON.stringify(call) === JSON.stringify({ path: "/repos/gitswitch", offset: 300 }), JSON.stringify(call));
+    await page.waitForFunction(() => document.body.innerText.includes("port offset 300"), { timeout: 4000 }).catch(() => null);
+    s = await text(page);
+    ok("  and the line shows it, with what does not change by itself", s.includes("port offset 300") && s.includes("Servers already running keep their ports"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean, { workspace: WORKSPACE_TWO_OFFSET, offsetRefusal: "Argos_06-10-26_V1 already uses port offset 0. Pick another, or change it there first." });
+    await page.waitForFunction(() => document.body.innerText.includes("Workspace #"), { timeout: 4000 }).catch(() => null);
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "change")?.click());
+    await page.waitForSelector('[aria-label="Port offset"]', { timeout: 3000 }).catch(() => null);
+    await page.click('[aria-label="Port offset"]', { clickCount: 3 });
+    await page.type('[aria-label="Port offset"]', "0");
+    await (await button(page, "Save")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("already uses port offset"), { timeout: 4000 }).catch(() => null);
+    const s = await text(page);
+    ok("an offset another copy uses is refused in the backend's words, without the error prefix", s.includes("Argos_06-10-26_V1 already uses port offset 0. Pick another, or change it there first.") && !s.includes("Configuration error:"));
+    ok("  and the editor stays open for another try", (await page.$('[aria-label="Port offset"]')) !== null);
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.waitForFunction(() => document.body.innerText.includes("Workspace #"), { timeout: 4000 }).catch(() => null);
+    const s = await text(page);
+    ok("the first copy says it keeps Compose's own name and has no export line", s.includes("Compose project: Compose's own name") && !s.includes("copy export line"));
+    ok("  with the listing unread, it says so rather than showing a zero", s.includes("listeners not read"));
+    await page.close();
+  }
+  {
+    const page = await openPortsPage(browser, server, { query: "?clone=%2FUsers%2Fme%2FDocuments%2FAcme%2Fgitswitch", storage: { "ports.onlyMine": false } });
+    await page.waitForFunction(() => document.body.innerText.includes("1 of 5"), { timeout: 4000 }).catch(() => null);
+    const value = await page.evaluate(() => document.querySelector('[aria-label="Filter ports"]')?.value ?? "");
+    const s = await text(page);
+    ok("the Ports page opened from the line filters by the folder", value === "/Users/me/Documents/Acme/gitswitch" && s.includes("1 of 5") && s.includes("node · pid 725"), `${value} / ${s.slice(Math.max(0, s.indexOf("of 5") - 4), s.indexOf("of 5") + 4)}`);
+    ok("  and leaves the address clean", (await page.evaluate(() => location.search)) === "");
     await page.close();
   }
 

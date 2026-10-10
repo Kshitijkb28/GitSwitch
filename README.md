@@ -66,8 +66,10 @@ for folders that still use HTTPS.
 - **Workspaces** — a repository cloned twice (to work in both with AI agents,
   say) gets a separate identity per copy: an eight-character id kept in the
   copy's own `.git/config` (a rename or move keeps it; nothing is pushed), a
-  port offset (the older copy keeps 0, the next takes 100, and so on, or pick
-  one), and — for every copy but the first — a Compose project name of its own,
+  port offset (the older copy keeps 0, the next takes 100, and so on — or change
+  it on the Repository page, where the workspace line also counts what listens
+  from this copy and links to those ports), and — for every copy but the first
+  — a Compose project name of its own,
   so the first copy's containers and volumes keep their names. The terminal
   drawer exports them (`GITSWITCH_WORKSPACE`, `GITSWITCH_WORKSPACE_PATH`,
   `GITSWITCH_WORKSPACE_NAME`, `GITSWITCH_PORT_OFFSET`, and `COMPOSE_PROJECT_NAME`
