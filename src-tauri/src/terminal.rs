@@ -36,8 +36,8 @@ struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
-    /// The shell's process id, for the test that proves none is left behind.
-    #[allow(dead_code)]
+    /// The shell's process id: the Ports page refuses to stop it, and the
+    /// test that proves none is left behind reads it.
     pid: Option<u32>,
 }
 
@@ -52,6 +52,12 @@ impl Drop for Session {
 fn sessions() -> &'static Mutex<HashMap<String, Session>> {
     static S: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The pids of every shell the drawer has open: the Ports page must never
+/// offer to stop one (closing the drawer is how).
+pub(crate) fn shell_pids() -> Vec<u32> {
+    sessions().lock().map(|m| m.values().filter_map(|s| s.pid).collect()).unwrap_or_default()
 }
 
 fn app_dir() -> Option<PathBuf> {

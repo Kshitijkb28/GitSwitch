@@ -274,6 +274,9 @@ pub(crate) mod tests {
             "history_resolve" => forward!(c::history_resolve, args, repo_path, text),
             // No link started the probe: there is never a page waiting.
             "deep_link_take" => reply(Ok::<Option<&str>, crate::error::AppError>(None)),
+            "ports_list" => forward!(c::ports_list, args),
+            "ports_kill" => forward!(c::ports_kill, args, pid, force, name),
+            "ports_container_stop" => forward!(c::ports_container_stop, args, id, project),
             // These take a `tauri::AppHandle` (tray label updates) and cannot run outside the app.
             "create_profile" | "update_profile" | "delete_profile" | "set_default_profile" | "sparse_clone"
             | "full_clone" => reply_err(format!(
@@ -469,6 +472,17 @@ pub(crate) mod tests {
             // this function's debug frame, which lies under every live
             // `invoke` — and an Update's Continue overflowed the 2 MiB stack.
             "coverage_while_covering" => Box::pin(coverage_while_covering(first.parse().unwrap_or(10))).await,
+            // The Ports page's refusals for the probe's own process and the
+            // drawer's shell: the error text, or null when it was not refused.
+            "ports_kill_self" => emit(&crate::ports::kill(std::process::id(), false, "").await.err().map(|e| e.to_string())),
+            "ports_kill_shell" => {
+                let (tx, _rx) = std::sync::mpsc::channel::<String>();
+                let id = crate::terminal::open_with(&repo(), 80, 24, move |chunk| tx.send(chunk).is_ok()).expect("a shell");
+                let pid = crate::terminal::shell_pids().into_iter().next().expect("the shell's pid");
+                let err = crate::ports::kill(pid, false, "").await.err().map(|e| e.to_string());
+                crate::terminal::close(&id);
+                emit(&err);
+            }
             "lock_helper_status" => emit(&crate::push_lock::helper_status().await),
             "lock_uninstall" => emit(&crate::push_lock::uninstall_all().await),
             "doctor_locks" => match crate::doctor::check_push_locks().await {

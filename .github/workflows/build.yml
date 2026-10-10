@@ -86,6 +86,7 @@ jobs:
           bash scripts/verify/sync.sh
           bash scripts/verify/tree.sh
           bash scripts/verify/stash.sh
+          bash scripts/verify/ports.sh
       # The same suites under Git Bash. Informational until they have been seen
       # green there: a failure is reported in the log and the step is marked,
       # but does not fail the run.
@@ -106,6 +107,16 @@ jobs:
         continue-on-error: true
         shell: bash
         run: bash scripts/verify/console.sh
+      # The Ports page's Windows listing has not been seen by a person: the raw
+      # PowerShell output is printed so a wrong field name is visible in the
+      # log even while the step itself is informational.
+      - name: Ports suite (Windows — informational)
+        if: matrix.os == 'windows-latest'
+        continue-on-error: true
+        shell: bash
+        run: |
+          powershell -NoProfile -NonInteractive -Command "Get-NetTCPConnection -State Listen | Select-Object -First 5 LocalAddress,LocalPort,OwningProcess | ConvertTo-Json -Compress"
+          bash scripts/verify/ports.sh
       # A real shell in a real pty, through the real git shim. Kept separate so
       # a failure here is attributed to the terminal rather than to git.
       # The shell is pinned per platform: runners set SHELL=/bin/bash even on

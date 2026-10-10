@@ -17,6 +17,83 @@ export async function deepLinkTake(): Promise<string | null> {
   return invoke("deep_link_take");
 }
 
+// --- Ports: every listening port, who holds it, and stopping it --------------
+
+/** The repository in a profile folder a process runs inside. */
+export interface CloneRef {
+  path: string;
+  name: string;
+  profile_name: string;
+}
+
+/** The container a port is published by, and its Compose project when it has one. */
+export interface ContainerRef {
+  id: string;
+  name: string;
+  project: string | null;
+  service: string | null;
+  working_dir: string | null;
+  container_port: number | null;
+}
+
+/** One listening port with everything the OS says about its holder. */
+export interface Listener {
+  key: string;
+  proto: "tcp" | "udp";
+  port: number;
+  addresses: string[];
+  scope: "loopback" | "all" | "lan";
+  pid: number | null;
+  name: string | null;
+  exe: string | null;
+  cwd: string | null;
+  started_at: string | null;
+  user: string | null;
+  /** Started from a GitSwitch terminal. */
+  ours: boolean;
+  workspace: string | null;
+  clone: CloneRef | null;
+  container: ContainerRef | null;
+  killable: boolean;
+  /** When not killable: why, in plain words. */
+  why_not: string | null;
+}
+
+export interface PortsReport {
+  os: "macos" | "linux" | "windows";
+  rows: Listener[];
+  /** What this listing could not see, one sentence each. */
+  notes: string[];
+  docker: "ok" | "missing" | "unavailable" | "timeout" | "skipped";
+  took_ms: number;
+}
+
+export interface KillOutcome {
+  pid: number;
+  ended: boolean;
+  how: "term" | "kill" | "taskkill" | "taskkill-force";
+  group: boolean;
+  message: string;
+}
+
+export interface ContainerStopOutcome {
+  stopped: string[];
+  message: string;
+}
+
+export async function portsList(): Promise<PortsReport> {
+  return invoke("ports_list");
+}
+
+/** `name` is what the page listed: a pid reused by another program is refused. */
+export async function portsKill(pid: number, force: boolean, name: string): Promise<KillOutcome> {
+  return invoke("ports_kill", { pid, force, name });
+}
+
+export async function portsContainerStop(id: string, project: string | null): Promise<ContainerStopOutcome> {
+  return invoke("ports_container_stop", { id, project });
+}
+
 export async function createProfile(params: {
   name: string;
   gitName: string;

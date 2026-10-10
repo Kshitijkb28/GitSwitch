@@ -712,6 +712,51 @@ async function openSshPage(browser, server, opts = {}) {
   return page;
 }
 
+/** The Ports page against a mocked backend: a listing of rows, and what Stop answers. */
+async function openPortsPage(browser, server, opts = {}) {
+  const cfg = {
+    rows: opts.rows ?? PORT_ROWS,
+    killResult: opts.killResult ?? null,
+    latency: opts.latency ?? 0,
+    storage: opts.storage ?? {},
+  };
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    for (const [k, v] of Object.entries(cfg.storage)) localStorage.setItem(`gitswitch:${k}`, JSON.stringify(v));
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (cmd, args) => {
+        window.__CALLS__.push({ cmd, args, at: Date.now() });
+        switch (cmd) {
+          case "ports_list":
+            if (cfg.latency) await wait(cfg.latency);
+            return { os: "macos", docker: "ok", took_ms: 50, notes: ["Processes of other users (including root) are listed from netstat; GitSwitch cannot inspect their folder or stop them."], rows: cfg.rows };
+          case "ports_kill":
+            return cfg.killResult ?? { pid: args.pid, ended: true, how: "term", group: true, message: `Stopped ${args.name} (pid ${args.pid}).` };
+          case "ports_container_stop":
+            return { stopped: [args.id], message: "Stopped carpool-proxy-1." };
+          default:
+            return null;
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}/ports`, { waitUntil: "networkidle0" });
+  await page.waitForFunction(() => document.body.innerText.includes("Every listener on this"), { timeout: 5000 });
+  return page;
+}
+
+const PORT_ROWS = [
+  { key: "tcp:18789:725", proto: "tcp", port: 18789, addresses: ["127.0.0.1", "::1"], scope: "loopback", pid: 725, name: "node", exe: "/opt/homebrew/bin/node", cwd: "/Users/me/Documents/Acme/gitswitch", started_at: "2026-10-11T01:00:00+05:30", user: "me", ours: true, workspace: "abc12345", clone: { path: "/Users/me/Documents/Acme/gitswitch", name: "gitswitch", profile_name: "Kirmada" }, container: null, killable: true, why_not: null },
+  { key: "tcp:27017:720", proto: "tcp", port: 27017, addresses: ["127.0.0.1", "::1"], scope: "loopback", pid: 720, name: "mongod", exe: "/opt/homebrew/bin/mongod", cwd: "/opt/homebrew", started_at: "2026-10-11T00:13:40+05:30", user: "me", ours: false, workspace: null, clone: null, container: null, killable: true, why_not: null },
+  { key: "tcp:8080:2842", proto: "tcp", port: 8080, addresses: ["*"], scope: "all", pid: 2842, name: "com.docker.backend", exe: null, cwd: null, started_at: null, user: "me", ours: false, workspace: null, clone: null, container: { id: "f50b929f94ba", name: "carpool-proxy-1", project: "carpool", service: "proxy", working_dir: "/Users/me/x", container_port: 80 }, killable: false, why_not: "Published by Docker — stop the container instead." },
+  { key: "tcp:8021:1", proto: "tcp", port: 8021, addresses: ["127.0.0.1", "::1"], scope: "loopback", pid: 1, name: "launchd", exe: "/sbin/launchd", cwd: null, started_at: null, user: "root", ours: false, workspace: null, clone: null, container: null, killable: false, why_not: "Owned by root — needs an administrator: stop it from Terminal with sudo kill 1." },
+  { key: "tcp:5000:999", proto: "tcp", port: 5000, addresses: ["*"], scope: "all", pid: 999, name: "python3", exe: "/usr/bin/python3", cwd: "/Users/me/Documents/releaseengineeringautomationandplatforminfrastructureteamnotifications/workspace/apps/web/server", started_at: null, user: "me", ours: false, workspace: null, clone: null, container: null, killable: true, why_not: null },
+];
+
 /** Auto Assign against a mocked backend: a profile with a key, one with only a saved account. */
 async function openAutoAssignPage(browser, server, opts = {}) {
   const page = await browser.newPage();
@@ -3684,6 +3729,113 @@ try {
     await sleep(700);
     ok("  a re-run of the other checks keeps it", (await text(page)).includes("@octo cannot see acme/app"));
     ok("  and the access check can be run again", (await page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Check again"))) === true);
+    await page.close();
+  }
+
+  section("Ports: who holds a port, and stopping it");
+  {
+    const page = await openPortsPage(browser, server);
+    await page.waitForFunction(() => document.body.innerText.includes("of 5"), { timeout: 4000 }).catch(() => null);
+    let s = await text(page);
+    ok("a listener from one of my repositories shows its clone and profile", s.includes("gitswitch · Kirmada") && s.includes("node · pid 725"));
+    ok("  the toggle defaults to my folders when any row has one, hiding the rest", s.includes("1 of 5") && !s.includes("mongod"), s.slice(s.indexOf("Only my"), s.indexOf("Only my") + 60));
+    await page.evaluate(() => document.querySelector('[aria-label="Only my repositories\' folders"]')?.click());
+    await sleep(200);
+    s = await text(page);
+    const stopOf = (name) => page.evaluate((n) => {
+      const li = [...document.querySelectorAll('li[role="row"]')].find((l) => l.innerText.includes(n));
+      const b = li && [...li.querySelectorAll("button")].find((x) => x.innerText.trim() === "Stop");
+      return b ? { disabled: b.disabled, title: b.title } : null;
+    }, name);
+    ok("  unticked, every port is listed — a root process with its Stop disabled and the reason under the row", s.includes("5 of 5") && (await stopOf("launchd"))?.disabled === true && (await stopOf("launchd"))?.title.startsWith("Owned by root") && s.includes("sudo kill 1"), JSON.stringify(await stopOf("launchd")));
+    await page.type('[aria-label="Filter ports"]', "27017");
+    await sleep(250);
+    s = await text(page);
+    ok("  the filter narrows by port", s.includes("1 of 5") && s.includes("mongod") && !s.includes("launchd"));
+    // A controlled input: cleared the way a person would, so React sees it.
+    await page.click('[aria-label="Filter ports"]', { clickCount: 3 });
+    await page.keyboard.press("Backspace");
+    await page.waitForFunction(() => document.body.innerText.includes("5 of 5"), { timeout: 4000 }).catch(() => null);
+    // Stop asks first, naming the process, the port and where it came from.
+    const clickStopIn = (needle) => page.evaluate((n) => {
+      const li = [...document.querySelectorAll('li[role="row"]')].find((l) => l.innerText.includes(n));
+      const b = li && [...li.querySelectorAll("button")].find((x) => x.innerText.trim() === "Stop");
+      if (!b) return false;
+      b.click();
+      return true;
+    }, needle);
+    ok("  (the node row is back once the filter is cleared)", await clickStopIn("node · pid 725"));
+    await sleep(250);
+    s = await text(page);
+    ok("Stop asks first, naming the process, the port and the clone it came from", s.includes("Stop node (pid 725) listening on tcp 18789?") && s.includes("It was started from gitswitch."));
+    ok("  and nothing has run yet", !(await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "ports_kill"))));
+    const listsBefore = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "ports_list").length);
+    await page.evaluate(() => [...document.querySelectorAll('[role="dialog"] button, .fixed button')].find((b) => b.innerText.trim() === "Stop")?.click());
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "ports_kill"), { timeout: 4000 }).catch(() => null);
+    await sleep(300);
+    const kill = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "ports_kill")?.args ?? null);
+    ok("  confirming stops it by pid and name, and the list is read again", kill?.pid === 725 && kill?.force === false && kill?.name === "node" && (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "ports_list").length)) > listsBefore, JSON.stringify(kill));
+    // A Docker-published port is never pid-killed: the container is stopped.
+    const docker = await page.evaluate(() => {
+      const li = [...document.querySelectorAll('li[role="row"]')].find((l) => l.innerText.includes("carpool-proxy-1"));
+      return li ? [...li.querySelectorAll("button")].map((b) => ({ t: b.innerText.trim(), d: b.disabled })) : null;
+    });
+    ok("a port published by Docker offers Stop container (and the project), never an enabled Stop", !!docker && docker.some((b) => b.t === "Stop container" && !b.d) && docker.some((b) => b.t.startsWith("Stop project carpool")) && !docker.some((b) => b.t === "Stop" && !b.d), JSON.stringify(docker));
+    ok("(Stop container on the Docker row)", await page.evaluate(() => {
+      const li = [...document.querySelectorAll('li[role="row"]')].find((l) => l.innerText.includes("carpool-proxy-1"));
+      const b = li && [...li.querySelectorAll("button")].find((x) => x.innerText.trim() === "Stop container");
+      if (!b) return false;
+      b.click();
+      return true;
+    }));
+    await sleep(250);
+    await page.evaluate(() => [...document.querySelectorAll(".fixed button")].find((b) => b.innerText.trim() === "Stop container")?.click());
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "ports_container_stop"), { timeout: 4000 }).catch(() => null);
+    const cs = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "ports_container_stop")?.args ?? null);
+    ok("  which stops that container by its id", cs?.id === "f50b929f94ba" && cs?.project === null, JSON.stringify(cs));
+    await page.close();
+  }
+  {
+    // A Stop the process ignored: Force stop appears, says what it does, and sends force.
+    const page = await openPortsPage(browser, server, { killResult: { pid: 725, ended: false, how: "term", group: true, message: "node (pid 725) ignored the stop request for 3 s — Force stop sends SIGKILL." } });
+    await page.waitForFunction(() => document.body.innerText.includes("of 5"), { timeout: 4000 }).catch(() => null);
+    ok("(Stop on the node row)", await page.evaluate(() => {
+      const li = [...document.querySelectorAll('li[role="row"]')].find((l) => l.innerText.includes("node · pid 725"));
+      const b = li && [...li.querySelectorAll("button")].find((x) => x.innerText.trim() === "Stop");
+      if (!b) return false;
+      b.click();
+      return true;
+    }));
+    await sleep(200);
+    await page.evaluate(() => [...document.querySelectorAll(".fixed button")].find((b) => b.innerText.trim() === "Stop")?.click());
+    await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Force stop"), { timeout: 4000 }).catch(() => null);
+    ok("a process that ignored Stop gets a Force stop button", await page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Force stop")));
+    await page.evaluate(() => [...document.querySelectorAll('li[role="row"] button')].find((b) => b.innerText.trim() === "Force stop")?.click());
+    await sleep(200);
+    const s = await text(page);
+    ok("  whose confirmation says it ends the process at once", s.includes("SIGKILL"));
+    await page.evaluate(() => [...document.querySelectorAll(".fixed button")].find((b) => b.innerText.trim() === "Force stop")?.click());
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "ports_kill").length >= 2, { timeout: 4000 }).catch(() => null);
+    const forced = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "ports_kill").at(-1)?.args ?? null);
+    ok("  and sends force", forced?.force === true && forced?.pid === 725, JSON.stringify(forced));
+    await page.close();
+  }
+  {
+    // Nothing from my folders: the empty state offers the rest of the machine.
+    const page = await openPortsPage(browser, server, { rows: PORT_ROWS.filter((r) => !r.clone), storage: { "ports.onlyMine": true } });
+    await page.waitForFunction(() => document.body.innerText.includes("Nothing is listening from your repositories' folders."), { timeout: 4000 }).catch(() => null);
+    ok("with my folders holding nothing, the page says so and offers every port", (await text(page)).includes("Nothing is listening from your repositories' folders."));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.startsWith("Show every port"))?.click());
+    await sleep(200);
+    ok("  and that link shows them", (await text(page)).includes("mongod"));
+    await page.close();
+  }
+  {
+    // A slow listing never stacks: one request in flight, ticks skipped meanwhile.
+    const page = await openPortsPage(browser, server, { latency: 7000 });
+    await sleep(11000);
+    const n = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "ports_list").length);
+    ok("a listing that takes 7 s is asked at most twice in 11 s — never stacked", n <= 2, String(n));
     await page.close();
   }
 

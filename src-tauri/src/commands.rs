@@ -14,6 +14,7 @@ use crate::github::{self, GitHubKey, GitHubUser, RepoPermissions};
 use crate::remote_repos::{self, LocalClones, RepoAccount, RepoListing};
 use crate::repo_scan::{self, ScannedRepo};
 use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
+use crate::ports;
 use crate::profiles::{self, Profile};
 use crate::signing;
 use crate::sparse::{self, CertInfo, CloneResult, DestinationStatus, SparseInfo, SparseSetResult};
@@ -607,6 +608,25 @@ pub async fn history_authors(repo_path: String, rev: String) -> Result<Vec<git_h
     tokio::task::spawn_blocking(move || git_history::authors(&repo_path, &rev))
         .await
         .map_err(|e| AppError::Command(format!("task failed: {}", e)))?
+}
+
+/// Every listening port on this machine, who holds it, and where it runs from.
+#[tauri::command]
+pub async fn ports_list() -> Result<ports::PortsReport, AppError> {
+    ports::list().await
+}
+
+/// Stop the process holding a port; `name` is what the page listed, so a
+/// pid reused by another program is refused.
+#[tauri::command]
+pub async fn ports_kill(pid: u32, force: bool, name: String) -> Result<ports::KillOutcome, AppError> {
+    ports::kill(pid, force, &name).await
+}
+
+/// Stop a container, or every container of a Compose project.
+#[tauri::command]
+pub async fn ports_container_stop(id: String, project: Option<String>) -> Result<ports::ContainerStopOutcome, AppError> {
+    ports::container_stop(&id, project.as_deref()).await
 }
 
 /// The page a gitswitch:// link asked for before the page listened (the link

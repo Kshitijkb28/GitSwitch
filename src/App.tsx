@@ -3,7 +3,7 @@ import { Routes, Route, NavLink, Navigate, useLocation, useNavigate } from "reac
 import { listen } from "@tauri-apps/api/event";
 import { readPersisted, writePersisted } from "./lib/persist";
 import { deepLinkTake } from "./lib/api";
-import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequestArrow, SquareTerminal } from "lucide-react";
+import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequestArrow, SquareTerminal, Network } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
 import { ProfileForm } from "./pages/ProfileForm";
@@ -16,6 +16,7 @@ import { AutoAssign } from "./pages/AutoAssign";
 import { Doctor } from "./pages/Doctor";
 import { CommitAudit } from "./pages/CommitAudit";
 import { Repo } from "./pages/Repo";
+import { Ports } from "./pages/Ports";
 import { ConsoleDrawer } from "./components/console/ConsoleDrawer";
 import { toggleConsole, useConsole } from "./lib/console";
 
@@ -110,6 +111,9 @@ function App() {
           >
             Repository
           </SidebarLink>
+          <SidebarLink to="/ports" icon={<Network size={18} />}>
+            Ports
+          </SidebarLink>
           <SidebarLink to="/auto-assign" icon={<ScanSearch size={18} />}>
             Auto Assign
           </SidebarLink>
@@ -157,6 +161,7 @@ function App() {
           <Route path="/repo" element={<Navigate to={`/repo/${rememberedRepoTab()}`} replace />} />
           <Route path="/changes" element={<Navigate to="/repo/changes" replace />} />
           <Route path="/auto-assign" element={<AutoAssign />} />
+          <Route path="/ports" element={<Ports />} />
           <Route path="/doctor" element={<Doctor />} />
           <Route path="/history" element={<Navigate to="/repo/history" replace />} />
           <Route path="/commits" element={<CommitAudit />} />
