@@ -53,6 +53,23 @@ OUT=$(probe sparse_info "$SB/clones/sparse")
 ok "  lists the repo's top-level folders" "$(printf '%s' "$OUT" | jqf available_dirs)" "docs"
 ok "  and reports the branch" "$(printf '%s' "$OUT" | jqf branch)" "main"
 
+section "Sparse clone: folder names git would quote"
+git init -q --bare "$SB/names.git"; git clone -q "$SB/names.git" "$SB/names-author" 2>/dev/null
+mkdir -p "$SB/names-author/café" "$SB/names-author/docs"; printf 'x\n' > "$SB/names-author/café/x.txt"; printf 'r\n' > "$SB/names-author/docs/readme.md"
+IS_WIN=0; case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) IS_WIN=1 ;; esac
+if [ "$IS_WIN" = 0 ]; then mkdir -p "$SB/names-author/say\"hi"; printf 'q\n' > "$SB/names-author/say\"hi/q.txt"; fi
+git -C "$SB/names-author" add -A >/dev/null; git -C "$SB/names-author" commit -qm names; git -C "$SB/names-author" push -q origin main 2>/dev/null
+OUT=$(probe sparse_clone "" "$SB/names.git,$SB/clones,names")
+INFO=$(probe sparse_info "$SB/clones/names")
+ok "a folder with an accented name is listed as it is on disk" "$(printf '%s' "$INFO" | "$PY" -c 'import sys,json;sys.stdout.reconfigure(encoding="utf-8");print("café" in json.load(sys.stdin)["available_dirs"])')" "True"
+OUT=$(probe sparse_set "$SB/clones/names" "café")
+ok "  and ticking it checks it out" "$(cat "$SB/clones/names/café/x.txt" 2>/dev/null || echo MISSING)" "x"
+ok "  and the selection reads back in the same spelling" "$(probe sparse_info "$SB/clones/names" | "$PY" -c 'import sys,json;sys.stdout.reconfigure(encoding="utf-8");print(json.load(sys.stdin)["sparse_dirs"])')" "['café']"
+if [ "$IS_WIN" = 0 ]; then
+  OUT=$(probe sparse_set "$SB/clones/names" 'café:say"hi')
+  ok "  a folder with a quote in its name too" "$(cat "$SB/clones/names/say\"hi/q.txt" 2>/dev/null || echo MISSING):$(probe sparse_info "$SB/clones/names" | "$PY" -c 'import sys,json;sys.stdout.reconfigure(encoding="utf-8");print(sorted(json.load(sys.stdin)["sparse_dirs"]))')" "q:['café', 'say\"hi']"
+fi
+
 section "Clone refusals are explained, not raw"
 OUT=$(probe clone "" "$SB/does-not-exist.git,$SB/clones,nope")
 ok "a bad URL fails with git's own words kept" "$OUT" "error"
@@ -84,6 +101,18 @@ ok "  saved alongside" "$([ -f "$R/.git/hooks/pre-commit.gitswitch-saved" ] && e
 echo y >> "$R/src/a.txt"; git -C "$R" add -A >/dev/null
 CHAINED=$(git -C "$R" commit -m "chained" 2>&1)
 ok "  and it still runs on commit" "$CHAINED" "FOREIGN HOOK RAN"
+OUT=$(probe guard_install "$R" "regress@example.test")
+echo z >> "$R/src/a.txt"; git -C "$R" add -A >/dev/null
+CHAINED=$(git -C "$R" commit -m "chained again" 2>&1)
+ok "  installing over its own guard keeps the chained hook" "$CHAINED" "FOREIGN HOOK RAN"
+ok "  the guard names the email it expects, where the app reads it" "$(probe guard_email "$R")" "regress@example.test"
+# A profile's email may hold a quote, a dollar sign or a backtick: the shell must take it literally.
+OUT=$(probe guard_install "$R" 'q"$HOME`x@example.test')
+echo w >> "$R/src/a.txt"; git -C "$R" add -A >/dev/null
+ok "an email the shell would expand is held exactly" "$(git -C "$R" commit -m "odd email" 2>&1)" 'should commit as: q"$HOME`x@example.test'
+ok "  and read back exactly" "$(probe guard_email "$R")" 'q\"$HOME`x@example.test'
+# Back to the history the sections below count.
+git -C "$R" reset -q --hard HEAD~1
 probe guard_uninstall "$R" >/dev/null
 ok "uninstall restores the foreign hook" "$(cat "$R/.git/hooks/pre-commit")" "FOREIGN HOOK RAN"
 
@@ -259,7 +288,70 @@ git init -q --bare "$UP-other.git"; git -C "$UP" remote add other "$UP-other.git
 ok "  a push to any remote counts" "$(hp "$UP" HEAD true | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(d["total"])')" "0"
 git -C "$UP" switch -q -c topic 2>/dev/null; printf 't\n' > "$UP/t.txt"; git -C "$UP" add -A >/dev/null; git -C "$UP" commit -qm "topic only"
 ok "  across all branches too" "$(hp "$UP" --all true | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(d["total"], [c["subject"] for c in d["commits"]])')" "1 ['topic only']"
+# All branches are branches, remote-tracking branches, tags and HEAD: not the
+# stash, notes, a preview's parked refs, git's prefetch refs, or GitSwitch's
+# own backup branches (an Update's, under today's name and the one an earlier
+# build gave it, and a reset's) — none is work to push, and each was marked
+# not pushed.
+printf 's\n' > "$UP/s.txt"; git -C "$UP" add s.txt; git -C "$UP" commit -qm "stale copy"
+git -C "$UP" branch gitswitch-before-update-1; git -C "$UP" branch gitswitch-before-sync-1; git -C "$UP" branch gitswitch-before-reset-20261008000000; git -C "$UP" reset -q --hard HEAD~1
+printf 'w\n' >> "$UP/t.txt"; git -C "$UP" stash -q
+git -C "$UP" update-ref refs/prefetch/remotes/origin/main "$(git -C "$UP" commit-tree -p HEAD -m 'fetched in the background' 'HEAD^{tree}')"
+git -C "$UP" update-ref refs/gitswitch-moved/origin/main "$(git -C "$UP" commit-tree -p HEAD -m 'parked by a preview' 'HEAD^{tree}')"
+git -C "$UP" notes add -m 'a note' HEAD
+WANT_ALL="$(git -C "$UP" rev-list --count --exclude='gitswitch-before-*' --branches --remotes --tags HEAD)"
+ok "  all branches leave out GitSwitch's backups, the stash, parked, prefetch and notes refs: only the branch's own commit is unpushed" "$(hp "$UP" --all true | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(d["total"], [c["subject"] for c in d["commits"]])')" "1 ['topic only']"
+ok "    and none of them is in the full list either" "$(hp "$UP" --all false | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];bad=[c["subject"] for c in d["commits"] if c["subject"] in ("stale copy","fetched in the background","parked by a preview") or c["subject"].startswith(("WIP on","index on","Notes added"))];print(d["total"]==int(sys.argv[1]), bad)' "$WANT_ALL")" "True []"
+AUTH=$(pinvoke history_authors "{\"repoPath\":\"$UP\",\"rev\":\"--all\"}")
+ok "    and the People list counts the same commits" "$(printf '%s' "$AUTH" | "$PY" -c 'import sys,json;print(sum(a["commits"] for a in json.load(sys.stdin)["value"])==int(sys.argv[1]))' "$WANT_ALL")" "True"
+ok "  a backup still opens when it is chosen by name" "$(hp "$UP" gitswitch-before-update-1 false | "$PY" -c 'import sys,json;print("stale copy" in [c["subject"] for c in json.load(sys.stdin)["value"]["commits"]])')" "True"
+# Paging: the second page is the next fifty, in the same order as the first.
+PG="$SB/paging"; git init -q "$PG"; for i in $(seq 1 60); do git -C "$PG" commit -q --allow-empty -m "c$i"; done
+P2=$(pinvoke history_page "{\"repoPath\":\"$PG\",\"rev\":\"HEAD\",\"offset\":50,\"limit\":50,\"search\":null,\"authors\":null,\"hidePointerOnly\":false,\"unpushedOnly\":false}")
+ok "the second page is the next fifty in order" "$(printf '%s' "$P2" | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(len(d["commits"]), d["has_more"], d["commits"][0]["hash"]==sys.argv[1])' "$(git -C "$PG" log --date-order --skip=50 -1 --format=%H HEAD)")" "10 False True"
 NR="$SB/noremote"; git init -q "$NR"; printf 'x\n' > "$NR/x.txt"; git -C "$NR" add -A >/dev/null; git -C "$NR" commit -qm "alone"
 ok "without a remote-tracking branch nothing is marked, and the page says there is none to compare with" "$(hp "$NR" HEAD false | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["value"];print(d["remote_refs"], [c["unpushed"] for c in d["commits"]])')" "False [False]"
+
+section "A folder a clone is still writing is listed as cloning, not as on this Mac"
+# Last: the profile made here becomes the default, which every later commit would carry.
+mkdir -p "$SB/profiled"
+"$PY" - "$SB/pprof.json" "$SB/profiled" <<'JSONPY'
+import json, sys
+json.dump({"name": "Profiled", "git_name": "P", "git_email": "p@example.test", "directories": [sys.argv[2]]}, open(sys.argv[1], "w"))
+JSONPY
+probe profile_apply "$SB" "$SB/pprof.json" >/dev/null
+git init -q "$SB/profiled/wip"; git -C "$SB/profiled/wip" remote add origin git@github.com:someone/wip.git
+git init -q "$SB/profiled/existing"; git -C "$SB/profiled/existing" remote add origin git@github.com:someone/existing.git
+OUT=$(probe local_clones_while_cloning "" "$SB/profiled/wip,git@github.com:someone/wip.git")
+ok "a folder a clone is still writing is listed as cloning, not as on this Mac" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["during"];print("someone/wip" in d["cloning"], "someone/wip" in d["clones"])')" "True False"
+ok "  and the Repository page's picker does not offer it — though it offers the one beside it" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;ps=[p.replace("\\","/") for p in json.load(sys.stdin)["picker"]];print(any(p.endswith("/wip") for p in ps), any(p.endswith("/existing") for p in ps))')" "False True"
+ok "  the repository beside it is listed as usual" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print("someone/existing" in json.load(sys.stdin)["during"]["clones"])')" "True"
+ok "once the clone is over it is on this Mac" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;d=json.load(sys.stdin)["after"];print("someone/wip" in d["clones"], len(d["cloning"]))')" "True 0"
+# A profile folder stored in another letter case than the disk spells it
+# (where the file system ignores case): the clone running into it is still
+# listed as cloning.
+mkdir -p "$SB/Case-Probe"
+if [ -d "$SB/case-probe" ]; then
+  mkdir -p "$SB/CasedClones"
+  "$PY" - "$SB/pcasedclones.json" "$SB/casedclones" <<'JSONPY'
+import json, sys
+json.dump({"name": "CasedClones", "git_name": "C", "git_email": "c@example.test", "directories": [sys.argv[2]]}, open(sys.argv[1], "w"))
+JSONPY
+  probe profile_apply "$SB" "$SB/pcasedclones.json" >/dev/null
+  # Stored exactly as typed (an older build, or a hand edit): the app itself
+  # now saves the disk's spelling.
+  STORE_R="$("$PY" -c 'import os;h=os.environ["HOME"];c=[os.path.join(h,"Library/Application Support/com.gitswitch.app/profiles.json"),os.path.join(h,".local/share/com.gitswitch.app/profiles.json")];print(next((p for p in c if os.path.exists(p)),"MISSING"))')"
+  "$PY" - "$STORE_R" "$SB/casedclones" <<'STOREPY'
+import json, sys
+f, folder = sys.argv[1:]
+d = json.load(open(f))
+for p in d["profiles"]:
+    if p["name"] == "CasedClones":
+        p["directories"] = [folder]
+json.dump(d, open(f, "w"))
+STOREPY
+  OUT=$(probe local_clones_while_cloning "" "$SB/CasedClones/wip2,git@github.com:someone/wip2.git")
+  ok "a clone into a folder stored in another letter case is still listed as cloning" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print("someone/wip2" in json.load(sys.stdin)["during"]["cloning"])')" "True"
+fi
 
 verify_result

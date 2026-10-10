@@ -120,12 +120,19 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
     if has("GitSwitch: commit blocked") {
         // Deliberately does not repeat the hook's own --no-verify suggestion:
         // the app fixes the identity instead of bypassing the check.
-        return advice(
-            "This folder's identity guard refused the commit.",
-            "The email git is configured with doesn't match the profile that owns this folder. Fix the identity in the Profiles page (or remove the repo-local override), then commit again.",
-            Some("fix-identity"),
-            s,
-        );
+        let said = |label: &str| {
+            s.lines()
+                .find_map(|l| l.trim().strip_prefix(label).map(|v| v.trim().to_string()))
+                .filter(|v| !v.is_empty())
+        };
+        let (expected, actual) = (said("this folder should commit as:"), said("git is currently configured as:"));
+        let guidance = match (expected, actual) {
+            (Some(e), Some(a)) => format!(
+                "The guard expects {e}; git is set to {a}. If {a} is this folder's profile email now, the guard is out of date: update it beside \"Committing as\". Otherwise fix the identity in the Profiles page (or remove the repo-local override), then commit again."
+            ),
+            _ => "The email git is configured with doesn't match the one this folder's guard expects. Fix the identity in the Profiles page (or remove the repo-local override), or update the guard beside \"Committing as\", then commit again.".to_string(),
+        };
+        return advice("This folder's identity guard refused the commit.", &guidance, Some("fix-identity"), s);
     }
 
     // --- Operation-specific ---
@@ -540,8 +547,14 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
         );
     }
 
-    // --- Transport: reuse the clone explainer rather than restate it ---
-    let delegated = crate::sparse::explain_clone_error(s, ctx.key_path, ctx.url.unwrap_or(""));
+    // --- The disk: a full one ends with the same lines as a dropped transfer ---
+    if let Some(d) = crate::sparse::disk_failure(s) {
+        return advice("The disk is full.", &d, None, s);
+    }
+
+    // --- Transport: reuse the clone explainer rather than restate it, in
+    // this operation's words (no "Clone as" here: the folder's profile decides) ---
+    let delegated = crate::sparse::explain_transport_error(s, ctx.key_path, ctx.url.unwrap_or(""), false);
     if delegated.trim() != s.trim() {
         // It recognised the failure; it already ends with "git said: …".
         let hint = delegated
@@ -550,7 +563,11 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
             .unwrap_or(&delegated)
             .to_string();
         return Advice {
-            headline: format!("The {} couldn't reach GitHub.", op.noun()),
+            headline: if crate::sparse::network_failure(s).is_some() {
+                format!("The {} couldn't reach the server.", op.noun())
+            } else {
+                format!("The {} was refused.", op.noun())
+            },
             guidance: hint,
             action: None,
             git_said: s.trim().to_string(),

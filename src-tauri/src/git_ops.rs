@@ -544,7 +544,9 @@ pub fn validate_repo_path(p: &str) -> Result<(), AppError> {
 
 /// The argv for a push. Pure, so a test can prove what it can never contain.
 pub fn build_push_args(remote: &str, local_branch: &str, remote_ref: &str, set_upstream: bool) -> Vec<String> {
-    let mut a: Vec<String> = vec!["push".into(), "--porcelain".into()];
+    // `--progress`: the counters keep coming while bytes move, so the push is
+    // stopped only for silence (`stall`), never for the size of what it sends.
+    let mut a: Vec<String> = vec!["push".into(), "--porcelain".into(), "--progress".into()];
     if set_upstream {
         a.push("--set-upstream".into());
     }
@@ -1620,7 +1622,7 @@ pub async fn push(repo_path: &str, set_upstream: bool, allow_unpushed_submodules
     let args = build_push_args(&remote, &branch, &remote_ref, needs_upstream);
     let out = GitCmd::at(repo_path)
         .args(args)
-        .timeout(NET_TIMEOUT)
+        .stall(crate::git_exec::net_stall())
         .run()
         .await?;
 
@@ -1696,10 +1698,20 @@ pub fn parse_push_porcelain(out: &str) -> Vec<PushedRef> {
 /// and `branch.<n>.rebase`, so the same button could merge for one user and
 /// rebase for another. Fetch and integrate are separate, and the mode the user
 /// picked is the command that runs.
-pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bool) -> Result<OpResult, AppError> {
+/// `source`: integrate a named remote-tracking branch ("origin/main") instead
+/// of the branch's upstream — every Pull rule still applies, with it standing
+/// in for the upstream.
+pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bool, source: Option<&str>) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
-    if let Some(r) = check(&Intent::Pull { mode, autostash }, &StatusFacts::from(&before)) {
+    let mut facts = StatusFacts::from(&before);
+    if let Some(src) = source {
+        facts.upstream = Some(src.to_string());
+    }
+    if let Some(r) = check(&Intent::Pull { mode, autostash }, &facts) {
         return Ok(OpResult::refused(r, before));
+    }
+    if let Some(src) = source {
+        return Box::pin(pull_from(repo_path, before, mode, with_lfs, autostash, src)).await;
     }
     let upstream = before.upstream.clone().unwrap_or_default();
     // The remote by git's own record, so a remote named with a slash is read
@@ -1724,18 +1736,43 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
         ));
     }
     let remote = branch_remote.unwrap_or_else(|| upstream.split('/').next().unwrap_or("origin").to_string());
+    Box::pin(pull_integrate(repo_path, before, mode, with_lfs, autostash, remote, upstream)).await
+}
+
+/// Pull from a named remote-tracking branch: the configured remote it starts
+/// with (the longest, so a remote named with a slash is read whole), the rest
+/// its branch.
+async fn pull_from(repo_path: &str, before: RepoStatus, mode: PullMode, with_lfs: bool, autostash: bool, src: &str) -> Result<OpResult, AppError> {
+    let remotes: Vec<String> = GitCmd::at(repo_path).args(["remote"]).ok_text().await.unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    let Some(remote) = remotes.iter().filter(|r| src.starts_with(&format!("{}/", r))).max_by_key(|r| r.len()).cloned() else {
+        return Ok(OpResult::refused(refuse("no-such-remote", format!("`{}` doesn't start with a remote of this repository.", src)), before));
+    };
+    crate::git_exec::validate_branch_name(&src[remote.len() + 1..])?;
+    Box::pin(pull_integrate(repo_path, before, mode, with_lfs, autostash, remote, src.to_string())).await
+}
+
+/// The fetch and the merge or rebase of a pull, `upstream` being the
+/// remote-tracking branch integrated (`<remote>/<branch>`).
+async fn pull_integrate(repo_path: &str, before: RepoStatus, mode: PullMode, with_lfs: bool, autostash: bool, remote: String, upstream: String) -> Result<OpResult, AppError> {
+    let named = before.upstream.as_deref() != Some(upstream.as_str());
     crate::git_exec::validate_remote_name(&remote)?;
     let head_before = before.head_oid.clone().unwrap_or_default();
 
     // Fetch only the remote's own refs: no refspec, no --prune, no --tags, so
     // nothing local can move in this step. No submodule recursion either —
     // `fetch.recurseSubmodules=on-demand` would fail the whole pull on one
-    // unreachable submodule remote.
+    // unreachable submodule remote. `--progress`, so a big fetch is stopped
+    // only when it goes silent, never for taking long — and kept as a pack
+    // (`fetch.unpackLimit=1`), because git reports nothing at all while it
+    // unpacks a fetch of under a hundred objects, however big they are.
     let fetched = GitCmd::at(repo_path)
-        .args(["fetch", "--quiet", "--no-recurse-submodules", "--", &remote])
-        .timeout(NET_TIMEOUT)
+        .for_fetch()
+        .args(["fetch", "--progress", "--no-recurse-submodules", "--", &remote])
         .run()
         .await?;
+    if fetched.ok() {
+        crate::git_exec::housekeeping(repo_path).await;
+    }
     if !fetched.ok() {
         let after = snapshot(repo_path).await?;
         let a = git_advice::explain(GitOp::Fetch, &fetched.stderr, &advice_ctx(&after));
@@ -1744,6 +1781,29 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
 
     // Fully qualified, so a local branch of the same name can't win.
     let upstream_ref = format!("refs/remotes/{}", upstream);
+    if named {
+        if GitCmd::at(repo_path).args(["rev-parse", "--verify", "--quiet", &upstream_ref]).ok_text().await.is_none() {
+            let after = snapshot(repo_path).await?;
+            return Ok(OpResult::refused(refuse("no-such-remote-branch", format!("{} has no branch `{}` — nothing to rebase onto.", remote, &upstream[remote.len() + 1..])), after));
+        }
+        // A rebase re-writes my commits: never one a remote branch already
+        // has, which only a force push could replace — GitSwitch never does.
+        if mode == PullMode::Rebase {
+            let count = |args: Vec<String>| async move { GitCmd::at(repo_path).args(args).ok_text().await.and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0) };
+            let mine = count(vec!["rev-list".into(), "--count".into(), format!("{}..HEAD", upstream_ref)]).await;
+            let unpushed = count(vec!["rev-list".into(), "--count".into(), "HEAD".into(), "--not".into(), upstream_ref.clone(), "--remotes".into()]).await;
+            if mine > unpushed {
+                let after = snapshot(repo_path).await?;
+                return Ok(OpResult::refused(
+                    refuse(
+                        "would-rewrite-pushed",
+                        format!("{} of the commits a rebase onto {} would re-write are already on a remote branch, and only a force push could replace them. Pull with merge instead.", mine - unpushed, upstream),
+                    ),
+                    after,
+                ));
+            }
+        }
+    }
     // Large files are downloaded after, by the step below, not inside the
     // merge or rebase on its 180s clock (see LfsAround).
     let lfs = lfs_before(repo_path, &before).await;
@@ -1951,8 +2011,105 @@ pub async fn submodule_update(repo_path: &str, paths: Option<Vec<String>>) -> Re
             validate_repo_path(path)?;
         }
     }
-    let report = crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url, paths.as_deref(), None).await;
+    // A populated submodule this moves — to the commit recorded for it — must
+    // lose nothing: no changes, operation or conflicts inside, no commit only
+    // its detached HEAD (or a nested one's: `--recursive` moves those too)
+    // holds. One that was never checked out has nothing to lose.
+    let mut was_populated: Vec<String> = Vec::new();
+    if let Some(p) = &paths {
+        let mut blockers: Vec<Refusal> = Vec::new();
+        for path in p {
+            let dir = PathBuf::from(repo_path).join(path);
+            if !(crate::sparse::own_repository(&dir).await && crate::sparse::is_checked_out(&dir).await) {
+                continue;
+            }
+            was_populated.push(path.clone());
+            let recorded = crate::tree::recorded_gitlink(repo_path, path).await;
+            if let Some(r) = Box::pin(crate::tree::submodule_move_blocker(repo_path, path, recorded.as_deref(), true)).await? {
+                blockers.push(r);
+            }
+        }
+        if let Some(first) = blockers.first() {
+            let message = blockers.iter().map(|r| r.message.as_str()).collect::<Vec<_>>().join(" ");
+            return Ok(OpResult::refused(refuse(&first.code, message), before));
+        }
+    }
+    let guarded = before.push.repo_blocked || before.push.lock.locked;
+    // What was really there before — checked out, not an interrupted
+    // download's leftovers, which the download clears and fetches again: what
+    // this download populates gets the repository's push treatment and its
+    // large-file step.
+    let mut populated_before = Vec::new();
+    for p in crate::push_guard::populated_submodules(std::path::Path::new(repo_path)).await {
+        if crate::sparse::is_checked_out(&std::path::Path::new(repo_path).join(&p)).await {
+            populated_before.push(p);
+        }
+    }
+    // Progress is recorded under the repository's path, for the page's strip,
+    // and removed when the download is over (however it ended).
+    let report = {
+        let _progress = crate::sparse::ProgressGuard::hold(repo_path);
+        let profile = crate::git_status::owning_profile_id(repo_path);
+        Box::pin(crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url, paths.as_deref(), Some(repo_path), profile.as_deref())).await
+    };
+    // A submodule this download populated — nested ones included — under a
+    // blocked or locked repository gets the same guard-rail at once; the
+    // lock's own layer for it is Repair's.
+    let mut inherited = String::new();
+    let fresh: Vec<String> = crate::push_guard::populated_submodules(std::path::Path::new(repo_path)).await.into_iter().filter(|p| !populated_before.contains(p)).collect();
+    // Their large files are fetched when the repository's own are all here
+    // (whoever keeps those keeps these) — and git-lfs is set up in them before
+    // any push guard is, so the guard chains its hook instead of git-lfs
+    // refusing to install next to the guard's.
+    let lfs_requested = !fresh.is_empty() && crate::lfs::lfs_status(repo_path).await.ok().is_some_and(|s| s.uses_lfs && s.installed && s.pointers == 0);
+    if lfs_requested {
+        for rel in &fresh {
+            lfs_setup_before_guard(&PathBuf::from(repo_path).join(rel).to_string_lossy()).await;
+        }
+    }
+    if guarded && !fresh.is_empty() {
+        let notes = crate::push_guard::cover_submodules(repo_path, Some(&fresh)).await;
+        inherited = if !notes.is_empty() {
+            format!(" Could not extend the push block to: {}.", notes.join("; "))
+        } else if before.push.lock.locked {
+            let out = Box::pin(crate::push_lock::lock_downloaded_submodules(repo_path, &fresh)).await;
+            if out.applied() {
+                " Pushes are locked here, so the downloaded submodule(s) were locked too, with the repository's lock.".to_string()
+            } else {
+                format!(
+                    " Pushes are locked here; the downloaded submodule(s) got the same guard-rail but not the lock ({}) — Repair (administrator) under Push access adds it.",
+                    out.message.trim_end_matches('.')
+                )
+            }
+        } else {
+            " Pushes are blocked here, so the downloaded submodule(s) got the same guard-rail.".to_string()
+        };
+    }
+    // The large files of what this download populated: fetched as decided
+    // above, said either way — a submodule's stubs are never left silent.
+    let mut lfs_notes = String::new();
+    if !fresh.is_empty() {
+        let _progress = crate::sparse::ProgressGuard::hold(repo_path);
+        for s in Box::pin(crate::sparse::lfs_in_submodules(std::path::Path::new(repo_path), Some(&fresh), lfs_requested, Some(repo_path))).await {
+            lfs_notes.push_str(&format!(" Git LFS in {}: {}", s.path, s.report.note));
+        }
+    }
     let after = snapshot(repo_path).await?;
+    // `git submodule update` can exit 0 and leave a populated one where it
+    // was (`update = none` somewhere git reads it, a merge of an ancestor):
+    // measured here, never assumed from the exit code.
+    let mut stuck: Vec<String> = Vec::new();
+    for path in &was_populated {
+        if report.failed_paths.contains(path) {
+            continue;
+        }
+        let dir = PathBuf::from(repo_path).join(path);
+        if let (Some(h), Some(r)) = (crate::sync::oid(&dir, "HEAD").await, crate::tree::recorded_gitlink(repo_path, path).await) {
+            if h != r {
+                stuck.push(format!("{} is at {}, not the recorded {}", path, crate::sync::short(&h), crate::sync::short(&r)));
+            }
+        }
+    }
 
     let headline = format!("{} of {} submodule(s) up to date.", report.downloaded, report.listed);
     let mut detail = String::new();
@@ -1962,10 +2119,25 @@ pub async fn submodule_update(repo_path: &str, paths: Option<Vec<String>>) -> Re
             report.unlisted
         ));
     }
+    if !report.cleared.is_empty() {
+        detail.push_str(&format!("An interrupted download of {} was cleared before downloading again. ", report.cleared.join(", ")));
+    }
     if let Some(err) = &report.error {
         detail.push_str(err);
     }
+    detail.push_str(&inherited);
+    detail.push_str(&lfs_notes);
+    let detail = detail.trim().to_string();
 
+    if !stuck.is_empty() {
+        let advice = Advice {
+            headline: "Not every submodule reached the commit this repository records.".to_string(),
+            guidance: format!("Not moved: {}. {}", stuck.join("; "), detail).trim().to_string(),
+            action: None,
+            git_said: String::new(),
+        };
+        return Ok(OpResult { submodules: Some(report), ..OpResult::failed(advice, after) });
+    }
     Ok(OpResult {
         submodules: Some(report),
         ..OpResult::done(headline, detail, after)
@@ -1985,8 +2157,13 @@ pub struct LfsFetch {
     /// The repository had no LFS filters, so `git lfs install --local` was run
     /// first — without it `git lfs pull` exits 0 and downloads nothing.
     pub configured_now: bool,
-    /// git-lfs failed. The caller decides how loudly to say so.
+    /// git-lfs failed and files are still missing. The caller decides how
+    /// loudly to say so.
     pub error: Option<Advice>,
+    /// git-lfs exited with an error, yet no file is missing — an object it
+    /// could not fetch whose file is already here, or a stop after the last
+    /// file was written. Said, never reported as a failure.
+    pub warning: Option<Advice>,
 }
 
 impl LfsFetch {
@@ -1996,6 +2173,7 @@ impl LfsFetch {
             fetched: 0,
             configured_now: false,
             error: None,
+            warning: None,
         }
     }
 }
@@ -2071,10 +2249,30 @@ pub(crate) async fn lfs_after(repo: &str, plan: &LfsAround) -> String {
     }
 }
 
+/// git-lfs's own setup (its filters and hooks) in a repository that uses large
+/// files and has none — run BEFORE a push guard adds its pre-push hook: git-lfs
+/// refuses to install over a hook that is not its own, while the guard keeps
+/// and chains whatever hook it finds. The other way round, every large file
+/// would stay a stub.
+pub(crate) async fn lfs_setup_before_guard(dir: &str) {
+    if let Ok(s) = crate::lfs::lfs_status(dir).await {
+        if s.uses_lfs && s.installed && !s.filters_configured {
+            let _ = GitCmd::at(dir).args(["lfs", "install", "--local"]).timeout(LOCAL_TIMEOUT).run().await;
+        }
+    }
+}
+
 /// Download the content behind every pointer stub. Safe to call on any repo:
 /// one that doesn't use LFS, has no stubs, or has no git-lfs installed simply
 /// reports that nothing was done.
 pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppError> {
+    Box::pin(fetch_lfs_content_reporting(repo_path, crate::lfs::progress_path(repo_path))).await
+}
+
+/// The same, with git-lfs's progress written to `progress_at` — the file the
+/// page polls. A submodule's download after an update reports into the
+/// superproject's, which is the one the page is looking at.
+pub(crate) async fn fetch_lfs_content_reporting(repo_path: &str, progress_at: std::path::PathBuf) -> Result<LfsFetch, AppError> {
     let before = crate::lfs::lfs_status(repo_path).await?;
     if !before.uses_lfs || !before.installed || before.pointers == 0 {
         return Ok(LfsFetch::nothing_to_do(before));
@@ -2099,12 +2297,13 @@ pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppEr
                 fetched: 0,
                 configured_now: false,
                 error: Some(advice),
+                warning: None,
             });
         }
         configured_now = true;
     }
 
-    let progress = crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path));
+    let progress = crate::lfs::ProgressFile::start_at(progress_at);
     let out = GitCmd::at(repo_path)
         .args(["lfs", "pull"])
         // Gigabytes of large files are normal; a transfer that is still moving
@@ -2116,17 +2315,27 @@ pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppEr
         .await?;
     drop(progress);
 
-    // Measure, don't assume: count the stubs again.
+    // Measure, don't assume: count the stubs again. The exit code is not the
+    // answer either way — git-lfs also fails on an object whose file is
+    // already here, or is stopped after it wrote the last one. Every stub
+    // filled, with every file still counted (a scan that failed would list
+    // none and read as "nothing missing"), is a warning, not a failure.
     let after = crate::lfs::lfs_status(repo_path).await?;
     let fetched = before.pointers.saturating_sub(after.pointers);
-    let error = if out.ok() {
-        None
+    let complete = after.pointers == 0 && after.tracked >= before.tracked;
+    let (error, warning) = if out.ok() {
+        (None, None)
     } else {
         let stderr = if out.stderr.is_empty() { out.text() } else { out.stderr.clone() };
-        Some(git_advice::explain(GitOp::Lfs, &stderr, &AdviceCtx::default()))
+        let advice = git_advice::explain(GitOp::Lfs, &stderr, &AdviceCtx::default());
+        if complete {
+            (None, Some(advice))
+        } else {
+            (Some(advice), None)
+        }
     };
 
-    Ok(LfsFetch { after, fetched, configured_now, error })
+    Ok(LfsFetch { after, fetched, configured_now, error, warning })
 }
 
 pub async fn lfs_pull(repo_path: &str) -> Result<OpResult, AppError> {
@@ -2205,8 +2414,13 @@ pub async fn lfs_pull(repo_path: &str) -> Result<OpResult, AppError> {
     if configured_now {
         detail.push_str(" (LFS filters were not set up for this repository, so `git lfs install --local` was run first.)");
     }
+    if let Some(w) = &done.warning {
+        detail.push_str(&format!(" git-lfs still exited with an error, but no file is missing: {}", w.headline));
+    }
     Ok(OpResult {
         lfs: Some(lfs_after),
+        // git-lfs's own words stay under "what git said"; the card stays green.
+        advice: done.warning.map(|w| Advice { guidance: String::new(), action: None, ..w }),
         ..OpResult::done(headline, detail, after)
     })
 }
@@ -2354,7 +2568,14 @@ pub async fn lfs_pull_paths(repo_path: &str, paths: Vec<String>) -> Result<OpRes
     let arrived = missing_before.saturating_sub(still_missing.len());
     let status = snapshot(repo_path).await?;
 
-    if let Some(stderr) = failure {
+    // git-lfs failed, yet everything asked for is here — and the scan still
+    // knows every path asked for, so an empty list is not a failed read: a
+    // warning on a green result, not a failure.
+    let mut warning: Option<Advice> = None;
+    if let Some(stderr) = failure.as_deref().filter(|_| still_missing.is_empty() && selected.iter().all(|p| after.knows(p))) {
+        warning = Some(git_advice::explain(GitOp::Lfs, stderr, &AdviceCtx::default()));
+    }
+    if let Some(stderr) = failure.filter(|_| warning.is_none()) {
         let advice = git_advice::explain(GitOp::Lfs, &stderr, &AdviceCtx::default());
         let names: Vec<String> = still_missing.iter().take(5).map(|f| f.path.clone()).collect();
         // Name what is still a stub. Reporting only a count is how a failure
@@ -2410,7 +2631,14 @@ pub async fn lfs_pull_paths(repo_path: &str, paths: Vec<String>) -> Result<OpRes
     if configured_now {
         detail.push_str(" (This repository's LFS filters weren't set up, so that was done first.)");
     }
-    Ok(OpResult { lfs: Some(after.to_status()), ..OpResult::done(headline, detail, status) })
+    if let Some(w) = &warning {
+        detail.push_str(&format!(" git-lfs still exited with an error, but no file asked for is missing: {}", w.headline));
+    }
+    Ok(OpResult {
+        lfs: Some(after.to_status()),
+        advice: warning.map(|w| Advice { guidance: String::new(), action: None, ..w }),
+        ..OpResult::done(headline, detail, status)
+    })
 }
 
 // --- Abort ---------------------------------------------------------------
@@ -2656,6 +2884,31 @@ mod tests {
                 let dashdash = args.iter().position(|a| a == "--").unwrap();
                 assert!(args.iter().position(|a| a == remote).unwrap() > dashdash);
             }
+        }
+    }
+
+    /// A command whose async work outgrows a thread's stack (2 MiB) crashes
+    /// without a word — an Update's Continue once did, in a debug build, when
+    /// its nested steps grew. The heavy nested steps are `Box::pin`ned; this
+    /// catches a future that grows grossly. (The overflow itself came from how
+    /// deep the debug build's poll frames nest, which a size cannot show: the
+    /// live harness, which drives every operation for real, is what finds it.)
+    #[test]
+    fn every_heavy_command_future_stays_far_below_a_threads_stack() {
+        let sizes: Vec<(&str, usize)> = vec![
+            ("sync_run", std::mem::size_of_val(&crate::sync::sync_run("/x", crate::sync::RunOptions { stash: true, bundles: false, with_lfs: false, fingerprint: Vec::new() }))),
+            ("sync_continue", std::mem::size_of_val(&crate::sync::sync_continue("/x", false))),
+            ("sync_abort", std::mem::size_of_val(&crate::sync::sync_abort("/x"))),
+            ("sync_plan", std::mem::size_of_val(&crate::sync::sync_plan("/x", true, true))),
+            ("submodule_update", std::mem::size_of_val(&submodule_update("/x", None))),
+            ("pull", std::mem::size_of_val(&pull("/x", PullMode::Rebase, true, true, None))),
+            ("push", std::mem::size_of_val(&push("/x", false, false))),
+            ("full_clone", std::mem::size_of_val(&crate::sparse::full_clone("u", "/p", None, None, true, true))),
+            ("repo_status", std::mem::size_of_val(&crate::git_status::repo_status("/x"))),
+        ];
+        for (name, size) in &sizes {
+            eprintln!("future size {}: {} bytes", name, size);
+            assert!(*size < 64 * 1024, "{} builds a {} byte future: Box::pin its heavy nested steps", name, size);
         }
     }
 
@@ -3091,7 +3344,7 @@ mod tests {
             assert!(r.message.contains("git rebase --abort"));
         }
         // Resolving a conflict is exactly the work an operation in progress needs.
-        assert!(check(&Intent::Tree(crate::tree::TreeIntent::ResolveSide { has_paths: true, submodule_selected: false, not_conflicted_selected: false }), &f).is_none());
+        assert!(check(&Intent::Tree(crate::tree::TreeIntent::ResolveSide { has_paths: true, not_conflicted_selected: false }), &f).is_none());
     }
 
     #[test]
@@ -3123,7 +3376,7 @@ mod tests {
         }
         assert!(check(&Intent::Stage, &f).is_none());
         // Resolution work is allowed: taking a side, and recovering a file from the autostash.
-        assert!(check(&Intent::Tree(crate::tree::TreeIntent::ResolveSide { has_paths: true, submodule_selected: false, not_conflicted_selected: false }), &f).is_none());
+        assert!(check(&Intent::Tree(crate::tree::TreeIntent::ResolveSide { has_paths: true, not_conflicted_selected: false }), &f).is_none());
         assert!(check(&Intent::Stash(crate::stash::StashIntent::RestoreFile { exists: true, in_stash: true }), &f).is_none());
         assert!(check(&Intent::SyncContinue, &f).is_none());
         assert!(check(&Intent::SyncAbort, &f).is_none());

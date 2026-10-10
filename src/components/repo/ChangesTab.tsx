@@ -4,7 +4,7 @@ import { Button } from "../Button";
 import { Card } from "../Card";
 import { useToast } from "../Toast";
 import { TreeLists, type DiscardVariant } from "../changes/TreeLists";
-import { CommitBox } from "../changes/CommitBox";
+import { CommitBox, type GuardAction } from "../changes/CommitBox";
 import { DiffPanel } from "../changes/DiffPanel";
 import { TidyUpStrip } from "./TidyUpStrip";
 import type { RepoActions } from "./StatusStrip";
@@ -25,7 +25,8 @@ import { DiscardAllModal } from "../changes/DiscardAllModal";
 import { usePersistedState } from "../../lib/persist";
 import { canonicalJoin } from "../../lib/paths";
 import { useRefreshOnFocus } from "../../lib/focus";
-import { elapsedLabel, runJob, useGitJob, clearJob, type GitJobKind } from "../../lib/gitJobs";
+import { notePushChanged } from "../../lib/console";
+import { elapsedLabel, runJob, useGitJob, clearJob, jobWritingFiles, type GitJobKind } from "../../lib/gitJobs";
 import * as api from "../../lib/api";
 import type { ChangeEntry, OpResult, PullMode, RepoStatus, SubmoduleInfo, SubmoduleStatus } from "../../lib/api";
 
@@ -184,7 +185,12 @@ export function ChangesTab({
   }, [subRefresh]);
 
   // Folders change behind the app's back: a terminal commit, a deleted clone.
-  useRefreshOnFocus(() => loadStatus(repoPath), 4000);
+  // Not while a job is writing this folder: a status read of a repository
+  // mid-download competes with the download and made the app lag.
+  useRefreshOnFocus(() => {
+    if (jobWritingFiles(repoPath)) return;
+    loadStatus(repoPath);
+  }, 4000);
 
   // The strip above the tabs shows what this tab knows.
   useEffect(() => {
@@ -285,6 +291,27 @@ export function ChangesTab({
   /** Work in another repo (a submodule) without waiting for the scan. */
   const openRepo = (path: string) => onOpenRepo(path);
 
+  // The identity guard of this repository or of a submodule shown inline:
+  // switched here, on any repository, and rewritten when it expects an email
+  // the profile no longer has.
+  const [guardBusy, setGuardBusy] = useState(false);
+  const guardAction = async (path: string, st: RepoStatus, action: GuardAction) => {
+    setGuardBusy(true);
+    try {
+      const msg =
+        action === "off"
+          ? await api.uninstallCommitGuard(path)
+          : await api.installCommitGuard(path, st.identity.profile_email ?? "");
+      toast.success(msg);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      setGuardBusy(false);
+      loadStatus(repoPath);
+      setSubRefresh((n) => n + 1);
+    }
+  };
+
   const message = drafts[repoPath] ?? "";
   const setMessage = (m: string) => setDrafts((d) => ({ ...d, [repoPath]: m }));
   // What the box shows is what gets committed: with nothing typed, a merge in
@@ -312,7 +339,9 @@ export function ChangesTab({
       // updated; the toast below says what happened either way.
       const stillHere = repoRef.current === forRepo;
       if (!quiet && stillHere) {
-        setResult(r);
+        // A result from inside a submodule is that submodule's: its paths and
+        // codes are relative to it, and no action keyed on them may run here.
+        setResult(target && target !== forRepo ? { ...r, inside: target } : r);
         setMarkersRetry(!r.ok && r.refusal?.code === "conflict-markers" && opts?.markers ? opts.markers : null);
       }
       if (r.status && stillHere) {
@@ -385,11 +414,15 @@ export function ChangesTab({
    * target): the result carries the submodule's status, never the parent's,
    * and the parent is re-read because its gitlink row moves.
    */
-  const pullInside = (repo: string, s: SubmoduleInfo) => {
+  const pullInside = (repo: string, s: SubmoduleInfo, source?: string) => {
     const abs = `${repo.replace(/\/+$/, "")}/${s.path}`;
+    // With a source: a rebase onto it ("Rebase onto origin/main"), whatever the page's pull mode.
+    const mode = source ? "rebase" : pullMode;
     return apply(
       `pull:${s.path}`,
-      () => api.changesPull(abs, pullMode, (status?.uses_lfs ?? false) && pullLfs, pullMode === "rebase" && pullAutostash),
+      // The page's option, as it is: whether LFS is used is the submodule's own
+      // matter, which the backend reads there (nothing to do where it is not).
+      () => api.changesPull(abs, mode, pullLfs, mode === "rebase" && pullAutostash, source ?? null),
       abs
     );
   };
@@ -444,16 +477,24 @@ export function ChangesTab({
         setIdentityRefresh((k) => k + 1);
       },
       initialise: (repo, paths) =>
-        runLongIn(repo, "submodules", `Initialising ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
+        runLongIn(repo, "submodules", `Downloading ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
           api.changesSubmoduleUpdate(repo, paths)
         ),
       updateOne: (repo, sub) => runLongIn(repo, "submodules", `Updating ${sub}…`, () => api.changesSubmoduleUpdate(repo, [sub])),
       pullInside,
       recordPointers: (repo) => apply("record", () => api.changesRecordPointers(repo)),
       recordOne: (repo, sub) => apply(`record:${sub}`, () => api.changesRecordPointers(repo, [sub])),
+      alignOne: (repo, sub) => runLongIn(repo, "submodules", `Checking out ${sub}'s recorded commit…`, () => api.changesSubmoduleAlign(repo, [sub])),
       startBranch: (repo, sub, name) => startBranch(repo, sub, name),
+      // The page's large-file choice, as Pull takes it: the backend decides
+      // which repositories of the update use LFS.
       update: (repo, stash, bundles, fingerprint) =>
-        runLongIn(repo, "sync", "Updating — fetching, rebasing, aligning submodules…", () => api.changesSyncRun(repo, stash, bundles, fingerprint)),
+        runLongIn(
+          repo,
+          "sync",
+          pullLfs ? "Updating — fetching, rebasing, aligning submodules, then the LFS files…" : "Updating — fetching, rebasing, aligning submodules…",
+          () => api.changesSyncRun(repo, stash, bundles, fingerprint, pullLfs)
+        ),
       stashNow: (repo) => apply("stash", () => api.changesStashPush(repo, "Before update", false)),
     });
   });
@@ -469,7 +510,7 @@ export function ChangesTab({
         primary: true,
       }
     : null;
-  const movedAction = result?.pull && (result.pull.submodules_moved ?? 0) > 0 ? { label: "Update…", onClick: onPreview, primary: true } : null;
+  const movedAction = result?.pull && !result.inside && (result.pull.submodules_moved ?? 0) > 0 ? { label: "Update…", onClick: onPreview, primary: true } : null;
   // A file staged with its conflict markers still in it: the refusal names
   // the lines, and whoever meant it (a file that really contains "<<<<<<<")
   // says so once.
@@ -509,9 +550,9 @@ export function ChangesTab({
     return apply(`branch:${sub}`, () => api.changesCreateBranch(inside, name, null, true), inside);
   };
 
-  // A result that belongs to a submodule (a push chained from here) carries
-  // its codes for the submodule, not for this repository: no action keyed on
-  // them is offered for it.
+  // A result that belongs to a submodule (a push chained from here, or any
+  // operation run inside one) carries its codes for the submodule, not for
+  // this repository: no action keyed on them is offered for it.
   const refusalCode = result?.inside ? undefined : result?.refusal?.code;
   // The submodule whose branch form the card should open (a nonce, then the path).
   const [branchFormFor, setBranchFormFor] = useState<string | null>(null);
@@ -680,6 +721,7 @@ export function ChangesTab({
             onPullMode={onPullMode}
             pullLfs={pullLfs}
             onPullLfs={onPullLfs}
+            lfsInSubmodules={subStatuses.some((s) => s.status.uses_lfs)}
             pullAutostash={pullAutostash}
             onPullAutostash={onPullAutostash}
             onUndoCommit={() => apply("undo", () => api.changesUndoCommit(repoPath))}
@@ -697,6 +739,12 @@ export function ChangesTab({
                 clearJob(repoPath);
               }}
               onRecordPointers={() => apply("record", () => api.changesRecordPointers(repoPath))}
+              // A result from inside a submodule names paths inside it: aligned there.
+              onAlignSubmodules={(paths) => {
+                const inside = result.inside;
+                if (inside) void apply("align", () => api.changesSubmoduleAlign(inside, paths), inside);
+                else void runLong("submodules", `Checking out the recorded commit${paths.length === 1 ? "" : "s"}…`, () => api.changesSubmoduleAlign(repoPath, paths));
+              }}
               extraAction={markersAction ?? syncHandOff ?? movedAction ?? historyAction ?? publishAction}
               extraActions={subPushActions}
             />
@@ -731,6 +779,8 @@ export function ChangesTab({
                 busy={anyBusy}
                 onCommit={onCommit}
                 onSwitchBranch={() => setBranchesFor(repoPath)}
+                onGuard={(a) => guardAction(repoPath, status, a)}
+                guardBusy={guardBusy}
               />
 
               {sectionSubs.map((s) => (
@@ -748,6 +798,8 @@ export function ChangesTab({
                   onOpenRepo={openRepo}
                   onDiscard={(paths, variant) => setConfirmDiscard({ paths, variant, target: s.status.path })}
                   onSwitchBranch={() => setBranchesFor(s.status.path)}
+                  onGuard={(a) => guardAction(s.status.path, s.status, a)}
+                  guardBusy={guardBusy}
                 />
               ))}
               {quietSubs > 0 && (
@@ -764,6 +816,9 @@ export function ChangesTab({
                 refreshKey={identityRefresh}
                 push={status.push}
                 onChanged={(p) => {
+                  // The terminal drawer's badge reads it again, whichever
+                  // repository this page shows by now.
+                  notePushChanged();
                   // A mode change that lands after a switch to another
                   // repository must not carry this status over to it.
                   if (repoRef.current !== repoPath) return;
@@ -789,13 +844,14 @@ export function ChangesTab({
                 refreshKey={subRefresh}
                 onOpenRepo={openRepo}
                 onUpdate={(paths) =>
-                  runLong("submodules", `Initialising ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
+                  runLong("submodules", `Downloading ${paths.length} submodule${paths.length === 1 ? "" : "s"}…`, () =>
                     api.changesSubmoduleUpdate(repoPath, paths)
                   )
                 }
-                onPullInside={(s) => void pullInside(repoPath, s)}
+                onPullInside={(s, source) => void pullInside(repoPath, s, source)}
                 onUpdateOne={(p) => void runLong("submodules", `Updating ${p}…`, () => api.changesSubmoduleUpdate(repoPath, [p]))}
                 onRecordOne={(p) => void apply(`record:${p}`, () => api.changesRecordPointers(repoPath, [p]))}
+                onAlignOne={(p) => void runLong("submodules", `Checking out ${p}'s recorded commit…`, () => api.changesSubmoduleAlign(repoPath, [p]))}
                 onStartBranch={(p, name) => void startBranch(repoPath, p, name)}
                 openBranchFormFor={branchFormFor}
                 sectionPaths={sectionPaths}

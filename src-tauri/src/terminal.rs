@@ -490,6 +490,69 @@ pub fn run_once(repo_path: &str, script: &str, timeout: Duration) -> Result<Stri
     Ok(collected.lock().map(|s| s.clone()).unwrap_or_default())
 }
 
+/// Open a shell at one size, run a line, resize it, run the line again, and
+/// return what each run printed — the proof that a resize reaches the shell
+/// (`stty size` is the line the suite uses). Sizes are (cols, rows).
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+pub fn run_resized(repo_path: &str, script: &str, first: (u16, u16), second: (u16, u16), timeout: Duration) -> Result<(String, String), AppError> {
+    let collected = Arc::new(Mutex::new(String::new()));
+    let last = Arc::new(Mutex::new(Instant::now()));
+    let out = collected.clone();
+    let tick = last.clone();
+    let id = open_with(repo_path, first.0, first.1, move |chunk| {
+        if let Ok(mut s) = out.lock() {
+            s.push_str(&chunk);
+        }
+        if let Ok(mut t) = tick.lock() {
+            *t = Instant::now();
+        }
+        true
+    })?;
+    let settle = |quiet: Duration, limit: Duration| {
+        let start = Instant::now();
+        loop {
+            let idle = last.lock().map(|t| t.elapsed()).unwrap_or(quiet);
+            if idle >= quiet || start.elapsed() >= limit || !is_open(&id) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let take = || collected.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
+    // Quiet is measured from the moment something was asked: without this a
+    // shell that had already been silent for a while counts as settled before
+    // it has answered at all.
+    let asked = || {
+        if let Ok(mut t) = last.lock() {
+            *t = Instant::now();
+        }
+    };
+    settle(Duration::from_millis(350), Duration::from_secs(5));
+    let _ = take(); // the banner and the first prompt are not the answer
+
+    write(&id, script)?;
+    write(&id, "\n")?;
+    asked();
+    settle(Duration::from_millis(600), timeout);
+    let before = take();
+
+    resize(&id, second.0, second.1)?;
+    // The shell redraws its prompt when it is told its window changed.
+    asked();
+    settle(Duration::from_millis(350), Duration::from_secs(5));
+    let _ = take();
+    write(&id, script)?;
+    write(&id, "\n")?;
+    asked();
+    settle(Duration::from_millis(600), timeout);
+    let after = take();
+
+    let _ = write(&id, "exit\n");
+    std::thread::sleep(Duration::from_millis(120));
+    close(&id);
+    Ok((before, after))
+}
+
 #[allow(dead_code)] // used by run_once above
 pub fn is_open(id: &str) -> bool {
     sessions().lock().map(|m| m.contains_key(id)).unwrap_or(false)

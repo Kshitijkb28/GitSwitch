@@ -23,8 +23,9 @@ import { Badge } from "../components/Badge";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import { baseName, isWithin, normPath } from "../lib/paths";
-import { usePersistedState, handOff } from "../lib/persist";
+import { usePersistedState, handOff, useSessionState } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
+import { arrivedLabel, formatKb, timeLeftLabel } from "../lib/gitJobs";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
 import { RefreshButton } from "../components/RefreshButton";
@@ -46,37 +47,6 @@ function profileForFolder(dir: string, profiles: Profile[]): Profile | null {
 }
 
 /** Folder name git will create — mirrors the backend's repo_name_from_url. */
-/** "1.2 GB" from GitHub's kilobytes. */
-/** "10.00 MiB" / "2.00 MiB/s", as git prints them, in bytes. */
-function gitSizeBytes(s: string): number | null {
-  const m = /^\s*([\d.]+)\s*(B|KiB|MiB|GiB|TiB)\b/.exec(s);
-  if (!m) return null;
-  const unit = { B: 1, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3, TiB: 1024 ** 4 }[m[2] as "B" | "KiB" | "MiB" | "GiB" | "TiB"];
-  return parseFloat(m[1]) * unit;
-}
-
-/**
- * "about 10 min left", from what has arrived, how fast, and how big GitHub
- * says the repository is — only the main download has that estimate.
- */
-function timeLeft(bytes: string, rate: string, estimateKb: number): string | null {
-  const have = gitSizeBytes(bytes);
-  const perSec = gitSizeBytes(rate);
-  if (have === null || perSec === null || perSec <= 0) return null;
-  const secs = Math.max(0, estimateKb * 1024 - have) / perSec;
-  if (secs < 60) return "less than a minute left";
-  const mins = Math.round(secs / 60);
-  if (mins < 60) return `about ${mins} min left`;
-  return `about ${Math.floor(mins / 60)} h ${mins % 60} min left`;
-}
-
-function formatKb(kb: number): string {
-  if (kb < 1024) return `${kb} KB`;
-  const mb = kb / 1024;
-  if (mb < 1024) return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
-  return `${(mb / 1024).toFixed(mb / 1024 < 10 ? 1 : 0)} GB`;
-}
-
 function repoNameFromUrl(url: string): string {
   const t = url.trim().replace(/\/+$/, "").replace(/(\.git)+$/, "");
   const parts = t.split(/[/:]/);
@@ -117,12 +87,12 @@ export function SparseClone() {
   const toast = useToast();
   const [url, setUrl] = usePersistedState("sparse.url", "");
   const [parentDir, setParentDir] = usePersistedState("sparse.parentDir", "");
-  const [folderName, setFolderName] = useState("");
+  const [folderName, setFolderName] = useSessionState("clone.folderName", "");
   const [mode, setMode] = usePersistedState<"full" | "sparse">("clone.mode", "full");
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [cloned, setCloned] = useState<api.CloneResult | null>(null);
   // "" = automatic: the destination folder's profile decides, like a terminal clone.
-  const [cloneAs, setCloneAs] = useState("");
+  const [cloneAs, setCloneAs] = useSessionState("clone.as", "");
   const [withSubmodules, setWithSubmodules] = usePersistedState("clone.submodules", true);
   // On by default: a clone of an LFS repository without this looks complete
   // but every large file is a pointer stub, and git status never says so.
@@ -137,7 +107,7 @@ export function SparseClone() {
   const navigate = useNavigate();
   const openInChanges = (path: string) => {
     handOff("changes", path);
-    navigate("/changes");
+    navigate("/repo/changes");
   };
 
   // Arriving from Repositories: take the link (and suggested profile) it sent,
@@ -199,7 +169,9 @@ export function SparseClone() {
   // Refresh must not keep what leaving the page would have dropped.
   function reloadAll() {
     reloadProfiles();
+    // What leaving and coming back drops: the last result, and its error.
     setCloned(null);
+    setError(null);
     setSparseLfs(null);
     setFromRepo(null);
     setRecheck((n) => n + 1);
@@ -250,7 +222,9 @@ export function SparseClone() {
     const urlChanged = sizeUrl.current !== url;
     sizeUrl.current = url;
     if (urlChanged) setSizeEstimate(null);
-    if (!/github\.com[:/]/.test(url)) return;
+    // Any address: the backend answers at once when it cannot ask (not GitHub,
+    // and not an SSH alias that stands for it).
+    if (!url.trim()) return;
     const id = window.setTimeout(() => {
       api
         .cloneSizeEstimate(url)
@@ -503,11 +477,13 @@ export function SparseClone() {
                     {progress.detail && <span className="text-zinc-500"> · {progress.detail}</span>}
                   </span>
                   <span className="text-zinc-500 tabular-nums">
-                    {progress.bytes}
-                    {progress.bytes && sizeEstimate && !progress.detail && ` of about ${formatKb(sizeEstimate.kb)}`}
+                    {arrivedLabel(progress)}
                     {progress.rate && ` · ${progress.rate}`}
-                    {progress.bytes && progress.rate && sizeEstimate && !progress.detail && (() => {
-                      const left = timeLeft(progress.bytes, progress.rate, sizeEstimate.kb);
+                    {(() => {
+                      // The backend says how long is left: against the host's
+                      // size when it is known, the objects otherwise — for the
+                      // main download and for each submodule alike.
+                      const left = typeof progress.eta_secs === "number" ? timeLeftLabel(progress.eta_secs) : null;
                       return left ? ` · ${left}` : "";
                     })()}
                   </span>
@@ -575,7 +551,8 @@ export function SparseClone() {
           />
           {sizeEstimate && (
             <p className="text-xs text-zinc-500" aria-label="Repository size">
-              About <span className="text-zinc-300">{formatKb(sizeEstimate.kb)}</span> on GitHub — large
+              About <span className="text-zinc-300">{formatKb(sizeEstimate.kb)}</span> on GitHub for this
+              repository — {mode === "full" && withSubmodules ? "its submodules download on top, and " : ""}large
               files kept in LFS are extra.
             </p>
           )}
@@ -903,6 +880,20 @@ export function SparseClone() {
                   Git LFS: {cloned.lfs.note}
                 </p>
               )}
+              {(cloned.submodule_lfs ?? []).map((s) => (
+                <p
+                  key={s.path}
+                  className={`text-xs mt-0.5 break-words ${
+                    s.report.error || (s.report.pointers_left > 0 && !s.report.installed)
+                      ? "text-amber-300/90"
+                      : s.report.pointers_left > 0
+                        ? "text-zinc-400"
+                        : "text-emerald-400/90"
+                  }`}
+                >
+                  Git LFS in {s.path}: {s.report.note}
+                </p>
+              ))}
               {cloned.lfs && cloned.lfs.pointers_left > 0 && cloned.lfs.installed && (
                 <Button size="sm" variant="secondary" className="mt-2" onClick={() => openInChanges(cloned.path)}>
                   <Download size={12} />

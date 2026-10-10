@@ -1,6 +1,7 @@
 // Headless checks for the Changes page against a mocked backend.
 // Serves the built app and replaces Tauri's invoke bridge before any app code
 // runs, so every repo state can be shown without touching a real repository.
+import fs from "node:fs";
 import { launch, serve, tally, DIST_OK } from "./browser.mjs";
 import {
   REPOS,
@@ -54,6 +55,14 @@ async function openPage(browser, server, scenario, opts = {}) {
     lfs: opts.lfs ?? null,
     repos: opts.repos ?? null,
     pushState: opts.pushState ?? null,
+    /** How far the block reaches into the submodules; null → none to speak of. */
+    pushCoverage: opts.pushCoverage ?? null,
+    /** Folders deleted since they were listed or remembered: path_exists says no, and a shell cannot start there. */
+    gonePaths: opts.gonePaths ?? [],
+    /** Folders that are there, but where a shell fails to start. */
+    terminalFails: opts.terminalFails ?? [],
+    /** What Repair (locked) answers; null → "Everything is in place." */
+    repairLockResult: opts.repairLockResult ?? null,
     pushResult: opts.pushResult ?? null,
     subPushResult: opts.subPushResult ?? null,
     consoleEntries: opts.consoleEntries ?? [],
@@ -87,7 +96,9 @@ async function openPage(browser, server, scenario, opts = {}) {
     /** {[cmd]: {code, message, guidance}} — that command answers with a refusal. */
     refuse: opts.refuse ?? {},
     autostash: opts.autostash ?? false,
-    treeReset: TREE_RESET_OUTCOME,
+    treeReset: opts.treeReset ?? TREE_RESET_OUTCOME,
+    /** The tree outcome changes_create_branch answers with (null: none). */
+    createBranchTree: opts.createBranchTree ?? null,
     stashDrop: STASH_DROP_OUTCOME,
     branchDelete: BRANCH_DELETE_OUTCOME,
     latency: Number(opts.latency ?? process.env.UI_LATENCY ?? 0) || 0,
@@ -96,15 +107,19 @@ async function openPage(browser, server, scenario, opts = {}) {
     /** The clone page: what git is doing, and how big GitHub says the repo is. */
     cloneProgress: opts.cloneProgress ?? null,
     cloneSize: opts.cloneSize ?? null,
+    /** How long the shell takes to start: the pty answers after this many ms. */
+    terminalOpenDelayMs: opts.terminalOpenDelayMs ?? 0,
+    /** More remembered settings (gitswitch:* keys, without the prefix). */
+    storage: opts.storage ?? null,
   };
-  const page = await browser.newPage();
-  await page.setViewport({ width: cfg.width, height: 900 });
-  await page.evaluateOnNewDocument(
+  // Named, so another engine can be handed the very same bridge (webkit.sh).
+  const bridge = (
     (repos, status, diffText, diffBinary, cfg) => {
       window.__CALLS__ = [];
       window.__SCENARIO__ = status;
       localStorage.clear();
       localStorage.setItem("gitswitch:changes.repo", JSON.stringify("/repos/gitswitch"));
+      for (const [k, v] of Object.entries(cfg.storage ?? {})) localStorage.setItem(`gitswitch:${k}`, JSON.stringify(v));
       if (cfg.pullMode) {
         localStorage.setItem("gitswitch:changes.pullMode", JSON.stringify(cfg.pullMode));
       }
@@ -150,7 +165,8 @@ async function openPage(browser, server, scenario, opts = {}) {
           }
           switch (cmd) {
             case "history_list_repos":
-              return Promise.resolve(cfg.repos ?? repos);
+              // A test clones one "behind the app's back" by setting window.__REPOS__.
+              return Promise.resolve(window.__REPOS__ ?? cfg.repos ?? repos);
             case "changes_repo_status": {
               const sub = args.repoPath && cfg.submoduleStatuses.find((s) => s.status.path === args.repoPath);
               if (sub) return Promise.resolve(sub.status);
@@ -168,7 +184,8 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "history_authors":
               return Promise.resolve([{ name: "Me", email: "me@example.test", commits: 2 }]);
             case "clone_progress":
-              return Promise.resolve(cfg.cloneProgress ?? null);
+              // A test ends a download part-way by setting window.__NO_PROGRESS__.
+              return Promise.resolve(window.__NO_PROGRESS__ ? null : cfg.cloneProgress ?? null);
             case "clone_size_estimate":
               return Promise.resolve(cfg.cloneSize ?? { repo: "owner/repo", kb: 1258291 });
             case "history_head":
@@ -181,6 +198,8 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(cfg.stashDetail);
             case "changes_reset":
               return done("Reset main to origin/main.", args.repoPath).then((r) => ({ ...r, tree: cfg.treeReset }));
+            case "changes_create_branch":
+              return done("create_branch ok", args.repoPath).then((r) => (cfg.createBranchTree ? { ...r, tree: cfg.createBranchTree } : r));
             case "changes_stash_drop":
               return done("Dropped stash@{0}.", args.repoPath).then((r) => ({ ...r, stash: cfg.stashDrop }));
             case "changes_delete_branch":
@@ -220,12 +239,23 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve((args?.sinceId ?? 0) > 0 ? [] : cfg.consoleEntries);
             case "console_clear":
               return Promise.resolve(null);
+            case "path_exists":
+              return Promise.resolve(!cfg.gonePaths.includes(args?.path));
             case "terminal_open":
-              return Promise.resolve("test-session");
+              if (cfg.gonePaths.includes(args?.repoPath)) return Promise.reject(`Command execution error: Not found: ${args.repoPath} no longer exists on disk`);
+              if (cfg.terminalFails.includes(args?.repoPath)) return Promise.reject("Command execution error: Could not open a terminal: no pty");
+              // The session id arrives when the shell has started — at once, or late.
+              return cfg.terminalOpenDelayMs
+                ? new Promise((res) => setTimeout(() => res("test-session"), cfg.terminalOpenDelayMs))
+                : Promise.resolve("test-session");
             case "terminal_write":
             case "terminal_resize":
             case "terminal_close":
               return Promise.resolve(null);
+            case "install_commit_guard":
+              return Promise.resolve("Guard installed");
+            case "uninstall_commit_guard":
+              return Promise.resolve("Guard removed.");
             case "changes_file_diff":
               return Promise.resolve(args.path === "logo.png" ? diffBinary : diffText);
             case "changes_pull":
@@ -240,6 +270,7 @@ async function openPage(browser, server, scenario, opts = {}) {
               if (cfg.subPushResult && args.repoPath !== window.__SCENARIO__.path) return Promise.resolve({ ...cfg.subPushResult, status: statusFor(args.repoPath) });
               return done("Done.");
             case "changes_submodule_update":
+            case "changes_submodule_align":
             case "changes_lfs_pull":
             case "changes_lfs_pull_paths":
               if (cfg.hang) return new Promise(() => {}); // never settles
@@ -296,7 +327,6 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "changes_discard":
             case "changes_abort":
             case "changes_switch_branch":
-            case "changes_create_branch":
             case "changes_rename_branch":
             case "changes_undo_commit":
             case "changes_resolve_side":
@@ -349,6 +379,7 @@ async function openPage(browser, server, scenario, opts = {}) {
                   locked_at: locked ? "2026-09-23T09:15:00Z" : null,
                 },
               };
+              window.__PUSH_NOW__ = state;
               return Promise.resolve({
                 outcome: "applied",
                 message: locked ? "Locked 1 repository. Lock helper installed." : guard ? "Pushes are blocked (guard-rail)." : locked === false && cur.lock.locked ? "Unlocked 1 repository." : "Pushes are allowed again.",
@@ -358,6 +389,7 @@ async function openPage(browser, server, scenario, opts = {}) {
               });
             }
             case "changes_repair_push_lock":
+              if (cfg.repairLockResult) return Promise.resolve({ command: null, job_nonce: null, state: window.__SCENARIO__.push, ...cfg.repairLockResult });
               return Promise.resolve({
                 outcome: "applied",
                 message: "Everything is in place.",
@@ -367,25 +399,38 @@ async function openPage(browser, server, scenario, opts = {}) {
               });
             case "push_lock_finish_manual":
               return Promise.resolve({ outcome: "applied", message: "Unlocked 1 repository.", command: null, job_nonce: null, changed: [], errors: [], bootstrapped: false });
+            case "changes_push_coverage":
+              return Promise.resolve(cfg.pushCoverage ?? { mode: "allowed", submodules: [], uncovered: [], needs_repair: false, summary: "" });
             case "changes_push_state":
+              // A mode changed in this page is what a later read sees, as in the app.
+              if (window.__PUSH_NOW__) return Promise.resolve(window.__PUSH_NOW__);
               if (cfg.pushState) return Promise.resolve({ ...window.__SCENARIO__.push, ...cfg.pushState, lock: { ...window.__SCENARIO__.push.lock, ...(cfg.pushState.lock || {}) } });
               return Promise.resolve({ ...window.__SCENARIO__.push, lock: { ...window.__SCENARIO__.push.lock, locked: false }, blocked: false, repo_blocked: false, reason: "Pushing is allowed from this folder." });
             case "changes_repair_push_block":
               return Promise.resolve({ ...window.__SCENARIO__.push, needs_repair: false });
             case "history_fetch":
               return Promise.resolve({ ok: true, message: "fetched" });
+            case "doctor_check_environment":
+            case "doctor_check_profiles":
+            case "doctor_check_repos":
+            case "doctor_check_keys":
+            case "doctor_check_push_locks":
+              return Promise.resolve([]);
+            case "doctor_check_repo_access":
+              return Promise.resolve([{ id: "remote-not-reachable:/work/app", severity: "warning", title: "@octo cannot see acme/app", detail: "GitHub answered for @octo: not found, with the repo scope.", fix: null, fix_label: null }]);
             default:
               return Promise.resolve(null);
           }
         },
       };
-    },
-    REPOS,
-    scenario,
-    DIFF_TEXT,
-    DIFF_BINARY,
-    cfg
+    }
   );
+  if (opts.bridgeOnly) {
+    return `(${bridge.toString()})(${[REPOS, scenario, DIFF_TEXT, DIFF_BINARY, cfg].map((a) => JSON.stringify(a)).join(",")});`;
+  }
+  const page = await browser.newPage();
+  await page.setViewport({ width: cfg.width, height: 900 });
+  await page.evaluateOnNewDocument(bridge, REPOS, scenario, DIFF_TEXT, DIFF_BINARY, cfg);
   await page.goto(`${server.url}/repo/changes`, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 5000 });
   return page;
@@ -496,15 +541,20 @@ async function openClonePage(browser, server, opts = {}) {
     mode: opts.mode ?? "full",
     /** "hang" keeps the clone running so the progress banner can be looked at. */
     cloneHang: opts.cloneHang ?? false,
+    cloneError: opts.cloneError ?? null,
     cloneProgress: opts.cloneProgress ?? null,
     cloneSize: opts.cloneSize ?? { repo: "me/big-data", kb: 1258291 },
+    profiles: opts.profiles ?? [],
+    url: opts.url ?? "git@github.com:me/big-data.git",
+    submodules: opts.submodules ?? null,
   };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
   await page.evaluateOnNewDocument((cfg) => {
     window.__CALLS__ = [];
     localStorage.clear();
-    localStorage.setItem("gitswitch:sparse.url", JSON.stringify("git@github.com:me/big-data.git"));
+    localStorage.setItem("gitswitch:sparse.url", JSON.stringify(cfg.url));
+    if (cfg.submodules !== null) localStorage.setItem("gitswitch:clone.submodules", JSON.stringify(cfg.submodules));
     localStorage.setItem("gitswitch:sparse.parentDir", JSON.stringify("/repos"));
     localStorage.setItem("gitswitch:clone.mode", JSON.stringify(cfg.mode));
     window.__TAURI_INTERNALS__ = {
@@ -512,7 +562,7 @@ async function openClonePage(browser, server, opts = {}) {
         window.__CALLS__.push({ cmd, args });
         switch (cmd) {
           case "get_profiles":
-            return Promise.resolve([]);
+            return Promise.resolve(cfg.profiles);
           case "lfs_available":
             return Promise.resolve(cfg.lfsTool);
           case "clone_destination_status":
@@ -521,7 +571,7 @@ async function openClonePage(browser, server, opts = {}) {
             return Promise.resolve(true);
           case "full_clone":
           case "sparse_clone":
-            return cfg.cloneHang ? new Promise(() => {}) : Promise.resolve(cfg.cloneResult);
+            return cfg.cloneHang ? new Promise(() => {}) : cfg.cloneError ? Promise.reject(cfg.cloneError) : Promise.resolve(cfg.cloneResult);
           case "clone_size_estimate":
             return Promise.resolve(cfg.cloneSize);
           case "clone_progress":
@@ -537,6 +587,226 @@ async function openClonePage(browser, server, opts = {}) {
   await page.goto(`${server.url}/sparse`, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => document.body.innerText.includes("Clone"), { timeout: 5000 });
   return page;
+}
+
+/**
+ * The GitHub sign-in page against a scripted backend. Each device-flow call
+ * answers from a list, in order: {resolve: value}, {reject: "text"} (sent the
+ * way an AppError is: "Command execution error: text"), or "hold", which parks
+ * the answer on window.__HELD__[cmd] for the test to release. An exhausted poll
+ * list answers authorization_pending. With keepStorage, what the page stored
+ * survives a reload or another page of the app.
+ */
+async function openAuthPage(browser, server, opts = {}) {
+  const cfg = {
+    ghAccounts: opts.ghAccounts ?? [],
+    code: { device_code: "dc", user_code: "ABCD-1234", verification_uri: "https://github.com/login/device", expires_in: opts.expires ?? 120, interval: 1 },
+    codeHold: opts.codeHold ?? false,
+    polls: opts.polls ?? [],
+    verifies: opts.verifies ?? [],
+    logoutError: opts.logoutError ?? null,
+    keepStorage: opts.keepStorage ?? false,
+    /** Logins whose sign-in the backend keeps; keepError: what keeping one answers. */
+    kept: opts.kept ?? [],
+    keepError: opts.keepError ?? null,
+  };
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    if (!cfg.keepStorage || !sessionStorage.getItem("__seeded__")) {
+      localStorage.clear();
+      sessionStorage.setItem("__seeded__", "1");
+    }
+    let accounts = [...cfg.ghAccounts];
+    let polls = 0;
+    let verifies = 0;
+    window.__HELD__ = {};
+    const reply = (cmd, entry, fallback) => {
+      if (entry === "hold") return new Promise((res, rej) => { window.__HELD__[cmd] = { res, rej }; });
+      if (entry && entry.reject !== undefined) return Promise.reject(`Command execution error: ${entry.reject}`);
+      if (entry && entry.resolve !== undefined) return Promise.resolve(entry.resolve);
+      return fallback();
+    };
+    window.__TAURI_INTERNALS__ = {
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args, at: Date.now() });
+        switch (cmd) {
+          case "gh_list_accounts":
+            return accounts.length ? Promise.resolve(accounts) : Promise.reject("Command execution error: No gh accounts found. Run `gh auth login` first.");
+          case "gh_logout":
+            if (cfg.logoutError) return Promise.reject(cfg.logoutError);
+            accounts = accounts.filter((a) => a !== args.account);
+            return Promise.resolve(`Removed ${args.account} from the GitHub CLI`);
+          case "github_device_code":
+            return cfg.codeHold
+              ? new Promise((res, rej) => { window.__HELD__.code = { res: () => res(cfg.code), rej }; })
+              : Promise.resolve(cfg.code);
+          case "github_poll_token":
+            return reply(cmd, cfg.polls[polls++], () => Promise.reject("Command execution error: authorization_pending"));
+          case "verify_github_token":
+            return reply(cmd, cfg.verifies[verifies++], () => Promise.reject("Command execution error: nothing scripted"));
+          case "github_signins":
+            return Promise.resolve(cfg.kept.map((login, i) => ({ login, id: i + 1 })));
+          case "github_signin_keep":
+            return cfg.keepError ? Promise.reject(cfg.keepError) : Promise.resolve(null);
+          case "github_signin_forget":
+            return Promise.resolve(null);
+          case "get_profiles":
+          case "list_ssh_keys":
+            return Promise.resolve([]);
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}/github`, { waitUntil: "networkidle0" });
+  await page.waitForFunction(() => document.body.innerText.includes("Sign in with GitHub"), { timeout: 5000 });
+  return page;
+}
+
+/** The SSH Keys page against a mocked backend: one key from an earlier visit, two gh logins. */
+async function openSshPage(browser, server, opts = {}) {
+  const cfg = {
+    register: opts.register ?? { resolve: "Registered on alice" },
+    noClipboard: opts.noClipboard ?? false,
+    /** Sign-ins kept here: they register keys too. */
+    kept: opts.kept ?? [],
+  };
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    if (cfg.noClipboard) {
+      Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true });
+      document.execCommand = () => false;
+    }
+    window.__TAURI_INTERNALS__ = {
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args });
+        switch (cmd) {
+          case "list_ssh_keys":
+            return Promise.resolve(["/home/me/.ssh/id_ed25519_gitswitch_work"]);
+          case "gh_list_accounts":
+            return Promise.resolve(["alice", "bob"]);
+          case "github_signins":
+            return Promise.resolve(cfg.kept.map((login, i) => ({ login, id: i + 1 })));
+          case "get_public_key":
+            return Promise.resolve("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGitSwitchTestKey me@example.test");
+          case "gh_register_ssh_key":
+            return cfg.register.reject ? Promise.reject(`Command execution error: ${cfg.register.reject}`) : Promise.resolve(cfg.register.resolve);
+          case "resolve_key_account":
+            return Promise.resolve("alice");
+          case "generate_ssh_key":
+            return Promise.resolve(["/home/me/.ssh/id_ed25519_new", "/home/me/.ssh/id_ed25519_new.pub"]);
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}/ssh`, { waitUntil: "networkidle0" });
+  await page.waitForFunction(() => document.body.innerText.includes("Existing SSH Keys"), { timeout: 5000 });
+  return page;
+}
+
+/** Auto Assign against a mocked backend: a profile with a key, one with only a saved account. */
+async function openAutoAssignPage(browser, server, opts = {}) {
+  const page = await browser.newPage();
+  await page.setViewport({ width: opts.width ?? 900, height: 900 });
+  await page.evaluateOnNewDocument(() => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    localStorage.setItem("gitswitch:autoassign.root", JSON.stringify("/w"));
+    const prof = (id, name, key, login, isDefault) => ({ id, name, git_name: name, git_email: `${id}@example.test`, ssh_key_path: key, is_default: isDefault, allow_push: true, signing_enabled: false, directories: [], remote_patterns: [], github_login: login, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" });
+    window.__TAURI_INTERNALS__ = {
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args });
+        switch (cmd) {
+          case "get_profiles":
+            return Promise.resolve([prof("p1", "Personal", "/k", null, true), prof("pk", "Bot", null, "acme-bot", false)]);
+          case "scan_repos":
+            return Promise.resolve([
+              { path: "/w/widgets", remote_url: "git@github.com:acme/widgets.git", owner: "acme", name: "widgets" },
+              { path: "/w/secret", remote_url: "git@github.com:acme/secret.git", owner: "acme", name: "secret" },
+            ]);
+          case "resolve_key_account":
+            return Promise.resolve("me-personal");
+          case "gh_list_accounts":
+            return Promise.resolve(["acme-bot", "me-personal"]);
+          case "gh_get_token":
+            return Promise.resolve(`t-${args.account}`);
+          case "verify_github_token":
+            return Promise.resolve({ id: 1, login: String(args.token).slice(2), name: null, email: null, avatar_url: "" });
+          case "check_repo_access":
+            return Promise.resolve(args.repo === "widgets" && args.token === "t-acme-bot" ? { admin: false, push: true, pull: true } : null);
+          case "update_profile":
+            return Promise.resolve({});
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  });
+  await page.goto(`${server.url}/auto-assign`, { waitUntil: "networkidle0" });
+  await page.waitForFunction(() => document.body.innerText.includes("Auto Assign"), { timeout: 5000 });
+  return page;
+}
+
+/** The profile form against a mocked backend: its profiles, gh logins and GitHub's answers. */
+async function openProfilePage(browser, server, opts = {}) {
+  const cfg = {
+    path: opts.path ?? "/profile/new",
+    profiles: opts.profiles ?? [],
+    ghAccounts: opts.ghAccounts ?? [],
+    user: opts.user ?? null,
+    keyAccount: opts.keyAccount ?? null,
+  };
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    window.__TAURI_INTERNALS__ = {
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args });
+        switch (cmd) {
+          case "get_profiles":
+            return Promise.resolve(cfg.profiles);
+          case "list_ssh_keys":
+            return Promise.resolve([]);
+          case "gh_list_accounts":
+            return Promise.resolve(cfg.ghAccounts);
+          case "gh_get_token":
+            return Promise.resolve("tok");
+          case "verify_github_token":
+            return Promise.resolve(cfg.user ?? { id: 1, login: args?.token ?? "someone", name: null, email: null, avatar_url: "" });
+          case "resolve_key_account":
+            return cfg.keyAccount ? Promise.resolve(cfg.keyAccount) : Promise.reject("the key could not be probed");
+          case "create_profile":
+          case "update_profile":
+            return Promise.resolve({ ...(cfg.profiles[0] ?? {}), ...args });
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}${cfg.path}`, { waitUntil: "networkidle0" });
+  return page;
+}
+
+// webkit.sh loads the built app into the system's WebKit — the engine the app
+// itself runs in on macOS — and needs this same bridge as a script to inject.
+if (process.env.GITSWITCH_BRIDGE_OUT) {
+  const src = await openPage(null, null, SCENARIOS.clean, {
+    bridgeOnly: true,
+    terminalOpenDelayMs: Number(process.env.GITSWITCH_TERMINAL_DELAY_MS ?? 0),
+  });
+  fs.writeFileSync(process.env.GITSWITCH_BRIDGE_OUT, src);
+  process.exit(0);
 }
 
 const server = await serve();
@@ -633,6 +903,64 @@ try {
       return true;
     }, label);
   {
+    // The block reaches into the submodules, and says so; one left out is named, with Repair.
+    const full = { mode: "guardrail", submodules: [{ path: "trinity", blocked: true, locked: false, needs_repair: false, covered: true }, { path: "staging", blocked: true, locked: false, needs_repair: false, covered: true }], uncovered: [], needs_repair: false, summary: "Covers this repository and 2 submodules." };
+    const page = await open(SCENARIOS.blocked, { pushCoverage: full });
+    await page.waitForFunction(() => document.body.innerText.includes("Covers this repository"), { timeout: 4000 }).catch(() => null);
+    ok("a blocked superproject says the block covers its submodules", (await text(page)).includes("Covers this repository and 2 submodules."));
+    await page.close();
+    const partial = { ...full, submodules: [full.submodules[0], { ...full.submodules[1], blocked: false, covered: false }], uncovered: ["staging"], needs_repair: true, summary: "Not covering 1 of 2 submodules: staging — a push from inside it is not stopped." };
+    const page2 = await open(SCENARIOS.blocked, { pushCoverage: partial });
+    await page2.waitForFunction(() => document.body.innerText.includes("Not covering"), { timeout: 4000 }).catch(() => null);
+    const s2 = await text(page2);
+    ok("  a submodule the block does not reach is named, with what that means", s2.includes("Not covering 1 of 2 submodules: staging") && s2.includes("not stopped"));
+    const repair = await button(page2, "Repair — cover them too");
+    ok("  and Repair is offered for it", repair !== null);
+    await repair?.click();
+    await page2.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_repair_push_block"), { timeout: 4000 }).catch(() => null);
+    ok("  which re-applies the block to the repository and its submodules", await page2.evaluate(() => window.__CALLS__.some((c) => c.cmd === "changes_repair_push_block" && c.args.repoPath === "/repos/gitswitch")));
+    await page2.close();
+  }
+  {
+    // Locked, and a submodule's own settings lost part of the block: Repair
+    // needs no password there, so it promises no prompt; afterwards the
+    // coverage is read again, though this repository's own state is the same.
+    const why = "it is locked, but its own settings lost part of the block; Repair puts it back without a password";
+    const cov = { mode: "locked", submodules: [{ path: "stock", blocked: true, locked: true, needs_repair: false, covered: false, why, by_superproject: true, drift: ["mirror-rewrite"] }], uncovered: ["stock"], needs_repair: true, needs_elevation: false, summary: `Not covering 1 of 1 submodule: stock (${why}).` };
+    const page = await open(SCENARIOS.locked, { pushCoverage: cov });
+    await page.waitForFunction(() => document.body.innerText.includes("Not covering"), { timeout: 4000 }).catch(() => null);
+    const labels = await page.evaluate(() => [...document.querySelectorAll("button")].map((b) => b.innerText.trim()));
+    ok("a submodule whose own settings lost part of the lock's block is offered Repair, promising no prompt", labels.includes("Repair — cover them too") && !labels.some((l) => l.includes("cover them too (administrator prompt)")), JSON.stringify(labels.filter((l) => l.startsWith("Repair"))));
+    const title = await page.evaluate(() => [...document.querySelectorAll("p")].find((p) => p.innerText.startsWith("Not covering"))?.title ?? "");
+    ok("  and the line's hover says what was measured", title.includes("stock: mirror-rewrite"), title);
+    const reads = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push_coverage").length);
+    const before = await reads();
+    await (await button(page, "Repair — cover them too"))?.click();
+    await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "changes_push_coverage").length > n, { timeout: 4000 }, before).catch(() => null);
+    ok("  after Repair the coverage is read again, though this repository's own state is unchanged", (await reads()) > before, `${before} -> ${await reads()}`);
+    await page.close();
+  }
+  {
+    // A submodule's lock layers drifted: Repair does need the administrator, and says so.
+    const cov = { mode: "locked", submodules: [{ path: "stock", blocked: true, locked: true, needs_repair: false, covered: false, why: "its lock needs repair", by_superproject: true, drift: ["stanza-stale"] }], uncovered: ["stock"], needs_repair: true, needs_elevation: true, summary: "Not covering 1 of 1 submodule: stock (its lock needs repair)." };
+    const page = await open(SCENARIOS.locked, { pushCoverage: cov });
+    await page.waitForFunction(() => document.body.innerText.includes("Not covering"), { timeout: 4000 }).catch(() => null);
+    ok("a submodule whose lock layers drifted is offered Repair with the administrator prompt named", await page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Repair — cover them too (administrator prompt)")));
+    await page.close();
+  }
+  {
+    // Repair that could not cover everything says so in amber, never a green "in place".
+    const cov = { mode: "locked", submodules: [{ path: "stock", blocked: true, locked: true, needs_repair: false, covered: false, why: "its lock needs repair", by_superproject: true, drift: ["stanza-stale"] }], uncovered: ["stock"], needs_repair: true, needs_elevation: true, summary: "Not covering 1 of 1 submodule: stock (its lock needs repair)." };
+    const message = "Repaired 1 repository. Not covering 1 of 1 submodule: stock (its lock needs repair).";
+    const page = await open(SCENARIOS.locked, { pushCoverage: cov, repairLockResult: { outcome: "incomplete", message } });
+    await page.waitForFunction(() => document.body.innerText.includes("Not covering"), { timeout: 4000 }).catch(() => null);
+    await (await button(page, "Repair — cover them too"))?.click();
+    await page.waitForFunction((m) => document.body.innerText.includes(m), { timeout: 4000 }, message).catch(() => null);
+    const box = await page.evaluate((m) => [...document.querySelectorAll("div")].reverse().find((d) => d.innerText.trim().startsWith(m.slice(0, 20)) && d.className.includes("rounded-lg border"))?.className ?? "", message);
+    ok("a Repair that left a submodule uncovered says so in amber, not as done", box.includes("amber") && !box.includes("emerald"), box);
+    await page.close();
+  }
+  {
     const page = await open(SCENARIOS.blocked);
     const s = await text(page);
     ok("a blocked repo says so on the button", s.includes("Push blocked"));
@@ -654,6 +982,7 @@ try {
     ok("Allowed is disabled (the UI treats the profile block as binding)", (await segment(page, "Allowed"))?.disabled === true);
     ok("  and says to change it in the profile", ((await segment(page, "Allowed"))?.title ?? "").includes("profile"));
     ok("  but Locked is still offered", (await segment(page, "Locked"))?.disabled === false);
+    ok("  and the Guard-rail can still be added for this repository", (await segment(page, "Guard-rail"))?.disabled === false);
     await page.close();
   }
   {
@@ -719,6 +1048,25 @@ try {
     const seg = await segment(page, "Locked");
     ok("on an unsupported platform Locked is disabled", seg?.disabled === true);
     ok("  with a reason in its tooltip", (seg?.title ?? "").includes("not available"));
+    await page.close();
+  }
+  {
+    // A guard-railed repository whose earlier lock reached a submodule that is
+    // still locked: "Allowed" unlocks that submodule, so it asks first and
+    // names it — the administrator prompt must never arrive unannounced.
+    const cov = { mode: "guardrail", submodules: [
+      { path: "trinity", blocked: true, locked: true, needs_repair: false, covered: true, why: "", by_superproject: true },
+      { path: "staging", blocked: true, locked: true, needs_repair: false, covered: true, why: "", by_superproject: false },
+    ], uncovered: [], needs_repair: false, summary: "Covers this repository and 2 submodules." };
+    const page = await open(SCENARIOS.blocked, { pushCoverage: cov });
+    await page.waitForFunction(() => document.body.innerText.includes("Covers this repository"), { timeout: 4000 }).catch(() => null);
+    await clickSegment(page, "Allowed");
+    await sleep(200);
+    const s = await text(page);
+    ok("Allowed on a repository whose lock reached a submodule asks first, naming that submodule and the prompt",
+      s.includes("also unlocks the submodules this repository's lock reached (trinity)") && !s.includes("(trinity, staging)") && (await button(page, "Unlock (administrator prompt)")) !== null,
+      s.slice(s.indexOf("Allowing pushes again"), s.indexOf("Allowing pushes again") + 220));
+    ok("  and nothing has run yet", !(await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "changes_set_push_mode"))));
     await page.close();
   }
   {
@@ -846,7 +1194,7 @@ try {
   // -----------------------------------------------------------------
   section("Update: the latest from upstream, your work on top");
   const stashBox = (page) =>
-    page.evaluate(() => document.querySelector('input[aria-label="Stash uncommitted changes during the sync"]')?.click() ?? false);
+    page.evaluate(() => document.querySelector('input[aria-label="Stash uncommitted changes during the update"]')?.click() ?? false);
   const drawer = (page) => page.$('[role="dialog"][aria-label="Update"]');
   const drawerText = (page) => page.evaluate(() => document.querySelector('[role="dialog"][aria-label="Update"]')?.innerText ?? "");
   const waitDrawer = (page) => page.waitForFunction(() => !!document.querySelector('[role="dialog"][aria-label="Update"]'), { timeout: 4000 });
@@ -897,12 +1245,13 @@ try {
     const s2 = await text(page);
     const run = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_sync_run"));
     ok("  and sends the plan's fingerprint and the choices", run && run.args.stash === true && run.args.bundles === false && run.args.fingerprint.length === 3);
+    ok("  with the page's large-file choice, as Pull takes it", run?.args.withLfs === true, JSON.stringify(run?.args));
     ok("the result is a table per repository, in the outcome's own words", s2.includes("this repository") && s2.includes("aaaa111 → cccc333") && s2.includes("rebased onto 7a9d38a") && s2.includes("fast-forwarded"));
     ok("  every check passed, said so", s2.includes("All 6 checks passed"));
     ok("  the backups are one click away, with the undo commands", s2.includes("Backups: 2 branches"));
     await page.evaluate(() => [...document.querySelectorAll("summary")].find((x) => x.innerText.includes("Backups"))?.click());
     await sleep(200);
-    ok("  the undo command is exact", (await text(page)).includes("git -C /repos/gitswitch reset --hard gitswitch-before-sync-"));
+    ok("  the undo command is exact", (await text(page)).includes("git -C /repos/gitswitch reset --hard gitswitch-before-update-"));
     await page.close();
   }
   {
@@ -950,6 +1299,28 @@ try {
     await page.waitForFunction(() => document.body.innerText.includes("Updating"), { timeout: 4000 });
     const s = await text(page);
     ok("a running update is a job banner that survives leaving the page", s.includes("Updating — fetching, rebasing") && s.includes("keeps running"));
+    await page.close();
+  }
+  {
+    // An Update that downloads a submodule upstream added shows its progress
+    // on the strip, as Download does — and the line goes when that download
+    // is over, while the Update carries on.
+    const page = await open(SCENARIOS.diverged, {
+      hang: true,
+      cloneProgress: { phase: "Submodules", percent: 37, done: 0, total: 1, bytes: "10.00 MiB", rate: "2.00 MiB/s", detail: "libs/new", estimate_kb: 1258291, eta_secs: 603 },
+    });
+    await (await button(page, "Preview update")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("replayed on top"), { timeout: 4000 });
+    await (await button(page, "Update now")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules 37%"), { timeout: 4000 }).catch(() => null);
+    const s = await text(page);
+    ok("while an Update downloads a submodule, the strip says which one, how much has arrived and how long is left",
+      s.includes("Updating") && s.includes("Submodules 37%") && s.includes("libs/new") && s.includes("10.00 MiB of about 1.2 GB") && s.includes("about 10 min left"),
+      s.slice(s.indexOf("Updating"), s.indexOf("Updating") + 200));
+    await page.evaluate(() => { window.__NO_PROGRESS__ = true; });
+    await page.waitForFunction(() => !document.body.innerText.includes("Submodules 37%"), { timeout: 4000 }).catch(() => null);
+    const s2 = await text(page);
+    ok("  and the line goes when that download is over, while the Update runs on", !s2.includes("Submodules 37%") && s2.includes("Updating"));
     await page.close();
   }
   {
@@ -1427,7 +1798,7 @@ try {
     ok("a capped untracked count is shown as a floor", s.includes("2000+ untracked files"));
     ok("a clean submodule says it is up to date", s.includes("up to date with what this repo records"));
     ok("recorded and checked-out commits are both shown", s.includes("dceaf0b") && s.includes("d9b93c5"));
-    ok("uninitialised ones are grouped, not listed 27 times", s.includes("27 not downloaded yet"));
+    ok("gitlinks with no address in .gitmodules are not called missing — no clone can download them", !s.includes("not downloaded yet") && s.includes("27 other submodule entries have no address in .gitmodules"));
     ok("  and it says git cannot fetch them", s.includes("fetch them"));
     await clickInRow(page, "trinity", { text: "Show what changed" });
     await sleep(300);
@@ -1499,7 +1870,9 @@ try {
   {
     // A detached submodule offers a branch at its checkout, named by the person; a recorded commit no remote has is marked on the row.
     const detached = sub({ path: "trinity", name: "trinity", own_branch: null, own_upstream: null, own_unpushed: 2, recorded_on_remote: false, summary: "up to date with what this repo records; detached" });
-    const page = await open(SCENARIOS.submodules, { submodules: [detached], subInner: SUB_INNER });
+    // The switch leaves a submodule nested in trinity elsewhere: the result is trinity's.
+    const createBranchTree = { ...TREE_RESET_OUTCOME, op: "create-branch", dropped: [], dropped_total: 0, backup: null, stash: null, recovery: null, submodule_mismatch: ["inner"] };
+    const page = await open(SCENARIOS.submodules, { submodules: [detached], subInner: SUB_INNER, createBranchTree });
     await page.waitForFunction(() => document.body.innerText.includes("Start a branch here"), { timeout: 4000 });
     const s = await text(page);
     ok("a detached submodule's row offers Start a branch here", s.includes("Start a branch here"));
@@ -1511,6 +1884,44 @@ try {
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_branch"), { timeout: 4000 });
     const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_branch").args);
     ok("  Enter creates the branch at the submodule's checkout and switches to it", call.repoPath === "/repos/gitswitch/trinity" && call.name === "fix/pointer" && call.from === null && call.switchTo === true, JSON.stringify(call));
+    await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Align submodules"), { timeout: 4000 }).catch(() => null);
+    await (await button(page, "Align submodules"))?.click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_align"), { timeout: 4000 }).catch(() => null);
+    const al = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_align").at(-1)?.args ?? null);
+    ok("  a submodule left elsewhere inside it is aligned there, not in the page's repository", al?.repoPath === "/repos/gitswitch/trinity" && JSON.stringify(al?.paths) === '["inner"]', JSON.stringify(al));
+    await page.close();
+  }
+  {
+    // While submodules download, the strip shows git's progress: phase, share, which submodule, bytes and rate.
+    // A submodule that is listed in .gitmodules and not downloaded: the one Download missing fetches.
+    const missing = sub({ path: "libs/sub", name: "sub", initialised: false, actual: null, actual_short: null, own_branch: null, own_upstream: null, state: "not-initialised", summary: "not downloaded yet — Download fetches it (git submodule update --init)" });
+    const page = await open(SCENARIOS.submodules, {
+      submodules: [SUBMODULES[0], missing],
+      subInner: SUB_INNER,
+      hang: true,
+      cloneProgress: { phase: "Submodules", percent: 37, done: 3, total: 8, bytes: "10.00 MiB", rate: "2.00 MiB/s", detail: "libs/sub", estimate_kb: 1258291, eta_secs: 603 },
+    });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 8000 }).catch(() => null);
+    await page.waitForFunction(() => document.body.innerText.includes("Download missing"), { timeout: 8000 }).catch(() => null);
+    const dl = await button(page, "Download missing");
+    const dlState = dl ? await dl.evaluate((e) => ({ disabled: e.disabled, text: e.innerText.trim() })) : null;
+    await dl?.click();
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules 37%"), { timeout: 8000 }).catch(() => null);
+    const s = await text(page);
+    ok("  (the Download button was there and enabled)", dlState !== null && dlState.disabled === false, JSON.stringify(dlState) + " | " + s.slice(s.indexOf("Submodules", s.indexOf("Submodules") + 1), s.indexOf("Submodules", s.indexOf("Submodules") + 1) + 500).replace(/\s+/g, " "));
+    ok("while submodules download, the strip says which one and how far", s.includes("Downloading 1 submodule") && s.includes("Submodules 37%") && s.includes("3 of 8") && s.includes("libs/sub") && s.includes("2.00 MiB/s"), s.includes("Downloading") ? s.slice(s.indexOf("Downloading"), s.indexOf("Downloading") + 160) : "no 'Downloading' on the page: " + s.slice(0, 300).replace(/\s+/g, " "));
+    ok("  with how much of the submodule's size has arrived, and how long is left at that rate", s.includes("10.00 MiB of about 1.2 GB") && s.includes("about 10 min left"), s.slice(s.indexOf("Submodules 37%"), s.indexOf("Submodules 37%") + 140));
+    ok("  as a bar", await page.evaluate(() => !!document.querySelector('[aria-label="Download progress"]')));
+    await page.close();
+  }
+  {
+    // A download that was interrupted (a .git entry, nothing checked out) is not populated: it is offered for download again.
+    const half = sub({ path: "half", name: "half", initialised: true, actual: null, actual_short: null, own_branch: null, own_upstream: null, state: "incomplete", summary: "its download was interrupted — nothing is checked out; Download finishes it (git submodule update --init)" });
+    const page = await open(SCENARIOS.submodules, { submodules: [half, SUBMODULES[0]], subInner: SUB_INNER });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    const s = await text(page);
+    ok("an interrupted download is counted among the ones to download, not the populated", s.includes("Download missing (1)") && s.includes("1 not downloaded yet"), s.slice(s.indexOf("Submodules"), s.indexOf("Submodules") + 300).replace(/\s+/g, " "));
+    ok("  and says what happened to it", s.includes("1 download interrupted — Download finishes it"), s.slice(s.indexOf("not downloaded"), s.indexOf("not downloaded") + 200).replace(/\s+/g, " "));
     await page.close();
   }
   {
@@ -1569,6 +1980,36 @@ try {
     await page.close();
   }
   {
+    // A submodule on a branch of its own with no upstream: its commits rebased onto its remote's latest.
+    const own = sub({ path: "solo", name: "solo", own_branch: "mine", own_upstream: null, latest_ref: "origin/main", summary: "on mine" });
+    const page = await open(SCENARIOS.submodules, { submodules: [...SUBMODULES, own], subInner: SUB_INNER });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    ok("a submodule on a branch without that upstream offers Rebase onto <remote>/<branch>", await clickInRow(page, "solo", { text: "Rebase onto origin/main" }));
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_pull"), { timeout: 4000 }).catch(() => null);
+    const pl = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_pull").at(-1)?.args ?? null);
+    ok("  which rebases inside the submodule onto that branch", pl?.repoPath === "/repos/gitswitch/solo" && pl?.mode === "rebase" && pl?.source === "origin/main", JSON.stringify(pl));
+    await page.close();
+  }
+  {
+    // A checkout ahead of the record — a go-back left it there — can be put back on it.
+    const lagging = sub({ path: "lagging", name: "lagging", ahead: 0, behind: 3, state: "moved", actual: "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0", actual_short: "a0a0a0a", summary: "sits 3 commits behind what this repo records; on main" });
+    const page = await open(SCENARIOS.submodules, { submodules: [...SUBMODULES, lagging], subInner: SUB_INNER });
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+    const rowButtons = (path) =>
+      page.evaluate((p) => {
+        const row = [...document.querySelectorAll("li")].find((r) => r.innerText.includes(p));
+        return row ? [...row.querySelectorAll("button")].map((b) => b.innerText.trim()) : null;
+      }, path);
+    ok("the card's row ahead of the record also offers Check out <recorded>", (await rowButtons("trinity"))?.includes("Check out dceaf0b") === true, JSON.stringify(await rowButtons("trinity")));
+    ok("  one behind it offers Update to instead", !(await rowButtons("lagging"))?.some((b) => b.startsWith("Check out")), JSON.stringify(await rowButtons("lagging")));
+    ok("  one at the record offers neither", !(await rowButtons("delivery"))?.some((b) => b.startsWith("Check out")), JSON.stringify(await rowButtons("delivery")));
+    ok("Check out on trinity", await clickInRow(page, "trinity", { text: "Check out dceaf0b" }));
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_align"), { timeout: 4000 }).catch(() => null);
+    const al = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_align").at(-1)?.args ?? null);
+    ok("  checks out that one path, in the repository", al?.repoPath === "/repos/gitswitch" && JSON.stringify(al?.paths) === '["trinity"]', JSON.stringify(al));
+    await page.close();
+  }
+  {
     const page = await open(SCENARIOS.submodules, { submodules: SUBMODULES, subInner: SUB_INNER });
     await page.waitForFunction(() => document.body.innerText.includes("2000+"), { timeout: 4000 });
     await clickInRow(page, "staging", { text: "Show what changed" });
@@ -1624,7 +2065,9 @@ try {
     const trinity = await rowButtons("trinity");
     ok("a submodule behind its own upstream offers Pull inside with the count", trinity?.includes("Pull inside (11)") === true, JSON.stringify(trinity));
     ok("  but not Update to: its checkout is ahead of the record", !trinity?.some((b) => b.startsWith("Update to")));
+    ok("  nor Rebase onto: its branch already follows origin/main", !trinity?.some((b) => b.startsWith("Rebase onto")), JSON.stringify(trinity));
     ok("  so it offers Record this pointer instead", trinity?.includes("Record this pointer") === true, JSON.stringify(trinity));
+    ok("  and Check out <recorded>, the way back to what the repository records", trinity?.includes("Check out dceaf0b") === true, JSON.stringify(trinity));
     const lag = await rowButtons("lagging");
     ok("a submodule behind the record offers Update to <recorded>", lag?.includes("Update to dceaf0b") === true, JSON.stringify(lag));
     ok("  and not Record this pointer: there is nothing ahead to record", !lag?.includes("Record this pointer"), JSON.stringify(lag));
@@ -1647,11 +2090,23 @@ try {
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_pull"), { timeout: 4000 });
     const pull = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_pull").at(-1).args);
     ok("  pulls inside the submodule, on its own branch", pull.repoPath === "/repos/gitswitch/trinity", JSON.stringify(pull));
+    ok("  with the page's LFS option — the parent's own use of LFS does not decide it", pull.withLfs === true, JSON.stringify(pull));
     ok("  and the scope stays the repository", (await scope()) === "");
     ok("Update to on lagging", await clickInTr("lagging", "Update to"));
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_update"), { timeout: 4000 });
     const upd = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_update").at(-1).args);
     ok("  asks for that one path only, in the repository", upd.repoPath === "/repos/gitswitch" && JSON.stringify(upd.paths) === '["lagging"]', JSON.stringify(upd));
+    // The row's buttons are disabled while the update above settles.
+    await page.waitForFunction(() => {
+      const row = [...document.querySelectorAll("tr")].find((r) => r.innerText.includes("trinity"));
+      const b = row && [...row.querySelectorAll("button")].find((x) => x.innerText.trim() === "Check out dceaf0b");
+      return !!b && !b.disabled;
+    }, { timeout: 4000 }).catch(() => null);
+    ok("Check out on trinity", await clickInTr("trinity", "Check out dceaf0b"));
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_align"), { timeout: 4000 }).catch(() => null);
+    const al = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_align").at(-1)?.args ?? null);
+    ok("  checks out that one path, in the repository (never inside the submodule)", al?.repoPath === "/repos/gitswitch" && JSON.stringify(al?.paths) === '["trinity"]', JSON.stringify(al));
+    await page.waitForFunction(() => ![...document.querySelectorAll("button")].some((b) => b.disabled && b.innerText.trim() === "Work inside"), { timeout: 4000 }).catch(() => null);
     ok("Work inside on delivery", await clickInTr("delivery", "Work inside"));
     await sleep(400);
     ok("  makes it the scope and opens Changes", (await scope()) === "delivery" && (await page.evaluate(() => location.pathname)) === "/repo/changes", `${await scope()} ${await page.evaluate(() => location.pathname)}`);
@@ -1775,7 +2230,7 @@ try {
       path: `/repos/team-${i}`,
       name: `team-repo-${i}`,
       profile_id: `acct-${i}`,
-      profile_name: i === 12 ? "Ethara" : `Team ${i}`,
+      profile_name: i === 12 ? "Acme" : `Team ${i}`,
       profile_email: `me${i}@x.test`,
     }));
     const page = await open(SCENARIOS.clean, { repos: [...REPOS, ...manyAccountRepos] });
@@ -1789,15 +2244,15 @@ try {
     await page.evaluate(() => {
       const i = document.querySelector('input[aria-label="Search"]');
       const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-      setter.call(i, "ethara");
+      setter.call(i, "acme");
       i.dispatchEvent(new Event("input", { bubbles: true }));
     });
     await sleep(200);
     const narrowed = await page.evaluate(() => ({
-      ethara: [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Ethara"),
+      acme: [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Acme"),
       teams: [...document.querySelectorAll("button")].filter((b) => b.innerText.trim().startsWith("Team ")).length,
     }));
-    ok("  and searching it works, ignoring case", narrowed.ethara && narrowed.teams === 0);
+    ok("  and searching it works, ignoring case", narrowed.acme && narrowed.teams === 0);
     await page.close();
   }
   {
@@ -1853,6 +2308,64 @@ try {
   }
 
   // -----------------------------------------------------------------
+  section("The terminal drawer never outgrows the window");
+  {
+    // A remembered 900 px drawer (dragged tall on a big screen) in a 600 px
+    // window: its header, pickers and close button were pushed above the
+    // window's top edge, so it could neither be closed nor shrunk.
+    const geo = (pg) =>
+      pg.evaluate(() => {
+        const d = document.querySelector('[aria-label="Terminal"]');
+        const r = d?.getBoundingClientRect();
+        const close = d?.querySelector('[aria-label="Close the terminal"]')?.getBoundingClientRect();
+        return r ? { top: Math.round(r.top), height: Math.round(r.height), closeTop: Math.round(close?.top ?? -1), win: window.innerHeight } : null;
+      });
+    const page = await open(SCENARIOS.clean, { storage: { "console.height": 900 } });
+    await page.setViewport({ width: 1280, height: 600 });
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal")?.click());
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
+    await sleep(300);
+    let g = await geo(page);
+    ok("a remembered height taller than the window is brought back inside it", !!g && g.top >= 0 && g.height <= g.win, JSON.stringify(g));
+    ok("  so the close button is on screen", !!g && g.closeTop >= 0 && g.closeTop < g.win, JSON.stringify(g));
+    // Dragging the handle to the very top cannot take the drawer past the window either.
+    const handle = await page.$('[aria-label="Resize the terminal"]');
+    const hb = await handle.boundingBox();
+    await page.mouse.move(hb.x + hb.width / 2, hb.y + hb.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(hb.x + hb.width / 2, 0, { steps: 5 });
+    await page.mouse.move(hb.x + hb.width / 2, -50, { steps: 2 });
+    await page.mouse.up();
+    await sleep(200);
+    g = await geo(page);
+    ok("  nor can a drag to the top edge", !!g && g.top >= 0 && g.closeTop >= 0, JSON.stringify(g));
+    // The window shrinks under an open drawer: it follows.
+    await page.setViewport({ width: 1280, height: 450 });
+    await sleep(300);
+    g = await geo(page);
+    ok("  and a window that shrinks under the open drawer brings it along", !!g && g.top >= 0 && g.closeTop >= 0 && g.height <= g.win, JSON.stringify(g));
+    // Half / Full in the header: sized to this window, header still on screen.
+    const clickLabel = (l) => page.evaluate((l) => document.querySelector(`[aria-label="${l}"]`)?.click(), l);
+    await clickLabel("Full window");
+    await sleep(250);
+    g = await geo(page);
+    ok("Full fills the window but for the page's header, with the drawer's header on screen", !!g && g.height >= g.win - 60 && g.height < g.win && g.closeTop >= 0, JSON.stringify(g));
+    await clickLabel("Half the window");
+    await sleep(250);
+    g = await geo(page);
+    ok("  Half is half of it", !!g && Math.abs(g.height - Math.floor(g.win / 2)) <= 2, JSON.stringify(g));
+    // The note has its own close; the drawer's Close stays what it says.
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("What it guards"))?.click());
+    await sleep(150);
+    ok("What it guards opens its note", (await text(page)).includes("not a barrier"));
+    await clickLabel("Close this note");
+    await sleep(150);
+    const t = await text(page);
+    ok("  the note's own × closes the note, not the terminal", !t.includes("not a barrier") && !!(await page.$('[aria-label="Terminal"]:not(.hidden)')) && t.includes("What it guards"));
+    await page.close();
+  }
+
   section("The terminal drawer");
   {
     const page = await open(SCENARIOS.clean);
@@ -1888,6 +2401,71 @@ try {
     ok("  and is honest that the guards can be stepped around", note.includes("not a barrier"));
     await page.close();
   }
+  // The rows the terminal draws, the box they are drawn in, and the rows the
+  // shell was last told it has. When the shell believes in more rows than are
+  // drawn, a full-screen program paints below the visible edge and the last
+  // lines cannot be reached — until something resizes the drawer.
+  const termShape = (page) => page.evaluate(() => {
+    const drawer = document.querySelector('[aria-label="Terminal"]');
+    const rowsEl = drawer?.querySelector(".xterm-rows");
+    const xterm = drawer?.querySelector(".xterm");
+    if (!rowsEl || !xterm) return null;
+    const host = xterm.parentElement.getBoundingClientRect();
+    const rows = rowsEl.children.length;
+    const cell = rows ? rowsEl.children[0].getBoundingClientRect().height : 0;
+    const lastBottom = rows ? rowsEl.lastElementChild.getBoundingClientRect().bottom : 0;
+    const sized = window.__CALLS__.filter((c) => c.cmd === "terminal_open" || c.cmd === "terminal_resize");
+    const last = sized[sized.length - 1];
+    return {
+      rows, cell: Math.round(cell * 100) / 100, boxHeight: Math.round(host.height), lastBottom: Math.round(lastBottom), boxBottom: Math.round(host.bottom),
+      windowHeight: window.innerHeight, toldRows: last?.args?.rows ?? null, toldBy: last?.cmd ?? null,
+      opened: window.__CALLS__.some((c) => c.cmd === "terminal_open"),
+    };
+  });
+  const openTerminal = async (page) => {
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click();
+    });
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"] .xterm-rows'), { timeout: 8000 });
+  };
+  {
+    const page = await open(SCENARIOS.clean);
+    await openTerminal(page);
+    await sleep(1500);
+    const s = await termShape(page);
+    ok("every row the terminal draws is inside the drawer: the last one ends above its bottom edge",
+      !!s && s.rows > 0 && s.lastBottom <= s.boxBottom + 1 && s.lastBottom <= s.windowHeight, JSON.stringify(s));
+    ok("  and the box is used: one more row would not fit",
+      !!s && s.cell > 0 && s.boxHeight - s.rows * s.cell < s.cell, JSON.stringify(s));
+    ok("  the shell was told the same number of rows it is drawn with", !!s && s.toldRows === s.rows, JSON.stringify(s));
+    // The box shrinks without the window changing: the note opens above it.
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.includes("What it guards")).click();
+    });
+    await sleep(900);
+    const n = await termShape(page);
+    ok("when the note opens above it the rows are fitted again, still inside the drawer",
+      !!n && n.rows < s.rows && n.lastBottom <= n.boxBottom + 1, JSON.stringify(n));
+    ok("  and the shell is told the new number", !!n && n.toldRows === n.rows && n.toldBy === "terminal_resize", JSON.stringify(n));
+    await page.close();
+  }
+  {
+    // A shell that takes a while to start: the box changes shape before the
+    // session exists, so the resize has nowhere to go at that moment.
+    const page = await open(SCENARIOS.clean, { terminalOpenDelayMs: 1800 });
+    await openTerminal(page);
+    await sleep(300);
+    await page.evaluate(() => {
+      [...document.querySelectorAll("button")].find((b) => b.innerText.includes("What it guards")).click();
+    });
+    await sleep(2600);
+    const s = await termShape(page);
+    ok("a shell that starts late is still told the rows the terminal ended up with",
+      !!s && s.rows > 0 && s.toldRows === s.rows, JSON.stringify(s));
+    ok("  which fit the drawer", !!s && s.lastBottom <= s.boxBottom + 1 && s.boxHeight - s.rows * s.cell < s.cell, JSON.stringify(s));
+    await page.close();
+  }
   {
     const page = await open(SCENARIOS.clean);
     await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
@@ -1913,8 +2491,8 @@ try {
   {
     // The drawer filters by account, the same way the Changes page does.
     const mixed = [
-      { path: "/repos/work-a", name: "work-a", profile_id: "p2", profile_name: "Ethara", profile_email: "me@work.test" },
-      { path: "/repos/work-b", name: "work-b", profile_id: "p2", profile_name: "Ethara", profile_email: "me@work.test" },
+      { path: "/repos/work-a", name: "work-a", profile_id: "p2", profile_name: "Acme", profile_email: "me@work.test" },
+      { path: "/repos/work-b", name: "work-b", profile_id: "p2", profile_name: "Acme", profile_email: "me@work.test" },
       { path: "/repos/mine-a", name: "mine-a", profile_id: "p1", profile_name: "Kirmada", profile_email: "me@personal.test" },
     ];
     const page = await open(SCENARIOS.clean, { repos: mixed });
@@ -1934,7 +2512,7 @@ try {
     });
     await sleep(200);
     await page.evaluate(() => {
-      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Ethara").click();
+      [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Acme").click();
     });
     await sleep(400);
     ok("  choosing an account narrows the repositories to it", (await drawerText()).includes("work-"));
@@ -1962,6 +2540,254 @@ try {
         [...document.querySelectorAll("input")].some((i) => (i.getAttribute("aria-label") || "").startsWith("Search"))
       ));
     await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("The identity guard is switched from the commit box, on any repository");
+  {
+    const guardCalls = (page) => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "install_commit_guard" || c.cmd === "uninstall_commit_guard").map((c) => ({ cmd: c.cmd, ...c.args })));
+    const clickText = (page, label) =>
+      page.evaluate((l) => {
+        const b = [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === l);
+        if (!b) return false;
+        b.click();
+        return true;
+      }, label);
+    {
+      const page = await open(SCENARIOS.clean);
+      await page.waitForFunction(() => document.body.innerText.includes("Committing as"), { timeout: 4000 });
+      ok("a repository with no wrong commits offers the guard", await clickText(page, "Turn on guard"));
+      await sleep(400);
+      ok("  which installs it with the folder profile's email", JSON.stringify(await guardCalls(page)) === JSON.stringify([{ cmd: "install_commit_guard", repoPath: "/repos/gitswitch", expectedEmail: "me@personal.test" }]), JSON.stringify(await guardCalls(page)));
+      await page.close();
+    }
+    {
+      const page = await open(SCENARIOS.guardOn);
+      await page.waitForFunction(() => document.body.innerText.includes("Committing as"), { timeout: 4000 });
+      ok("a guarded repository says so", (await text(page)).includes("guard on"));
+      ok("  and turns it off again", await clickText(page, "Turn off guard"));
+      await sleep(400);
+      ok("  through the app's uninstall", JSON.stringify(await guardCalls(page)) === JSON.stringify([{ cmd: "uninstall_commit_guard", repoPath: "/repos/gitswitch" }]), JSON.stringify(await guardCalls(page)));
+      await page.close();
+    }
+    {
+      const page = await open(SCENARIOS.guardStale);
+      await page.waitForFunction(() => document.body.innerText.includes("Committing as"), { timeout: 4000 });
+      ok("a guard that expects another email says which", (await text(page)).includes("guard expects old@personal.test"));
+      await page.evaluate(() => {
+        const t = document.querySelector("textarea");
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+        setter.call(t, "a message");
+        t.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await sleep(250);
+      const commit = await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("Commit"))?.disabled);
+      ok("  the commit waits for it, though the identity is right", commit === true && (await text(page)).includes("identity guard still expects old@personal.test"));
+      ok("  Update guard is offered", await clickText(page, "Update guard"));
+      await sleep(400);
+      ok("  and rewrites it with the profile's email", JSON.stringify(await guardCalls(page)) === JSON.stringify([{ cmd: "install_commit_guard", repoPath: "/repos/gitswitch", expectedEmail: "me@personal.test" }]), JSON.stringify(await guardCalls(page)));
+      await page.close();
+    }
+  }
+
+  // -----------------------------------------------------------------
+  section("The terminal opens where the page is");
+  {
+    const opens = (page) => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "terminal_open").map((c) => c.args?.repoPath));
+    const closes = (page) => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "terminal_close").length);
+    const waitOpens = (page, n) =>
+      page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "terminal_open").length >= n, { timeout: 8000 }, n).then(() => true).catch(() => false);
+    const sidebarTerminal = (page) => page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal").click());
+    const ctrlBacktick = async (page) => {
+      await page.keyboard.down("Control");
+      await page.keyboard.press("`");
+      await page.keyboard.up("Control");
+      await sleep(300);
+    };
+    const pickOnPage = async (page, name) => {
+      await page.evaluate(() => {
+        const labels = [...document.querySelectorAll("label")];
+        labels.find((l) => l.innerText.trim() === "Repository").parentElement.querySelector("button").click();
+      });
+      await sleep(250);
+      const picked = await page.evaluate((n) => {
+        const b = [...document.querySelectorAll(".absolute.z-50 button")].find((x) => x.innerText.trim().startsWith(n));
+        if (!b) return false;
+        b.click();
+        return true;
+      }, name);
+      await sleep(400);
+      return picked;
+    };
+    // The drawer's repository picker: the second Select inside the drawer.
+    const drawerPicker = (page) =>
+      page.evaluate(() => {
+        const drawer = document.querySelector('[aria-label="Terminal"]');
+        const triggers = [...drawer.querySelectorAll(".relative > button")];
+        return triggers[1]?.innerText.trim() ?? null;
+      });
+    const openDrawerPicker = (page) =>
+      page.evaluate(() => {
+        const drawer = document.querySelector('[aria-label="Terminal"]');
+        [...drawer.querySelectorAll(".relative > button")][1].click();
+      });
+    {
+      const page = await open(SCENARIOS.clean);
+      await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+      ok("(the page picks argos)", await pickOnPage(page, "argos"));
+      await sidebarTerminal(page);
+      await waitOpens(page, 1);
+      ok("a repository picked on the page is where the sidebar's Terminal opens the shell", (await opens(page)).at(-1) === "/repos/argos", JSON.stringify(await opens(page)));
+      await ctrlBacktick(page);
+      ok("(the page picks gitswitch again)", await pickOnPage(page, "gitswitch"));
+      await ctrlBacktick(page);
+      await waitOpens(page, 2);
+      ok("  Ctrl+` follows the page the same way", (await opens(page)).at(-1) === "/repos/gitswitch", JSON.stringify(await opens(page)));
+      ok("  and the shell it leaves is closed, once", (await closes(page)) === 1, String(await closes(page)));
+      await page.close();
+    }
+    {
+      // The drawer's list was read before a clone was deleted: picking that
+      // clone starts no shell there — the drawer goes back to the page's
+      // folder and says why.
+      const gone = { path: "/repos/gone-clone", name: "gone-clone", profile_id: "p2", profile_name: "Work", profile_email: "me@work.test" };
+      const page = await open(SCENARIOS.clean, { repos: [...REPOS, gone], gonePaths: [gone.path] });
+      await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+      await sidebarTerminal(page);
+      await waitOpens(page, 1);
+      await openDrawerPicker(page);
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll(".absolute.z-50 button")].find((x) => x.innerText.trim().startsWith("gone-clone"))?.click());
+      await sleep(1200);
+      const s = await text(page);
+      ok("a folder deleted since the drawer listed it gets no shell", !(await opens(page)).includes(gone.path), JSON.stringify(await opens(page)));
+      ok("  the drawer goes back to the page's folder, and says why", (await opens(page)).at(-1) === "/repos/gitswitch" && s.includes("gone-clone is no longer on this Mac"), JSON.stringify(await opens(page)));
+      await page.evaluate(() => document.querySelector('[aria-label="Close this note"]')?.click());
+      await sleep(150);
+      ok("  and that note can be closed, leaving the terminal open", !(await text(page)).includes("gone-clone is no longer on this Mac") && (await opens(page)).at(-1) === "/repos/gitswitch");
+      ok("  and no error is left on screen", !s.includes("no longer exists on disk"));
+      await page.close();
+    }
+    {
+      // A shell that could not start says so on a line of its own, not over
+      // the prompt, and the message goes once a shell starts elsewhere.
+      const page = await open(SCENARIOS.clean, { terminalFails: ["/repos/argos"] });
+      await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+      ok("(the page picks argos)", await pickOnPage(page, "argos"));
+      await sidebarTerminal(page);
+      await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"] [role="alert"]'), { timeout: 8000 }).catch(() => null);
+      const geo = await page.evaluate(() => {
+        const d = document.querySelector('[aria-label="Terminal"]');
+        const alert = d?.querySelector('[role="alert"]')?.getBoundingClientRect();
+        const xterm = d?.querySelector(".xterm")?.getBoundingClientRect();
+        return alert && xterm ? { alertBottom: Math.round(alert.bottom), xtermTop: Math.round(xterm.top) } : null;
+      });
+      ok("a shell that could not start says so above the terminal, not over its first line", !!geo && geo.alertBottom <= geo.xtermTop + 1, JSON.stringify(geo));
+      await openDrawerPicker(page);
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll(".absolute.z-50 button")].find((x) => x.innerText.trim().startsWith("gitswitch"))?.click());
+      await waitOpens(page, 2);
+      await sleep(500);
+      ok("  and the message goes once a shell starts in another folder", !(await page.evaluate(() => !!document.querySelector('[aria-label="Terminal"] [role="alert"]'))));
+      await page.close();
+    }
+    {
+      // The page itself remembered the deleted clone: it moves to a
+      // repository that is there, and so does the terminal.
+      const page = await open(SCENARIOS.clean, { storage: { "repo.path": "/repos/gone-clone", "changes.repo": "/repos/gone-clone", "console.repo": "/repos/gone-clone" }, gonePaths: ["/repos/gone-clone"] });
+      await page.waitForFunction(() => JSON.parse(localStorage.getItem("gitswitch:repo.path") ?? '""') !== "/repos/gone-clone", { timeout: 6000 }).catch(() => null);
+      const now = await page.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:repo.path") ?? '""'));
+      ok("a remembered repository deleted since gives way to one that is there", now === "/repos/gitswitch", now);
+      await sidebarTerminal(page);
+      await waitOpens(page, 1);
+      await sleep(400);
+      ok("  and the terminal opens there, never in the deleted folder", !(await opens(page)).includes("/repos/gone-clone") && (await opens(page)).at(-1) === "/repos/gitswitch", JSON.stringify(await opens(page)));
+      await page.close();
+    }
+    {
+      const page = await open(SCENARIOS.clean, { storage: { "console.repo": "/repos/argos" } });
+      await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+      await sidebarTerminal(page);
+      await waitOpens(page, 1);
+      ok("a repository the drawer remembers from an earlier run does not win over the page's", (await opens(page))[0] === "/repos/gitswitch", JSON.stringify(await opens(page)));
+      await page.close();
+    }
+    {
+      const page = await open(SCENARIOS.submodules, { submodules: SUBMODULES, subInner: SUB_INNER });
+      await page.waitForFunction(() => document.body.innerText.includes("Submodules"), { timeout: 4000 });
+      await page.evaluate(() => [...document.querySelectorAll('[role="tab"]')].find((b) => b.innerText.trim().startsWith("Submodules")).click());
+      await page.waitForFunction(() => [...document.querySelectorAll("tr button")].some((b) => b.innerText.trim().startsWith("Work inside")), { timeout: 4000 });
+      await page.evaluate(() => {
+        const row = [...document.querySelectorAll("tr")].find((r) => r.innerText.includes("delivery"));
+        [...row.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("Work inside")).click();
+      });
+      await page.waitForFunction(() => JSON.parse(localStorage.getItem("gitswitch:repo.sub") ?? '""') === "delivery", { timeout: 4000 });
+      await sidebarTerminal(page);
+      await waitOpens(page, 1);
+      await sleep(600);
+      ok("inside a submodule the shell opens in the submodule", (await opens(page)).at(-1) === "/repos/gitswitch/delivery", JSON.stringify(await opens(page)));
+      ok("  is not swapped for another repository afterwards", (await opens(page)).length === 1, JSON.stringify(await opens(page)));
+      const label = await drawerPicker(page);
+      ok("  and the drawer's picker names it", (label ?? "").includes("delivery"), label);
+      await page.close();
+    }
+    {
+      const page = await open(SCENARIOS.submodules, {
+        submodules: SUBMODULES,
+        subInner: SUB_INNER,
+        storage: { "repo.path": "/repos/gitswitch", "repo.sub": "delivery", "changes.repo": "/repos/gitswitch/delivery" },
+      });
+      await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+      await sidebarTerminal(page);
+      await waitOpens(page, 1);
+      await sleep(600);
+      ok("  also when the page starts inside it", JSON.stringify(await opens(page)) === JSON.stringify(["/repos/gitswitch/delivery"]), JSON.stringify(await opens(page)));
+      await page.close();
+    }
+    {
+      const page = await open(SCENARIOS.clean);
+      await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+      await ctrlBacktick(page);
+      await waitOpens(page, 1);
+      await ctrlBacktick(page);
+      await page.evaluate((fresh) => { window.__REPOS__ = fresh; }, [
+        ...REPOS,
+        { path: "/repos/fresh", name: "fresh", profile_id: "p1", profile_name: "Kirmada", profile_email: "me@personal.test" },
+      ]);
+      await ctrlBacktick(page);
+      await sleep(400);
+      await openDrawerPicker(page);
+      await sleep(250);
+      const listed = await page.evaluate(() => [...document.querySelectorAll('[aria-label="Terminal"] .absolute.z-50 button')].map((b) => b.innerText.trim()));
+      ok("a repository cloned since the drawer was last open is in its picker", listed.some((l) => l.startsWith("fresh")), JSON.stringify(listed));
+      // Pick argos inside the drawer: the shell moves there.
+      await page.evaluate(() => [...document.querySelectorAll('[aria-label="Terminal"] .absolute.z-50 button')].find((b) => b.innerText.trim().startsWith("argos")).click());
+      await waitOpens(page, 2);
+      await sleep(300);
+      const [o, c] = [(await opens(page)).length, await closes(page)];
+      await ctrlBacktick(page);
+      await ctrlBacktick(page);
+      await sleep(500);
+      ok("a repository picked inside the drawer survives closing and reopening it while the page stays put",
+        (await opens(page)).length === o && (await closes(page)) === c && (await opens(page)).at(-1) === "/repos/argos", JSON.stringify(await opens(page)));
+      await page.close();
+    }
+    {
+      const page = await open(SCENARIOS.clean);
+      await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+      await sidebarTerminal(page);
+      await waitOpens(page, 1);
+      ok("(the page picks argos with the drawer open)", await pickOnPage(page, "argos"));
+      const clicked = await page.evaluate(() => {
+        const b = [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Terminal here");
+        if (!b) return false;
+        b.click();
+        return true;
+      });
+      await waitOpens(page, 2);
+      ok("the Repository page's Terminal here points an open drawer at the page's repository", clicked && (await opens(page)).at(-1) === "/repos/argos", JSON.stringify(await opens(page)));
+      await page.close();
+    }
   }
 
   // -----------------------------------------------------------------
@@ -2011,6 +2837,10 @@ try {
     await sleep(700);
     const t = await page.evaluate(() => document.querySelector('[aria-label="Terminal"]').innerText);
     ok("a repository you can push to gets no badge at all", !t.includes("Guard-rail") && !t.includes("Locked"));
+    // Push access changed on the page while the drawer is open: the badge follows.
+    await clickSegment(page, "Guard-rail");
+    const followed = await page.waitForFunction(() => document.querySelector('[aria-label="Terminal"]').innerText.includes("Guard-rail"), { timeout: 4000 }).then(() => true).catch(() => false);
+    ok("  turning the guard-rail on in Push access shows it on the open drawer's badge at once", followed);
     await page.close();
   }
 
@@ -2229,6 +3059,24 @@ try {
     ok("the banner says how far the download has got", s.includes("2 of 4 files"));
     ok("  in bytes a person can read", s.includes("1.0 GB of 3.0 GB"));
     ok("  and names the file being transferred", s.includes("media/video/clip.bin"));
+    // Coming back to the window while it downloads does not re-read the whole
+    // folder (that competed with the download and made the app lag).
+    const reads = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status").length);
+    const before = await reads();
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await sleep(400);
+    ok("  coming back to the window during the download does not re-read the folder", (await reads()) === before);
+    await page.close();
+  }
+  {
+    // Control: with nothing running, coming back does re-read it.
+    const page = await open(SCENARIOS.lfsRepo, { lfs: LFS_POINTERS });
+    await page.waitForFunction(() => document.body.innerText.includes("Pull LFS files (5)"), { timeout: 4000 });
+    await sleep(4200); // past the focus refresh's minimum interval
+    const before = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status").length);
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await sleep(400);
+    ok("(control: with nothing running, coming back to the window re-reads the folder)", (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status").length)) > before);
     await page.close();
   }
   {
@@ -2398,7 +3246,34 @@ try {
     await page.waitForFunction(() => document.body.innerText.includes("Submodules 37%"), { timeout: 4000 });
     const s = await text(page);
     ok("while submodules download, the line says which one it is on", s.includes("Submodules 37%") && s.includes("3 of 8") && s.includes("libs/sub"), s.slice(s.indexOf("Submodules"), s.indexOf("Submodules") + 60));
-    ok("  without the GitHub size estimate, which is about the main download", !s.includes("of about"));
+    ok("  with no size and no time left claimed while nothing says either", !s.includes("of about") && !s.includes("left"));
+    await page.close();
+  }
+  {
+    // A submodule in flight: what its host says it weighs, what has arrived, and the time left.
+    const page = await openClonePage(browser, server, {
+      cloneHang: true,
+      cloneProgress: { phase: "Submodules", percent: 40, done: 3, total: 8, bytes: "10.00 MiB", rate: "2.00 MiB/s", detail: "libs/sub", estimate_kb: 1258291, eta_secs: 603 },
+    });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Clone").click());
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules 40%"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a submodule's download shows how much has arrived of its own size, the rate, and how long is left",
+      s.includes("libs/sub") && s.includes("10.00 MiB of about 1.2 GB") && s.includes("2.00 MiB/s") && s.includes("about 10 min left"),
+      s.slice(s.indexOf("Submodules 40%"), s.indexOf("Submodules 40%") + 160));
+    await page.close();
+  }
+  {
+    // A host that does not say how big the repository is: the time left still shows, the size does not.
+    const page = await openClonePage(browser, server, {
+      cloneHang: true,
+      cloneProgress: { phase: "Submodules", percent: 40, done: 3, total: 8, bytes: "10.00 MiB", rate: "2.00 MiB/s", detail: "libs/sub", eta_secs: 4200 },
+    });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Clone").click());
+    await page.waitForFunction(() => document.body.innerText.includes("Submodules 40%"), { timeout: 4000 });
+    const s = await text(page);
+    ok("on a host that does not say the size, the time left still shows and no size is invented",
+      s.includes("about 1 h 10 min left") && !s.includes("of about"), s.slice(s.indexOf("Submodules 40%"), s.indexOf("Submodules 40%") + 160));
     await page.close();
   }
   {
@@ -2410,6 +3285,433 @@ try {
     await page.waitForFunction(() => document.body.innerText.includes("Large files 40%"), { timeout: 4000 });
     const s = await text(page);
     ok("while large files download, the line counts them, with the bytes git-lfs reported and the file it is on", s.includes("2 of 5") && s.includes("1.0 MiB of 4.0 MiB") && s.includes("media/video/intro.mp4") && !s.includes("of about"), s.slice(s.indexOf("Large files"), s.indexOf("Large files") + 90));
+    await page.close();
+  }
+
+  section("Edit Profile shows the profile's own GitHub account");
+  {
+    const home = { id: "p1", name: "Home", git_name: "Some Display Name", git_email: "me@home.test", ssh_key_path: null, github_login: "octo-home", is_default: true, allow_push: true, signing_enabled: false, directories: [], remote_patterns: [], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+    const picked = (page) => page.evaluate(() => {
+      const card = [...document.querySelectorAll("div")].find((d) => d.innerText.toLowerCase().startsWith("autofill from github"));
+      return (card?.querySelector("button")?.innerText ?? "").trim();
+    });
+    for (const [label, profile, keyAccount] of [
+      ["Edit Profile shows the account the profile records, though its git username is a display name", home, null],
+      ["  even when its key cannot be probed", { ...home, ssh_key_path: "/k/id_home" }, null],
+      ["  however the stored login is spelled", { ...home, github_login: "@Octo-Home" }, null],
+    ]) {
+      const page = await openProfilePage(browser, server, { path: "/profile/p1/edit", profiles: [profile], ghAccounts: ["octo-work", "octo-home"], keyAccount });
+      await page.waitForFunction(() => document.body.innerText.toLowerCase().includes("autofill from github"), { timeout: 5000 }).catch(() => null);
+      await page.waitForFunction(() => {
+        const card = [...document.querySelectorAll("div")].find((d) => d.innerText.toLowerCase().startsWith("autofill from github"));
+        return (card?.querySelector("button")?.innerText ?? "").includes("octo-home");
+      }, { timeout: 4000 }).catch(() => null);
+      ok(label, (await picked(page)).includes("octo-home"), await picked(page));
+      if (profile === home) {
+        ok("  the identity fields are left as saved", await page.evaluate(() => document.querySelector('input[placeholder="Your git user.name"]')?.value) === "Some Display Name");
+      }
+      await page.close();
+    }
+  }
+
+  section("Profiles: HTTPS clones push over SSH with the profile's key");
+  {
+    const work = { id: "p2", name: "Work", git_name: "octo-work", git_email: "me@work.test", ssh_key_path: "/k/id_work", github_login: "octo-work", is_default: false, allow_push: true, signing_enabled: false, directories: ["/w"], remote_patterns: [], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+    const box = (pg) =>
+      pg.evaluate(() => {
+        const i = [...document.querySelectorAll("label")].find((x) => x.innerText.includes("Push HTTPS clones over SSH"))?.querySelector('input[type="checkbox"]');
+        return i ? JSON.stringify({ checked: i.checked, disabled: i.disabled }) : "missing";
+      });
+    const page = await openProfilePage(browser, server, { path: "/profile/p2/edit", profiles: [work] });
+    await page.waitForFunction(() => document.body.innerText.includes("Push HTTPS clones over SSH"), { timeout: 5000 }).catch(() => null);
+    ok("a profile with a key offers to push its HTTPS clones over SSH, off until turned on", (await box(page)) === JSON.stringify({ checked: false, disabled: false }), await box(page));
+    await page.evaluate(() => [...document.querySelectorAll("label")].find((x) => x.innerText.includes("Push HTTPS clones over SSH"))?.querySelector('input[type="checkbox"]')?.click());
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Update Profile")?.click());
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "update_profile"), { timeout: 4000 }).catch(() => null);
+    const sent = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "update_profile")?.args ?? null);
+    ok("  turning it on is saved as on", sent?.pushOverSsh === true, JSON.stringify(sent));
+    await page.close();
+    const nokey = await openProfilePage(browser, server, { path: "/profile/p2/edit", profiles: [{ ...work, ssh_key_path: null }] });
+    await nokey.waitForFunction(() => document.body.innerText.includes("Push HTTPS clones over SSH"), { timeout: 5000 }).catch(() => null);
+    ok("  without a key it cannot be on", (await box(nokey)) === JSON.stringify({ checked: false, disabled: true }), await box(nokey));
+    await nokey.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("GitHub CLI accounts: removing one");
+  {
+    const clickText = (page, label) =>
+      page.evaluate((l) => {
+        const b = [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === l);
+        if (!b) return false;
+        b.click();
+        return true;
+      }, label);
+    const openRemove = (page) => page.evaluate(() => document.querySelector('button[title="Remove this account from the GitHub CLI"]')?.click());
+    {
+      const page = await openAuthPage(browser, server, { ghAccounts: ["alice", "bob"], logoutError: "Command execution error: gh logout failed for alice: no accounts matched that criteria" });
+      await page.waitForFunction(() => document.body.innerText.includes("alice"), { timeout: 4000 });
+      await openRemove(page);
+      await sleep(200);
+      await clickText(page, "Remove Account");
+      await sleep(400);
+      const s = await text(page);
+      ok("a failed removal says why, inside the dialog", s.includes("Remove GitHub Account?") && s.includes("no accounts matched that criteria"), s.slice(0, 300));
+      ok("  and Remove Account can be pressed again", await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Remove Account")?.disabled === false));
+      await clickText(page, "Cancel");
+      await sleep(200);
+      await openRemove(page);
+      await sleep(200);
+      ok("  reopening the dialog starts clean", !(await text(page)).includes("no accounts matched"));
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { ghAccounts: ["alice", "bob"] });
+      await page.waitForFunction(() => document.body.innerText.includes("alice"), { timeout: 4000 });
+      await openRemove(page);
+      await sleep(200);
+      await clickText(page, "Remove Account");
+      await sleep(500);
+      const s = await text(page);
+      ok("a successful removal closes the dialog", !s.includes("Remove GitHub Account?"));
+      ok("  and the list is read again, without the account", (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "gh_list_accounts").length)) >= 2 && !s.includes("alice") && s.includes("bob"));
+      await page.close();
+    }
+  }
+
+  section("GitHub sign-in: a way out of every wait");
+  {
+    const signIn = (page) => page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
+    const polls = (page) => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "github_poll_token").length);
+    {
+      const page = await openAuthPage(browser, server, { codeHold: true });
+      await signIn(page);
+      await page.waitForFunction(() => document.body.innerText.includes("Requesting a sign-in code"), { timeout: 4000 });
+      ok("while a sign-in code is requested, the page offers Cancel", await page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Cancel")));
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Cancel")?.click());
+      await sleep(300);
+      const s = await text(page);
+      ok("  Cancel there returns to both sign-in choices", s.includes("GitHub Device Authorization") && s.includes("Use GitHub CLI"));
+      await page.evaluate(() => window.__HELD__.code?.res());
+      await sleep(2500);
+      ok("  a code that arrives after Cancel is neither shown nor polled for", !(await text(page)).includes("ABCD-1234") && (await polls(page)) === 0);
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { codeHold: true });
+      await signIn(page);
+      await page.waitForFunction(() => document.body.innerText.includes("Requesting a sign-in code"), { timeout: 4000 });
+      await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Profiles"))?.click());
+      await sleep(300);
+      await page.evaluate(() => window.__HELD__.code?.res());
+      await sleep(2500);
+      ok("a code that arrives after the page is left starts no polling", (await polls(page)) === 0);
+      await page.close();
+    }
+  }
+
+  section("GitHub sign-in reaches Connected! through failures that are not GitHub's answer");
+  {
+    const user = { id: 4242, login: "octo-signin", name: "Octo Signin", email: null, avatar_url: "" };
+    const page = await openAuthPage(browser, server, {
+      polls: [
+        { reject: "authorization_pending" },
+        { reject: "Failed to poll for token: error sending request for url (https://github.com/login/oauth/access_token): operation timed out" },
+        { reject: "GitHub returned 502 Bad Gateway: " },
+        { reject: "slow_down" },
+        { resolve: { access_token: "gho_test", token_type: "bearer", scope: "read:user" } },
+      ],
+      verifies: [{ reject: "HTTP request failed: connection reset" }, { resolve: user }],
+    });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
+    const stillTrying = await page.waitForFunction(() => document.body.innerText.includes("still trying"), { timeout: 8000 }).then(() => true).catch(() => false);
+    ok("a check GitHub did not answer keeps the code on screen, and the page says it is still trying", stillTrying && (await text(page)).includes("ABCD-1234"));
+    const connected = await page.waitForFunction(() => document.body.innerText.includes("Connected!"), { timeout: 30000 }).then(() => true).catch(() => false);
+    const calls = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "github_poll_token" || c.cmd === "verify_github_token").map((c) => ({ cmd: c.cmd, at: c.at, token: c.args?.token })));
+    const pollsAt = calls.filter((c) => c.cmd === "github_poll_token").map((c) => c.at);
+    const verifies = calls.filter((c) => c.cmd === "verify_github_token");
+    ok("the device-flow sign-in reaches Connected! with the account's login", connected && (await text(page)).includes("@octo-signin"));
+    ok("  a timed-out check or a 502 while waiting does not end the sign-in", pollsAt.length === 5, String(pollsAt.length));
+    ok("  after slow_down the next check waits at least 5 s longer", pollsAt.length === 5 && pollsAt[4] - pollsAt[3] >= 5500, String(pollsAt[4] - pollsAt[3]));
+    ok("  a token GitHub granted is checked again, not polled for again", verifies.length === 2 && verifies.every((v) => v.token === "gho_test") && pollsAt.length === 5);
+    await page.close();
+  }
+
+  section("A GitHub sign-in fills a profile later, as a gh login does");
+  {
+    const user = { id: 4242, login: "octo-signin", name: "Octo Signin", email: null, avatar_url: "" };
+    const page = await openAuthPage(browser, server, {
+      keepStorage: true,
+      kept: ["octo-signin"],
+      polls: [{ resolve: { access_token: "gho_test", token_type: "bearer", scope: "read:user" } }],
+      verifies: [{ resolve: user }],
+    });
+    const field = (label) =>
+      page.evaluate((l) => [...document.querySelectorAll("label")].find((x) => x.innerText.trim() === l)?.parentElement.querySelector("input")?.value ?? null, label);
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
+    await page.waitForFunction(() => document.body.innerText.includes("Connected!"), { timeout: 8000 });
+    ok("the sign-in itself is kept — through the backend, with the token GitHub granted", await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "github_signin_keep" && c.args?.token === "gho_test")));
+    ok("  and the Connected screen says what that gives", (await text(page)).includes("keeps the sign-in in this computer's keychain"));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Create Profile from GitHub")?.click());
+    await page.waitForFunction(() => [...document.querySelectorAll("label")].some((l) => l.innerText.trim() === "Git Email"), { timeout: 4000 });
+    await sleep(300);
+    ok("Create Profile from GitHub fills the login and the no-reply email, as the form's autofill does",
+      (await field("Git Username")) === "octo-signin" && (await field("Git Email")) === "4242+octo-signin@users.noreply.github.com",
+      `${await field("Git Username")} / ${await field("Git Email")}`);
+    ok("  the account is preselected in Autofill from GitHub", (await text(page)).includes("octo-signin · signed in with GitHub"));
+    await page.goto(`${server.url}/profile/new`, { waitUntil: "networkidle0" });
+    await page.waitForFunction(() => document.body.innerText.toLowerCase().includes("autofill from github"), { timeout: 4000 }).catch(() => null);
+    ok("with no gh login, the profile form offers Autofill from the account signed in with GitHub", (await text(page)).toLowerCase().includes("autofill from github"));
+    await page.evaluate(() => {
+      const card = [...document.querySelectorAll("div")].find((d) => d.innerText.toLowerCase().startsWith("autofill from github"));
+      card?.querySelector("button")?.click();
+    });
+    await sleep(250);
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("octo-signin · signed in with GitHub") && b.closest(".absolute"))?.click());
+    await sleep(500);
+    ok("  picking it fills the same login and email", (await field("Git Username")) === "octo-signin" && (await field("Git Email")) === "4242+octo-signin@users.noreply.github.com");
+    ok("  without asking gh for a token", !(await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "gh_get_token"))));
+    await page.goto(`${server.url}/github`, { waitUntil: "networkidle0" });
+    await page.waitForFunction(() => document.body.innerText.includes("Signed in with GitHub on this computer"), { timeout: 4000 }).catch(() => null);
+    ok("the sign-in is listed on the GitHub page after a reload", (await text(page)).includes("Signed in with GitHub on this computer") && (await text(page)).includes("octo-signin"));
+    ok("  as kept in the keychain", (await text(page)).includes("Sign-in kept in the keychain"));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Forget")?.click());
+    await sleep(300);
+    ok("  Forget forgets the kept sign-in as well", await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "github_signin_forget" && c.args?.login === "octo-signin")));
+    await page.goto(`${server.url}/profile/new`, { waitUntil: "networkidle0" });
+    await sleep(400);
+    ok("  and once forgotten, the form no longer offers it", !(await text(page)).toLowerCase().includes("autofill from github"));
+    await page.close();
+  }
+
+  {
+    // A credential store that refuses: the sign-in still connects, and says
+    // what is missing without it.
+    const user = { id: 4242, login: "octo-signin", name: "Octo Signin", email: null, avatar_url: "" };
+    const page = await openAuthPage(browser, server, {
+      keepError: "Command execution error: The system's credential store refused it: no keychain",
+      polls: [{ resolve: { access_token: "gho_test", token_type: "bearer", scope: "read:user" } }],
+      verifies: [{ resolve: user }],
+    });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
+    await page.waitForFunction(() => document.body.innerText.includes("Connected!"), { timeout: 8000 }).catch(() => null);
+    const s = await text(page);
+    ok("a sign-in the keychain refused still connects, and says repositories and keys need gh for it", s.includes("Connected!") && s.includes("could not be kept on this computer") && s.includes("no keychain"));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Autofill fills the account's own git identity");
+  {
+    const scoped = { id: 42, login: "octo-home", name: "Octo Home", email: null, avatar_url: "", emails: ["me@home.test", "alt@home.test"], primary_email: "me@home.test", email_scope_missing: false };
+    const unscoped = { ...scoped, emails: [], primary_email: null, email_scope_missing: true };
+    const pick = async (page, login) => {
+      await page.waitForFunction(() => document.body.innerText.toLowerCase().includes("autofill from github"), { timeout: 5000 }).catch(() => null);
+      await page.evaluate(() => {
+        const card = [...document.querySelectorAll("div")].find((d) => d.innerText.toLowerCase().startsWith("autofill from github"));
+        card?.querySelector("button")?.click();
+      });
+      await sleep(250);
+      await page.evaluate((l) => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === l)?.click(), login);
+      await sleep(600);
+    };
+    const value = (page, placeholder) => page.evaluate((ph) => document.querySelector(`input[placeholder="${ph}"]`)?.value ?? null, placeholder);
+    {
+      const page = await openProfilePage(browser, server, { path: "/profile/new", ghAccounts: ["octo-home"], user: scoped });
+      await pick(page, "octo-home");
+      ok("the git username is the login, not the display name", (await value(page, "Your git user.name")) === "octo-home");
+      ok("the git email is the account's primary address, not the no-reply one", (await value(page, "your@email.com")) === "me@home.test", await value(page, "your@email.com"));
+      const t = await text(page);
+      ok("  the no-reply and the other verified address are one click away", t.includes("42+octo-home@users.noreply.github.com") && t.includes("alt@home.test"));
+      await page.close();
+    }
+    {
+      const page = await openProfilePage(browser, server, { path: "/profile/new", ghAccounts: ["octo-home"], user: unscoped });
+      await pick(page, "octo-home");
+      ok("without user:email the page says how to share the private addresses", (await text(page)).includes("gh auth refresh -h github.com -s user:email"));
+      await page.close();
+    }
+    {
+      const stored = { id: "p1", name: "Home", git_name: "octo-home", git_email: "me@home.test", ssh_key_path: null, is_default: true, allow_push: true, signing_enabled: false, directories: [], remote_patterns: [], github_login: "octo-home", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+      const page = await openProfilePage(browser, server, { path: "/profile/p1/edit", profiles: [stored], ghAccounts: ["octo-home"], user: unscoped });
+      await page.waitForFunction(() => document.querySelector('input[placeholder="your@email.com"]')?.value === "me@home.test", { timeout: 5000 }).catch(() => null);
+      await pick(page, "octo-home");
+      ok("re-picking a profile's own account keeps its stored address when the token cannot read the account's", (await value(page, "your@email.com")) === "me@home.test", await value(page, "your@email.com"));
+      await page.close();
+    }
+  }
+
+  // -----------------------------------------------------------------
+  section("SSH Keys: a key made on an earlier visit can be registered from its row");
+  {
+    const clickText = (page, label) =>
+      page.evaluate((l) => {
+        const b = [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === l);
+        if (!b) return false;
+        b.click();
+        return true;
+      }, label);
+    const registerFromRow = async (page) => {
+      await clickText(page, "Register");
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Select an account…"))?.click());
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === "alice")?.click());
+      await sleep(200);
+      // The row's own Register button, inside the expanded row.
+      await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Register" && !b.disabled);
+        buttons[buttons.length - 1]?.click();
+      });
+      await sleep(600);
+    };
+    {
+      const page = await openSshPage(browser, server);
+      await registerFromRow(page);
+      const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "gh_register_ssh_key")?.args ?? null);
+      ok("a key from an earlier visit is registered from its row", call?.keyPath === "/home/me/.ssh/id_ed25519_gitswitch_work" && call?.account === "alice", JSON.stringify(call));
+      ok("  and the row says which account it authenticates as", (await text(page)).includes("authenticates as") && (await text(page)).includes("alice"));
+      await page.close();
+    }
+    {
+      // A sign-in kept here registers keys as well as a gh login does.
+      const page = await openSshPage(browser, server, { kept: ["octo-kept"], register: { resolve: "Registered on octo-kept" } });
+      await clickText(page, "Register");
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Select an account…"))?.click());
+      await sleep(250);
+      const offered = await page.evaluate(() => [...document.querySelectorAll(".absolute button")].map((b) => b.innerText.trim()));
+      ok("a sign-in kept here is offered for registering a key, beside the gh logins", offered.includes("octo-kept (signed in here)") && offered.includes("alice"), JSON.stringify(offered));
+      await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === "octo-kept (signed in here)")?.click());
+      await sleep(200);
+      await page.evaluate(() => {
+        const buttons = [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Register" && !b.disabled);
+        buttons[buttons.length - 1]?.click();
+      });
+      await sleep(600);
+      const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "gh_register_ssh_key")?.args ?? null);
+      ok("  and registering with it names that sign-in", call?.account === "signin:octo-kept", JSON.stringify(call));
+      await page.close();
+    }
+    {
+      const page = await openSshPage(browser, server, { register: { reject: "This gh login can't add SSH keys to alice. Grant it once with: gh auth refresh -h github.com -s admin:public_key, then press Register again." } });
+      await registerFromRow(page);
+      ok("a login without the key scope is told the command that fixes it", (await text(page)).includes("gh auth refresh"));
+      await page.close();
+    }
+    {
+      const page = await openSshPage(browser, server, { noClipboard: true });
+      await clickText(page, "Copy public key");
+      await sleep(400);
+      ok("a copy that fails says so", (await text(page)).includes("Couldn't copy"));
+      await page.close();
+    }
+    {
+      const page = await openSshPage(browser, server);
+      await page.type('input[placeholder="e.g., work, personal"]', "new");
+      await page.type('input[placeholder="your@email.com"]', "me@example.test");
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("Generate Key"))?.click());
+      await page.waitForFunction(() => document.body.innerText.includes("Next: Test Connection"), { timeout: 4000 }).catch(() => null);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Next: Test Connection"))?.click());
+      await page.waitForFunction(() => document.body.innerText.includes("Test SSH Connection"), { timeout: 4000 }).catch(() => null);
+      ok("the Test step has a way back", await clickText(page, "Back"));
+      await sleep(250);
+      ok("  to the key", (await text(page)).includes("Your Public Key"));
+      await page.close();
+    }
+  }
+
+  section("Auto Assign: a profile without a usable key is matched by its saved account");
+  {
+    const page = await openAutoAssignPage(browser, server, { width: 900 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Scan")?.click());
+    await page.waitForFunction(() => document.body.innerText.includes("2 repos found"), { timeout: 8000 }).catch(() => null);
+    await sleep(300);
+    const t = await text(page);
+    ok("a profile without an SSH key is proposed through its saved GitHub account", t.includes("Bot (acme-bot · saved account)"), t.slice(t.indexOf("repos found"), t.indexOf("repos found") + 300));
+    ok("  and the reason shows at 900 px", await page.evaluate(() => [...document.querySelectorAll("main span, main div")].some((el) => el.innerText.trim().startsWith("push · acme-bot") && el.getBoundingClientRect().width > 0)));
+    ok("a repository no account can see says why", t.includes("no account has access"));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("Apply 1 assignment"))?.click());
+    await sleep(500);
+    const upd = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "update_profile").map((c) => c.args));
+    ok("Apply assigns it to that profile", upd.some((a) => a.id === "pk" && (a.directories ?? []).includes("/w/widgets")), JSON.stringify(upd));
+    await page.close();
+  }
+
+  section("Leaving a page and coming back keeps where you were");
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll('a[role="tab"]')].find((a) => a.innerText.trim().startsWith("History"))?.click());
+    await sleep(400);
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Doctor"))?.click());
+    await sleep(400);
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Repository"))?.click());
+    await sleep(500);
+    ok("coming back to Repository opens the tab you left, History — not Changes", (await page.evaluate(() => location.pathname)) === "/repo/history");
+    await page.close();
+  }
+  {
+    const WORK = { id: "p2", name: "Work", git_name: "Me At Work", git_email: "me@work.test", ssh_key_path: "/Users/me/.ssh/id_work", is_default: false, allow_push: true, signing_enabled: false, directories: ["/work"], remote_patterns: [], github_login: null, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+    const page = await openClonePage(browser, server, { profiles: [WORK] });
+    await page.evaluate(() => {
+      const label = [...document.querySelectorAll("label")].find((l) => l.innerText.trim() === "Clone as");
+      label?.parentElement.querySelector("button")?.click();
+    });
+    await sleep(250);
+    await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim().startsWith("Work"))?.click());
+    await sleep(200);
+    await page.type('input[placeholder="Defaults to the repo name"]', "data-work");
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Doctor"))?.click());
+    await sleep(400);
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Clone"))?.click());
+    await sleep(500);
+    const asLabel = await page.evaluate(() => [...document.querySelectorAll("label")].find((l) => l.innerText.trim() === "Clone as")?.parentElement.querySelector("button")?.innerText.trim() ?? "");
+    const folder = await page.evaluate(() => document.querySelector('input[placeholder="Defaults to the repo name"]')?.value ?? "");
+    ok("Clone as and the folder name are what you chose, after visiting another page", asLabel.startsWith("Work") && folder === "data-work", `${asLabel} / ${folder}`);
+    await page.close();
+  }
+
+  section("Doctor: the GitHub access check");
+  {
+    const page = await open(SCENARIOS.clean);
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim().startsWith("Doctor"))?.click());
+    await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Check now"), { timeout: 4000 }).catch(() => null);
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Check now")?.click());
+    await page.waitForFunction(() => document.body.innerText.includes("@octo cannot see acme/app"), { timeout: 4000 }).catch(() => null);
+    ok("Doctor's access check lists what it found", (await text(page)).includes("@octo cannot see acme/app"));
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Run checks")?.click());
+    await sleep(700);
+    ok("  a re-run of the other checks keeps it", (await text(page)).includes("@octo cannot see acme/app"));
+    ok("  and the access check can be run again", (await page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Check again"))) === true);
+    await page.close();
+  }
+
+  section("A gitswitch:// link that started the app");
+  {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 900 });
+    await page.evaluateOnNewDocument(() => {
+      window.__CALLS__ = [];
+      localStorage.clear();
+      window.__TAURI_INTERNALS__ = {
+        transformCallback: () => 1,
+        invoke: async (cmd, args) => {
+          window.__CALLS__.push({ cmd, args });
+          if (cmd === "plugin:event|listen") return 1;
+          // The link came before the page listened: the backend kept it.
+          if (cmd === "deep_link_take") return "/doctor";
+          if (cmd === "get_profiles" || cmd.startsWith("doctor_check")) return [];
+          return null;
+        },
+      };
+    });
+    await page.goto(`${server.url}/`, { waitUntil: "networkidle0" });
+    await page.waitForFunction(() => location.pathname === "/doctor", { timeout: 4000 }).catch(() => null);
+    const where = await page.evaluate(() => location.pathname);
+    ok("a link that started the app opens the page it names", where === "/doctor", where);
+    const order = await page.evaluate(() => window.__CALLS__.map((c) => c.cmd).filter((c) => c === "plugin:event|listen" || c === "deep_link_take"));
+    ok("  collected once the page listens, so a link after that is not missed either", order.join(",") === "plugin:event|listen,deep_link_take", order.join(","));
     await page.close();
   }
 
@@ -2428,7 +3730,7 @@ try {
   {
     const page = await openClonePage(browser, server, {
       cloneHang: true,
-      cloneProgress: { phase: "Receiving objects", percent: 45, done: 556, total: 1234, bytes: "10.00 MiB", rate: "2.00 MiB/s" },
+      cloneProgress: { phase: "Receiving objects", percent: 45, done: 556, total: 1234, bytes: "10.00 MiB", rate: "2.00 MiB/s", estimate_kb: 1258291, eta_secs: 603 },
     });
     await page.waitForFunction(() => document.body.innerText.includes("About 1.2 GB on GitHub"), { timeout: 4000 });
     ok("before cloning, the page says how big GitHub says the repository is", true);
@@ -2439,6 +3741,25 @@ try {
     ok("  with how many objects, how much has arrived of the estimate, and the rate", s.includes("556 of 1,234") && s.includes("10.00 MiB of about 1.2 GB") && s.includes("2.00 MiB/s"));
     ok("  and how long is left at that rate", s.includes("about 10 min left"), s.slice(s.indexOf("2.00 MiB/s"), s.indexOf("2.00 MiB/s") + 40));
     ok("  as a bar", await page.evaluate(() => !!document.querySelector('[aria-label="Clone progress"]')));
+    await page.close();
+  }
+  {
+    const page = await openClonePage(browser, server, { url: "git@gh-work:me/big-data.git" });
+    const shown = await page
+      .waitForFunction(() => document.body.innerText.includes("About 1.2 GB on GitHub"), { timeout: 4000 })
+      .then(() => true)
+      .catch(() => false);
+    const asked = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "clone_size_estimate").map((c) => c.args?.url));
+    ok("an address through an SSH alias shows GitHub's size before cloning", shown && asked.includes("git@gh-work:me/big-data.git"), JSON.stringify(asked));
+    const line = await page.evaluate(() => document.querySelector('[aria-label="Repository size"]')?.innerText ?? "");
+    ok("  and says the submodules download on top of it", line.includes("submodules download on top"), line);
+    await page.close();
+  }
+  {
+    const page = await openClonePage(browser, server, { submodules: false });
+    await page.waitForFunction(() => document.body.innerText.includes("About 1.2 GB on GitHub"), { timeout: 4000 }).catch(() => null);
+    const line = await page.evaluate(() => document.querySelector('[aria-label="Repository size"]')?.innerText ?? "");
+    ok("  but not when submodules are left out", line.includes("About 1.2 GB") && !line.includes("submodules"), line);
     await page.close();
   }
   const lfsBox = (page) => page.$('input[aria-label="Also download Git LFS files"]');
@@ -2476,6 +3797,17 @@ try {
     const s = await text(page);
     ok("Refresh drops the result card, as leaving the page would", !s.includes("Cloned big-data") && !s.includes("Downloaded 5 large files"));
     ok("  and keeps the form", await page.evaluate(() => [...document.querySelectorAll("input")].some((i) => i.value.includes("big-data"))));
+    await page.close();
+  }
+  {
+    // A failed clone's red message goes with Refresh too.
+    const page = await openClonePage(browser, server, { cloneError: "git clone failed: Repository not found." });
+    await clickClone(page);
+    await page.waitForFunction(() => document.body.innerText.includes("Repository not found"), { timeout: 4000 }).catch(() => null);
+    ok("a failed clone shows its error", (await text(page)).includes("Repository not found"));
+    await (await button(page, "Refresh"))?.click();
+    await page.waitForFunction(() => !document.body.innerText.includes("Repository not found"), { timeout: 4000 }).catch(() => null);
+    ok("  and Refresh drops it, as leaving the page would", !(await text(page)).includes("Repository not found"));
     await page.close();
   }
   {
@@ -2784,6 +4116,21 @@ try {
     const s2 = await text(page);
     ok("  the result names the backup branch and the undo command", s2.includes("gitswitch-before-reset-20260923120000") && s2.includes("undo: git -C /repos/gitswitch reset --hard"));
     ok("  and which commits left the branch", s2.includes("seal work"));
+    await page.close();
+  }
+  {
+    // A hard go-back that leaves a submodule ahead of the record offers to put it back.
+    const page = await open(SCENARIOS.diverged, { treeReset: { ...TREE_RESET_OUTCOME, submodule_mismatch: ["trinity"] } });
+    await (await button(page, "Reset to origin/main…")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Reset to origin/main?"), { timeout: 4000 });
+    await (await button(page, "Reset")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Align submodules checks out"), { timeout: 4000 }).catch(() => null);
+    ok("a go-back that leaves a submodule elsewhere names it and says what Align submodules does", (await text(page)).includes("trinity sits at a commit other than what this repository records. Align submodules checks out the commit it records"));
+    ok("  and offers the button", (await buttonState(page, "Align submodules"))?.disabled === false);
+    await (await button(page, "Align submodules")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_submodule_align"), { timeout: 4000 }).catch(() => null);
+    const al = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_submodule_align").at(-1)?.args ?? null);
+    ok("  which checks out the named submodules, in the repository", al?.repoPath === "/repos/gitswitch" && JSON.stringify(al?.paths) === '["trinity"]', JSON.stringify(al));
     await page.close();
   }
   {
@@ -3114,7 +4461,27 @@ try {
   {
     const page = await open(SCENARIOS.syncPausedInSub);
     const row = await rowWith(page, "both modified");
-    ok("a conflicted gitlink row has no side buttons (the sync finishes it)", row !== null && !row.buttons.some((b) => b.title.startsWith("Keep mine") || b.title.startsWith("Take theirs")));
+    ok("a conflicted gitlink row with no commit named for either side has no side buttons", row !== null && !row.buttons.some((b) => b.title.startsWith("Keep mine") || b.title.startsWith("Take theirs")));
+    await page.close();
+  }
+  {
+    // A conflicted submodule pointer whose sides the status names: Keep mine / Take theirs move it there.
+    const pointer = {
+      ...SCENARIOS.conflicted.entries[0],
+      path: "vendor/lib",
+      is_submodule: true,
+      stage_modes: ["160000", "160000", "160000"],
+      stage_oids: ["a".repeat(40), "b".repeat(40), "c".repeat(40)],
+      pointer_mine: "b".repeat(40),
+      pointer_theirs: "c".repeat(40),
+    };
+    const page = await open({ ...SCENARIOS.conflicted, entries: [...SCENARIOS.conflicted.entries, pointer], conflicted_count: 2 });
+    const row = await rowWith(page, "vendor/lib");
+    ok("a conflicted submodule pointer offers Keep mine and Take theirs, naming the commit each records", row !== null && row.buttons.some((b) => b.title.startsWith("Keep mine (main): vendor/lib at bbbbbbb")) && row.buttons.some((b) => b.title.startsWith("Take theirs (the branch being merged in): vendor/lib at ccccccc")), JSON.stringify(row?.buttons));
+    await clickInRow(page, "vendor/lib", { text: "Take theirs" });
+    await sleep(300);
+    const th = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_resolve_side").at(-1));
+    ok("  Take theirs resolves that pointer with theirs", th?.args?.paths?.length === 1 && th.args.paths[0] === "vendor/lib" && th.args.side === "theirs", JSON.stringify(th?.args));
     await page.close();
   }
   {

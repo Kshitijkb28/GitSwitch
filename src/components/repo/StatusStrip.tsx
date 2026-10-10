@@ -4,6 +4,7 @@ import { Button } from "../Button";
 import { whyDisabled } from "../changes/PullControl";
 import { agoLabel } from "../changes/BranchCard";
 import type { GitJob } from "../../lib/gitJobs";
+import { progressLine } from "../../lib/gitJobs";
 import type { PullMode, RemotePeek, RepoStatus, SubmoduleInfo } from "../../lib/api";
 
 /** What the strip's buttons do — supplied by the Changes tab, which owns the operations. */
@@ -25,10 +26,13 @@ export type StripActions = {
 export type RepoActions = StripActions & {
   initialise: (repo: string, paths: string[]) => Promise<unknown>;
   updateOne: (repo: string, sub: string) => Promise<unknown>;
-  pullInside: (repo: string, sub: SubmoduleInfo) => Promise<unknown>;
+  /** `git pull` inside `sub` — or, with `source`, a rebase onto that remote-tracking branch. */
+  pullInside: (repo: string, sub: SubmoduleInfo, source?: string) => Promise<unknown>;
   recordPointers: (repo: string) => Promise<unknown>;
   /** One commit in `repo` recording where the submodule `sub` is checked out now (a row's "Record this pointer"). */
   recordOne: (repo: string, sub: string) => Promise<unknown>;
+  /** Checks out, inside `sub`, the commit `repo` records for it (a row's "Check out <commit>"). */
+  alignOne: (repo: string, sub: string) => Promise<unknown>;
   /** A branch at a detached submodule's checkout, so its commits can be kept and pushed. */
   startBranch: (repo: string, sub: string, name: string) => Promise<unknown>;
   /** Runs an assessed plan (the Update drawer's "Update now"). */
@@ -256,6 +260,16 @@ export function StatusStrip({
             <span className="inline-flex items-center gap-1 ml-2 text-sky-300">
               <Loader2 size={11} className="animate-spin" />
               {job.label}
+              {job.progress && (
+                <span className="inline-flex items-center gap-1.5 text-sky-200/90" aria-label="Download progress">
+                  <span>· {progressLine(job.progress)}</span>
+                  {job.progress.percent !== null && (
+                    <span className="inline-block w-20 h-1 rounded bg-zinc-800 overflow-hidden align-middle">
+                      <span className="block h-1 rounded bg-sky-400" style={{ width: `${Math.max(0, Math.min(100, job.progress.percent))}%` }} />
+                    </span>
+                  )}
+                </span>
+              )}
             </span>
           )}
         </p>

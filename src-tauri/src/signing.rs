@@ -216,6 +216,7 @@ mod tests {
             directories: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            push_over_ssh: None,
         }
     }
 

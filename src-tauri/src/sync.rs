@@ -15,14 +15,17 @@
 //! Facts behind the choices are recorded in `scripts/verify/sync-facts.md`.
 
 use crate::error::AppError;
-use crate::git_exec::{GitCmd, LOCAL_TIMEOUT, NET_TIMEOUT};
+use crate::git_exec::{GitCmd, LFS_TIMEOUT, LOCAL_TIMEOUT, NET_TIMEOUT, READ_TIMEOUT};
 use crate::git_ops::{check, Intent, OpResult, Refusal, StatusFacts};
 use crate::git_status::{self, RepoStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-pub const BACKUP_PREFIX: &str = "gitswitch-before-sync-";
+pub const BACKUP_PREFIX: &str = "gitswitch-before-update-";
+/// Every name an Update's backup branch has had, so a backup an earlier build
+/// made is still recognised as one: the feature was called Sync before.
+pub const BACKUP_PREFIXES: &[&str] = &[BACKUP_PREFIX, "gitswitch-before-sync-"];
 const STATE_FILE: &str = "gitswitch-sync.json";
 const STATE_VERSION: u32 = 1;
 const MAX_LISTED: usize = 30;
@@ -141,6 +144,15 @@ pub struct SubFacts {
     /// upstream — so each can record the rewritten copy of what it pointed at.
     #[serde(default)]
     pub own_pointers_on_line: bool,
+    /// My pointer commits git will leave out, oldest first: each moves the
+    /// pointer forward to a commit upstream's pointer already contains, so
+    /// git's fast-forward rule takes upstream's at each.
+    #[serde(default)]
+    pub own_pointers_superseded: Vec<String>,
+    /// Why the rest cannot be kept one by one, when they cannot:
+    /// "merge" | "off-line" | "moved-back".
+    #[serde(default)]
+    pub own_pointers_off_line: Option<String>,
     /// My branch records a commit that is not ahead of the one we both
     /// started from: the pointer was moved back, or onto another line.
     #[serde(default)]
@@ -487,9 +499,14 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
             // of my pointer commits replays onto the pointer it started from
             // and the rebase cannot stop on it. With all of them along the
             // checked-out line the update keeps them one by one (below).
+            let why = match f.own_pointers_off_line.as_deref() {
+                Some("merge") => "one of them points at a merge commit in it",
+                Some("moved-back") => "one of them moves it back to a commit upstream already has",
+                _ => "not every one points at a commit on its checked-out line",
+            };
             block(&mut p, "squash-own", format!(
-                "{} of your commits move this submodule's pointer and not every one points at a commit on its checked-out line; squash them, or do this one by hand",
-                f.own_commits_moving_gitlink
+                "{} of your commits move this submodule's pointer and {}; squash them, or do this one by hand",
+                f.own_commits_moving_gitlink, why
             ));
         } else {
             let target = f.target.clone().unwrap_or_default();
@@ -594,13 +611,35 @@ pub fn plan(facts: &SyncFacts, stash: bool) -> SyncPlan {
                     if f.dirty_tracked > 0 {
                         p.notes.push(format!("its {} stashed and re-applied around the rebase", plural(f.dirty_tracked, "uncommitted change is", "uncommitted changes are")));
                     }
-                    if f.own_commits_moving_gitlink > 1 {
-                        p.notes.push(format!(
-                            "{} commits of yours move its pointer; each will record the rewritten copy of the commit it pointed at",
-                            f.own_commits_moving_gitlink
-                        ));
+                    let kept = f.own_commits_moving_gitlink.saturating_sub(f.own_pointers_superseded.len());
+                    if kept > 1 {
+                        p.notes.push(format!("{} commits of yours move its pointer; each will record the rewritten copy of the commit it pointed at", kept));
                     }
                 }
+            }
+        }
+        if p.action != "blocked" && !f.own_pointers_superseded.is_empty() {
+            // Left out only when the pointer is all the commit changes; one that
+            // also changes files is kept, with upstream's pointer in place of its own.
+            let left_out = f.own_pointers_superseded.iter().filter(|o| s.own_commits.iter().any(|c| &c.oid == *o && c.already_upstream)).count();
+            let kept = f.own_pointers_superseded.len() - left_out;
+            if left_out > 0 {
+                p.notes.push(format!(
+                    "{} of yours point{} at commits upstream's pointer already contains; git leaves {} out",
+                    plural(left_out, "pointer commit", "pointer commits"),
+                    if left_out == 1 { "s" } else { "" },
+                    if left_out == 1 { "it" } else { "them" }
+                ));
+            }
+            if kept > 0 {
+                p.notes.push(format!(
+                    "{} of yours that move{} its pointer also change{} other files: git keeps {}, with upstream's newer pointer in place of {}",
+                    plural(kept, "commit", "commits"),
+                    if kept == 1 { "s" } else { "" },
+                    if kept == 1 { "s" } else { "" },
+                    if kept == 1 { "it" } else { "them" },
+                    if kept == 1 { "its own" } else { "theirs" }
+                ));
             }
         }
         if p.action == "blocked" {
@@ -795,6 +834,69 @@ pub struct SyncState {
     /// nothing else of the commit remains, it was already upstream.
     #[serde(default)]
     pub pointer_upstreams: Vec<String>,
+    /// The repositories of this update that use Git LFS — "" for the
+    /// superproject, otherwise the submodule's path — each with whether every
+    /// one of its large files was present before the update.
+    #[serde(default)]
+    pub lfs: BTreeMap<String, bool>,
+    /// Large files are written as pointer stubs while the update rewrites the
+    /// working trees, and downloaded afterwards on their own clock — as Pull
+    /// does. Left to itself git downloads them INSIDE the rebase, through the
+    /// smudge filter, where a slow or unreachable LFS server fails the whole
+    /// update. Off when one of your uncommitted changes is itself a large
+    /// file (the autostash would put it back as a stub), and off when a
+    /// checkout is deliberately partial (a file you had would become a stub).
+    /// `false` in a state an older build wrote, which then behaves as before.
+    #[serde(default)]
+    pub lfs_skip: bool,
+    /// The page's "Also download Git LFS files", as Pull honours it: every
+    /// large file still a pointer stub after the update is downloaded, in
+    /// each repository of it that uses LFS. Kept in the state, so an update
+    /// continued after a pause still does it.
+    #[serde(default)]
+    pub with_lfs: bool,
+    /// Decided for each repository of the update alone ("" for the
+    /// superproject, else the submodule's path), among those using Git LFS
+    /// with its filters set up: true — its large files are written as pointer
+    /// stubs while the update rewrites it, and downloaded afterwards; false —
+    /// git downloads them inside the rewrite, on the large-file clock. One
+    /// submodule's stubs, or a large file among one repository's uncommitted
+    /// changes, decide nothing for the others. `None` in a state an older
+    /// build wrote: `lfs_skip` then decides for every repository, as it did.
+    #[serde(default)]
+    pub lfs_stub: Option<BTreeMap<String, bool>>,
+}
+
+/// How the update treats one repository's large files while it rewrites it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+enum LfsMode {
+    /// Nothing to decide: no large files, or no smudge filter set up there.
+    #[default]
+    Plain,
+    /// Written as pointer stubs; downloaded afterwards, on their own clock.
+    Stubs,
+    /// Downloaded by git inside the command, on the large-file clock.
+    Inside,
+}
+
+impl SyncState {
+    fn lfs_mode(&self, key: &str) -> LfsMode {
+        match &self.lfs_stub {
+            Some(m) => match m.get(key) {
+                Some(true) => LfsMode::Stubs,
+                Some(false) => LfsMode::Inside,
+                None => LfsMode::Plain,
+            },
+            // A state an older build wrote: its one switch, for every repository.
+            None if self.lfs_skip => LfsMode::Stubs,
+            None => LfsMode::Plain,
+        }
+    }
+
+    /// git downloads large files inside a rewrite somewhere in this update.
+    fn downloads_inside(&self) -> bool {
+        self.lfs_stub.as_ref().is_some_and(|m| m.values().any(|stubbed| !*stubbed))
+    }
 }
 
 /// `rebase` announces each commit it leaves out as empty: "dropping <oid>
@@ -879,7 +981,10 @@ pub struct SyncSummary {
 }
 
 pub async fn summary_for(repo: &Path) -> Option<SyncSummary> {
-    if let Some(st) = read_state(repo).await {
+    // A state whose update is over (one a crash left behind between finishing
+    // and removing it) is not a paused update: offering Continue or Abort on
+    // it would undo finished work. The next update replaces it.
+    if let Some(st) = read_state(repo).await.filter(|st| st.phase != "done" && st.phase != "aborted") {
         // One extra `git status`, only while paused: what the person still
         // has to resolve before the update can go on.
         let mut pointer_left = false;
@@ -960,6 +1065,139 @@ const FETCH_FANOUT: usize = 6;
 
 fn g(repo: &Path) -> GitCmd {
     GitCmd::at(repo).pinned()
+}
+
+/// A command that rewrites the working tree at `dir`, one repository of the
+/// update rooted at `root`: its large files written as pointer stubs when the
+/// update downloads them afterwards; where git downloads them inside the
+/// command instead, on the large-file clock, with git-lfs's progress in the
+/// file the page reads — a long download is not a hung rebase. `normal` is
+/// the command's clock otherwise.
+fn rewrite_cmd(dir: &Path, root: &Path, mode: LfsMode, normal: std::time::Duration) -> GitCmd {
+    let cmd = g(dir);
+    match mode {
+        LfsMode::Stubs => cmd.env("GIT_LFS_SKIP_SMUDGE", "1").timeout(normal),
+        LfsMode::Inside => cmd.timeout(LFS_TIMEOUT).env("GIT_LFS_PROGRESS", crate::lfs::progress_path(&root.to_string_lossy()).to_string_lossy().to_string()),
+        LfsMode::Plain => cmd.timeout(normal),
+    }
+}
+
+/// `rewrite_cmd` for the update's repository `key`: "" for the superproject,
+/// else the submodule's path.
+fn rw(st: &SyncState, root: &Path, key: &str, normal: std::time::Duration) -> GitCmd {
+    let dir = if key.is_empty() { root.to_path_buf() } else { root.join(key) };
+    rewrite_cmd(&dir, root, st.lfs_mode(key), normal)
+}
+
+/// Whether any of the repository's uncommitted changes to tracked files is a
+/// file Git LFS manages — what an autostash would carry. When git cannot say,
+/// the answer is yes: then nothing is written as a stub.
+async fn dirty_large_file(repo: &Path) -> bool {
+    let Some(changed) = g(repo).args(["diff", "--name-only", "-z", "HEAD"]).ok_text().await else { return false };
+    let paths: Vec<&str> = changed.split('\0').filter(|p| !p.is_empty()).collect();
+    if paths.is_empty() {
+        return false;
+    }
+    let input = format!("{}\0", paths.join("\0")).into_bytes();
+    let Ok(out) = g(repo).args(["check-attr", "-z", "--stdin", "filter"]).stdin_bytes(input).run().await else { return true };
+    if !out.ok() {
+        return true;
+    }
+    // `-z`: path NUL attribute NUL value NUL, repeated.
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let fields: Vec<&str> = text.split('\0').collect();
+    fields.chunks(3).any(|c| c.len() == 3 && c[2] == "lfs")
+}
+
+/// Which repositories of the update use Git LFS and whether each was
+/// complete — and, for each one alone, whether the update writes its large
+/// files as pointer stubs (see `SyncState::lfs_stub`).
+async fn lfs_plan(repo: &Path, subs: &[SubState], with_lfs: bool) -> (BTreeMap<String, bool>, BTreeMap<String, bool>) {
+    let mut lfs = BTreeMap::new();
+    let mut stub = BTreeMap::new();
+    let mut repos: Vec<(String, PathBuf)> = vec![(String::new(), repo.to_path_buf())];
+    repos.extend(subs.iter().map(|s| (s.path.clone(), repo.join(&s.path))));
+    for (key, dir) in repos {
+        // An empty submodule folder would answer with the superproject's state.
+        if !key.is_empty() && !dir.join(".git").exists() {
+            continue;
+        }
+        let Ok(s) = crate::lfs::lfs_status(&dir.to_string_lossy()).await else { continue };
+        if !(s.uses_lfs && s.installed) {
+            continue;
+        }
+        lfs.insert(key.clone(), s.pointers == 0);
+        // Without an LFS smudge filter git downloads nothing inside a rewrite
+        // there, so there is nothing to decide. Asked of the filter itself:
+        // `filter.lfs.required` may be unset or spelt otherwise while git
+        // still runs the filter.
+        let smudges = g(&dir).args(["config", "--get-regexp", r"^filter\.lfs\.(process|smudge)$"]).ok_text().await.is_some_and(|v| !v.trim().is_empty());
+        if !smudges {
+            continue;
+        }
+        // Stubs only where every large file was present: a deliberately
+        // partial checkout would get stubs for files the person had, and the
+        // download afterwards cannot tell those from the ones left out on
+        // purpose — unless every large file is to be downloaded afterwards
+        // anyway, as Pull does when asked. Never where one of the person's
+        // uncommitted changes is a large file: the autostash would put it
+        // back as a stub.
+        let stubbed = (with_lfs || s.pointers == 0) && !dirty_large_file(&dir).await;
+        stub.insert(key, stubbed);
+    }
+    (lfs, stub)
+}
+
+/// After the update: download the large files that are now pointer stubs —
+/// everywhere when the person asked for them (`with_lfs`, as Pull does),
+/// otherwise where every large file was present before and the update wrote
+/// stubs, so that stays true. Anywhere else, say how many are stubs rather
+/// than leave them silently. Sentences with their leading space, one per
+/// repository that has news.
+async fn lfs_after_update(repo: &Path, st: &SyncState) -> String {
+    let mut out = String::new();
+    let mut targets: Vec<(String, bool)> = st.lfs.iter().map(|(p, c)| (p.clone(), *c)).collect();
+    if st.with_lfs {
+        // A submodule the update itself downloaded was not measured before.
+        for s in &st.subs {
+            if !st.lfs.contains_key(&s.path) {
+                targets.push((s.path.clone(), false));
+            }
+        }
+    }
+    for (path, complete_before) in &targets {
+        let dir = if path.is_empty() { repo.to_path_buf() } else { repo.join(path) };
+        if !dir.is_dir() {
+            continue;
+        }
+        let place = if path.is_empty() { "here".to_string() } else { format!("in {}", path) };
+        let dir_s = dir.to_string_lossy().to_string();
+        if st.with_lfs || (st.lfs_mode(path) == LfsMode::Stubs && *complete_before) {
+            // Into the superproject's progress file: that is the one the page
+            // polls, whichever repository is downloading.
+            let progress_at = crate::lfs::progress_path(&repo.to_string_lossy());
+            match Box::pin(crate::git_ops::fetch_lfs_content_reporting(&dir_s, progress_at)).await {
+                Ok(f) => match f.error {
+                    Some(a) => out.push_str(&format!(" The large files {} didn't download: {} The LFS card can fetch them.", place, a.headline)),
+                    None if f.fetched > 0 => out.push_str(&format!(" Downloaded {} {}.", plural(f.fetched, "LFS file", "LFS files"), place)),
+                    None => {}
+                },
+                Err(e) => out.push_str(&format!(" The large files {} didn't download: {} The LFS card can fetch them.", place, e)),
+            }
+        } else if let Ok(s) = crate::lfs::lfs_status(&dir_s).await {
+            if s.uses_lfs && s.pointers > 0 {
+                out.push_str(&format!(
+                    " {} {} {} still {} — use Pull LFS files to download {}.",
+                    plural(s.pointers, "LFS file", "LFS files"),
+                    place,
+                    if s.pointers == 1 { "is" } else { "are" },
+                    if s.pointers == 1 { "a pointer stub" } else { "pointer stubs" },
+                    if s.pointers == 1 { "it" } else { "them" }
+                ));
+            }
+        }
+    }
+    out
 }
 
 pub(crate) async fn oid(repo: &Path, rev: &str) -> Option<String> {
@@ -1391,10 +1629,13 @@ fn same_url(a: &str, b: &str) -> bool {
 }
 
 async fn fetch_remote(repo: &Path, remote: &str, extra: &[&str]) -> Result<(), String> {
-    let mut args = vec!["fetch", "--quiet", "--no-recurse-submodules", "--", remote];
+    // `--progress`: stopped only for silence, never for the size of the fetch.
+    // Kept as a pack, because git reports nothing while it unpacks a small one.
+    let mut args = vec!["fetch", "--progress", "--no-recurse-submodules", "--", remote];
     args.extend_from_slice(extra);
-    let out = g(repo).args(args).timeout(NET_TIMEOUT).run().await.map_err(|e| e.to_string())?;
+    let out = g(repo).for_fetch().args(args).run().await.map_err(|e| e.to_string())?;
     if out.ok() {
+        crate::git_exec::housekeeping(repo).await;
         Ok(())
     } else {
         Err(out.stderr.trim().lines().last().unwrap_or("fetch failed").to_string())
@@ -1634,6 +1875,8 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
                 _ => false,
             },
             own_pointers_on_line: false,
+            own_pointers_superseded: Vec::new(),
+            own_pointers_off_line: None,
             pointer_rewound: false,
             index_pointer: s.recorded.clone(),
             dirty_tracked: s.dirty_tracked,
@@ -1693,24 +1936,56 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
                             .and_then(|n| n.trim().parse().ok())
                             .unwrap_or(f.own_commits.len());
                     }
-                    // Several commits of mine move this pointer: the update
-                    // can keep them one by one only when each points at a
-                    // plain commit along the checked-out line, past where we
-                    // parted from upstream.
-                    if f.own_commits_moving_gitlink > 1 && f.upstream_moves_gitlink {
-                        let mut on_line = true;
-                        for m in moving.iter().filter(|m| !own_commits.iter().any(|c| &c.oid == *m && c.already_upstream)) {
-                            let Some(ptr) = gitlink_at(&repo, m, &s.path).await else {
-                                on_line = false;
+                    // My pointer commits, oldest first, that move it forward to
+                    // a commit upstream's pointer already contains: replaying
+                    // each, git takes upstream's (its fast-forward rule) and
+                    // leaves the commit out. The first that does otherwise
+                    // ends the run: after it the pointer is mine again.
+                    if f.base_link.is_some() {
+                        for m in moving.iter().rev().filter(|m| !own_commits.iter().any(|c| &c.oid == *m && c.already_upstream)) {
+                            let merge = g(&repo).args(["rev-parse", "--verify", "--quiet", &format!("{}^2", m)]).ok_text().await.is_some();
+                            let (Some(o), Some(p)) = (gitlink_at(&repo, &format!("{}^", m), &s.path).await, gitlink_at(&repo, m, &s.path).await) else {
                                 break;
                             };
-                            let merge = g(&sub).args(["rev-parse", "--verify", "--quiet", &format!("{}^2", ptr)]).ok_text().await.is_some();
-                            if merge || !is_ancestor(&sub, &ptr, h).await || is_ancestor(&sub, &ptr, t).await {
-                                on_line = false;
+                            let forward = same_oid(&o, &p) || is_ancestor(&sub, &o, &p).await;
+                            let contained = same_oid(&p, t) || is_ancestor(&sub, &p, t).await;
+                            if merge || !forward || !contained {
+                                break;
+                            }
+                            f.own_pointers_superseded.push(m.clone());
+                        }
+                    }
+                    // Several commits of mine move this pointer: the update
+                    // can keep the ones git does not leave out one by one only
+                    // when each points at a plain commit along the checked-out
+                    // line, past where we parted from upstream.
+                    if f.own_commits_moving_gitlink > 1 && f.upstream_moves_gitlink {
+                        let mut off: Option<&str> = None;
+                        let kept: Vec<String> = moving
+                            .iter()
+                            .filter(|m| !own_commits.iter().any(|c| &c.oid == *m && c.already_upstream) && !f.own_pointers_superseded.contains(m))
+                            .cloned()
+                            .collect();
+                        for m in &kept {
+                            let Some(ptr) = gitlink_at(&repo, m, &s.path).await else {
+                                off = Some("off-line");
+                                break;
+                            };
+                            if g(&sub).args(["rev-parse", "--verify", "--quiet", &format!("{}^2", ptr)]).ok_text().await.is_some() {
+                                off = Some("merge");
+                                break;
+                            }
+                            if !is_ancestor(&sub, &ptr, h).await {
+                                off = Some("off-line");
+                                break;
+                            }
+                            if is_ancestor(&sub, &ptr, t).await {
+                                off = Some("moved-back");
                                 break;
                             }
                         }
-                        f.own_pointers_on_line = on_line;
+                        f.own_pointers_on_line = off.is_none();
+                        f.own_pointers_off_line = off.map(str::to_string);
                     }
                     // Diverged: its commits would be re-written, so the
                     // identity git has there matters — as it does for a commit.
@@ -1743,43 +2018,19 @@ pub async fn gather_facts(repo_path: &str, fetch: bool) -> Result<SyncFacts, App
     // A pointer bump upstream has since moved past: replaying it, git merges
     // the two pointers, takes upstream's newer commit, finds my commit empty
     // and leaves it out ("patch contents already upstream"). Foreseen when
-    // the commit moves nothing but pointers, each from the commit we both
-    // started from to one upstream's pointer already contains, and no other
-    // commit of mine moves the same pointer.
-    for i in 0..own_commits.len() {
-        if own_commits[i].already_upstream || !own_commits[i].only_pointers || own_commits[i].touches.is_empty() {
+    // the commit moves nothing but pointers, and each submodule it moves
+    // counts it among its superseded pointer commits (see SubFacts).
+    for c in own_commits.iter_mut() {
+        if c.already_upstream || !c.only_pointers || c.touches.is_empty() {
             continue;
         }
         // Every file it touches must be a pointer accounted for below.
-        if own_files.get(&own_commits[i].oid).map(|f| f.len()) != Some(own_commits[i].touches.len()) {
+        if own_files.get(&c.oid).map(|f| f.len()) != Some(c.touches.len()) {
             continue;
         }
-        let mut superseded = true;
-        for path in own_commits[i].touches.clone() {
-            let shared = own_commits.iter().enumerate().any(|(j, o)| j != i && o.touches.contains(&path));
-            let fact = submodules.iter().find(|f| f.path == path);
-            let (Some(f), false) = (fact, shared) else {
-                superseded = false;
-                break;
-            };
-            let (Some(t), Some(b), true) = (&f.target, &f.base_link, f.target_present) else {
-                superseded = false;
-                break;
-            };
-            let Some(mine) = gitlink_at(&repo, &own_commits[i].oid, &path).await else {
-                superseded = false;
-                break;
-            };
-            let sub = repo.join(&path);
-            let forward = same_oid(b, &mine) || is_ancestor(&sub, b, &mine).await;
-            let contained = same_oid(&mine, t) || is_ancestor(&sub, &mine, t).await;
-            if !(forward && contained) {
-                superseded = false;
-                break;
-            }
-        }
+        let superseded = c.touches.iter().all(|path| submodules.iter().find(|f| &f.path == path).is_some_and(|f| f.own_pointers_superseded.contains(&c.oid)));
         if superseded {
-            own_commits[i].already_upstream = true;
+            c.already_upstream = true;
         }
     }
 
@@ -1905,6 +2156,9 @@ pub struct Verified {
 pub struct RunOptions {
     pub stash: bool,
     pub bundles: bool,
+    /// Download every large file still a pointer stub afterwards (the page's
+    /// "Also download Git LFS files").
+    pub with_lfs: bool,
     /// From the plan; empty skips the "upstream moved since you assessed" check (tests only).
     pub fingerprint: Vec<(String, String)>,
 }
@@ -2046,7 +2300,7 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
         // match the original, so the check afterwards must not count it dropped.
         remember_resolved(repo, st).await;
         crate::git_ops::commit_resolved_pick(repo).await;
-        let out = g(repo).args(["rebase", "--continue"]).timeout(NET_TIMEOUT).run().await?;
+        let out = rw(st, repo, "", NET_TIMEOUT).args(["rebase", "--continue"]).run().await?;
         note_drops(st, &out.stderr);
         if !out.ok() && !rebase_in_progress(repo).await {
             return Err(AppError::Command(format!("rebase --continue failed: {}", out.stderr.trim())));
@@ -2068,7 +2322,7 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
     }
     st.phase = "aligning".into();
     write_state_at(state_file, st)?;
-    align_submodules(repo, st, state_file).await
+    Box::pin(align_submodules(repo, st, state_file)).await
 }
 
 /// Note the commit the superproject's rebase is replaying right now, just
@@ -2114,6 +2368,7 @@ async fn remember_resolved(repo: &Path, st: &mut SyncState) {
 /// `--theirs` is ever right here.
 async fn resolve_gitlink_stop(repo: &Path, st: &mut SyncState, state_file: &Path, c: &git_status::ChangeEntry) -> Result<(), AppError> {
     let path = c.path.clone();
+    let lfs_mode = st.lfs_mode(&path);
     let at_commit = stopped_sha(repo).await;
     let hand_over = |st: &mut SyncState, hint: String| {
         st.needs_user = Some(NeedsUser { where_: format!("submodule:{}", path), paths: vec![path.clone()], hint, at_commit: at_commit.clone() });
@@ -2177,7 +2432,7 @@ async fn resolve_gitlink_stop(repo: &Path, st: &mut SyncState, state_file: &Path
     if needs_rebase {
         // Detached: rebase detached, re-attach afterwards when the branch was where it stood.
         ss.stash_before = Some(stash_top(&sub).await);
-        let out = g(&sub).args(["rebase", "--merge", "--autostash", &ours]).timeout(NET_TIMEOUT).run().await?;
+        let out = rewrite_cmd(&sub, repo, lfs_mode, NET_TIMEOUT).args(["rebase", "--merge", "--autostash", &ours]).run().await?;
         if !out.ok() {
             ss.rebased = true;
             ss.note = "rebase stopped on a conflict inside it".into();
@@ -2386,9 +2641,9 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
         if is_ancestor(&sub, &head, &recorded).await {
             let on_branch = g(&sub).args(["symbolic-ref", "-q", "HEAD"]).ok_text().await.is_some();
             let out = if on_branch {
-                g(&sub).args(["merge", "--ff-only", "--no-edit", "--no-stat", "--", &recorded]).timeout(LOCAL_TIMEOUT).run().await?
+                rw(st, repo, &path, LOCAL_TIMEOUT).args(["merge", "--ff-only", "--no-edit", "--no-stat", "--", &recorded]).run().await?
             } else {
-                g(&sub).args(["checkout", "--quiet", "--detach", &recorded]).timeout(LOCAL_TIMEOUT).run().await?
+                rw(st, repo, &path, LOCAL_TIMEOUT).args(["checkout", "--quiet", "--detach", &recorded]).run().await?
             };
             if out.ok() {
                 st.subs[i].aligned = true;
@@ -2416,7 +2671,7 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
             continue;
         }
         st.subs[i].stash_before = Some(stash_top(&sub).await);
-        let out = g(&sub).args(["rebase", "--merge", "--autostash", &recorded]).timeout(NET_TIMEOUT).run().await?;
+        let out = rw(st, repo, &path, NET_TIMEOUT).args(["rebase", "--merge", "--autostash", &recorded]).run().await?;
         st.subs[i].rebased = true;
         if !out.ok() {
             st.needs_user = Some(NeedsUser {
@@ -2458,13 +2713,48 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
             (false, "new upstream; the rebased branch does not record it after all".to_string())
         } else {
             let url = g(repo).args(["config", "--get", &format!("remote.{}.url", st.plan.superproject.remote)]).ok_text().await.unwrap_or_default();
-            let report = crate::sparse::update_submodules(repo, None, None, url.trim(), Some(std::slice::from_ref(&path)), None).await;
+            let repo_s = repo.to_string_lossy().to_string();
+            let report = {
+                let _progress = crate::sparse::ProgressGuard::hold(&repo_s);
+                let profile = crate::git_status::owning_profile_id(&repo_s);
+                Box::pin(crate::sparse::update_submodules(repo, None, None, url.trim(), Some(std::slice::from_ref(&path)), Some(repo_s.as_str()), profile.as_deref())).await
+            };
             match (&report.error, report.downloaded) {
                 (None, n) if n > 0 => (true, format!("new upstream; downloaded at {}", short(&recorded))),
                 (None, _) => (false, "new upstream; could not be downloaded — Download it from the Submodules tab".to_string()),
                 (Some(e), _) => (false, format!("new upstream; could not be downloaded: {} — Download it from the Submodules tab", e.trim())),
             }
         };
+        // Under a blocked or locked repository the new submodule gets the
+        // same guard-rail at once — and, under a lock, the lock itself. Its
+        // large files are to be downloaded afterwards: git-lfs is set up in it
+        // first, so the guard chains git-lfs's hook rather than git-lfs
+        // refusing to install next to the guard's.
+        let mut note = note;
+        if ok && st.with_lfs {
+            for rel in std::iter::once(path.clone()).chain(crate::push_guard::populated_submodules(&sub).await.into_iter().map(|r| format!("{}/{}", path, r))) {
+                crate::git_ops::lfs_setup_before_guard(&repo.join(&rel).to_string_lossy()).await;
+            }
+        }
+        if ok {
+            if let Ok(ps) = Box::pin(crate::git_status::push_state_for(&repo.to_string_lossy())).await {
+                if ps.repo_blocked || ps.lock.locked {
+                    let notes = Box::pin(crate::push_guard::cover_submodules(&repo.to_string_lossy(), Some(std::slice::from_ref(&path)))).await;
+                    note = if !notes.is_empty() {
+                        format!("{}; the push block could not be extended to it: {}", note, notes.join("; "))
+                    } else if ps.lock.locked {
+                        let out = Box::pin(crate::push_lock::lock_downloaded_submodules(&repo.to_string_lossy(), std::slice::from_ref(&path))).await;
+                        if out.applied() {
+                            format!("{}; locked with the repository's lock", note)
+                        } else {
+                            format!("{}; given the repository's guard-rail but not the lock ({}) — Repair (administrator) under Push access adds it", note, out.message.trim_end_matches('.'))
+                        }
+                    } else {
+                        format!("{}; given the repository's push block", note)
+                    };
+                }
+            }
+        }
         st.subs.push(SubState {
             path: path.clone(),
             branch_before: None,
@@ -2513,6 +2803,16 @@ pub(crate) fn shell_quote(s: &str) -> String {
 
 async fn finish(repo_path: &str, st: &SyncState, state_file: &Path) -> Result<OpResult, AppError> {
     let repo = PathBuf::from(repo_path);
+    // Done or aborted: the update is over, so its state goes first — a
+    // download of large files can take hours, and a state left behind for
+    // that long would show a finished update as a paused one, with an Abort
+    // that undoes it. Then the large files it wrote as stubs come, on their
+    // own clock. A pause leaves them until the update is through.
+    let over = st.phase == "done" || st.phase == "aborted";
+    if over {
+        std::fs::remove_file(state_file).ok();
+    }
+    let large_files = if over { Box::pin(lfs_after_update(&repo, st)).await } else { String::new() };
     let outcome = build_outcome(&repo, st).await;
     let status = Box::pin(git_status::repo_status(repo_path)).await?;
     let mut op = if st.phase == "done" {
@@ -2639,12 +2939,13 @@ async fn finish(repo_path: &str, st: &SyncState, state_file: &Path) -> Result<Op
         if !outcome.verified.dirty_paths_unchanged {
             detail.push_str(" The set of files with uncommitted changes differs from before the update — check the file list.");
         }
+        detail.push_str(&large_files);
         let mut r = OpResult::done(headline, detail.trim().to_string(), status);
         r.ok = verified;
         r
     } else if st.phase == "aborted" {
         std::fs::remove_file(state_file).ok();
-        OpResult::done("Update aborted.".to_string(), "Everything is back where it was, except what is named below.".to_string(), status)
+        OpResult::done("Update aborted.".to_string(), format!("Everything is back where it was, except what is named below.{}", large_files), status)
     } else {
         let nu = st.needs_user.clone().unwrap_or(NeedsUser { where_: "superproject".into(), paths: vec![], hint: String::new(), at_commit: None });
         let mut r = OpResult::done(
@@ -3144,7 +3445,19 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         git_said: String::new(),
         handed_over: Vec::new(),
         pointer_upstreams: Vec::new(),
+        lfs: BTreeMap::new(),
+        lfs_skip: false,
+        with_lfs: opts.with_lfs,
+        lfs_stub: None,
     };
+    let (lfs, stub) = lfs_plan(&repo, &st.subs, opts.with_lfs).await;
+    st.lfs = lfs;
+    // An older build reading this state back has one switch for everything.
+    st.lfs_skip = !stub.is_empty() && stub.values().all(|stubbed| *stubbed);
+    st.lfs_stub = Some(stub);
+    // git downloads large files inside a rewrite somewhere: its progress goes
+    // where the page reads it, and is cleared when the update is over.
+    let _lfs_progress = st.downloads_inside().then(|| crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path)));
     write_state_at(&state_file, &st)?;
 
     // Backups first; a name collision fails closed.
@@ -3169,7 +3482,7 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         }
     }
     if opts.bundles {
-        if let Some(dir) = dirs::data_dir().map(|d| d.join("com.gitswitch.app").join("sync-backups").join(format!("{}-{}", crate::paths::base_name(repo_path), id))) {
+        if let Some(dir) = dirs::data_dir().map(|d| d.join("com.gitswitch.app").join("update-backups").join(format!("{}-{}", crate::paths::base_name(repo_path), id))) {
             if let Ok(p) = write_bundle(&repo, &dir, "superproject").await {
                 st.bundles.push(p);
             }
@@ -3194,7 +3507,7 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         let mut args = vec!["rebase", "--merge"];
         args.push(if st.stash { "--autostash" } else { "--no-autostash" });
         args.push(&upstream_ref);
-        let out = g(&repo).args(args).timeout(NET_TIMEOUT).run().await?;
+        let out = rw(&st, &repo, "", NET_TIMEOUT).args(args).run().await?;
         note_drops(&mut st, &out.stderr);
         if !out.ok() && !rebase_in_progress(&repo).await {
             // Refused before starting (a hook, an untracked file): nothing to undo but the backup branches.
@@ -3224,6 +3537,7 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
     let Some(mut st) = read_state(&repo).await else {
         return Ok(OpResult::refused(Refusal { code: "no-sync".into(), message: "No update is paused here.".into() }, status));
     };
+    let _lfs_progress = st.downloads_inside().then(|| crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path)));
     // A file staged with its conflict markers still in it would be committed
     // that way by `rebase --continue`; refuse by name unless told otherwise.
     if let Some(path) = sub_rebase_in_progress(&repo, &st).await {
@@ -3239,7 +3553,7 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
             }
         }
         crate::git_ops::commit_resolved_pick(&sub).await;
-        let out = g(&sub).args(["rebase", "--continue"]).timeout(NET_TIMEOUT).run().await?;
+        let out = rw(&st, &repo, &path, NET_TIMEOUT).args(["rebase", "--continue"]).run().await?;
         if !out.ok() && rebase_in_progress(&sub).await {
             let status = Box::pin(git_status::repo_status(repo_path)).await?;
             return Ok(OpResult::refused(Refusal { code: "sub-rebase-stopped".into(), message: format!("Rebasing {} stopped again: {}", path, out.stderr.trim()) }, status));
@@ -3258,7 +3572,7 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
                 at_commit: None,
             });
             write_state_at(&state_file, &st)?;
-            return finish(repo_path, &st, &state_file).await;
+            return Box::pin(finish(repo_path, &st, &state_file)).await;
         }
         if let Some(ss) = st.subs.iter_mut().find(|s| s.path == path) {
             let new_head = oid(&sub, "HEAD").await.unwrap_or_default();
@@ -3298,8 +3612,8 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
         }
         // The user staged the resolution of the stash. The leftover stash entry is theirs to drop; carry on.
         st.needs_user = None;
-        align_submodules(&repo, &mut st, &state_file).await?;
-        return finish(repo_path, &st, &state_file).await;
+        Box::pin(align_submodules(&repo, &mut st, &state_file)).await?;
+        return Box::pin(finish(repo_path, &st, &state_file)).await;
     }
     // A pointer the update handed over ("put it where you want it, stage it,
     // then Continue"): until it is staged there is nothing to continue with —
@@ -3325,14 +3639,14 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
             // afterwards must not call it dropped.
             remember_resolved(&repo, &mut st).await;
             crate::git_ops::commit_resolved_pick(&repo).await;
-            let out = g(&repo).args(["rebase", "--continue"]).timeout(NET_TIMEOUT).run().await?;
+            let out = rw(&st, &repo, "", NET_TIMEOUT).args(["rebase", "--continue"]).run().await?;
             note_drops(&mut st, &out.stderr);
             if !out.ok() && !rebase_in_progress(&repo).await {
                 return Err(AppError::Command(format!("rebase --continue failed: {}", out.stderr.trim())));
             }
             st.needs_user = None;
-            drive(&repo, &mut st, &state_file).await?;
-            return finish(repo_path, &st, &state_file).await;
+            Box::pin(drive(&repo, &mut st, &state_file)).await?;
+            return Box::pin(finish(repo_path, &st, &state_file)).await;
         }
         let status = Box::pin(git_status::repo_status(repo_path)).await?;
         return Ok(OpResult::refused(Refusal { code: "unmerged-paths".into(), message: "Resolve and stage every conflicted file first.".into() }, status));
@@ -3348,14 +3662,16 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
         let mut notes = put_back_submodules(&repo, &mut st).await;
         notes.extend(put_back_urls(&repo, &mut st).await);
         st.phase = "aborted".into();
-        let mut r = finish(repo_path, &st, &state_file).await?;
+        let mut r = Box::pin(finish(repo_path, &st, &state_file)).await?;
         if !notes.is_empty() {
-            r.detail = notes.join(" ");
+            // As in sync_abort: the notes name what was put back; what finish
+            // said about the large files stays.
+            r.detail = r.detail.replacen("Everything is back where it was, except what is named below.", &notes.join(" "), 1);
         }
         return Ok(r);
     }
-    align_submodules(&repo, &mut st, &state_file).await?;
-    finish(repo_path, &st, &state_file).await
+    Box::pin(align_submodules(&repo, &mut st, &state_file)).await?;
+    Box::pin(finish(repo_path, &st, &state_file)).await
 }
 
 /// A submodule's pause is over: record it in the superproject's stop and carry
@@ -3395,7 +3711,7 @@ async fn resume_after_submodule(repo_path: &str, repo: &Path, st: &mut SyncState
                             st.handed_over.push(path.to_string());
                         }
                         write_state_at(state_file, st)?;
-                        return finish(repo_path, st, state_file).await;
+                        return Box::pin(finish(repo_path, st, state_file)).await;
                     }
                 }
             }
@@ -3405,16 +3721,16 @@ async fn resume_after_submodule(repo_path: &str, repo: &Path, st: &mut SyncState
         // The commit being replayed now records a rewritten pointer.
         remember_resolved(repo, st).await;
         crate::git_ops::commit_resolved_pick(repo).await;
-        let out = g(repo).args(["rebase", "--continue"]).timeout(NET_TIMEOUT).run().await?;
+        let out = rw(st, repo, "", NET_TIMEOUT).args(["rebase", "--continue"]).run().await?;
         note_drops(st, &out.stderr);
         if !out.ok() && !rebase_in_progress(repo).await {
             return Err(AppError::Command(format!("rebase --continue failed: {}", out.stderr.trim())));
         }
-        drive(repo, st, state_file).await?;
+        Box::pin(drive(repo, st, state_file)).await?;
     } else {
-        align_submodules(repo, st, state_file).await?;
+        Box::pin(align_submodules(repo, st, state_file)).await?;
     }
-    finish(repo_path, st, state_file).await
+    Box::pin(finish(repo_path, st, state_file)).await
 }
 
 /// Some remote branch already has this commit: moving a checkout or a branch
@@ -3454,6 +3770,7 @@ async fn put_back_urls(repo: &Path, st: &mut SyncState) -> Vec<String> {
 }
 
 async fn put_back_submodules(repo: &Path, st: &mut SyncState) -> Vec<String> {
+    let modes: BTreeMap<String, LfsMode> = st.subs.iter().map(|s| (s.path.clone(), st.lfs_mode(&s.path))).collect();
     let mut notes: Vec<String> = Vec::new();
     let handed_over = st.handed_over.clone();
     for s in st.subs.iter_mut() {
@@ -3464,7 +3781,7 @@ async fn put_back_submodules(repo: &Path, st: &mut SyncState) -> Vec<String> {
             continue;
         }
         if rebase_in_progress(&sub).await {
-            let _ = g(&sub).args(["rebase", "--abort"]).timeout(LOCAL_TIMEOUT).run().await;
+            let _ = rewrite_cmd(&sub, repo, modes.get(&s.path).copied().unwrap_or_default(), LOCAL_TIMEOUT).args(["rebase", "--abort"]).run().await;
         }
         // Where it really is now: aborting its rebase may already have put
         // it back (and re-applied what it had stashed — that is not "moved").
@@ -3520,8 +3837,8 @@ async fn put_back_submodules(repo: &Path, st: &mut SyncState) -> Vec<String> {
         if dirty.is_empty() && unmerged(&sub).await.is_empty() {
             let target = s.head_before.clone();
             let ok = match &s.branch_before {
-                Some(b) => g(&sub).args(["switch", "--quiet", "-C", b, &target]).run().await.map(|o| o.ok()).unwrap_or(false),
-                None => g(&sub).args(["checkout", "--quiet", "--detach", &target]).run().await.map(|o| o.ok()).unwrap_or(false),
+                Some(b) => rewrite_cmd(&sub, repo, modes.get(&s.path).copied().unwrap_or_default(), READ_TIMEOUT).args(["switch", "--quiet", "-C", b, &target]).run().await.map(|o| o.ok()).unwrap_or(false),
+                None => rewrite_cmd(&sub, repo, modes.get(&s.path).copied().unwrap_or_default(), READ_TIMEOUT).args(["checkout", "--quiet", "--detach", &target]).run().await.map(|o| o.ok()).unwrap_or(false),
             };
             // A branch the update moved to re-attach a detached checkout
             // goes back to where it stood, too.
@@ -3554,16 +3871,17 @@ pub async fn sync_abort(repo_path: &str) -> Result<OpResult, AppError> {
     let Some(mut st) = read_state(&repo).await else {
         return Ok(OpResult::refused(Refusal { code: "no-sync".into(), message: "No update is paused here.".into() }, status));
     };
+    let _lfs_progress = st.downloads_inside().then(|| crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path)));
     let mut notes: Vec<String> = put_back_submodules(&repo, &mut st).await;
     if rebase_in_progress(&repo).await {
-        let out = g(&repo).args(["rebase", "--abort"]).timeout(LOCAL_TIMEOUT).run().await?;
+        let out = rw(&st, &repo, "", LOCAL_TIMEOUT).args(["rebase", "--abort"]).run().await?;
         if !out.ok() {
             notes.push(format!("the superproject rebase could not be aborted: {}", out.stderr.trim()));
         }
     } else if oid(&repo, "HEAD").await.as_deref() != Some(st.head_before.as_str()) {
         let (dirty, _) = dirty_sets(&repo).await;
         if dirty.is_empty() && unmerged(&repo).await.is_empty() && !autostash_left(&repo, st.stash_before.as_deref()).await {
-            let _ = g(&repo).args(["reset", "--hard", &st.head_before]).timeout(LOCAL_TIMEOUT).run().await;
+            let _ = rw(&st, &repo, "", LOCAL_TIMEOUT).args(["reset", "--hard", &st.head_before]).run().await;
             notes.push(format!("the superproject was put back at {}", short(&st.head_before)));
         } else {
             notes.push(format!("the superproject was left as rebased because it has uncommitted changes; its pre-update tip is branch {}", st.backup.clone().unwrap_or_default()));
@@ -3573,9 +3891,10 @@ pub async fn sync_abort(repo_path: &str) -> Result<OpResult, AppError> {
     notes.extend(put_back_urls(&repo, &mut st).await);
     st.phase = "aborted".into();
     st.needs_user = None;
-    let mut r = finish(repo_path, &st, &state_file).await?;
+    let mut r = Box::pin(finish(repo_path, &st, &state_file)).await?;
     if !notes.is_empty() {
-        r.detail = notes.join(" ");
+        // The notes name what was put back; what finish said about the large files stays.
+        r.detail = r.detail.replacen("Everything is back where it was, except what is named below.", &notes.join(" "), 1);
     }
     Ok(r)
 }
@@ -3681,6 +4000,57 @@ pub async fn record_pointers(repo_path: &str, only: Option<&[String]>) -> Result
     g(&repo).args(["commit", "--quiet", "--only", "-m", &msg, "--"]).args(paths.iter().map(String::as_str)).timeout(LOCAL_TIMEOUT).text().await?;
     let after = Box::pin(git_status::repo_status(repo_path)).await?;
     Ok(OpResult::done(format!("Recorded {} submodule pointer(s).", paths.len()), msg, after))
+}
+
+#[cfg(test)]
+mod lfs_mode_tests {
+    use super::*;
+
+    fn state(lfs_skip: bool, stub: Option<BTreeMap<String, bool>>) -> SyncState {
+        SyncState {
+            version: STATE_VERSION,
+            nonce: String::new(),
+            started_at: String::new(),
+            phase: "rebasing".into(),
+            repo: String::new(),
+            upstream_ref: String::new(),
+            upstream_oid: String::new(),
+            head_before: String::new(),
+            stash: false,
+            backup: None,
+            captures: BTreeMap::new(),
+            subs: vec![],
+            needs_user: None,
+            plan: SyncPlan::default(),
+            bundles: vec![],
+            resolved: vec![],
+            dropped_by_git: vec![],
+            emptied: vec![],
+            stash_before: None,
+            git_said: String::new(),
+            handed_over: vec![],
+            pointer_upstreams: vec![],
+            lfs: BTreeMap::new(),
+            lfs_skip,
+            with_lfs: false,
+            lfs_stub: stub,
+        }
+    }
+
+    #[test]
+    fn each_repository_is_decided_alone_and_an_old_state_keeps_its_one_switch() {
+        let st = state(false, Some(BTreeMap::from([(String::new(), true), ("lib".to_string(), false)])));
+        assert_eq!(st.lfs_mode(""), LfsMode::Stubs);
+        assert_eq!(st.lfs_mode("lib"), LfsMode::Inside);
+        assert_eq!(st.lfs_mode("other"), LfsMode::Plain);
+        assert!(st.downloads_inside());
+        let all = state(true, None);
+        assert_eq!(all.lfs_mode(""), LfsMode::Stubs);
+        assert_eq!(all.lfs_mode("lib"), LfsMode::Stubs);
+        assert!(!all.downloads_inside());
+        let none = state(false, None);
+        assert_eq!(none.lfs_mode(""), LfsMode::Plain);
+    }
 }
 
 #[cfg(test)]
@@ -3920,6 +4290,23 @@ mod tests {
         assert!(p.submodules[0].predicted_gitlink_conflict);
         assert!(p.submodules[0].notes.iter().any(|n| n.contains("2 commits of yours move its pointer")), "{:?}", p.submodules[0].notes);
         a.own_pointers_on_line = false;
+        // A blocker says which disqualifier fired.
+        a.own_pointers_off_line = Some("moved-back".into());
+        assert!(plan(&facts(vec![a.clone()]), true).submodules[0].reason.contains("moves it back to a commit upstream already has"));
+        a.own_pointers_off_line = None;
+        // A superseded pointer commit is "left out" only when git really drops
+        // it — a commit that also changes files is kept, and said to be.
+        let mut f = facts(vec![{
+            let mut b = sub("A");
+            b.own_pointers_superseded = vec!["1".repeat(40)];
+            b
+        }]);
+        let kept = plan(&f, true);
+        assert!(kept.submodules[0].notes.iter().any(|n| n.contains("also changes other files: git keeps it")), "{:?}", kept.submodules[0].notes);
+        assert!(!kept.submodules[0].notes.iter().any(|n| n.contains("git leaves")), "{:?}", kept.submodules[0].notes);
+        f.superproject.own_commits[0].already_upstream = true;
+        let left = plan(&f, true);
+        assert!(left.submodules[0].notes.iter().any(|n| n.contains("1 pointer commit of yours points at commits upstream's pointer already contains; git leaves it out")), "{:?}", left.submodules[0].notes);
         // Upstream left it alone: every pointer commit replays onto the pointer
         // it started from, and the checkout is already where the last one put it.
         a.upstream_moves_gitlink = false;
@@ -4080,6 +4467,10 @@ mod tests {
             git_said: String::new(),
             handed_over: vec![],
             pointer_upstreams: vec![],
+            lfs: BTreeMap::new(),
+            lfs_skip: false,
+            with_lfs: false,
+            lfs_stub: None,
         };
         let a = "a".repeat(40);
         let stderr = format!(
@@ -4310,6 +4701,10 @@ mod tests {
             handed_over: vec!["A".into()],
             pointer_upstreams: vec![],
             bundles: vec![],
+            lfs: BTreeMap::from([(String::new(), true), ("A".to_string(), false)]),
+            lfs_skip: true,
+            with_lfs: true,
+            lfs_stub: Some(BTreeMap::from([(String::new(), true), ("A".to_string(), false)])),
         };
         let json = serde_json::to_string(&st).unwrap();
         let back: SyncState = serde_json::from_str(&json).unwrap();

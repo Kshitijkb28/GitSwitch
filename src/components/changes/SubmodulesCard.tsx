@@ -12,12 +12,14 @@ interface Props {
   onOpenRepo: (path: string) => void;
   /** Initialise exactly these never-populated submodules. Populated ones are never touched. */
   onUpdate: (paths: string[]) => void;
-  /** `git pull` inside one submodule, on its own branch. */
-  onPullInside: (sub: SubmoduleInfo) => void;
+  /** `git pull` inside one submodule, on its own branch — or, with `source`, a rebase onto that remote-tracking branch. */
+  onPullInside: (sub: SubmoduleInfo, source?: string) => void;
   /** `git submodule update -- <path>`: check out the commit this repository records. */
   onUpdateOne: (path: string) => void;
   /** One commit in this repository recording where that submodule is checked out now. */
   onRecordOne: (path: string) => void;
+  /** Checks out the commit this repository records, inside that submodule (local, its branches untouched). */
+  onAlignOne: (path: string) => void;
   /** A branch at a detached submodule's checkout, named by the person. */
   onStartBranch: (path: string, name: string) => void;
   /** "<nonce>:<path>" — opens that submodule's branch form (a push that needs one). */
@@ -38,7 +40,26 @@ export const canPullInside = (s: SubmoduleInfo) => s.initialised && quiet(s) && 
  * not checked out from under.
  */
 export const canUpdate = (s: SubmoduleInfo) =>
-  s.initialised && quiet(s) && s.behind > 0 && s.ahead === 0 && s.dirty_tracked === 0 && !s.recorded_missing;
+  s.initialised && s.listed && quiet(s) && s.behind > 0 && s.ahead === 0 && s.dirty_tracked === 0 && !s.recorded_missing;
+/**
+ * "Check out <recorded>": the checkout sits past (or beside) the record — a
+ * go-back, a switch or a discard left it there — and the record is where it
+ * belongs. Its branch keeps its commits; a detached HEAD holding commits no
+ * branch has is the backend's refusal ("Start a branch here" first). One with
+ * no address in .gitmodules, behind the record, gets it too: git cannot
+ * update it, a local checkout can.
+ */
+export const canCheckOutRecorded = (s: SubmoduleInfo) =>
+  s.initialised && quiet(s) && s.dirty_tracked === 0 && !s.recorded_missing && (s.ahead > 0 || (!s.listed && s.behind > 0));
+export const checkOutRecordedTitle = (s: SubmoduleInfo) =>
+  `Checks out ${s.recorded_short}, the commit this repository records, inside ${s.path}${s.own_branch ? ` — ${s.own_branch} keeps its commits, only the checkout moves` : ""}. Nothing is fetched or committed.`;
+/**
+ * "Rebase onto <remote>/<branch>": its own commits on top of what its remote
+ * has now — when that is not already its branch's upstream (Pull inside does that).
+ */
+export const canRebaseLatest = (s: SubmoduleInfo) => s.initialised && quiet(s) && !!s.own_branch && !!s.latest_ref && s.latest_ref !== s.own_upstream;
+export const rebaseLatestTitle = (s: SubmoduleInfo) =>
+  `git fetch, then git rebase ${s.latest_ref} inside ${s.path}: ${s.own_branch}'s own commits on top of what its remote has now. Nothing in this repository changes until you record the pointer.`;
 export const pullInsideTitle = (s: SubmoduleInfo) =>
   `git pull inside ${s.path}: brings ${s.own_branch} up to date with ${s.own_upstream}${s.own_behind > 0 ? ` (${s.own_behind} behind)` : ""}. Nothing in this repository changes until you record the pointer.`;
 export const updateTitle = (s: SubmoduleInfo) =>
@@ -67,9 +88,12 @@ function chipClass(state: SubmoduleInfo["state"]): string {
       return "bg-amber-500/15 text-amber-300";
     case "not-initialised":
       return "bg-zinc-700/50 text-zinc-400";
+    case "incomplete":
+      return "bg-amber-500/15 text-amber-300";
     case "unmapped":
       return "bg-red-500/15 text-red-300";
   }
+  return "bg-zinc-700/50 text-zinc-400";
 }
 
 function chipLabel(state: SubmoduleInfo["state"]): string {
@@ -77,7 +101,9 @@ function chipLabel(state: SubmoduleInfo["state"]): string {
     case "moved-and-dirty":
       return "moved + dirty";
     case "not-initialised":
-      return "not initialised";
+      return "not downloaded";
+    case "incomplete":
+      return "download interrupted";
     case "unmapped":
       return "unfetchable";
     default:
@@ -144,6 +170,7 @@ function SubmoduleRow({
   onPullInside,
   onUpdateOne,
   onRecordOne,
+  onAlignOne,
   onStartBranch,
   openBranchFormFor,
   hasSection,
@@ -154,9 +181,10 @@ function SubmoduleRow({
   sub: SubmoduleInfo;
   busy: boolean;
   onOpenRepo: (path: string) => void;
-  onPullInside: (sub: SubmoduleInfo) => void;
+  onPullInside: (sub: SubmoduleInfo, source?: string) => void;
   onUpdateOne: (path: string) => void;
   onRecordOne: (path: string) => void;
+  onAlignOne: (path: string) => void;
   /** A branch at a detached submodule's checkout. */
   onStartBranch: (path: string, name: string) => void;
   /** "<nonce>:<path>" — the page asks this row to open its branch form. */
@@ -349,6 +377,12 @@ function SubmoduleRow({
               Pull inside{sub.own_behind > 0 ? ` (${sub.own_behind})` : ""}
             </Button>
           )}
+          {canRebaseLatest(sub) && (
+            <Button size="sm" variant="ghost" disabled={busy} onClick={() => onPullInside(sub, sub.latest_ref ?? undefined)} title={rebaseLatestTitle(sub)} className="px-1.5">
+              <Download size={13} />
+              Rebase onto {sub.latest_ref}
+            </Button>
+          )}
           {canUpdate(sub) && (
             <Button size="sm" variant="secondary" disabled={busy} onClick={() => onUpdateOne(sub.path)} title={updateTitle(sub)} className="px-1.5">
               <GitCommitHorizontal size={13} />
@@ -359,6 +393,12 @@ function SubmoduleRow({
             <Button size="sm" variant="secondary" disabled={busy} onClick={() => onRecordOne(sub.path)} title={recordTitle(sub)} className="px-1.5">
               <GitCommitHorizontal size={13} />
               Record this pointer
+            </Button>
+          )}
+          {canCheckOutRecorded(sub) && (
+            <Button size="sm" variant="secondary" disabled={busy} onClick={() => onAlignOne(sub.path)} title={checkOutRecordedTitle(sub)} className="px-1.5">
+              <GitCommitHorizontal size={13} />
+              Check out {sub.recorded_short}
             </Button>
           )}
           {canStartBranch(sub) && !branching && (
@@ -408,6 +448,7 @@ export function SubmodulesCard({
   onPullInside,
   onUpdateOne,
   onRecordOne,
+  onAlignOne,
   onStartBranch,
   openBranchFormFor,
   refreshKey,
@@ -436,10 +477,15 @@ export function SubmodulesCard({
 
   if (!loading && subs.length === 0 && !error) return null;
 
-  const present = subs.filter((s) => s.initialised);
-  const missing = subs.filter((s) => !s.initialised);
-  const fetchable = missing.filter((s) => s.listed).length;
-  const unfetchable = missing.length - fetchable;
+  // An interrupted download is not populated: it is downloadable again.
+  const present = subs.filter((s) => s.initialised && s.state !== "incomplete");
+  const notThere = subs.filter((s) => !s.initialised || s.state === "incomplete");
+  // Only what a download can bring is missing: a gitlink with no address in
+  // .gitmodules stays empty in every clone, and is said so, not warned about.
+  const missing = notThere.filter((s) => s.listed);
+  const noAddress = notThere.filter((s) => !s.listed);
+  const fetchable = missing.length;
+  const interrupted = missing.filter((s) => s.state === "incomplete").length;
 
   return (
     <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40">
@@ -455,7 +501,7 @@ export function SubmodulesCard({
             size="sm"
             variant="ghost"
             disabled={busy}
-            onClick={() => onUpdate(missing.filter((s) => s.listed).map((s) => s.path))}
+            onClick={() => onUpdate(missing.map((s) => s.path))}
             title="git submodule update --init for the never-initialised ones only — populated submodules are left exactly as they are"
           >
             <Download size={13} />
@@ -477,6 +523,7 @@ export function SubmodulesCard({
             onPullInside={onPullInside}
             onUpdateOne={onUpdateOne}
             onRecordOne={onRecordOne}
+            onAlignOne={onAlignOne}
             onStartBranch={onStartBranch}
             openBranchFormFor={openBranchFormFor}
             hasSection={sectionPaths.includes(s.path)}
@@ -493,35 +540,37 @@ export function SubmodulesCard({
             <div className="min-w-0 flex-1">
               <p className="text-xs text-zinc-400 leading-relaxed">
                 {missing.length} not downloaded yet
-                {fetchable > 0 && unfetchable > 0
-                  ? ` — ${fetchable} can be fetched with Download missing, ${unfetchable} have no entry in .gitmodules so git can't fetch them`
-                  : fetchable > 0
-                    ? " — Download missing fetches them (git submodule update --init)"
-                    : " — none of them have an entry in .gitmodules, so git can't fetch them"}
-                .
+                {interrupted > 0 && ` (${interrupted} download${interrupted === 1 ? "" : "s"} interrupted — Download finishes ${interrupted === 1 ? "it" : "them"})`}
+                {" — Download missing fetches them (git submodule update --init)."}
               </p>
-              <button
-                onClick={() => setShowAllMissing((v) => !v)}
-                className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer mt-1"
-              >
-                {showAllMissing ? "Hide them" : "List them"}
-              </button>
-              {showAllMissing && (
-                <ul className="mt-1 max-h-40 overflow-y-auto space-y-0.5">
-                  {missing.map((s) => (
-                    <li
-                      key={`${repoPath}/${s.path}`}
-                      className="text-xs font-mono text-zinc-500 truncate"
-                      title={s.summary}
-                    >
-                      {s.path}
-                      {!s.listed && <span className="text-red-400/70"> · unfetchable</span>}
-                    </li>
-                  ))}
-                </ul>
-              )}
             </div>
           </div>
+        </div>
+      )}
+      {noAddress.length > 0 && (
+        <div className="px-3 py-2 border-t border-zinc-700/50">
+          <p className="text-xs text-zinc-500 leading-relaxed">
+            {noAddress.length === 1
+              ? "1 other submodule entry has no address in .gitmodules, so git can't fetch it"
+              : `${noAddress.length} other submodule entries have no address in .gitmodules, so git can't fetch them`}{" "}
+            — those folders stay empty, as with any clone.
+          </p>
+          <button
+            onClick={() => setShowAllMissing((v) => !v)}
+            className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer mt-1"
+          >
+            {showAllMissing ? "Hide them" : "List them"}
+          </button>
+          {showAllMissing && (
+            <ul className="mt-1 max-h-40 overflow-y-auto space-y-0.5">
+              {noAddress.map((s) => (
+                <li key={`${repoPath}/${s.path}`} className="text-xs font-mono text-zinc-500 truncate" title={s.summary}>
+                  {s.path}
+                  <span className="text-zinc-600"> · unfetchable</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
     </div>

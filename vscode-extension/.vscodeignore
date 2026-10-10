@@ -3,3 +3,4 @@ src/**
 **/*.map
 tsconfig.json
 node_modules/**
+out/test/**

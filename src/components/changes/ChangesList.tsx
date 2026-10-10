@@ -254,6 +254,34 @@ export function ChangesList({
                       </Button>
                     </>
                   )}
+                  {onResolveSide && e.is_submodule && e.kind === "conflicted" && (e.pointer_mine || e.pointer_theirs) && (
+                    <>
+                      {e.pointer_mine && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={busy}
+                          onClick={() => onResolveSide([e.path], "mine")}
+                          title={`Keep mine (${mine}): ${e.path} at ${e.pointer_mine.slice(0, 7)} — the submodule is checked out there and recorded`}
+                          className="px-1.5"
+                        >
+                          Keep mine
+                        </Button>
+                      )}
+                      {e.pointer_theirs && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={busy}
+                          onClick={() => onResolveSide([e.path], "theirs")}
+                          title={`Take theirs (${theirs}): ${e.path} at ${e.pointer_theirs.slice(0, 7)} — the submodule is checked out there and recorded`}
+                          className="px-1.5"
+                        >
+                          Take theirs
+                        </Button>
+                      )}
+                    </>
+                  )}
                   {onResolveSide && !e.is_submodule && (
                     <>
                       <Button

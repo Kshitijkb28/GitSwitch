@@ -30,6 +30,9 @@ pub struct BranchInfo {
     pub last_author: String,
     pub last_date: String,
     pub last_subject: String,
+    /// One of GitSwitch's own backup branches (see `is_safety_branch`).
+    #[serde(default)]
+    pub is_backup: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -58,6 +61,9 @@ pub struct HistoryCommit {
     pub lane: usize,
     pub parent_lanes: Vec<usize>,
     pub active_lanes: Vec<usize>,
+    /// A lane was already waiting for it (a child above it, on this page or
+    /// an earlier one): its line comes from above. False for a tip.
+    pub from_above: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -158,8 +164,61 @@ fn commit_ref(repo: &Path, rev: &str) -> Option<CommitRef> {
 pub struct MergeInfo {
     /// Branches whose history contains this branch's tip — i.e. it's merged in.
     pub merged_into: Vec<String>,
-    /// The merge commits on this branch, newest first.
+    /// The merge commits on this branch, newest first (at most 50).
     pub merges: Vec<HistoryCommit>,
+    /// How the tip got into the first few of `merged_into`.
+    pub merged_by: Vec<MergedBy>,
+    /// Every merge commit in the branch's history, and whether `merges` stops short.
+    pub merges_total: usize,
+    pub merges_truncated: bool,
+}
+
+/// How a branch's tip got into another branch.
+#[derive(Debug, Serialize, Clone)]
+pub struct MergedBy {
+    pub branch: String,
+    /// "merge" | "fast-forward" | "same-commit"
+    pub how: String,
+    /// The merge commit that brought it in, for "merge".
+    pub commit: Option<MergeCommit>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct MergeCommit {
+    pub hash: String,
+    pub short: String,
+    pub subject: String,
+    pub author_name: String,
+    pub date: String,
+    pub parents: Vec<String>,
+}
+
+/// How `tip` got into `target` (a full ref that contains it): the first
+/// commit on the target's main line that contains the tip. Its first parent
+/// being the tip means the commits sit on that line — a fast-forward; anything
+/// else is the merge that brought the tip in through another parent.
+fn merged_by(repo: &Path, tip: &str, target: &str) -> Option<(String, Option<MergeCommit>)> {
+    let fp = git(repo, &["rev-list", "--first-parent", &format!("{}..{}", tip, target)]).ok()?;
+    let fp: Vec<&str> = fp.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if fp.is_empty() {
+        return Some(("same-commit".into(), None));
+    }
+    let anc = git(repo, &["rev-list", "--ancestry-path", &format!("{}..{}", tip, target)]).ok()?;
+    let anc: std::collections::HashSet<&str> = anc.lines().map(str::trim).collect();
+    let m = fp.iter().rev().find(|c| anc.contains(**c))?;
+    let raw = git(repo, &["log", "-n1", "--no-show-signature", &format!("--format=%H{US}%h{US}%P{US}%aN{US}%aI{US}%s", US = US), m]).ok()?;
+    let f: Vec<&str> = raw.trim_end_matches('\n').splitn(6, US).collect();
+    if f.len() < 6 {
+        return None;
+    }
+    let parents: Vec<String> = f[2].split_whitespace().map(str::to_string).collect();
+    if parents.first().map(String::as_str) == Some(tip) {
+        return Some(("fast-forward".into(), None));
+    }
+    Some((
+        "merge".into(),
+        Some(MergeCommit { hash: f[0].to_string(), short: f[1].to_string(), parents, author_name: f[3].to_string(), date: f[4].to_string(), subject: f[5].trim().to_string() }),
+    ))
 }
 
 /// `refs/remotes/<remote>/HEAD`: a remote's symbolic pointer at its default
@@ -213,6 +272,8 @@ pub struct GraphRow {
     pub lane: usize,
     pub parent_lanes: Vec<usize>,
     pub active: Vec<usize>,
+    /// A lane was waiting for this commit: its line comes from above.
+    pub from_above: bool,
 }
 
 /// Assign each commit a column, the way `git log --graph` does.
@@ -227,7 +288,9 @@ pub fn assign_lanes(commits: &[(String, Vec<String>)]) -> Vec<GraphRow> {
     let mut rows = Vec::with_capacity(commits.len());
 
     for (hash, parents) in commits {
-        let lane = match lanes.iter().position(|l| l.as_deref() == Some(hash.as_str())) {
+        let waiting = lanes.iter().position(|l| l.as_deref() == Some(hash.as_str()));
+        let from_above = waiting.is_some();
+        let lane = match waiting {
             Some(i) => i,
             None => match lanes.iter().position(|l| l.is_none()) {
                 Some(i) => {
@@ -288,9 +351,21 @@ pub fn assign_lanes(commits: &[(String, Vec<String>)]) -> Vec<GraphRow> {
             lane,
             parent_lanes,
             active,
+            from_above,
         });
     }
     rows
+}
+
+/// The parents the graph draws edges to: all of them, or — in a list filtered
+/// by people or words, where git rewrites no parents — only those the list
+/// shows, as `git log --graph` does. Lanes waiting for commits that are never
+/// listed would otherwise pile up, one more per row.
+pub fn graph_parents(parents: &[String], members: Option<&std::collections::HashSet<String>>) -> Vec<String> {
+    match members {
+        Some(m) => parents.iter().filter(|p| m.contains(p.as_str())).cloned().collect(),
+        None => parents.to_vec(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -310,12 +385,17 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
                 if out.iter().any(|e| e.path == r.path) {
                     continue;
                 }
+                // Whose it is: the deepest profile folder that holds it — the
+                // rule the generated gitconfig follows — not whichever
+                // profile's folder happened to be scanned first.
+                let owner = crate::commit_audit::owning_profile(&r.path, &store.profiles).unwrap_or(p);
+                let (profile_id, profile_name, profile_email) = (owner.id.clone(), owner.name.clone(), owner.git_email.clone());
                 out.push(RepoRef {
                     name: crate::paths::base_name(&r.path),
                     path: r.path,
-                    profile_id: p.id.clone(),
-                    profile_name: p.name.clone(),
-                    profile_email: p.git_email.clone(),
+                    profile_id,
+                    profile_name,
+                    profile_email,
                 });
             }
         }
@@ -397,6 +477,7 @@ pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
 
         branches.push(BranchInfo {
             is_current: f[7].trim() == "*",
+            is_backup: !is_remote && is_safety_branch(&name),
             is_remote,
             name,
             upstream,
@@ -456,7 +537,34 @@ pub fn parse_shortlog(out: &str) -> Vec<AuthorCount> {
         .collect()
 }
 
-/// Who commits on the viewed revision (or everywhere, for "--all"), most
+/// The names GitSwitch gives its own backup branches: before an update, a
+/// reset, a commit-audit rewrite.
+fn safety_prefixes() -> impl Iterator<Item = &'static str> {
+    crate::sync::BACKUP_PREFIXES.iter().copied().chain([crate::tree::RESET_BACKUP_PREFIX, "gitswitch-backup-"])
+}
+
+/// One of GitSwitch's own backup branches — a safety net, not anyone's work.
+pub(crate) fn is_safety_branch(name: &str) -> bool {
+    safety_prefixes().any(|p| name.starts_with(p))
+}
+
+/// What "All branches" walks: every local branch, remote-tracking branch and
+/// tag, and HEAD (a detached checkout, a submodule). Not `--all`, which also
+/// walks the stash, notes, the refs a preview parks and git's prefetch refs —
+/// and not GitSwitch's own backup branches: none of them is work anyone
+/// pushes, and listed, each was marked "not pushed" for good. A backup still
+/// opens when it is chosen by name. `--exclude` applies to the `--branches`
+/// right after it only.
+fn all_branches_revs(repo: &Path) -> Vec<String> {
+    let mut revs: Vec<String> = safety_prefixes().map(|p| format!("--exclude={}*", p)).collect();
+    revs.extend(["--branches", "--remotes", "--tags"].map(String::from));
+    if git(repo, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).is_ok() {
+        revs.push("HEAD".into());
+    }
+    revs
+}
+
+/// Who commits on the viewed revision (or on all branches, for "--all"), most
 /// frequent first — the list behind the History page's people filter. Capped:
 /// a long-lived repository can have thousands of one-off authors.
 pub fn authors(repo_path: &str, rev: &str) -> Result<Vec<AuthorCount>, AppError> {
@@ -464,7 +572,14 @@ pub fn authors(repo_path: &str, rev: &str) -> Result<Vec<AuthorCount>, AppError>
     if rev != "--all" && rev.starts_with('-') {
         return Err(AppError::Config(format!("Invalid revision: {}", rev)));
     }
-    let raw = git(&repo, &["shortlog", "-sne", rev])?;
+    let mut args: Vec<String> = vec!["shortlog".into(), "-sne".into()];
+    if rev == "--all" {
+        args.extend(all_branches_revs(&repo));
+    } else {
+        args.push(rev.to_string());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let raw = git(&repo, &refs)?;
     let mut list = parse_shortlog(&raw);
     list.truncate(300);
     Ok(list)
@@ -572,7 +687,8 @@ fn classify_touches(files: &[String], gitlinks: &[String]) -> (Vec<String>, bool
     (touched, only)
 }
 
-/// One page of history for a branch (or every branch when `rev` is "--all").
+/// One page of history for a branch (or all branches when `rev` is "--all":
+/// see `all_branches_revs`).
 /// `authors`: only commits by any of these (emails or names, literal);
 /// `hide_pointer_only`: leave out commits that change nothing but submodule
 /// pointers (the CI bumps a superproject's history fills up with);
@@ -606,14 +722,25 @@ pub fn history_page(
     // --use-mailmap on the command line: the people list is always mapped,
     // and `log.mailmap=false` in someone's config must not make the rows and
     // the count disagree with it.
-    let mut count_args: Vec<String> =
-        if by_author { vec!["log".into(), "--use-mailmap".into(), "--no-show-signature".into(), "--format=%x2e".into()] } else { vec!["rev-list".into(), "--count".into()] };
+    // Filtered by people or words, the ids themselves are read (not a count):
+    // the graph then joins only the commits the list shows.
+    // Not-pushed-only and ranges hide commits too: their parents may never be
+    // listed either (git ref names cannot contain "..", so it means a range).
+    let filtered = by_author || search.is_some_and(|s| !s.trim().is_empty()) || unpushed_only || rev.contains("..");
+    let mut count_args: Vec<String> = if by_author {
+        vec!["log".into(), "--use-mailmap".into(), "--no-show-signature".into(), "--format=%H".into()]
+    } else if filtered {
+        vec!["rev-list".into()]
+    } else {
+        vec!["rev-list".into(), "--count".into()]
+    };
+    // Everything above the page as well as the page: a page's lanes carry on
+    // from the commits above it, so it is laid out with them, not on its own.
     let mut log_args: Vec<String> = vec![
         "log".into(),
         "--use-mailmap".into(),
         "--no-show-signature".into(),
-        format!("--skip={}", offset),
-        format!("-n{}", limit),
+        format!("-n{}", offset.saturating_add(limit)),
         "--date-order".into(),
         format!("--format={}", fmt),
     ];
@@ -654,8 +781,9 @@ pub fn history_page(
         }
     }
     if rev == "--all" {
-        count_args.push("--all".into());
-        log_args.push("--all".into());
+        let all = all_branches_revs(&repo);
+        count_args.extend(all.iter().cloned());
+        log_args.extend(all);
     } else {
         count_args.push(rev.to_string());
         log_args.push(rev.to_string());
@@ -687,7 +815,12 @@ pub fn history_page(
 
     let count_ref: Vec<&str> = count_args.iter().map(String::as_str).collect();
     let counted = git(&repo, &count_ref).unwrap_or_default();
-    let total: usize = if by_author { counted.lines().filter(|l| l.trim() == ".").count() } else { counted.trim().parse().unwrap_or(0) };
+    let is_oid = |l: &str| (l.len() == 40 || l.len() == 64) && l.chars().all(|c| c.is_ascii_hexdigit());
+    let members: Option<std::collections::HashSet<String>> = filtered.then(|| counted.lines().map(str::trim).filter(|l| is_oid(l)).map(str::to_string).collect());
+    let total: usize = match &members {
+        Some(m) => m.len(),
+        None => counted.trim().parse().unwrap_or(0),
+    };
 
     let log_ref: Vec<&str> = log_args.iter().map(String::as_str).collect();
     // A repo with no commits yet makes `git log` exit non-zero; that's an empty
@@ -703,13 +836,13 @@ pub fn history_page(
 
     let graph_input: Vec<(String, Vec<String>)> = parsed
         .iter()
-        .map(|(h, p, _)| (h.clone(), p.clone()))
+        .map(|(h, p, _)| (h.clone(), graph_parents(p, members.as_ref())))
         .collect();
     let rows = assign_lanes(&graph_input);
 
-    let mut commits = Vec::with_capacity(parsed.len());
+    let mut commits = Vec::with_capacity(parsed.len().saturating_sub(offset));
     let mut max_lane = 0usize;
-    for (i, (hash, parents, f)) in parsed.into_iter().enumerate() {
+    for (i, (hash, parents, f)) in parsed.into_iter().enumerate().skip(offset) {
         let row = &rows[i];
         max_lane = max_lane
             .max(row.active.iter().copied().max().unwrap_or(0))
@@ -734,6 +867,7 @@ pub fn history_page(
             lane: row.lane,
             parent_lanes: row.parent_lanes.clone(),
             active_lanes: row.active.clone(),
+            from_above: row.from_above,
             touches_submodules: Vec::new(),
             only_submodules: false,
             unpushed: false,
@@ -876,24 +1010,72 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
 
     // Full ref names, so each remote's symbolic HEAD (short name: just
     // "origin") can be recognised and left out.
-    let merged_into: Vec<String> = git(
+    let listed = git(
         &repo,
-        &["for-each-ref", &format!("--contains={}", tip), "--format=%(refname)", "refs/heads", "refs/remotes"],
+        &["for-each-ref", &format!("--contains={}", tip), "--format=%(refname) %(objectname)", "refs/heads", "refs/remotes"],
     )
-    .unwrap_or_default()
-    .lines()
-    .map(str::trim)
-    .filter(|r| !r.is_empty() && !is_remote_head(r))
-    .map(|r| r.trim_start_matches("refs/heads/").trim_start_matches("refs/remotes/").to_string())
-    .filter(|s| s != branch)
-    .collect();
+    .unwrap_or_default();
+    // (full ref, short name, its commit)
+    let containing: Vec<(String, String, String)> = listed
+        .lines()
+        .filter_map(|l| l.trim().rsplit_once(' '))
+        .filter(|(r, _)| !r.is_empty() && !is_remote_head(r))
+        // A backup branch contains what it backed up: it says nothing about where the work went.
+        .filter(|(r, _)| !r.strip_prefix("refs/heads/").is_some_and(is_safety_branch))
+        .map(|(r, o)| (r.to_string(), r.trim_start_matches("refs/heads/").trim_start_matches("refs/remotes/").to_string(), o.to_string()))
+        .filter(|(_, s, _)| s != branch)
+        .collect();
+    let merged_into: Vec<String> = containing.iter().map(|(_, s, _)| s.clone()).collect();
 
-    let page = history_page(repo_path, branch, 0, 400, None, None, false, false)?;
-    let merges = page.commits.into_iter().filter(|c| c.is_merge).take(50).collect();
+    // How it got into the first few: local branches first, each target commit once.
+    let mut order: Vec<&(String, String, String)> = containing.iter().collect();
+    order.sort_by_key(|(r, _, _)| !r.starts_with("refs/heads/"));
+    let mut seen = std::collections::HashSet::new();
+    let mut merged_by_list = Vec::new();
+    for (full, short, oid) in order {
+        if merged_by_list.len() >= 5 || !seen.insert(oid.clone()) {
+            continue;
+        }
+        if let Some((how, commit)) = merged_by(&repo, tip.trim(), full) {
+            merged_by_list.push(MergedBy { branch: short.clone(), how, commit });
+        }
+    }
+
+    // The merges in the branch's history, newest first: fifty, and how many there are.
+    let fmt = format!("%H{US}%h{US}%P{US}%aN{US}%aE{US}%cI{US}%D{US}%s{US}%aI", US = US);
+    let raw = git(&repo, &["log", "--merges", "--no-show-signature", "--date-order", "-n51", &format!("--format={}", fmt), "--end-of-options", branch]).unwrap_or_default();
+    let mut merges: Vec<HistoryCommit> = parse_log(&raw)
+        .into_iter()
+        .map(|(hash, parents, f)| HistoryCommit {
+            short: f[1].clone(),
+            is_merge: true,
+            author_name: f[3].clone(),
+            author_email: f[4].clone(),
+            date: f[5].clone(),
+            subject: f[7].clone(),
+            author_date: f[8].clone(),
+            refs: Vec::new(),
+            hash,
+            parents,
+            lane: 0,
+            parent_lanes: Vec::new(),
+            active_lanes: Vec::new(),
+            from_above: false,
+            touches_submodules: Vec::new(),
+            only_submodules: false,
+            unpushed: false,
+        })
+        .collect();
+    let merges_truncated = merges.len() > 50;
+    merges.truncate(50);
+    let merges_total = git(&repo, &["rev-list", "--count", "--merges", "--end-of-options", branch]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(merges.len());
 
     Ok(MergeInfo {
         merged_into,
         merges,
+        merged_by: merged_by_list,
+        merges_total,
+        merges_truncated,
     })
 }
 
@@ -915,7 +1097,8 @@ fn snapshot_refs(repo: &Path, space: &str) -> String {
 /// and the comparison is returned to the caller as evidence.
 pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
     let repo = PathBuf::from(repo_path);
-    if git(&repo, &["remote"])?.trim().is_empty() {
+    let remotes: Vec<String> = git(&repo, &["remote"])?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    if remotes.is_empty() {
         return Err(AppError::Config("This repo has no remote to fetch from.".into()));
     }
 
@@ -924,7 +1107,49 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
     let locals_before = snapshot_refs(&repo, "refs/heads");
     let remotes_before = snapshot_refs(&repo, "refs/remotes");
 
-    git(&repo, &["fetch", "--all", "--quiet"])?;
+    // Each remote on its own, through the shared runner (no credential prompt
+    // can hang it) with git's progress on: only a long SILENCE stops it —
+    // never the size of what arrives, and never nothing at all (it used to
+    // wait for ever on a server that stopped answering). Not `--all`: with
+    // two remotes or more git hands each to a child fetch that is not given
+    // `--progress`, and into a pipe that child says nothing while it
+    // downloads. The remotes `--all` would skip (`skipFetchAll`) are skipped.
+    // No submodule recursion, as everywhere else in the app. Called from a
+    // blocking thread, hence `block_on`.
+    let rt = tokio::runtime::Handle::current();
+    let mut failures: Vec<String> = Vec::new();
+    for remote in &remotes {
+        if git(&repo, &["config", "--bool", "--get", &format!("remote.{}.skipFetchAll", remote)]).map(|v| v.trim() == "true").unwrap_or(false) {
+            continue;
+        }
+        if crate::git_exec::validate_remote_name(remote).is_err() {
+            failures.push(format!("{}: not a remote name git can be given safely; fetch it in a terminal.", remote));
+            continue;
+        }
+        let fetched = rt.block_on(
+            crate::git_exec::GitCmd::at(&repo)
+                .for_fetch()
+                .args(["fetch", "--progress", "--no-recurse-submodules", "--", remote])
+                .run(),
+        );
+        match fetched {
+            Ok(out) if out.ok() => {}
+            Ok(out) => {
+                // In the fetch's own words (not the Clone page's), with the
+                // remote's address so a certificate organisation is recognised.
+                let url = git(&repo, &["remote", "get-url", "--", remote]).unwrap_or_default();
+                let ctx = crate::git_advice::AdviceCtx { url: Some(url.trim()), remote: Some(remote), ..Default::default() };
+                let a = crate::git_advice::explain(crate::git_advice::GitOp::Fetch, &out.stderr, &ctx);
+                let guidance = if a.guidance.is_empty() { String::new() } else { format!(" {}", a.guidance) };
+                failures.push(format!("{}: {}{}\n\ngit said: {}", remote, a.headline, guidance, a.git_said));
+            }
+            Err(e) => failures.push(format!("{}: {}", remote, e)),
+        }
+    }
+    rt.block_on(crate::git_exec::housekeeping(&repo));
+    if !failures.is_empty() {
+        return Err(AppError::Command(failures.join("\n\n")));
+    }
 
     let head_after = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default();
     let worktree_after = git(&repo, &["status", "--porcelain"]).unwrap_or_default();
@@ -1024,6 +1249,25 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tip_is_drawn_as_one_and_a_continuing_line_comes_from_above() {
+        let rows = assign_lanes(&[("c".into(), vec!["b".into()]), ("b".into(), vec!["a".into()]), ("a".into(), vec![])]);
+        assert_eq!(rows.iter().map(|r| r.from_above).collect::<Vec<_>>(), vec![false, true, true]);
+    }
+
+    #[test]
+    fn a_filtered_list_joins_only_the_commits_it_shows() {
+        // Every other commit is someone else's: unfiltered parents would leave
+        // a lane waiting for each of them, one more per row.
+        let shown: std::collections::HashSet<String> = ["e", "c", "a"].iter().map(|s| s.to_string()).collect();
+        let chain = [("e", "d"), ("c", "b"), ("a", "")];
+        let input: Vec<(String, Vec<String>)> = chain.iter().map(|(h, p)| (h.to_string(), graph_parents(&[p.to_string()].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>(), Some(&shown)))).collect();
+        let rows = assign_lanes(&input);
+        assert!(rows.iter().all(|r| r.lane == 0), "{:?}", rows.iter().map(|r| r.lane).collect::<Vec<_>>());
+        let raw: Vec<(String, Vec<String>)> = chain.iter().map(|(h, p)| (h.to_string(), [p.to_string()].into_iter().filter(|p| !p.is_empty()).collect())).collect();
+        assert!(assign_lanes(&raw).iter().any(|r| r.lane > 0), "without the filter the lanes pile up");
+    }
 
     #[test]
     fn a_log_line_needs_all_nine_fields_and_keeps_the_author_date_last() {

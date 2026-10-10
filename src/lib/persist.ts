@@ -39,17 +39,46 @@ export function writePersisted<T>(key: string, value: T) {
 }
 
 /**
- * Hand a repository to another page before navigating there. It sets that
- * page's repository AND clears its narrower selection (History's submodule),
- * so a sub-selection left over from an earlier visit cannot hijack the
- * hand-off and show a different repository than the one that was sent.
+ * Hand a repository to the Repository page before navigating there. The page
+ * shows exactly the repository that was sent, whatever an earlier visit left
+ * behind: its scope (a submodule), its account filter — which would move the
+ * page to that account's first repository — and History's branch, which
+ * belonged to another repository. So the hand-off lands under All accounts,
+ * on all branches; a plain return to the page still restores everything.
  */
-export function handOff(page: "changes" | "history", repo: string) {
-  writePersisted(`${page}.repo`, repo);
-  if (page === "history") writePersisted("history.sub", "");
-  // Both pages now live on the Repository page, which reads these keys.
+export function handOff(_page: "changes" | "history", repo: string) {
   writePersisted("repo.path", repo);
   writePersisted("repo.sub", "");
+  writePersisted("repo.account", "");
+  // The keys the pages read before they shared one selection, kept in step.
+  writePersisted("changes.repo", repo);
+  writePersisted("changes.account", "");
+  writePersisted("history.repo", repo);
+  writePersisted("history.sub", "");
+  writePersisted("history.account", "");
+  writePersisted("history.rev", "--all");
+}
+
+const session = new Map<string, unknown>();
+
+/**
+ * Like usePersistedState, but kept only while the app runs: a value that
+ * must survive leaving a page and coming back, and must not outlive the
+ * session (an account chosen for one clone, days later, for another).
+ */
+export function useSessionState<T>(key: string, initial: T) {
+  const [value, setValue] = useState<T>(() => (session.has(key) ? (session.get(key) as T) : initial));
+  const set = useCallback(
+    (next: T | ((prev: T) => T)) => {
+      setValue((prev) => {
+        const v = typeof next === "function" ? (next as (p: T) => T)(prev) : next;
+        session.set(key, v);
+        return v;
+      });
+    },
+    [key]
+  );
+  return [value, set] as const;
 }
 
 export function usePersistedState<T>(key: string, initial: T) {

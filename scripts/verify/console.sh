@@ -138,4 +138,20 @@ ok "it execs the real git at the end" "$OUT" 'exec "'
 ok "  and is honest that it can be stepped around" "$OUT" "guard-rail against a slip, not a barrier"
 fi
 
+# A resize is what keeps a full-screen program inside the drawer: when the
+# shell believes in more rows than are drawn, its last lines land below the
+# visible edge. So the size must reach the shell itself, not only the page.
+if [ "$IS_WIN" = 0 ]; then
+section "A resize reaches the shell"
+OUT=$(probe term_resized "$SB/work" "80x24,100x17,stty size")
+sized() { printf '%s' "$OUT" | "$PY" -c "
+import sys,json,re
+d=json.load(sys.stdin)
+print(re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()][B0]|\r', '', d.get('$1','')))
+"; }
+ok "the shell starts with the size it was opened with (rows, columns)" "$(sized first)" "24 80"
+ok "  and after a resize it reports the new one" "$(sized second)" "17 100"
+ok "  not the old one any more" "$(sized second | grep -c '24 80')" "0"
+fi
+
 verify_result

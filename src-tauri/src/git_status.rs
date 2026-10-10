@@ -45,6 +45,13 @@ pub struct ChangeEntry {
     pub stage_modes: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub stage_oids: Vec<String>,
+    /// A conflicted submodule pointer: the commit "Keep mine" records and the
+    /// one "Take theirs" records, the rebase's swap already applied. None for
+    /// a side that has no submodule there (added or removed on one side).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pointer_mine: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pointer_theirs: Option<String>,
     pub staged_added: Option<u64>,
     pub staged_removed: Option<u64>,
     pub unstaged_added: Option<u64>,
@@ -315,6 +322,9 @@ pub struct RepoIdentity {
     pub signing_key: Option<String>,
     /// "gitswitch" | "foreign" | "none"
     pub guard: String,
+    /// The email GitSwitch's guard expects, when it is GitSwitch's: it is
+    /// written into the hook, so it goes stale when the profile's email changes.
+    pub guard_email: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -428,6 +438,8 @@ fn blank_entry(path: String) -> ChangeEntry {
         recorded_oid: None,
         stage_modes: Vec::new(),
         stage_oids: Vec::new(),
+        pointer_mine: None,
+        pointer_theirs: None,
         staged_added: None,
         staged_removed: None,
         unstaged_added: None,
@@ -957,6 +969,7 @@ async fn read_identity(repo: &Path, hooks: &Path) -> RepoIdentity {
         signing_on,
         signing_key,
         guard: crate::commit_audit::guard_state_in(hooks),
+        guard_email: crate::commit_audit::guard_email_in(hooks),
     }
 }
 
@@ -988,21 +1001,21 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         )));
     }
 
-    let status_out = GitCmd::at(&repo)
+    let status_args = |inside: &'static str| ["status", "--porcelain=v2", "-z", "--branch", "--show-stash", "--untracked-files=all", inside];
+    let mut status_out = GitCmd::at(&repo)
         // Don't fight the user's terminal for index.lock while polling.
         .top_flag("--no-optional-locks")
-        .args([
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--branch",
-            "--show-stash",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ])
+        .args(status_args("--ignore-submodules=none"))
         .timeout(READ_TIMEOUT)
         .run()
         .await?;
+    // A submodule whose download was interrupted (a .git entry with no work
+    // tree behind it) makes git refuse the whole status. The repository's own
+    // status is still readable without looking inside the submodules — each
+    // of those is measured on its own by the submodule list anyway.
+    if !status_out.ok() && (status_out.stderr.contains("failed in submodule") || status_out.stderr.contains("not a git repository")) {
+        status_out = GitCmd::at(&repo).top_flag("--no-optional-locks").args(status_args("--ignore-submodules=all")).timeout(READ_TIMEOUT).run().await?;
+    }
     if !status_out.ok() {
         // With filter.lfs.required set and git-lfs gone, status itself fails
         // with a message that looks like a dropped connection. Say what it is.
@@ -1091,7 +1104,7 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
 
     let identity = read_identity(&repo, &paths.hooks).await;
     let push =
-        crate::push_guard::push_state(&repo, &paths.hooks, identity.profile_id.as_deref()).await;
+        Box::pin(crate::push_guard::push_state(&repo, &paths.hooks, identity.profile_id.as_deref())).await;
 
     // Amending a published commit would require a force-push, which this app
     // never does — so the UI must know before offering the checkbox.
@@ -1147,6 +1160,20 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
 
     let name = crate::paths::base_name(repo_path);
 
+    // A conflicted submodule pointer, in the person's words: which commit
+    // "Keep mine" and "Take theirs" record — a rebase swaps git's sides.
+    let op_kind = operation.as_ref().map(|o| o.kind.clone());
+    let mut entries = parsed.entries;
+    for e in entries.iter_mut().filter(|e| e.kind == "conflicted" && e.stage_modes.iter().any(|m| m == "160000")) {
+        let pick = |side: crate::tree::Side| {
+            let i = if crate::tree::side_flag(op_kind.as_deref(), side) == "--ours" { 1 } else { 2 };
+            (e.stage_modes.get(i).map(String::as_str) == Some("160000")).then(|| e.stage_oids.get(i).cloned()).flatten()
+        };
+        let (mine, theirs) = (pick(crate::tree::Side::Mine), pick(crate::tree::Side::Theirs));
+        e.pointer_mine = mine;
+        e.pointer_theirs = theirs;
+    }
+
     Ok(RepoStatus {
         path: crate::paths::norm(repo_path),
         name,
@@ -1158,7 +1185,7 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
         ahead: parsed.ahead,
         behind: parsed.behind,
         last_fetch_secs: seconds_since(&paths.fetch_head),
-        entries: parsed.entries,
+        entries,
         staged_count,
         unstaged_count,
         untracked_count,
@@ -1207,7 +1234,7 @@ pub async fn push_state_for(repo_path: &str) -> Result<crate::push_guard::PushSt
     let repo = PathBuf::from(repo_path);
     let paths = git_paths(&repo).await?;
     let profile_id = profile_for_repo(repo_path).await.map(|p| p.id);
-    Ok(crate::push_guard::push_state(&repo, &paths.hooks, profile_id.as_deref()).await)
+    Ok(Box::pin(crate::push_guard::push_state(&repo, &paths.hooks, profile_id.as_deref())).await)
 }
 
 pub async fn repair_push_block_for(repo_path: &str) -> Result<crate::push_guard::PushState, AppError> {

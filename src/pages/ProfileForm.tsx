@@ -12,6 +12,7 @@ import { useToast } from "../components/Toast";
 import type { Profile } from "../types/profile";
 import { baseName } from "../lib/paths";
 import * as api from "../lib/api";
+import { identityOf, isSignInValue, loginOfValue, rememberedSignIns, SIGNIN_PREFIX } from "../lib/signins";
 
 export function ProfileForm() {
   const navigate = useNavigate();
@@ -25,6 +26,8 @@ export function ProfileForm() {
   const [gitEmail, setGitEmail] = useState(searchParams.get("github_email") || "");
   const [sshKeyPath, setSshKeyPath] = useState("");
   const [allowPush, setAllowPush] = useState(true);
+  // HTTPS clones in the folders push over SSH with the key (off unless turned on).
+  const [pushOverSsh, setPushOverSsh] = useState(false);
   const [signingEnabled, setSigningEnabled] = useState(false);
   const [signingBusy, setSigningBusy] = useState(false);
   const [signingMsg, setSigningMsg] = useState<string | null>(null);
@@ -45,6 +48,12 @@ export function ProfileForm() {
   const [ghAccounts, setGhAccounts] = useState<string[]>([]);
   const [autofillAccount, setAutofillAccount] = useState("");
   const [autofilling, setAutofilling] = useState(false);
+  // Working out which account a loaded profile is, in the background.
+  const [preselecting, setPreselecting] = useState(false);
+  /** Why only the no-reply address is offered, and how to share the others. */
+  const [emailHint, setEmailHint] = useState<string | null>(null);
+  const scopeHint = (login: string) =>
+    `GitHub shares @${login}'s private addresses only with a token that has the user:email scope. In a terminal: gh auth switch -h github.com -u ${login}, then gh auth refresh -h github.com -s user:email. Then pick the account again.`;
   const [suggestions, setSuggestions] = useState<{ names: string[]; emails: string[] }>({
     names: [],
     emails: [],
@@ -65,16 +74,20 @@ export function ProfileForm() {
   // anything the user typed is left alone.
   const autoFilledName = useRef<string | null>(null);
 
+  // Accounts signed in with GitHub on this computer: their public identity
+  // only, no token — offered beside gh's logins.
+  const [signins] = useState(rememberedSignIns);
+
+  /** A gh login asks GitHub through gh's token; a remembered sign-in answers from what was kept. */
   async function fetchIdentity(account: string) {
+    if (isSignInValue(account)) {
+      const login = loginOfValue(account).toLowerCase();
+      const saved = signins.find((s) => s.login.toLowerCase() === login);
+      if (!saved) throw new Error(`${loginOfValue(account)} is no longer remembered — sign in with GitHub again.`);
+      return identityOf(saved);
+    }
     const token = await api.ghGetToken(account);
-    const u = await api.verifyGithubToken(token);
-    const noreply = `${u.id}+${u.login}@users.noreply.github.com`;
-    return {
-      login: u.login,
-      email: u.email || noreply,
-      names: Array.from(new Set([u.login, u.name].filter(Boolean) as string[])),
-      emails: Array.from(new Set([u.email, noreply].filter(Boolean) as string[])),
-    };
+    return identityOf(await api.verifyGithubToken(token));
   }
 
   /** The user chose an account — fill the git identity fields. */
@@ -96,7 +109,11 @@ export function ProfileForm() {
       // Default to the login handle — that's what git identities conventionally
       // use, and GitHub attributes commits by email regardless of the name.
       setGitName(idty.login);
-      setGitEmail(idty.email);
+      // Re-picking a profile's own account whose token cannot read its
+      // addresses keeps the address the profile has, not the no-reply one.
+      const own = isEdit && !!githubLogin && githubLogin.replace(/^@/, "").toLowerCase() === idty.login.toLowerCase();
+      if (!(own && idty.scopeMissing)) setGitEmail(idty.email);
+      setEmailHint(idty.scopeMissing ? scopeHint(idty.login) : null);
       setName((prev) => (!prev || prev === autoFilledName.current ? idty.login : prev));
       autoFilledName.current = idty.login;
       toast.success(`Filled in ${idty.login}'s git identity`);
@@ -124,6 +141,7 @@ export function ProfileForm() {
       const idty = await fetchIdentity(account);
       if (isCancelled() || userPicked.current || autofillSeq.current !== seq) return;
       setSuggestions({ names: idty.names, emails: idty.emails });
+      setEmailHint(idty.scopeMissing ? scopeHint(idty.login) : null);
     } catch {
       // Leave the chips empty; the dropdown still shows the matched account.
     }
@@ -143,6 +161,8 @@ export function ProfileForm() {
     accountsPromise.then((a) => !cancelled && setGhAccounts(a));
 
     if (!isEdit) {
+      const fromSignIn = searchParams.get("account");
+      if (fromSignIn) void preselectAccount(fromSignIn, isCancelled);
       return () => {
         cancelled = true;
       };
@@ -163,6 +183,7 @@ export function ProfileForm() {
         setGitEmail(profile.git_email);
         setSshKeyPath(profile.ssh_key_path ?? "");
         setAllowPush(profile.allow_push);
+        setPushOverSsh(profile.push_over_ssh ?? false);
       setSigningEnabled(profile.signing_enabled);
         setIsDefaultProfile(profile.is_default);
         setDirectories(profile.directories);
@@ -177,17 +198,27 @@ export function ProfileForm() {
         void (async () => {
           const accounts = await accountsPromise;
           if (cancelled || userPicked.current) return;
-          const byName = accounts.find(
-            (a) => a.toLowerCase() === profile.git_name.trim().toLowerCase()
-          );
-          if (byName) await preselectAccount(byName, isCancelled);
-          if (!profile.ssh_key_path) return;
-          const login = await api
-            .resolveKeyAccount(profile.ssh_key_path)
-            .catch(() => null);
-          if (cancelled || userPicked.current || !login) return;
-          const byKey = accounts.find((a) => a.toLowerCase() === login.toLowerCase());
-          if (byKey && byKey !== byName) await preselectAccount(byKey, isCancelled);
+          setPreselecting(true);
+          try {
+            // The account the profile records comes first: it is what its
+            // pushes are checked against, whatever its git username says.
+            const byStored = accountValueFor(profile.github_login ?? "", accounts);
+            if (byStored) {
+              await preselectAccount(byStored, isCancelled);
+              return;
+            }
+            const byName = accountValueFor(profile.git_name, accounts);
+            if (byName) await preselectAccount(byName, isCancelled);
+            if (!profile.ssh_key_path) return;
+            const login = await api
+              .resolveKeyAccount(profile.ssh_key_path)
+              .catch(() => null);
+            if (cancelled || userPicked.current || !login) return;
+            const byKey = accountValueFor(login, accounts);
+            if (byKey && byKey !== byName) await preselectAccount(byKey, isCancelled);
+          } finally {
+            if (!cancelled) setPreselecting(false);
+          }
         })();
       } catch (e) {
         if (!cancelled) setError(String(e));
@@ -200,6 +231,23 @@ export function ProfileForm() {
       cancelled = true;
     };
   }, [id, isEdit]);
+
+  const accountOptions = [
+    ...ghAccounts.map((a) => ({ value: a, label: a })),
+    ...signins
+      .filter((s) => !ghAccounts.some((a) => a.toLowerCase() === s.login.toLowerCase()))
+      .map((s) => ({ value: `${SIGNIN_PREFIX}${s.login}`, label: `${s.login} · signed in with GitHub` })),
+  ];
+  /** The value in the picker for a login, from either source. */
+  const accountValueFor = (login: string, gh: string[]): string | undefined => {
+    const l = login.trim().replace(/^@/, "").toLowerCase();
+    if (!l) return undefined;
+    const fromGh = gh.find((a) => a.toLowerCase() === l);
+    if (fromGh) return fromGh;
+    const saved = signins.find((s) => s.login.toLowerCase() === l);
+    return saved ? `${SIGNIN_PREFIX}${saved.login}` : undefined;
+  };
+  const pickedLogin = loginOfValue(autofillAccount);
 
   async function handleSubmit(e: SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -219,9 +267,10 @@ export function ProfileForm() {
           allowPush,
           signingEnabled,
           remotePatterns,
+          pushOverSsh,
           // Only a pick the person made changes the stored account; the
           // background preselection is a display guess, not a decision.
-          githubLogin: userPicked.current && autofillAccount ? autofillAccount : githubLogin,
+          githubLogin: userPicked.current && autofillAccount ? pickedLogin : githubLogin,
         });
         toast.success(`Profile "${name}" updated successfully`);
       } else {
@@ -234,7 +283,8 @@ export function ProfileForm() {
           allowPush,
           signingEnabled,
           remotePatterns,
-          githubLogin: (userPicked.current && autofillAccount) || githubLogin || null,
+          pushOverSsh,
+          githubLogin: (userPicked.current && pickedLogin) || githubLogin || null,
         });
         toast.success(`Profile "${name}" created successfully`);
       }
@@ -303,7 +353,8 @@ export function ProfileForm() {
     setError(null);
     try {
       // Prefer the account the user picked; otherwise ask the key itself.
-      let account = autofillAccount;
+      // Registering goes through gh's token, so only a gh login can do it.
+      let account = autofillAccount && !isSignInValue(autofillAccount) ? autofillAccount : "";
       if (!account) {
         const login = await api.resolveKeyAccount(sshKeyPath).catch(() => null);
         if (!login) {
@@ -389,7 +440,7 @@ export function ProfileForm() {
       )}
 
       <form onSubmit={handleSubmit} className="space-y-6">
-        {ghAccounts.length > 0 && (
+        {accountOptions.length > 0 && (
           <Card>
             <div className="flex items-center gap-2 mb-1">
               <GitHubIcon size={16} className="text-emerald-400" />
@@ -398,8 +449,9 @@ export function ProfileForm() {
               </h2>
             </div>
             <p className="text-xs text-zinc-500 mb-3">
-              Pick a GitHub account (from your <span className="font-mono">gh</span>{" "}
-              logins) to fill in the git name &amp; email automatically.
+              Pick a GitHub account (your <span className="font-mono">gh</span> logins, or an
+              account signed in with GitHub on this computer) to fill in the git name &amp; email
+              automatically.
             </p>
             <div className="flex items-center gap-2">
               <Select
@@ -408,11 +460,11 @@ export function ProfileForm() {
                 disabled={autofilling}
                 placeholder="Select a GitHub account…"
                 optionIcon={<GitHubIcon size={14} />}
-                options={ghAccounts.map((a) => ({ value: a, label: a }))}
+                options={accountOptions}
                 className="flex-1"
               />
-              {autofilling && (
-                <Loader2 size={18} className="animate-spin text-emerald-400 shrink-0" />
+              {(autofilling || preselecting) && (
+                <Loader2 size={18} className="animate-spin text-emerald-400 shrink-0" aria-label="Looking up the account" />
               )}
             </div>
           </Card>
@@ -423,7 +475,7 @@ export function ProfileForm() {
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <p className="text-xs text-zinc-400">
                 Pushes from this profile's repositories are expected to go as{" "}
-                <span className="text-zinc-200">@{(userPicked.current && autofillAccount) || githubLogin}</span>.
+                <span className="text-zinc-200">@{(userPicked.current && pickedLogin) || githubLogin}</span>.
                 The Changes page says so when a push would go as someone else.
               </p>
               <Button
@@ -477,6 +529,7 @@ export function ProfileForm() {
               options={altOptions(suggestions.emails, originalIdentity?.email, gitEmail)}
               onPick={setGitEmail}
             />
+            {emailHint && <p className="text-xs text-amber-300/80 break-words">{emailHint}</p>}
           </div>
         </Card>
 
@@ -543,7 +596,7 @@ export function ProfileForm() {
                   addDirectory();
                 }
               }}
-              className="flex-1"
+              containerClassName="flex-1 min-w-0"
             />
             <Button type="button" variant="secondary" onClick={addDirectory}>
               <FolderPlus size={16} />
@@ -626,6 +679,7 @@ export function ProfileForm() {
                           <p className="text-zinc-500 font-mono break-all">
                             {r.changed ? r.new_url : r.note}
                           </p>
+                          {r.changed && <p className="text-zinc-600 break-words">{r.note}</p>}
                         </div>
                       </div>
                     ))
@@ -660,7 +714,7 @@ export function ProfileForm() {
                 }
               }}
               aria-label="Remote rule"
-              className="flex-1"
+              containerClassName="flex-1 min-w-0"
             />
             <Button type="button" variant="secondary" onClick={addRemotePattern}>
               <Globe size={16} />
@@ -721,15 +775,48 @@ export function ProfileForm() {
                 </span>
               ) : (
                 <span className="block text-xs text-zinc-600 mt-1">
-                  Covers standard github.com remotes in this profile's folders.
-                  Remotes with a custom ssh-host alias or an explicit push URL,
-                  and anyone who sets a more specific rewrite of their own or
-                  GIT_CONFIG_NOSYSTEM, get past it. A folder profile that allows
+                  Covers every remote of every repository in this profile's
+                  folders, whatever its address: GitHub in any form, an ssh-host
+                  alias, another host, a local path. What gets past it: a remote
+                  with its own push URL (remote.&lt;name&gt;.pushurl), a more
+                  specific rewrite of your own, and a git that does not read your
+                  global config (another HOME or GIT_CONFIG_GLOBAL). A folder profile that allows
                   pushes does not undo a parent profile's block. For a block that
                   needs the administrator password to remove, lock the repository
                   on the Changes page.
                 </span>
               )}
+            </span>
+          </label>
+          <label
+            className={`flex items-start gap-3 select-none mt-4 pt-4 border-t border-zinc-800 ${
+              allowPush && sshKeyPath ? "cursor-pointer" : "opacity-60 cursor-not-allowed"
+            }`}
+          >
+            <Checkbox
+              checked={pushOverSsh && allowPush && !!sshKeyPath}
+              disabled={!allowPush || !sshKeyPath}
+              onChange={setPushOverSsh}
+              className="mt-0.5"
+            />
+            <span className="min-w-0">
+              <span className="text-sm text-zinc-200 font-medium">
+                Push HTTPS clones over SSH with this profile's key
+              </span>
+              <span className="block text-xs text-zinc-500 mt-0.5">
+                A repository cloned with an <span className="font-mono">https://github.com/</span> address
+                pushes with this key — as its GitHub account — instead of whichever account
+                the credential helper remembers. Only the push moves (git's{" "}
+                <span className="font-mono">pushInsteadOf</span>): fetch, pull and Git LFS
+                downloads stay on HTTPS. A remote with its own push URL keeps it. Leave it off for an
+                organisation that requires SSH certificates (its addresses start with{" "}
+                <span className="font-mono">org-…@github.com</span>): it refuses a plain key.
+              </span>
+              {!sshKeyPath ? (
+                <span className="block text-xs text-amber-400/80 mt-1">Pick an SSH key above first.</span>
+              ) : !allowPush ? (
+                <span className="block text-xs text-zinc-600 mt-1">Pushes are blocked in these folders.</span>
+              ) : null}
             </span>
           </label>
         </Card>
@@ -755,7 +842,8 @@ export function ProfileForm() {
               </span>
               <span className="block text-xs text-zinc-500 mt-0.5">
                 Sets <span className="font-mono">gpg.format=ssh</span> and{" "}
-                <span className="font-mono">commit.gpgsign</span> for these folders, and
+                <span className="font-mono">commit.gpgsign</span>{" "}
+                {isDefaultProfile ? "wherever no other profile's folder or remote rule applies" : "for these folders"}, and
                 keeps <span className="font-mono">~/.ssh/allowed_signers</span> in sync so
                 signatures verify locally too.
               </span>

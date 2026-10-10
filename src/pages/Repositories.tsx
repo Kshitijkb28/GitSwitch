@@ -22,7 +22,7 @@ import { Select } from "../components/Select";
 import { Checkbox } from "../components/Checkbox";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { useToast } from "../components/Toast";
-import { usePersistedState } from "../lib/persist";
+import { handOff, usePersistedState } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
@@ -151,6 +151,15 @@ export function Repositories() {
   /** Fresh local answers win over whatever the listing said when it was fetched. */
   const localPathOf = (r: api.RemoteRepo) =>
     local ? local.clones[r.full_name.toLowerCase()] ?? null : r.local_path;
+  /** The folder a clone of this repository is still being written into. */
+  const cloningPathOf = (r: api.RemoteRepo) => local?.cloning?.[r.full_name.toLowerCase()] ?? null;
+  // While a clone runs, the list is read again until it is done.
+  const anyCloning = Object.keys(local?.cloning ?? {}).length > 0;
+  useEffect(() => {
+    if (!anyCloning) return;
+    const id = window.setInterval(refreshLocal, 5000);
+    return () => window.clearInterval(id);
+  }, [anyCloning, refreshLocal]);
   const cloneUrlOf = (r: api.RemoteRepo) => {
     const orgUser = local?.org_ssh_users[r.owner.toLowerCase()];
     return orgUser ? `${orgUser}@github.com:${r.owner}/${r.name}.git` : r.clone_url;
@@ -287,14 +296,8 @@ export function Repositories() {
       refreshLocal();
       return;
     }
-    try {
-      localStorage.setItem("gitswitch:history.repo", JSON.stringify(path));
-      localStorage.setItem("gitswitch:history.account", JSON.stringify(""));
-      localStorage.setItem("gitswitch:history.rev", JSON.stringify("--all"));
-    } catch {
-      /* storage unavailable — History will simply open on its default repo */
-    }
-    navigate("/history");
+    handOff("history", path);
+    navigate("/repo/history");
   }
 
   async function copyLink(url: string) {
@@ -349,8 +352,9 @@ export function Repositories() {
           <BookMarked size={32} className="mx-auto text-zinc-600 mb-3" />
           <h3 className="text-lg font-medium text-zinc-300">No GitHub accounts signed in</h3>
           <p className="text-sm text-zinc-500 mt-1 max-w-md mx-auto">
-            Sign in with the GitHub CLI (<span className="font-mono">gh auth login</span>) or on the
-            GitHub Auth page, and your repositories will show up here.
+            Sign in on the GitHub page — with GitHub itself, or the GitHub CLI's{" "}
+            <span className="font-mono">gh auth login</span> — then Refresh, and the repositories each account
+            can reach show up here.
           </p>
           <Button className="mt-4" variant="secondary" onClick={() => navigate("/github")}>
             <GitHubIcon size={16} />
@@ -500,6 +504,7 @@ export function Repositories() {
             {visible.map((r) => {
               const suggestion = profileName(suggestionFor(r));
               const localPath = localPathOf(r);
+              const cloningPath = localPath ? null : cloningPathOf(r);
               return (
                 <div key={r.full_name} className="flex items-start gap-3 py-3 min-w-0">
                   <span className="mt-0.5 shrink-0 text-zinc-500" title={r.private ? "Private" : "Public"}>
@@ -527,6 +532,10 @@ export function Repositories() {
                         <span className="text-emerald-400/80" title={localPath}>
                           {" "}· cloned at {shortPath(localPath)}
                         </span>
+                      ) : cloningPath ? (
+                        <span className="text-sky-300/80" title={cloningPath}>
+                          {" "}· cloning into {shortPath(cloningPath)}…
+                        </span>
                       ) : (
                         suggestion && <> · clones as {suggestion}</>
                       )}
@@ -545,6 +554,11 @@ export function Repositories() {
                       <Button size="sm" variant="secondary" onClick={() => openInHistory(localPath)}>
                         <FolderOpen size={14} />
                         Open
+                      </Button>
+                    ) : cloningPath ? (
+                      <Button size="sm" variant="secondary" onClick={() => navigate("/sparse")} title="The Clone page shows its progress">
+                        <Loader2 size={14} className="animate-spin" />
+                        Cloning…
                       </Button>
                     ) : (
                       <Button size="sm" onClick={() => cloneRepo(r)}>

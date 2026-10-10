@@ -128,6 +128,7 @@ function identity(over = {}) {
     signing_on: false,
     signing_key: null,
     guard: "none",
+    guard_email: null,
     ...over,
   };
 }
@@ -275,8 +276,8 @@ export const SYNC_OUTCOME = {
   phase: "done",
   needs_user: null,
   backups: [
-    { repo: "/repos/gitswitch", branch: "gitswitch-before-sync-20260923120000", oid: SYNC_SUPER.head, recovery: "git -C /repos/gitswitch reset --hard gitswitch-before-sync-20260923120000" },
-    { repo: "/repos/gitswitch/A", branch: "gitswitch-before-sync-20260923120000", oid: SYNC_SUB_A.head, recovery: "git -C /repos/gitswitch/A reset --hard gitswitch-before-sync-20260923120000" },
+    { repo: "/repos/gitswitch", branch: "gitswitch-before-update-20260923120000", oid: SYNC_SUPER.head, recovery: "git -C /repos/gitswitch reset --hard gitswitch-before-update-20260923120000" },
+    { repo: "/repos/gitswitch/A", branch: "gitswitch-before-update-20260923120000", oid: SYNC_SUB_A.head, recovery: "git -C /repos/gitswitch/A reset --hard gitswitch-before-update-20260923120000" },
   ],
   bundles: [],
   head_before: SYNC_SUPER.head,
@@ -376,6 +377,15 @@ export const REBASE_OP = {
 
 export const SCENARIOS = {
   clean: status(),
+
+  // The identity guard is GitSwitch's and expects the profile's email…
+  guardOn: status({ identity: identity({ guard: "gitswitch", guard_email: "me@personal.test" }) }),
+  // …or an email the profile had before it was changed: it would refuse the commit.
+  guardStale: status({
+    identity: identity({ guard: "gitswitch", guard_email: "old@personal.test" }),
+    entries: [entry({ path: "src/staged.ts", staged: "M", unstaged: ".", staged_added: 1, staged_removed: 0 })],
+    staged_count: 1,
+  }),
 
   dirty: status({
     entries: [

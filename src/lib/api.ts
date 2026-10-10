@@ -12,6 +12,11 @@ export async function getProfiles(): Promise<Profile[]> {
   return invoke("get_profiles");
 }
 
+/** The page a gitswitch:// link asked for before the page listened (the link that started the app). */
+export async function deepLinkTake(): Promise<string | null> {
+  return invoke("deep_link_take");
+}
+
 export async function createProfile(params: {
   name: string;
   gitName: string;
@@ -22,6 +27,7 @@ export async function createProfile(params: {
   signingEnabled?: boolean | null;
   remotePatterns?: string[] | null;
   githubLogin?: string | null;
+  pushOverSsh?: boolean | null;
 }): Promise<Profile> {
   return invoke("create_profile", params);
 }
@@ -37,6 +43,7 @@ export async function updateProfile(params: {
   signingEnabled?: boolean | null;
   remotePatterns?: string[] | null;
   githubLogin?: string | null;
+  pushOverSsh?: boolean | null;
 }): Promise<Profile> {
   return invoke("update_profile", params);
 }
@@ -90,10 +97,9 @@ export async function ghLogout(account: string): Promise<string> {
 
 export async function ghRegisterSshKey(
   account: string,
-  keyPath: string,
-  title: string
+  keyPath: string
 ): Promise<string> {
-  return invoke("gh_register_ssh_key", { account, keyPath, title });
+  return invoke("gh_register_ssh_key", { account, keyPath });
 }
 
 export async function resolveKeyAccount(
@@ -154,6 +160,8 @@ export interface BranchInfo {
   last_author: string;
   last_date: string;
   last_subject: string;
+  /** One of GitSwitch's own backup branches (before an update, a reset, a rewrite). */
+  is_backup?: boolean;
 }
 
 export interface HistoryCommit {
@@ -177,6 +185,8 @@ export interface HistoryCommit {
   lane: number;
   parent_lanes: number[];
   active_lanes: number[];
+  /** A lane was waiting for it: its line comes from above (false for a tip). */
+  from_above?: boolean;
 }
 
 export interface HistoryPage {
@@ -294,6 +304,17 @@ export async function historySyncStatus(
 export interface MergeInfo {
   merged_into: string[];
   merges: HistoryCommit[];
+  /** How the branch got into the first few branches that contain it. */
+  merged_by?: MergedBy[];
+  merges_total?: number;
+  merges_truncated?: boolean;
+}
+
+export interface MergedBy {
+  branch: string;
+  /** merge | fast-forward | same-commit */
+  how: string;
+  commit: { hash: string; short: string; subject: string; author_name: string; date: string; parents: string[] } | null;
 }
 
 export async function historyListRepos(): Promise<RepoRef[]> {
@@ -348,6 +369,10 @@ export interface CommitInfo {
   date: string;
   subject: string;
   pushed: boolean;
+  /** The local branches holding it, when no remote-tracking branch does. */
+  branches: string[];
+  /** On the checked-out branch: what Fix rewrites. */
+  on_head: boolean;
 }
 
 export interface RepoAudit {
@@ -362,6 +387,10 @@ export interface RepoAudit {
   has_upstream: boolean;
   dirty: boolean;
   guard: "none" | "gitswitch" | "foreign";
+  /** Wrong commits of yours on other local branches. */
+  other_branch_count: number;
+  /** Why Fix cannot run here now, when it cannot. */
+  fix_blocker: string | null;
 }
 
 export async function auditCommits(): Promise<RepoAudit[]> {
@@ -409,6 +438,16 @@ export async function doctorCheckRepos(): Promise<Finding[]> {
 }
 
 /** Doctor's repair for a repository-local identity override. */
+/** Doctor, on request: can the account each repository pushes as see it on GitHub? */
+export async function doctorCheckRepoAccess(): Promise<Finding[]> {
+  return invoke("doctor_check_repo_access");
+}
+
+/** One of Doctor's own repairs, by its finding's fix id. */
+export async function doctorApplyFix(fix: string): Promise<string> {
+  return invoke("doctor_apply_fix", { fix });
+}
+
 export async function doctorUnsetLocal(repoPath: string, key: string): Promise<string> {
   return invoke("doctor_unset_local", { repoPath, key });
 }
@@ -420,6 +459,8 @@ export async function doctorFixSshConfig(): Promise<string> {
 export interface ScannedRepo {
   path: string;
   remote_url: string;
+  /** origin's own push URL, when set and different from remote_url (masked). */
+  push_url?: string;
   owner: string;
   name: string;
 }
@@ -460,6 +501,8 @@ export interface SubmoduleReport {
   /** the listed submodules whose update failed, by path */
   failed_paths: string[];
   error: string | null;
+  /** Submodules whose interrupted download was cleared before downloading again. */
+  cleared?: string[];
 }
 
 /** The large files after a checkout — present whenever the repo uses Git LFS. */
@@ -489,6 +532,8 @@ export interface CloneResult {
   mapped_to: string | null;
   submodules: SubmoduleReport | null;
   lfs: LfsReport | null;
+  /** The same for each populated submodule that uses Git LFS. */
+  submodule_lfs?: { path: string; report: LfsReport }[];
 }
 
 export interface SparseSetResult {
@@ -510,6 +555,10 @@ export interface CloneProgress {
   rate: string | null;
   /** What is being worked on right now: the submodule being fetched, the large file being downloaded. */
   detail?: string;
+  /** What the host says the repository being downloaded weighs, in kilobytes; absent when it does not say. */
+  estimate_kb?: number;
+  /** Seconds left at the current rate; absent when there is nothing to base it on yet. */
+  eta_secs?: number;
 }
 
 export async function cloneProgress(destPath: string): Promise<CloneProgress | null> {
@@ -559,7 +608,7 @@ export async function fullClone(
 }
 
 export interface RepoAccount {
-  /** "gh:<account>" or "profile:<profile id>" */
+  /** "gh:<login>" (a GitHub CLI login) or "signin:<login>" (a sign-in kept here) */
   key: string;
   label: string;
   source: string;
@@ -598,6 +647,8 @@ export interface LocalClones {
   owner_profiles: Record<string, string>;
   /** owner (lowercase) -> "org-<id>" SSH user seen locally */
   org_ssh_users: Record<string, string>;
+  /** "owner/name" (lowercase) -> the folder a clone is still writing it into */
+  cloning?: Record<string, string>;
 }
 
 /** Which repos are on this machine right now — local disk only, no network. */
@@ -689,17 +740,25 @@ export async function sparseAdd(
   return invoke("sparse_add", { repoPath, dirs });
 }
 
-export async function storeGithubToken(
-  profileId: string,
-  token: string
-): Promise<void> {
-  return invoke("store_github_token", { profileId, token });
+/** A login signed in with "Sign in with GitHub" and kept here; its token is in the system's credential store. */
+export interface KeptSignIn {
+  login: string;
+  id: number;
 }
 
-export async function getGithubToken(
-  profileId: string
-): Promise<string | null> {
-  return invoke("get_github_token", { profileId });
+/** Keep a "Sign in with GitHub": GitHub is asked whose token it is, and the token goes to the system's credential store. */
+export async function githubSigninKeep(token: string): Promise<GitHubUser> {
+  return invoke("github_signin_keep", { token });
+}
+
+/** Forget a kept sign-in: its token and its login. */
+export async function githubSigninForget(login: string): Promise<void> {
+  return invoke("github_signin_forget", { login });
+}
+
+/** The sign-ins kept here, newest first. */
+export async function githubSignins(): Promise<KeptSignIn[]> {
+  return invoke("github_signins");
 }
 
 export async function applyGitConfig(): Promise<void> {
@@ -714,8 +773,14 @@ export interface GitHubUser {
   id: number;
   login: string;
   name: string | null;
+  /** The public address, if the account shows one. */
   email: string | null;
   avatar_url: string;
+  /** The account's verified addresses, primary first (needs the user:email scope). */
+  emails?: string[];
+  primary_email?: string | null;
+  /** The token could not read the account's addresses. */
+  email_scope_missing?: boolean;
 }
 
 export interface GitHubKey {
@@ -791,6 +856,9 @@ export interface ChangeEntry {
   /** Conflicted entries only: modes and oids of index stages 1, 2, 3 (base, ours, theirs). */
   stage_modes?: string[];
   stage_oids?: string[];
+  /** A conflicted submodule pointer: the commit Keep mine / Take theirs records (sides already mapped). */
+  pointer_mine?: string;
+  pointer_theirs?: string;
   staged_added: number | null;
   staged_removed: number | null;
   unstaged_added: number | null;
@@ -859,6 +927,8 @@ export interface RepoIdentity {
   signing_on: boolean;
   signing_key: string | null;
   guard: "gitswitch" | "foreign" | "none";
+  /** The email GitSwitch's guard expects; it goes stale when the profile's email changes. */
+  guard_email: string | null;
 }
 
 export interface RemotePushState {
@@ -917,8 +987,40 @@ export interface PushState {
 
 export type PushMode = "allowed" | "guardrail" | "locked";
 
+/** One submodule's share of the repository's push block or lock. */
+export interface SubCoverage {
+  path: string;
+  blocked: boolean;
+  locked: boolean;
+  needs_repair: boolean;
+  /** It has what the repository has: a lock under a locked repository, at least the guard-rail under a blocked one. */
+  covered: boolean;
+  /** When not covered: what it has instead, in plain words. */
+  why: string;
+  /** Its block is the repository's doing: the repository's "Allowed" takes it away (with the prompt when it is a lock). */
+  by_superproject?: boolean;
+  /** When its lock is not whole: what was measured, in the lock's own terms. */
+  drift?: string[];
+}
+
+/** How far the repository's push block or lock reaches into its submodules — where the code lives. */
+export interface PushCoverage {
+  mode: PushMode;
+  submodules: SubCoverage[];
+  /** Submodules with less than the repository has: a push from inside them is not stopped. */
+  uncovered: string[];
+  /** Repair can do something about what is uncovered. */
+  needs_repair: boolean;
+  /** ...and part of it is the administrator's: Repair shows the prompt. */
+  needs_elevation?: boolean;
+  /** One sentence for the card; empty when there is nothing to say. */
+  summary: string;
+}
+
 export type JobOutcomeKind =
   | "applied"
+  /** What could be done was done; something is still not covered (the message says what). */
+  | "incomplete"
   | "cancelled"
   | "denied"
   | "no-agent"
@@ -1053,7 +1155,9 @@ export interface SubmoduleInfo {
     | "dirty"
     | "moved-and-dirty"
     | "not-initialised"
-    | "unmapped";
+    | "unmapped"
+    /** A `.git` entry but nothing checked out: a download that was interrupted. Downloadable again. */
+    | "incomplete";
   summary: string;
   gitdir_valid: boolean;
   operation: string | null;
@@ -1067,6 +1171,8 @@ export interface SubmoduleInfo {
   recorded_on_remote: boolean | null;
   /** Commits at its checkout that no remote-tracking branch has; `null` without one to compare with. */
   own_unpushed: number | null;
+  /** `<remote>/<branch>` a clone would follow, when that remote-tracking branch is here. */
+  latest_ref?: string | null;
 }
 
 export interface LfsStatus {
@@ -1290,7 +1396,7 @@ export interface StashRef {
 }
 
 export interface TreeOutcome {
-  /** switch | create-branch | delete-branch | rename-branch | undo-commit | reset | detach | revert | cherry-pick | resolve-side | discard-all */
+  /** switch | create-branch | delete-branch | rename-branch | undo-commit | reset | detach | revert | cherry-pick | resolve-side | discard-all | align-submodules */
   op: string;
   head_before: string | null;
   head_after: string | null;
@@ -1694,9 +1800,11 @@ export async function changesSyncRun(
   repoPath: string,
   stash: boolean,
   bundles: boolean,
-  fingerprint: [string, string][]
+  fingerprint: [string, string][],
+  /** Download every large file still a pointer stub afterwards, in each repository that uses LFS. */
+  withLfs = false
 ): Promise<OpResult> {
-  return invoke("changes_sync_run", { repoPath, stash, bundles, fingerprint });
+  return invoke("changes_sync_run", { repoPath, stash, bundles, fingerprint, withLfs });
 }
 
 export async function changesSyncContinue(repoPath: string, allowMarkers = false): Promise<OpResult> {
@@ -1802,14 +1910,21 @@ export async function changesPull(
   repoPath: string,
   mode: PullMode,
   withLfs: boolean,
-  autostash: boolean
+  autostash: boolean,
+  /** A remote-tracking branch to integrate instead of the upstream ("origin/main"). */
+  source: string | null = null
 ): Promise<OpResult> {
-  return invoke("changes_pull", { repoPath, mode, withLfs, autostash });
+  return invoke("changes_pull", { repoPath, mode, withLfs, autostash, source });
 }
 
 /** `paths`: only these submodules (the never-initialised ones); null = every listed one. */
 export async function changesSubmoduleUpdate(repoPath: string, paths: string[] | null = null): Promise<OpResult> {
   return invoke("changes_submodule_update", { repoPath, paths });
+}
+
+/** Checks out, in these submodules, the commit the repository records for each. Local only. */
+export async function changesSubmoduleAlign(repoPath: string, paths: string[]): Promise<OpResult> {
+  return invoke("changes_submodule_align", { repoPath, paths });
 }
 
 export async function changesContinue(repoPath: string, allowMarkers = false): Promise<OpResult> {
@@ -1851,6 +1966,10 @@ export async function pushLockFinishManual(nonce: string): Promise<JobOutcome> {
 
 export async function doctorCheckPushLocks(): Promise<Finding[]> {
   return invoke("doctor_check_push_locks");
+}
+
+export async function changesPushCoverage(repoPath: string): Promise<PushCoverage> {
+  return invoke("changes_push_coverage", { repoPath });
 }
 
 export async function changesRepairPushBlock(repoPath: string): Promise<PushState> {

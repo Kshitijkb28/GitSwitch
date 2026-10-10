@@ -1,17 +1,18 @@
 # =============================================================================
-# GitSwitch — Linux package BUILDER image.
+# GitSwitch in Docker — one file, three targets:
 #
-# IMPORTANT: This image does NOT run the app. GitSwitch is a native desktop GUI
-# (Tauri), and a container has no display. This image exists to *build* the
-# Linux installers (.deb / .AppImage / .rpm) reproducibly on any machine.
+#   builder (the default): the Linux installers (.deb / .AppImage / .rpm)
+#       docker build -t gitswitch-builder .
+#       docker run --rm -v "$PWD/dist-linux:/out" gitswitch-builder
+#   app: the built app, on any Docker host, no checkout needed
+#       docker compose up app        then open http://localhost:6080/vnc.html
+#   dev: `tauri dev` on the checkout mounted from the host
+#       docker compose up dev        then open http://localhost:6080/vnc.html
 #
-# Usage (produces installers into ./dist-linux on your host):
-#   docker build -t gitswitch-builder .
-#   docker run --rm -v "$PWD/dist-linux:/out" gitswitch-builder
-#
-# The build artifacts land in /out on the host. Nothing else is touched.
+# A desktop app needs a display: the container runs a virtual one (Xvfb) and
+# shows it in the host's browser through noVNC, bound to localhost only.
 # =============================================================================
-FROM rust:1-bookworm AS builder
+FROM rust:1-bookworm AS toolchain
 
 # System deps required by Tauri v2 on Linux (webkit2gtk 4.1, gtk, ayatana tray…)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -46,6 +47,9 @@ ENV APPIMAGE_EXTRACT_AND_RUN=1
 
 WORKDIR /app
 
+# --- the installers ------------------------------------------------------------
+FROM toolchain AS compile
+
 # Cache dependencies first
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -62,5 +66,44 @@ ARG BUNDLES=deb,rpm,appimage
 RUN npm run build \
  && cargo tauri build --bundles "$BUNDLES"
 
-# Default: copy the built installers to the mounted /out volume.
+# --- `tauri dev` on the mounted checkout ---------------------------------------
+FROM toolchain AS dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb x11vnc novnc websockify openbox dbus dbus-x11 xauth \
+    fonts-dejavu-core libgl1-mesa-dri git git-lfs openssh-client \
+ && rm -rf /var/lib/apt/lists/* \
+ && git config --system safe.directory '*' \
+ && mkdir -p -m 1777 /tmp/.X11-unix
+ENV DISPLAY=:99 WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 NO_AT_BRIDGE=1 XDG_RUNTIME_DIR=/tmp/xdg
+COPY scripts/docker/display.sh scripts/docker/dev.sh /usr/local/bin/
+RUN sed -i 's/\r$//' /usr/local/bin/display.sh /usr/local/bin/dev.sh \
+ && chmod 755 /usr/local/bin/display.sh /usr/local/bin/dev.sh
+EXPOSE 6080
+CMD ["/usr/local/bin/dev.sh"]
+
+# --- the built app, on any Docker host -----------------------------------------
+FROM debian:bookworm-slim AS app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb x11vnc novnc websockify openbox dbus dbus-x11 xauth \
+    fonts-dejavu-core libgl1-mesa-dri git git-lfs openssh-client ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && git config --system safe.directory '*' \
+ && mkdir -p -m 1777 /tmp/.X11-unix
+# The package pulls the webkit/gtk/tray runtime it declares, and puts the app
+# and its two sidecars side by side in /usr/bin, where the app looks for them.
+COPY --from=compile /app/src-tauri/target/release/bundle/deb/ /tmp/deb/
+RUN apt-get update && apt-get install -y --no-install-recommends /tmp/deb/*.deb \
+ && rm -rf /var/lib/apt/lists/* /tmp/deb \
+ && useradd -m gitswitch
+ENV DISPLAY=:99 WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 NO_AT_BRIDGE=1 XDG_RUNTIME_DIR=/tmp/xdg
+COPY scripts/docker/display.sh scripts/docker/app.sh /usr/local/bin/
+RUN sed -i 's/\r$//' /usr/local/bin/display.sh /usr/local/bin/app.sh \
+ && chmod 755 /usr/local/bin/display.sh /usr/local/bin/app.sh
+USER gitswitch
+WORKDIR /home/gitswitch
+EXPOSE 6080
+CMD ["/usr/local/bin/app.sh"]
+
+# --- the default: copy the installers out ----------------------------------------
+FROM compile AS builder
 CMD ["bash", "-c", "mkdir -p /out && cp -v src-tauri/target/release/bundle/deb/*.deb /out/ 2>/dev/null; cp -v src-tauri/target/release/bundle/appimage/*.AppImage /out/ 2>/dev/null; cp -rv src-tauri/target/release/bundle/rpm/*.rpm /out/ 2>/dev/null; echo 'Linux installers copied to ./dist-linux'"]

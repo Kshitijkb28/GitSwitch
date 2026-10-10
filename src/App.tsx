@@ -1,5 +1,8 @@
-import { useEffect } from "react";
-import { Routes, Route, NavLink, Navigate, useLocation } from "react-router-dom";
+import { useEffect, useRef } from "react";
+import { Routes, Route, NavLink, Navigate, useLocation, useNavigate } from "react-router-dom";
+import { listen } from "@tauri-apps/api/event";
+import { readPersisted, writePersisted } from "./lib/persist";
+import { deepLinkTake } from "./lib/api";
 import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequestArrow, SquareTerminal } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
@@ -16,8 +19,48 @@ import { Repo } from "./pages/Repo";
 import { ConsoleDrawer } from "./components/console/ConsoleDrawer";
 import { toggleConsole, useConsole } from "./lib/console";
 
+const REPO_TABS = ["changes", "history", "submodules"];
+
+/** The Repository page's tab the person was last on. */
+function rememberedRepoTab(): string {
+  const t = readPersisted<string>("repo.tab", "changes");
+  return REPO_TABS.includes(t) ? t : "changes";
+}
+
 function App() {
   const location = useLocation();
+  const navigate = useNavigate();
+  // A gitswitch:// link (the VS Code extension's "Open GitSwitch") names a
+  // page. Listened for once: `navigate` changes with every page, the listener
+  // need not. The link that started the app came before anyone listened: it
+  // is collected once the listener is in place.
+  const navigateRef = useRef(navigate);
+  useEffect(() => {
+    navigateRef.current = navigate;
+  }, [navigate]);
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let gone = false;
+    listen<string>("navigate", (e) => navigateRef.current(e.payload))
+      .then((f) => {
+        if (gone) return f();
+        stop = f;
+        return deepLinkTake().then((page) => {
+          if (!gone && typeof page === "string" && page.startsWith("/")) navigateRef.current(page);
+        });
+      })
+      .catch(() => {});
+    return () => {
+      gone = true;
+      stop?.();
+    };
+  }, []);
+  // The tab on screen is remembered, so the sidebar's Repository and /repo
+  // bring the person back to it after another page.
+  const repoTabHere = /^\/repo\/(changes|history|submodules)\/?$/.exec(location.pathname)?.[1] ?? null;
+  useEffect(() => {
+    if (repoTabHere) writePersisted("repo.tab", repoTabHere);
+  }, [repoTabHere]);
   const { open: consoleOpen, height: consoleHeight } = useConsole();
 
   // Ctrl/Cmd + ` is the shortcut every other editor uses for its terminal.
@@ -61,7 +104,7 @@ function App() {
             Clone
           </SidebarLink>
           <SidebarLink
-            to="/repo/changes"
+            to={`/repo/${repoTabHere ?? rememberedRepoTab()}`}
             icon={<GitPullRequestArrow size={18} />}
             active={/^\/repo(\/|$)/.test(location.pathname)}
           >
@@ -111,7 +154,7 @@ function App() {
           <Route path="/repos" element={<Repositories />} />
           <Route path="/sparse" element={<SparseClone />} />
           <Route path="/repo/:tab" element={<Repo />} />
-          <Route path="/repo" element={<Navigate to="/repo/changes" replace />} />
+          <Route path="/repo" element={<Navigate to={`/repo/${rememberedRepoTab()}`} replace />} />
           <Route path="/changes" element={<Navigate to="/repo/changes" replace />} />
           <Route path="/auto-assign" element={<AutoAssign />} />
           <Route path="/doctor" element={<Doctor />} />

@@ -143,7 +143,7 @@ ARGS=$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"paths
 ok "a path outside the repository is refused" "$(pinvoke changes_submodule_update "$ARGS")" "isn't a path inside this repository"
 cd "$SB/super"
 
-ok "  and initialising from the Changes page reports no clone progress — no clone is running there" "$TRACE_INIT" "[]"
+ok "  and downloading from the Changes page reports progress under the repository's path, for the page's strip" "$(printf '%s' "$TRACE_INIT" | "$PY" -c 'import sys,json;t=json.load(sys.stdin);print(sorted(set(p["phase"] for p in t)), t[0]["done"] if t else None)')" "['Submodules'] 0"
 
 section "Cloning this superproject names each submodule as it arrives"
 mkdir -p "$SB/clones"
@@ -330,5 +330,201 @@ pair "$SB/pcd" lib; git -C "$SB/pcd/work/lib" checkout -q --detach; bump "$SB/pc
 # (the call on its own line: macOS bash 3.2 mangles \" inside "$( )")
 OUT=$(pinvoke changes_push "{\"repoPath\":\"$SB/pcd/work\",\"setUpstream\":false,\"allowUnpushedSubmodules\":false}")
 ok "for a detached submodule the refusal asks for a branch there first" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["refusal"]["message"])')" "Push lib first (it is detached — start a branch there first), or push anyway."
+
+section "A download that was interrupted is not 'populated': it is finished by Download"
+IC="$SB/incomplete"; mkdir -p "$IC"
+git init -q --bare "$IC/super.git"; git init -q --bare "$IC/lib.git"
+git clone -q "$IC/lib.git" "$IC/author-lib" 2>/dev/null; printf 'lib v1\n' > "$IC/author-lib/lib.txt"; git -C "$IC/author-lib" add -A >/dev/null; git -C "$IC/author-lib" commit -qm "lib: initial"; git -C "$IC/author-lib" push -q origin main 2>/dev/null
+git clone -q "$IC/super.git" "$IC/author" 2>/dev/null; printf 'readme\n' > "$IC/author/README.md"; git -C "$IC/author" add -A >/dev/null; git -C "$IC/author" commit -qm "super: initial"
+( cd "$IC/author" && git submodule add -q "$IC/lib.git" lib 2>/dev/null ); git -C "$IC/author" commit -qam "super: add lib" >/dev/null; git -C "$IC/author" push -q origin main 2>/dev/null
+git clone -q "$IC/super.git" "$IC/work" 2>/dev/null; W="$IC/work"
+# What a crash or a stall mid-download leaves: the gitfile and a module directory without a commit.
+# (`--separate-git-dir` makes exactly what `git submodule update` makes first: the gitfile in lib/, the git dir under .git/modules/.)
+mkdir -p "$W/.git/modules"; git init -q --separate-git-dir "$W/.git/modules/lib" "$W/lib" 2>/dev/null
+ok "the repository's own status still reads with such a submodule in it" "$(probe status "$W" | jqf branch)" "main"
+OUT=$(probe submodules_list "$W")
+ok "the row says the download was interrupted, and is not counted as populated" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;s=json.load(sys.stdin)[0];print(s["initialised"], s["actual"], s["state"], s["summary"])')" "True None incomplete its download was interrupted — nothing is checked out; Download finishes it (git submodule update --init)"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W\",\"paths\":[\"lib\"]}")
+ok "Download clears the leftovers and finishes it, saying so" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["downloaded"], v["submodules"]["cleared"], "was cleared before downloading again" in v["detail"])')" "True 1 ['lib'] True"
+ok "  and lib is checked out at the recorded commit" "$(git -C "$W/lib" rev-parse HEAD 2>/dev/null):$(probe submodules_list "$W" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["state"])')" "$(git -C "$W" rev-parse HEAD:lib):clean"
+# A module directory that does hold commits is never removed: a submodule whose HEAD points nowhere is finished by a checkout, its commits kept.
+git -C "$W/lib" symbolic-ref HEAD refs/heads/nowhere
+OUT=$(probe submodules_list "$W")
+ok "a submodule with commits but nothing checked out is reported as incomplete too" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;s=json.load(sys.stdin)[0];print(s["state"])')" "incomplete"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W\",\"paths\":[\"lib\"]}")
+ok "  Download does not throw its commits away" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["cleared"])'):$([ "$(git -C "$W/.git/modules/lib" rev-list --all --count)" -gt 0 ] && echo kept || echo GONE):$(git -C "$W/lib" rev-parse HEAD 2>/dev/null)" "True []:kept:$(git -C "$W" rev-parse HEAD:lib)"
+# An interrupted transfer: HEAD gone, only a temporary pack — nothing git can read, nothing to keep.
+rm -f "$W/.git/modules/lib/HEAD"; find "$W/.git/modules/lib/refs" -type f -delete; rm -f "$W/.git/modules/lib/packed-refs"; rm -rf "$W/.git/modules/lib/objects"; mkdir -p "$W/.git/modules/lib/objects/pack"; printf 'partial' > "$W/.git/modules/lib/objects/pack/tmp_pack_abc"; find "$W/lib" -mindepth 1 ! -name .git -delete
+ok "  a module directory git cannot even open, with only a temporary pack, is seen as incomplete" "$(probe submodules_list "$W" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["state"])')" "incomplete"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W\",\"paths\":[\"lib\"]}")
+ok "  and Download clears it and downloads afresh" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["cleared"])'):$(git -C "$W/lib" rev-parse HEAD 2>/dev/null)" "True ['lib']:$(git -C "$W" rev-parse HEAD:lib)"
+# The harsher leftover: a bare module directory, which git cannot even run status in. The page survives it, and Download clears it.
+git clone -q "$IC/super.git" "$IC/work2" 2>/dev/null; W2="$IC/work2"
+mkdir -p "$W2/.git/modules/lib"; git init -q --bare "$W2/.git/modules/lib" 2>/dev/null; printf 'gitdir: ../.git/modules/lib\n' > "$W2/lib/.git"
+ok "a bare leftover does not take the repository's status down" "$(probe status "$W2" | jqf branch):$(probe submodules_list "$W2" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["state"])')" "main:incomplete"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W2\",\"paths\":[\"lib\"]}")
+ok "  and Download clears it and finishes the download" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["cleared"])'):$(git -C "$W2/lib" rev-parse HEAD 2>/dev/null)" "True ['lib']:$(git -C "$W2" rev-parse HEAD:lib)"
+
+# A download stopped after its transfer and before its checkout: HEAD is there, the index is not.
+rm -f "$(git -C "$W/lib" rev-parse --absolute-git-dir)/index"; find "$W/lib" -mindepth 1 ! -name .git -delete
+ok "a submodule whose commit arrived but was never checked out is incomplete, not a submodule full of deletions" "$(probe submodules_list "$W" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["state"])'):$(probe sub_statuses "$W" | "$PY" -c 'import sys,json;print(len(json.load(sys.stdin)))')" "incomplete:0"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$W\",\"paths\":[\"lib\"]}")
+ok "  and Download finishes it, keeping what arrived" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["cleared"], v["submodules"]["downloaded"])'):$(cat "$W/lib/lib.txt" 2>/dev/null):$(probe submodules_list "$W" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)[0]["state"])')" "True [] 1:lib v1:clean"
+
+section "A download that takes a while says how long is left"
+# A submodule big enough to watch, behind a remote that sends it slowly: the
+# pack goes through a hook that trickles it out. (git honours that hook from
+# the sandbox's own global config only, and only on the pack protocol — hence
+# the file:// address; a plain path is hard-linked and never downloads.)
+git init -q --bare "$SB/big.git"; git clone -q "$SB/big.git" "$SB/author-big" 2>/dev/null
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/author-big/blob$i.bin"; done
+git -C "$SB/author-big" add -A >/dev/null; git -C "$SB/author-big" commit -qm "about 3 MiB that will not compress"; git -C "$SB/author-big" push -q origin main 2>/dev/null
+cat > "$SB/trickle.sh" <<'TRICKLE'
+#!/bin/sh
+# Run the real pack-objects and pass its output on a little at a time.
+"$@" | perl -e '$|=1; binmode STDIN; binmode STDOUT; while (read(STDIN, $b, 32768)) { print $b; select(undef, undef, undef, 0.1); }'
+TRICKLE
+chmod +x "$SB/trickle.sh"
+git config --global uploadpack.packObjectsHook "$SB/trickle.sh"
+git init -q "$SB/super-big"; printf 'r\n' > "$SB/super-big/README.md"; git -C "$SB/super-big" add -A >/dev/null; git -C "$SB/super-big" commit -qm init
+( cd "$SB/super-big" && git submodule add -q "file://$SB/big.git" big 2>/dev/null ); git -C "$SB/super-big" commit -qm "a big submodule"
+OUT=$(probe clone "" "$SB/super-big,$SB/clones,bigclone,submodules")
+git config --global --unset uploadpack.packObjectsHook
+TRACE_BIG=$(probe_trace)
+ok "the slow submodule arrives all the same" "$(printf '%s' "$OUT" | jqf submodules.downloaded):$(ls "$SB/clones/bigclone/big" | wc -l | tr -d ' ')" "1:24"
+ok "  while it came in, its line said how much had arrived and how fast" "$(printf '%s' "$TRACE_BIG" | "$PY" -c 'import sys,json;e=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="big" and p.get("bytes") and p.get("rate")];print(len(e)>0, e[-1]["bytes"] if e else "", e[-1]["rate"] if e else "")')" "True"
+ok "  and how long was left, from the share of objects that had arrived" "$(printf '%s' "$TRACE_BIG" | "$PY" -c 'import sys,json;e=[p["eta_secs"] for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="big" and isinstance(p.get("eta_secs"),int)];print(len(e)>0 and all(0<=x<600 for x in e), e[:6])')" "True"
+ok "  the time left goes down as it arrives" "$(printf '%s' "$TRACE_BIG" | "$PY" -c 'import sys,json;e=[p["eta_secs"] for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="big" and isinstance(p.get("eta_secs"),int)];print(len(e)>=2 and e[-1]<=e[0], e[:1], e[-1:])')" "True"
+ok "  no size is claimed for a host that was never asked" "$(printf '%s' "$TRACE_BIG" | "$PY" -c 'import sys,json;print(any("estimate_kb" in p for p in json.load(sys.stdin)))')" "False"
+
+section "A downloaded submodule that has to fetch its new commit shows the download, and a slow one is not stopped"
+# Downloaded before; the superproject now records a commit the submodule does
+# not have. git's own `submodule update` fetches it without a word of
+# progress — nothing to show, and a long fetch looked like a stall.
+git init -q --bare "$SB/grow.git"; git clone -q "file://$SB/grow.git" "$SB/author-grow" 2>/dev/null
+printf 'v1\n' > "$SB/author-grow/v.txt"; git -C "$SB/author-grow" add -A >/dev/null; git -C "$SB/author-grow" commit -qm "grow: v1"; git -C "$SB/author-grow" push -q origin main 2>/dev/null
+git init -q --bare "$SB/super-grow.git"; git clone -q "$SB/super-grow.git" "$SB/author-super-grow" 2>/dev/null
+printf 'r\n' > "$SB/author-super-grow/README.md"; git -C "$SB/author-super-grow" add -A >/dev/null; git -C "$SB/author-super-grow" commit -qm init
+( cd "$SB/author-super-grow" && git submodule add -q "file://$SB/grow.git" grow 2>/dev/null ); git -C "$SB/author-super-grow" commit -qm "add grow"; git -C "$SB/author-super-grow" push -q origin main 2>/dev/null
+git clone -q --recurse-submodules "$SB/super-grow.git" "$SB/grow-work" 2>/dev/null
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/author-grow/g$i.bin"; done
+git -C "$SB/author-grow" add -A >/dev/null; git -C "$SB/author-grow" commit -qm "grow: about 3 MiB more"; git -C "$SB/author-grow" push -q origin main 2>/dev/null
+git -C "$SB/author-super-grow/grow" pull -q --ff-only origin main 2>/dev/null; git -C "$SB/author-super-grow" add grow; git -C "$SB/author-super-grow" commit -qm "grow: bump"; git -C "$SB/author-super-grow" push -q origin main 2>/dev/null
+# The superproject alone: git's own pull would fetch the submodule's commit on
+# the quiet (`fetch.recurseSubmodules=on-demand`), which is what the app's
+# Pull turns off and what a plain `git pull --no-recurse-submodules` does.
+git -C "$SB/grow-work" pull -q --ff-only --no-recurse-submodules origin main 2>/dev/null
+WANT=$(git -C "$SB/grow-work" ls-files -s -- grow | awk '{print $2}')
+ok "(the commit the superproject now records is not in the downloaded submodule yet)" "$(git -C "$SB/grow-work/grow" cat-file -e "$WANT^{commit}" 2>/dev/null && echo present || echo absent)" "absent"
+git config --global uploadpack.packObjectsHook "$SB/trickle.sh"
+T0=$(date +%s); OUT=$(GITSWITCH_STALL_SECS=3 pinvoke changes_submodule_update "{\"repoPath\":\"$SB/grow-work\",\"paths\":[\"grow\"]}"); T1=$(date +%s)
+TRACE_GROW=$(probe_trace)
+git config --global --unset uploadpack.packObjectsHook
+ok "a submodule that had to fetch 3 MiB slowly reaches the recorded commit — not stopped" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["ok"], v["submodules"]["downloaded"], v["submodules"]["failed_paths"])'):$(git -C "$SB/grow-work/grow" rev-parse HEAD)" "True 1 []:$WANT"
+ok "  it really took longer than the silence allowed (3 s)" "$([ $((T1-T0)) -ge 5 ] && echo "slow enough" || echo "too quick to prove anything: $((T1-T0))s")" "slow enough"
+ok "  while it fetched, its line said how much had arrived and how fast" "$(printf '%s' "$TRACE_GROW" | "$PY" -c 'import sys,json;e=[p for p in json.load(sys.stdin) if p["phase"]=="Submodules" and p.get("detail")=="grow" and p.get("bytes") and p.get("rate")];print(len(e)>0)')" "True"
+ok "  and how long was left" "$(printf '%s' "$TRACE_GROW" | "$PY" -c 'import sys,json;print(any(isinstance(p.get("eta_secs"),int) for p in json.load(sys.stdin) if p.get("detail")=="grow"))')" "True"
+ok "  with no size from a host — a fetch brings only what is new" "$(printf '%s' "$TRACE_GROW" | "$PY" -c 'import sys,json;print(any("estimate_kb" in p for p in json.load(sys.stdin)))')" "False"
+ok "  and the folder is a clean checkout of it" "$(git -C "$SB/grow-work/grow" status --porcelain | wc -l | tr -d ' '):$(ls "$SB/grow-work/grow" | grep -c '^g')" "0:24"
+OUT=$(PROBE_LEFT_FILE="$SB/left.json" PROBE_LEFT_FOR="$SB/grow-work" pinvoke changes_submodule_update "{\"repoPath\":\"$SB/grow-work\",\"paths\":[\"grow\"]}")
+ok "  when a download is over its line is gone, so the next one does not open on it" "$(printf '%s' "$(probe_trace)" | "$PY" -c 'import sys,json;print(len(json.load(sys.stdin))>0)'):$(cat "$SB/left.json")" "True:null"
+
+section "Submodules at dot-prefixed paths (.memory, .audit, a nested .seed) are cloned, listed and covered like any other"
+for r in memory audit seed; do git init -q --bare "$SB/dot-$r.git"; git clone -q "$SB/dot-$r.git" "$SB/author-dot-$r" 2>/dev/null; printf '%s\n' "$r" > "$SB/author-dot-$r/$r.txt"; git -C "$SB/author-dot-$r" add -A >/dev/null; git -C "$SB/author-dot-$r" commit -qm "$r: initial"; git -C "$SB/author-dot-$r" push -q origin main 2>/dev/null; done
+( cd "$SB/author-dot-audit" && git submodule add -q "$SB/dot-seed.git" .seed 2>/dev/null ); git -C "$SB/author-dot-audit" commit -qm "audit: add .seed"; git -C "$SB/author-dot-audit" push -q origin main 2>/dev/null
+git init -q --bare "$SB/super-dots.git"; git clone -q "$SB/super-dots.git" "$SB/author-super-dots" 2>/dev/null
+printf 'r\n' > "$SB/author-super-dots/README.md"; git -C "$SB/author-super-dots" add -A >/dev/null; git -C "$SB/author-super-dots" commit -qm init
+( cd "$SB/author-super-dots" && git submodule add -q "$SB/dot-memory.git" .memory 2>/dev/null && git submodule add -q "$SB/dot-audit.git" .audit 2>/dev/null )
+git -C "$SB/author-super-dots" commit -qm "add .memory and .audit"; git -C "$SB/author-super-dots" push -q origin main 2>/dev/null
+OUT=$(probe clone "" "$SB/super-dots.git,$SB/clones,dotclone,submodules")
+D="$SB/clones/dotclone"
+ok "cloning with submodules downloads both" "$(printf '%s' "$OUT" | jqf submodules.downloaded):$(printf '%s' "$OUT" | jqf submodules.listed):$(printf '%s' "$OUT" | jqf submodules.failed_paths)" "2:2:[]"
+ok "  and the nested one inside .audit" "$(cat "$D/.audit/.seed/seed.txt" 2>/dev/null || echo MISSING)" "seed"
+ok "  the Submodules tab lists them as downloaded and up to date — not missing, not interrupted" "$(probe submodules_list "$D" | "$PY" -c 'import sys,json;print(sorted((s["path"], s["state"]) for s in json.load(sys.stdin)))')" "[('.audit', 'clean'), ('.memory', 'clean')]"
+ok "  the repository's status is whole" "$(probe status "$D" | jqf branch):$(probe status "$D" | jqf has_submodules)" "main:True"
+OUT=$(probe push_mode "$D" "guardrail")
+ok "blocking pushes reaches all three, the nested one included" "$(pinvoke changes_push_coverage "{\"repoPath\":\"$D\"}" | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"];print(sorted(s["path"] for s in c["submodules"] if s["covered"]), c["summary"])')" "['.audit', '.audit/.seed', '.memory'] Covers this repository and 3 submodules."
+git -C "$D/.memory" push origin main >/dev/null 2>&1; RC=$?
+ok "  a push from inside .memory is refused in a plain terminal" "$([ "$RC" -ne 0 ] && echo refused || echo PUSHED)" "refused"
+OUT=$(probe push_mode "$D" "allowed")
+ok "  and allowing it again frees them" "$(git -C "$D/.memory" config --local --get gitswitch.pushBlocked || echo unset):$(git -C "$D/.audit/.seed" config --local --get gitswitch.pushBlocked || echo unset)" "unset:unset"
+
+section "A submodule's size is asked for only on its first full download"
+# A fake API that logs every request and says each repository weighs 8 MiB.
+# The submodules' addresses are GitHub's; the sandbox's own config sends the
+# download itself to local copies (url.<local>.insteadOf).
+"$PY" - "$SB/api.log" > "$SB/api-port" <<'PYAPI' &
+import http.server, sys, json
+log = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(log, "a") as f:
+            f.write("%s token=%s\n" % (self.path, "yes" if self.headers.get("Authorization") else "no"))
+        body = json.dumps({"size": 8192}).encode()
+        self.send_response(200 if self.path.startswith("/repos/acme/") else 404)
+        self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYAPI
+API_PID=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SB/api-port" ] && break; sleep 0.5; done
+API="http://127.0.0.1:$(cat "$SB/api-port")"
+for r in widget shal; do
+  git init -q --bare "$SB/$r.git"; git clone -q "file://$SB/$r.git" "$SB/author-$r" 2>/dev/null
+  printf '%s\n' "$r" > "$SB/author-$r/$r.txt"; git -C "$SB/author-$r" add -A >/dev/null; git -C "$SB/author-$r" commit -qm "$r: v1"; git -C "$SB/author-$r" push -q origin main 2>/dev/null
+  git config --global "url.file://$SB/$r.git.insteadOf" "https://github.com/acme/$r.git"
+done
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do head -c 131072 /dev/urandom > "$SB/author-widget/w$i.bin"; done
+git -C "$SB/author-widget" add -A >/dev/null; git -C "$SB/author-widget" commit -qm "widget: 3 MiB"; git -C "$SB/author-widget" push -q origin main 2>/dev/null
+git init -q --bare "$SB/super-api.git"; git clone -q "$SB/super-api.git" "$SB/author-super-api" 2>/dev/null
+printf 'r\n' > "$SB/author-super-api/README.md"; git -C "$SB/author-super-api" add -A >/dev/null; git -C "$SB/author-super-api" commit -qm init
+( cd "$SB/author-super-api" && git submodule add -q "https://github.com/acme/widget.git" widget 2>/dev/null && git submodule add -q "https://github.com/acme/shal.git" shal 2>/dev/null )
+git -C "$SB/author-super-api" config -f .gitmodules submodule.shal.shallow true
+git -C "$SB/author-super-api" add -A >/dev/null; git -C "$SB/author-super-api" commit -qm "two submodules, one shallow"; git -C "$SB/author-super-api" push -q origin main 2>/dev/null
+git clone -q "$SB/super-api.git" "$SB/api-work" 2>/dev/null
+: > "$SB/api.log"
+git config --global uploadpack.packObjectsHook "$SB/trickle.sh"
+OUT=$(GITSWITCH_GITHUB_API="$API" pinvoke changes_submodule_update "{\"repoPath\":\"$SB/api-work\",\"paths\":[\"widget\"]}")
+TRACE_API=$(probe_trace)
+git config --global --unset uploadpack.packObjectsHook
+ok "a first download asks the host once how big the submodule is" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["submodules"]["downloaded"])'):$(grep -c '^/repos/acme/widget ' "$SB/api.log")" "1:1"
+ok "  and shows how much of that has arrived" "$(printf '%s' "$TRACE_API" | "$PY" -c 'import sys,json;print(any(p.get("estimate_kb")==8192 for p in json.load(sys.stdin) if p.get("detail")=="widget"))')" "True"
+OUT=$(GITSWITCH_GITHUB_API="$API" pinvoke changes_submodule_update "{\"repoPath\":\"$SB/api-work\",\"paths\":[\"widget\"]}")
+ok "updating a submodule that already has its commit asks nothing — nothing is downloaded" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["ok"])'):$(grep -c '^/repos/acme/widget ' "$SB/api.log")" "True:1"
+OUT=$(GITSWITCH_GITHUB_API="$API" pinvoke changes_submodule_update "{\"repoPath\":\"$SB/api-work\",\"paths\":[\"shal\"]}")
+ok "a shallow submodule is not asked about — it downloads one commit, not the history the host weighs" "$(cat "$SB/api-work/shal/shal.txt" 2>/dev/null || echo MISSING):$(grep -c '^/repos/acme/shal ' "$SB/api.log")" "shal:0"
+{ kill "$API_PID" && wait "$API_PID"; } 2>/dev/null
+for r in widget shal; do git config --global --unset "url.file://$SB/$r.git.insteadOf"; done
+
+section "A submodule's own commits rebased onto its remote's latest, from its row"
+LR="$SB/latest"; mkdir -p "$LR"
+git init -q --bare "$LR/lib.git"; git clone -q "$LR/lib.git" "$LR/lib-author" 2>/dev/null
+printf 'v1\n' > "$LR/lib-author/f.txt"; git -C "$LR/lib-author" add -A >/dev/null; git -C "$LR/lib-author" commit -qm "lib: v1"; git -C "$LR/lib-author" push -q origin main 2>/dev/null
+git init -q --bare "$LR/super.git"; git clone -q "$LR/super.git" "$LR/author" 2>/dev/null
+( cd "$LR/author" && git submodule add -q "$LR/lib.git" lib 2>/dev/null ); git -C "$LR/author" commit -qm "super: add lib" >/dev/null; git -C "$LR/author" push -q origin main 2>/dev/null
+git clone -q --recurse-submodules "$LR/super.git" "$LR/w" 2>/dev/null
+# "Start a branch here" on the detached submodule: a branch with no upstream, and a commit of mine on it.
+git -C "$LR/w/lib" switch -q -c mine; printf 'mine\n' > "$LR/w/lib/mine.txt"; git -C "$LR/w/lib" add -A >/dev/null; git -C "$LR/w/lib" commit -qm "lib: mine"
+printf 'v2\n' > "$LR/lib-author/f.txt"; git -C "$LR/lib-author" commit -qam "lib: v2"; git -C "$LR/lib-author" push -q origin main 2>/dev/null
+git -C "$LR/w/lib" fetch -q origin 2>/dev/null
+OUT=$(probe submodules_list "$LR/w")
+ok "the row knows the branch a clone would follow, read locally" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;s=json.load(sys.stdin)[0];print(s.get("latest_ref"), s.get("own_branch"), s.get("own_upstream"))')" "origin/main mine None"
+OUT=$(pinvoke changes_pull "{\"repoPath\":\"$LR/w/lib\",\"mode\":\"rebase\",\"withLfs\":false,\"autostash\":false,\"source\":\"origin/main\"}")
+ok "Rebase onto origin/main puts my commit on top of the remote's latest" "$(printf '%s' "$OUT" | jqf value.ok):$(git -C "$LR/w/lib" log --format=%s -2 | tr '\n' '|')" "True:lib: mine|lib: v2|"
+ok "  on my branch, which still has no upstream" "$(git -C "$LR/w/lib" symbolic-ref -q --short HEAD):$(git -C "$LR/w/lib" rev-parse --abbrev-ref '@{u}' 2>/dev/null || echo none)" "mine:none"
+# Once my commit is on a remote branch, a rebase would re-write it: refused.
+git -C "$LR/w/lib" push -q origin mine 2>/dev/null
+printf 'v3\n' > "$LR/lib-author/f.txt"; git -C "$LR/lib-author" commit -qam "lib: v3"; git -C "$LR/lib-author" push -q origin main 2>/dev/null
+git -C "$LR/w/lib" fetch -q origin 2>/dev/null
+HEAD_NOW="$(git -C "$LR/w/lib" rev-parse HEAD)"
+OUT=$(pinvoke changes_pull "{\"repoPath\":\"$LR/w/lib\",\"mode\":\"rebase\",\"withLfs\":false,\"autostash\":false,\"source\":\"origin/main\"}")
+ok "a rebase that would re-write a pushed commit is refused" "$(printf '%s' "$OUT" | jqf value.refusal.code):$(git -C "$LR/w/lib" rev-parse HEAD)" "would-rewrite-pushed:$HEAD_NOW"
+OUT=$(pinvoke changes_pull "{\"repoPath\":\"$LR/w/lib\",\"mode\":\"rebase\",\"withLfs\":false,\"autostash\":false,\"source\":\"origin/nowhere\"}")
+ok "a branch the remote does not have is refused by name" "$(printf '%s' "$OUT" | jqf value.refusal.code)" "no-such-remote-branch"
+OUT=$(pinvoke changes_pull "{\"repoPath\":\"$LR/w/lib\",\"mode\":\"rebase\",\"withLfs\":false,\"autostash\":false,\"source\":\"elsewhere/main\"}")
+ok "  and so is a remote it does not have" "$(printf '%s' "$OUT" | jqf value.refusal.code)" "no-such-remote"
 
 verify_result

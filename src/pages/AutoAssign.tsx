@@ -58,6 +58,7 @@ export function AutoAssign() {
   const [statusLine, setStatusLine] = useState("");
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [profileLogins, setProfileLogins] = useState<Record<string, string | null>>({});
+  const [loginSources, setLoginSources] = useState<Record<string, "key" | "saved" | null>>({});
   const [rows, setRows] = useState<RepoRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
@@ -90,21 +91,28 @@ export function AutoAssign() {
       setStatusLine("Resolving which account each profile's SSH key belongs to…");
       const profs = await api.getProfiles();
       setProfiles(profs);
+      // The key first — it is who git authenticates as; without a key the
+      // check can use (none, or one locked by a passphrase), the GitHub
+      // account the profile says it pushes as.
       const logins: Record<string, string | null> = {};
+      const sources: Record<string, "key" | "saved" | null> = {};
       await Promise.all(
         profs.map(async (p) => {
-          if (!p.ssh_key_path) {
-            logins[p.id] = null;
-            return;
+          let byKey: string | null = null;
+          if (p.ssh_key_path) {
+            try {
+              byKey = await api.resolveKeyAccount(p.ssh_key_path);
+            } catch {
+              byKey = null;
+            }
           }
-          try {
-            logins[p.id] = await api.resolveKeyAccount(p.ssh_key_path);
-          } catch {
-            logins[p.id] = null;
-          }
+          const saved = (p.github_login ?? "").trim().replace(/^@/, "") || null;
+          logins[p.id] = byKey ?? saved;
+          sources[p.id] = byKey ? "key" : saved ? "saved" : null;
         })
       );
       setProfileLogins(logins);
+      setLoginSources(sources);
 
       // 3. Collect gh accounts + tokens
       setStatusLine("Loading GitHub CLI accounts…");
@@ -353,7 +361,7 @@ export function AutoAssign() {
               return (
                 <div
                   key={r.repo.path}
-                  className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-zinc-800/50 border border-zinc-700/50 min-w-0 flex-wrap sm:flex-nowrap"
+                  className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-zinc-800/50 border border-zinc-700/50 min-w-0 flex-wrap lg:flex-nowrap"
                 >
                   <Folder size={15} className="text-zinc-500 shrink-0" />
                   <div className="min-w-0 flex-1">
@@ -367,7 +375,8 @@ export function AutoAssign() {
                     </p>
                   </div>
 
-                  <div className="hidden lg:flex items-center gap-1 shrink-0 max-w-[38%] overflow-hidden">
+                  {/* Below 1024 px the reasons get a line of their own rather than disappearing. */}
+                  <div className="flex flex-wrap items-center gap-1 basis-full order-last lg:order-none lg:basis-auto lg:flex-nowrap lg:shrink-0 lg:max-w-[38%] lg:overflow-hidden">
                     {r.repo.owner ? (
                       <>
                         {accessEntries.map(([login, perms]) => (
@@ -402,7 +411,7 @@ export function AutoAssign() {
                         ...profiles.map((p) => ({
                           value: p.id,
                           label: profileLogins[p.id]
-                            ? `${p.name} (${profileLogins[p.id]})`
+                            ? `${p.name} (${profileLogins[p.id]}${loginSources[p.id] === "saved" ? " · saved account" : ""})`
                             : p.name,
                         })),
                       ]}
@@ -422,9 +431,9 @@ export function AutoAssign() {
           </div>
           <p className="text-xs text-zinc-600 mt-3">
             "push · account" means that account can push to the repo — repos are
-            proposed to the profile whose SSH key belongs to an account with push
-            access. A folder moves to exactly one profile; conflicts are cleaned
-            up automatically.
+            proposed to the profile whose SSH key — or, without a usable key, whose
+            saved GitHub account — has push access. A folder moves to exactly one
+            profile; conflicts are cleaned up automatically.
           </p>
         </Card>
       )}

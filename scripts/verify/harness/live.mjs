@@ -87,6 +87,8 @@ function probeInvoke(cmd, args) {
         ...process.env,
         HOME: ENV.home,
         GIT_CONFIG_NOSYSTEM: "1",
+        // Never the real keychain: the debug build keeps tokens here instead.
+        GITSWITCH_TOKEN_DIR: `${ENV.home}/tokens`,
         PROBE_OP: "invoke",
         PROBE_CMD: cmd,
         PROBE_JSON: JSON.stringify(args ?? {}),
@@ -326,7 +328,7 @@ async function clickInDialogRow(page, title, rowText, pick, timeout = WAIT) {
     if (!panel) return false;
     // Prefer the row that NAMES rowText exactly (a leaf element whose text is
     // just that), then fall back to a substring match: a branch such as
-    // "gitswitch-before-sync-…" whose row mentions "main" must not be picked
+    // "gitswitch-before-update-…" whose row mentions "main" must not be picked
     // for "main".
     const all = [...panel.querySelectorAll("li")];
     const exact = all.filter((r) => [...r.querySelectorAll("*")].some((el) => el.children.length === 0 && el.innerText.trim() === rowText));
@@ -880,7 +882,8 @@ try {
     ok("  c.txt holds my content", fs.readFileSync(`${WORK}/c.txt`, "utf8") === "mine again\n");
     ok("  Continue update is enabled once nothing is unmerged", await waitUntilAsync(async () => (await buttonState(page, "Continue update"))?.disabled === false));
     ok("Continue update", await click(page, "Continue update"));
-    ok("  the page says Updated", await waitText(page, "Updated: "));
+    const said = await waitText(page, "Updated: ");
+    ok("  the page says Updated", said, said ? "" : (await text(page)).replace(/\s+/g, " ").slice(0, 900));
     ok("  with every check passed — the resolved commit counts as on top", await waitText(page, "All 6 checks passed"));
     ok("  git: my commits are on top of upstream's, nothing in progress, the state file gone", git(WORK, "rev-list", "--count", "origin/main..HEAD") === ownBefore && !exists(`${WORK}/.git/rebase-merge`) && !exists(`${WORK}/.git/gitswitch-sync.json`));
     ok("  and c.txt is mine", git(WORK, "show", "HEAD:c.txt") === "mine again");

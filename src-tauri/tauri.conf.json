@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.gitswitch.app",
   "build": {
-    "beforeDevCommand": "bash scripts/build-lock-helper.sh debug && npm run dev",
+    "beforeDevCommand": "cargo run --quiet --manifest-path src-tauri/Cargo.toml -p gitswitch-sidecars -- debug && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build && bash scripts/build-lock-helper.sh release",
+    "beforeBuildCommand": "npm run build && cargo run --quiet --manifest-path src-tauri/Cargo.toml -p gitswitch-sidecars -- release",
     "frontendDist": "../dist"
   },
   "app": {
@@ -21,7 +21,18 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: https://avatars.githubusercontent.com",
+        "connect-src": "'self' ipc: http://ipc.localhost",
+        "object-src": "'none'",
+        "base-uri": "'self'"
+      },
+      "dangerousDisableAssetCspModification": [
+        "style-src"
+      ]
     }
   },
   "bundle": {
@@ -38,6 +49,9 @@
       "binaries/gitswitch-lock-helper",
       "binaries/gitswitch-git-shim"
     ],
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "windows": {
       "nsis": {
         "installMode": "perMachine"
@@ -51,6 +65,13 @@
         "https://github.com/Kshitijkb28/GitSwitch/releases/latest/download/latest.json"
       ],
       "dialog": false
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "gitswitch"
+        ]
+      }
     }
   }
 }

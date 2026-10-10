@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type SubmitEvent } from "react";
 import {
   X,
   FileText,
@@ -32,6 +32,9 @@ import type {
   TreeCommitRef,
 } from "../../lib/api";
 
+/** Files listed for a commit before "Show all". */
+const FILES_SHOWN = 200;
+
 type Props = {
   detail: CommitDetail;
   /** Known when the commit was reached through "Go to commit"; null from a row click. */
@@ -44,6 +47,8 @@ type Props = {
   /** Runs one git operation; the page owns busy state, toasts, the result card and reloads. */
   onAction: (key: string, fn: () => Promise<OpResult>) => Promise<OpResult | undefined>;
   onResolve: (hash: string) => Promise<CommitTarget | null>;
+  /** Opens another commit in this panel (a parent). */
+  onOpenCommit?: (hash: string) => void;
 };
 
 type Mode = null | "goback" | "branch";
@@ -110,6 +115,7 @@ export function CommitDetailPanel({
   onClose,
   onAction,
   onResolve,
+  onOpenCommit,
 }: Props) {
   const toast = useToast();
   const job = useGitJob(repoPath);
@@ -141,6 +147,10 @@ export function CommitDetailPanel({
 
   // --- file diffs ------------------------------------------------------------
   const [openFile, setOpenFile] = useState<string | null>(null);
+  // A commit can touch thousands of files (a vendored tree, a formatter run):
+  // the first ones are listed, the rest on request.
+  const [allFiles, setAllFiles] = useState(false);
+  useEffect(() => setAllFiles(false), [detail.hash]);
   const [fileDiff, setFileDiff] = useState<FileDiff | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -232,7 +242,7 @@ export function CommitDetailPanel({
     afterAction(await onAction("reset", () => api.changesReset(repoPath, detail.hash, m, m === "hard" && stash)));
   }
 
-  async function createBranch(e: FormEvent) {
+  async function createBranch(e: SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     const name = branchName.trim();
     if (!name) return;
@@ -471,9 +481,15 @@ export function CommitDetailPanel({
             {detail.parents.length === 0 && (
               <p className="text-zinc-400">none (root commit)</p>
             )}
-            {detail.parents.map((p) => (
-              <p key={p} className="text-zinc-300 font-mono truncate">{p.slice(0, 12)}</p>
-            ))}
+            {detail.parents.map((p) =>
+              onOpenCommit ? (
+                <button key={p} type="button" onClick={() => onOpenCommit(p)} className="block text-left text-zinc-300 hover:text-white font-mono truncate cursor-pointer" title={`Open ${p}`}>
+                  {p.slice(0, 12)}
+                </button>
+              ) : (
+                <p key={p} className="text-zinc-300 font-mono truncate">{p.slice(0, 12)}</p>
+              )
+            )}
           </div>
         </div>
 
@@ -491,7 +507,7 @@ export function CommitDetailPanel({
           <span className="text-[11px] text-zinc-600">— click one to see its diff</span>
         </div>
         <div className={`space-y-1 pr-1 min-w-0 ${openFile ? "" : "max-h-64 overflow-y-auto"}`}>
-          {detail.files.map((f) => {
+          {(allFiles ? detail.files : detail.files.slice(0, FILES_SHOWN)).map((f) => {
             const open = openFile === f.path;
             return (
               <div key={f.path} className="min-w-0">
@@ -532,6 +548,15 @@ export function CommitDetailPanel({
           })}
           {detail.files.length === 0 && (
             <p className="text-xs text-zinc-600">No file changes (empty or merge commit).</p>
+          )}
+          {!allFiles && detail.files.length > FILES_SHOWN && (
+            <button
+              type="button"
+              onClick={() => setAllFiles(true)}
+              className="text-xs text-emerald-400 hover:text-emerald-300 cursor-pointer py-1"
+            >
+              Show all {detail.files.length.toLocaleString()} files
+            </button>
           )}
         </div>
       </div>

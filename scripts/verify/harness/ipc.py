@@ -20,6 +20,8 @@ lib_rs = open(f"{ROOT}/src-tauri/src/lib.rs").read()
 api_ts = open(f"{ROOT}/src/lib/api.ts").read()
 
 INJECTED = {"app"}  # tauri injects these, the frontend never sends them
+# ...as it does any parameter of a type it supplies itself, whatever its name.
+INJECTED_TYPE = re.compile(r"^(?:tauri::)?(?:(?:AppHandle|Window|WebviewWindow|Webview)\b|State\s*<)")
 
 
 def camel(name: str) -> str:
@@ -46,16 +48,31 @@ def split_params(text: str):
 
 
 # --- Rust: every #[tauri::command] and its parameters -----------------------
+def balanced_params(text: str, open_at: int) -> str:
+    """The parameter list from the `(` at `open_at` to its matching `)`: a
+    type such as `Vec<(String, String)>` holds parentheses of its own."""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_at + 1 : i]
+    return text[open_at + 1 :]
+
+
 rust = {}
 for m in re.finditer(
-    r"#\[tauri::command\]\s*(?:#\[[^\]]*\]\s*)*pub\s+(?:async\s+)?fn\s+(\w+)\s*\(([^)]*)\)",
+    r"#\[tauri::command\]\s*(?:#\[[^\]]*\]\s*)*pub\s+(?:async\s+)?fn\s+(\w+)\s*\(",
     commands_rs,
 ):
-    name, params = m.group(1), m.group(2)
+    name, params = m.group(1), balanced_params(commands_rs, m.end() - 1)
     args = set()
     for p in split_params(params):
-        pname = p.split(":")[0].strip()
-        if pname and pname not in INJECTED:
+        pname, _, ptype = p.partition(":")
+        pname, ptype = pname.strip(), ptype.strip()
+        if pname and pname not in INJECTED and not INJECTED_TYPE.match(ptype):
             args.add(camel(pname))
     rust[name] = args
 

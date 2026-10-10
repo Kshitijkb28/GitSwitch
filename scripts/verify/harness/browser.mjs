@@ -31,14 +31,15 @@ const TYPES = {
 };
 
 /** Serve dist/ on a free port with an SPA fallback. */
-export function serve() {
+/** `opts.headers`: added to every response (the sweep serves the app's own CSP). */
+export function serve(opts = {}) {
   const server = http.createServer((req, res) => {
     const url = req.url.split("?")[0];
     let file = path.join(DIST, url === "/" ? "index.html" : url);
     if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) {
       file = path.join(DIST, "index.html");
     }
-    res.writeHead(200, { "Content-Type": TYPES[path.extname(file)] ?? "text/plain" });
+    res.writeHead(200, { "Content-Type": TYPES[path.extname(file)] ?? "text/plain", ...(opts.headers ?? {}) });
     res.end(fs.readFileSync(file));
   });
   return new Promise((resolve) => {

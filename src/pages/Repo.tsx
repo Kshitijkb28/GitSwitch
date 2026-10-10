@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, useNavigate, useParams } from "react-router-dom";
-import { GitBranch, Box, GitGraph, FileDiff, GitPullRequestArrow } from "lucide-react";
+import { GitBranch, Box, GitGraph, FileDiff, GitPullRequestArrow, SquareTerminal } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
@@ -16,6 +16,7 @@ import { usePersistedState } from "../lib/persist";
 import { baseName, canonicalJoin, normPath } from "../lib/paths";
 import { useRefreshOnFocus } from "../lib/focus";
 import { useGitJob } from "../lib/gitJobs";
+import { openConsole } from "../lib/console";
 import { open as pickFolder } from "@tauri-apps/plugin-dialog";
 import * as api from "../lib/api";
 import type { PullMode, RepoRef, RepoStatus, SubmoduleInfo } from "../lib/api";
@@ -51,6 +52,8 @@ export function Repo() {
   const [subs, setSubs] = useState<SubmoduleInfo[]>([]);
   /** Every gitlink, populated or not — whether the repository has submodules at all. */
   const [gitlinkPaths, setGitlinkPaths] = useState<string[]>([]);
+  /** The repository the gitlink list above was read for. */
+  const [gitlinksFor, setGitlinksFor] = useState("");
   const gitlinks = gitlinkPaths.length;
   const [status, setStatus] = useState<RepoStatus | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(false);
@@ -109,12 +112,33 @@ export function Repo() {
   );
 
   // A remembered repository that is in no profile folder (a submodule opened as
-  // its own repository, a folder opened by hand) stays selectable.
+  // its own repository, a folder opened by hand) stays selectable — while it
+  // is on disk. One deleted since gives way to the first repository listed,
+  // or the page (and the terminal it hands its folder to) would work in a
+  // folder that is not there.
   useEffect(() => {
     if (loadingRepos || !sel.path) return;
-    if (!repos.some((r) => r.path === sel.path)) {
-      setExtraRepos((l) => (l.includes(sel.path) ? l : [...l, sel.path]));
-    }
+    if (repos.some((r) => r.path === sel.path)) return;
+    const path = sel.path;
+    let stale = false;
+    api
+      .pathExists(path)
+      .then((exists) => {
+        if (stale) return;
+        if (exists === false) {
+          const next = visibleRepos[0]?.path ?? repos[0]?.path;
+          if (next) sel.setPath(next);
+          return;
+        }
+        setExtraRepos((l) => (l.includes(path) ? l : [...l, path]));
+      })
+      .catch(() => {
+        if (!stale) setExtraRepos((l) => (l.includes(path) ? l : [...l, path]));
+      });
+    return () => {
+      stale = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadingRepos, repos, sel.path]);
 
   // No repository yet: take the first one the scan finds.
@@ -140,6 +164,7 @@ export function Repo() {
     if (!sel.path) {
       setSubs([]);
       setGitlinkPaths([]);
+      setGitlinksFor("");
       return;
     }
     let cancelled = false;
@@ -149,6 +174,7 @@ export function Repo() {
         if (cancelled) return;
         const usable = list.filter((m) => m.initialised && m.listed && m.gitdir_valid);
         setGitlinkPaths(list.map((m) => m.path));
+        setGitlinksFor(sel.path);
         setSubs(usable);
         // A scope that is no gitlink at all is stale (the submodule was removed);
         // one that merely is not initialised or mapped stays — "Open as its own
@@ -237,6 +263,11 @@ export function Repo() {
   const movedCount = subs.filter((m) => m.state === "moved" || m.state === "moved-and-dirty").length;
 
   const go = (t: Tab) => navigate(`/repo/${t}`);
+  useEffect(() => {
+    if (tab === "submodules" && !sel.sub && sel.path && gitlinksFor === sel.path && gitlinkPaths.length === 0) {
+      navigate("/repo/changes", { replace: true });
+    }
+  }, [tab, sel.sub, sel.path, gitlinksFor, gitlinkPaths.length, navigate]);
   pathRef.current = sel.effectivePath;
   // The drawer belongs to one repository: moving to another closes it.
   useEffect(() => {
@@ -339,8 +370,6 @@ export function Repo() {
       actionsRef.current?.refresh();
     });
   };
-  // A submodule path relative to the scoped repository, as a scope of the repository.
-  const scoped = (p: string) => (sel.sub ? `${sel.sub}/${p}` : p);
   // Arriving on a tab re-reads the repository, as opening the old page did:
   // the terminal drawer or an operation on another tab may have moved HEAD.
   const firstTab = useRef(true);
@@ -351,10 +380,6 @@ export function Repo() {
     }
     actionsRef.current?.refresh();
   }, [tab]);
-  const workInside = (subPath: string) => {
-    sel.setSub(subPath);
-    go("changes");
-  };
 
   return (
     <div className="max-w-6xl mx-auto space-y-4">
@@ -422,6 +447,16 @@ export function Repo() {
             }}
           >
             Open a folder…
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={!sel.effectivePath}
+            onClick={() => openConsole(sel.effectivePath)}
+            title="Open the terminal in this repository, or the submodule you are inside"
+          >
+            <SquareTerminal size={14} />
+            Terminal here
           </Button>
         </div>
       </header>
@@ -580,16 +615,23 @@ export function Repo() {
         visible={tab === "submodules"}
         busy={busy}
         refreshKey={reloadKey}
-        onWorkInside={(p) => workInside(scoped(p))}
+        // A row is a submodule of what the page shows: at the top a scope, from
+        // inside a scope the nested repository itself (openSubOfScope) — never
+        // a two-level scope, which the page would drop as unknown.
+        onWorkInside={(p) => {
+          openSubOfScope(p);
+          go("changes");
+        }}
         onOpenHistory={(p) => {
-          sel.setSub(scoped(p));
+          openSubOfScope(p);
           go("history");
         }}
         onInitialise={(paths) => runHere((a) => a.initialise(sel.effectivePath, paths))}
         onRecordPointers={() => runHere((a) => a.recordPointers(sel.effectivePath))}
-        onPullInside={(s) => runHere((a) => a.pullInside(sel.effectivePath, s))}
+        onPullInside={(s, source) => runHere((a) => a.pullInside(sel.effectivePath, s, source))}
         onUpdateOne={(p) => runHere((a) => a.updateOne(sel.effectivePath, p))}
         onRecordOne={(p) => runHere((a) => a.recordOne(sel.effectivePath, p))}
+        onAlignOne={(p) => runHere((a) => a.alignOne(sel.effectivePath, p))}
         onStartBranch={(p, name) => runHere((a) => a.startBranch(sel.effectivePath, p, name))}
         onPreview={() => {
           // The whole repository is what updates; the drawer is opened for it

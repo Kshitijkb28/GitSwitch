@@ -132,6 +132,31 @@ pub(crate) mod tests {
         }};
     }
 
+    /// Coverage read while the submodules' pieces are re-applied (a lock
+    /// job's last step, a Repair), `rounds` times, in one process as in the
+    /// app: the readings that called a sound lock or block broken, and what the
+    /// re-applying could not write.
+    async fn coverage_while_covering(rounds: usize) {
+        let path = repo();
+        let mut flagged: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        for _ in 0..rounds {
+            let state = match Box::pin(git_status::push_state_for(&path)).await {
+                Ok(s) => s,
+                Err(e) => return emit_err(e),
+            };
+            let (cov, n) = tokio::join!(
+                Box::pin(crate::push_guard::coverage(&path, &state)),
+                Box::pin(crate::push_guard::cover_submodules(&path, None))
+            );
+            if !cov.uncovered.is_empty() {
+                flagged.push(cov.summary);
+            }
+            notes.extend(n);
+        }
+        emit(&serde_json::json!({ "rounds": rounds, "flagged": flagged, "notes": notes }));
+    }
+
     pub(crate) async fn invoke() {
         use crate::commands as c;
         let cmd = std::env::var("PROBE_CMD").unwrap_or_default();
@@ -143,6 +168,22 @@ pub(crate) mod tests {
         match cmd.as_str() {
             // profiles / repositories
             "get_profiles" => reply(c::get_profiles()),
+            "doctor_apply_fix" => forward!(c::doctor_apply_fix, args, fix),
+            "doctor_check_repo_access" => forward!(c::doctor_check_repo_access, args),
+            "audit_commits" => forward!(c::audit_commits, args),
+            "fix_unpushed_commits" => forward!(c::fix_unpushed_commits, args, repo_path),
+            "verify_github_token" => forward!(c::verify_github_token, args, token),
+            "github_signin_keep" => forward!(c::github_signin_keep, args, token),
+            "gh_register_ssh_key" => forward!(c::gh_register_ssh_key, args, account, key_path),
+            "github_signin_forget" => match arg::<String>(&args, "login") {
+                Ok(login) => reply(c::github_signin_forget(login)),
+                Err(e) => reply_err(e),
+            },
+            "github_signins" => reply(Ok::<_, crate::error::AppError>(c::github_signins())),
+            "repo_accounts" => forward!(c::repo_accounts, args),
+            "gh_list_accounts" => forward!(c::gh_list_accounts, args),
+            "gh_logout" => forward!(c::gh_logout, args, account),
+            "apply_git_config" => reply(c::apply_git_config()),
             "history_list_repos" => forward!(c::history_list_repos, args),
             "path_exists" => {
                 let path: String = match arg(&args, "path") { Ok(v) => v, Err(e) => return reply_err(e) };
@@ -155,6 +196,7 @@ pub(crate) mod tests {
             "changes_submodule_statuses" => forward!(c::changes_submodule_statuses, args, repo_path),
             "changes_lfs_status" => forward!(c::changes_lfs_status, args, repo_path),
             "lfs_available" => forward_plain!(c::lfs_available, args),
+            "convert_repos_to_ssh" => forward!(c::convert_repos_to_ssh, args, directory),
             // Changes page: operations
             "changes_stage" => forward!(c::changes_stage, args, repo_path, paths, allow_markers),
             "changes_stage_all" => forward!(c::changes_stage_all, args, repo_path),
@@ -162,8 +204,9 @@ pub(crate) mod tests {
             "changes_discard" => forward!(c::changes_discard, args, repo_path, paths),
             "changes_commit" => forward!(c::changes_commit, args, repo_path, message, amend),
             "changes_push" => forward!(c::changes_push, args, repo_path, set_upstream, allow_unpushed_submodules),
-            "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash),
+            "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash, source),
             "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path, paths),
+            "changes_submodule_align" => forward!(c::changes_submodule_align, args, repo_path, paths),
             "changes_lfs_pull" => forward!(c::changes_lfs_pull, args, repo_path),
             "changes_lfs_files" => forward!(c::changes_lfs_files, args, repo_path),
             "changes_lfs_pull_paths" => forward!(c::changes_lfs_pull_paths, args, repo_path, paths),
@@ -174,7 +217,7 @@ pub(crate) mod tests {
             "changes_abort" => forward!(c::changes_abort, args, repo_path),
             // sync
             "changes_sync_plan" => forward!(c::changes_sync_plan, args, repo_path, stash, fetch),
-            "changes_sync_run" => forward!(c::changes_sync_run, args, repo_path, stash, bundles, fingerprint),
+            "changes_sync_run" => forward!(c::changes_sync_run, args, repo_path, stash, bundles, fingerprint, with_lfs),
             "changes_sync_continue" => forward!(c::changes_sync_continue, args, repo_path, allow_markers),
             "changes_sync_abort" => forward!(c::changes_sync_abort, args, repo_path),
             "changes_open_path" => forward!(c::changes_open_path, args, repo_path, path, reveal),
@@ -186,6 +229,7 @@ pub(crate) mod tests {
             "changes_set_push_mode" => forward!(c::changes_set_push_mode, args, repo_path, mode),
             "changes_repair_push_lock" => forward!(c::changes_repair_push_lock, args, repo_path),
             "changes_repair_push_block" => forward!(c::changes_repair_push_block, args, repo_path),
+            "changes_push_coverage" => forward!(c::changes_push_coverage, args, repo_path),
             "push_lock_helper_status" => forward_plain!(c::push_lock_helper_status, args),
             "push_lock_finish_manual" => forward_plain!(c::push_lock_finish_manual, args, nonce),
             // tree: branches, undo, reset, revert, conflicts
@@ -228,6 +272,8 @@ pub(crate) mod tests {
             "history_peek" => forward!(c::history_peek, args, repo_path),
             "history_commit_file_diff" => forward!(c::history_commit_file_diff, args, repo_path, hash, path),
             "history_resolve" => forward!(c::history_resolve, args, repo_path, text),
+            // No link started the probe: there is never a page waiting.
+            "deep_link_take" => reply(Ok::<Option<&str>, crate::error::AppError>(None)),
             // These take a `tauri::AppHandle` (tray label updates) and cannot run outside the app.
             "create_profile" | "update_profile" | "delete_profile" | "set_default_profile" | "sparse_clone"
             | "full_clone" => reply_err(format!(
@@ -249,17 +295,61 @@ pub(crate) mod tests {
             "invoke" => invoke().await,
             // --- identity: a profile written into the sandbox HOME's gitconfig ---
             // first = a JSON file {name, git_name, git_email, ssh_key_path?, directories[]}
+            // PROBE_ARGS = "<script>": what is on this Mac, read once, then the
+            // script runs (a clone deleted, moved or made behind the app's
+            // back), then read again — in one process, as the app does.
+            "local_clones_around" => {
+                let before = crate::remote_repos::local_clones().await.map(|c| c.clones).unwrap_or_default();
+                let _ = std::process::Command::new("sh").arg(first).status();
+                let after = crate::remote_repos::local_clones().await.map(|c| c.clones).unwrap_or_default();
+                emit(&serde_json::json!({ "before": before, "after": after }));
+            }
             "profile_apply" => {
                 let text = std::fs::read_to_string(first).expect("profile json file");
                 let v: serde_json::Value = serde_json::from_str(&text).expect("profile json");
                 let str_of = |k: &str| v[k].as_str().unwrap_or_default().to_string();
                 let dirs: Vec<String> = v["directories"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default();
                 let remotes: Vec<String> = v["remote_patterns"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect()).unwrap_or_default();
-                match crate::profiles::create_profile(str_of("name"), str_of("git_name"), str_of("git_email"), v["ssh_key_path"].as_str().map(String::from), dirs, v["allow_push"].as_bool().unwrap_or(true), false, remotes, v["github_login"].as_str().map(String::from)) {
+                match crate::profiles::create_profile(str_of("name"), str_of("git_name"), str_of("git_email"), v["ssh_key_path"].as_str().map(String::from), dirs, v["allow_push"].as_bool().unwrap_or(true), v["signing_enabled"].as_bool().unwrap_or(false), remotes, v["github_login"].as_str().map(String::from), v["push_over_ssh"].as_bool()) {
                     Ok(p) => match crate::git_config::apply_git_config() {
                         Ok(()) => emit(&p),
                         Err(e) => emit_err(e),
                     },
+                    Err(e) => emit_err(e),
+                }
+            }
+            // What the app does at start-up: every profile's include file
+            // written again from the store.
+            "refresh_profile_includes" => match crate::git_config::refresh_profile_includes() {
+                Ok(()) => emit(&"refreshed"),
+                Err(e) => emit_err(e),
+            },
+            // A clone running into DEST (PROBE_ARGS "<dest>,<url>"): what the
+            // local index and the Repository page's picker say meanwhile, and
+            // after it is over.
+            "local_clones_while_cloning" => {
+                let dest = a.first().cloned().unwrap_or_default();
+                let url = a.get(1).cloned().unwrap_or_default();
+                let guard = crate::sparse::CloneGuard::hold(std::path::Path::new(&dest), &url);
+                let during = crate::remote_repos::local_clones().await.ok();
+                let picker: Vec<String> = crate::git_history::list_repos().await.map(|v| v.into_iter().map(|r| r.path).collect()).unwrap_or_default();
+                drop(guard);
+                let after = crate::remote_repos::local_clones().await.ok();
+                emit(&serde_json::json!({ "during": during, "picker": picker, "after": after }));
+            }
+            // Saves a profile with the folders and email given, as the app's
+            // update_profile command does (which also updates the tray, and
+            // that needs the app) — Doctor's "Save it as the disk spells it",
+            // or an email change the identity guards must follow.
+            "profile_update" => {
+                let text = std::fs::read_to_string(first).expect("profile json file");
+                let v: serde_json::Value = serde_json::from_str(&text).expect("profile json");
+                let dirs: Option<Vec<String>> = v["directories"].as_array().map(|a| a.iter().filter_map(|d| d.as_str().map(String::from)).collect());
+                let email = v["git_email"].as_str().map(String::from);
+                let key = v["ssh_key_path"].as_str().map(String::from);
+                let signs = v["signing_enabled"].as_bool();
+                match crate::commands::update_profile_core(v["id"].as_str().unwrap_or_default().to_string(), None, None, email, key, dirs, None, signs, None, None, v["push_over_ssh"].as_bool()).await {
+                    Ok(p) => emit(&p),
                     Err(e) => emit_err(e),
                 }
             }
@@ -290,7 +380,16 @@ pub(crate) mod tests {
             "pull" => {
                 let with_lfs = a.iter().skip(1).any(|s| s == "lfs");
                 let autostash = a.iter().skip(1).any(|s| s == "autostash");
-                show(git_ops::pull(&repo(), PullMode::parse(first).unwrap(), with_lfs, autostash).await)
+                show(git_ops::pull(&repo(), PullMode::parse(first).unwrap(), with_lfs, autostash, None).await)
+            }
+            // The History page's Fetch, on a blocking thread as the command runs it.
+            "history_fetch" => {
+                let r = repo();
+                match tokio::task::spawn_blocking(move || crate::git_history::fetch_repo(&r)).await {
+                    Ok(Ok(res)) => emit(&res),
+                    Ok(Err(e)) => emit_err(e),
+                    Err(e) => emit_err(e),
+                }
             }
             "peek" => match crate::peek::peek_remote(&repo()).await {
                 Ok(r) => emit(&r),
@@ -327,7 +426,7 @@ pub(crate) mod tests {
                 Err(e) => emit_err(e),
             },
             // PROBE_ARGS: "[nostash][,bundles]" — no fingerprint: the run measures afresh
-            "sync_run" => show(crate::sync::sync_run(&repo(), crate::sync::RunOptions { stash: !a.iter().any(|s| s == "nostash"), bundles: a.iter().any(|s| s == "bundles"), fingerprint: Vec::new() }).await),
+            "sync_run" => show(crate::sync::sync_run(&repo(), crate::sync::RunOptions { stash: !a.iter().any(|s| s == "nostash"), bundles: a.iter().any(|s| s == "bundles"), with_lfs: a.iter().any(|s| s == "lfs"), fingerprint: Vec::new() }).await),
             "sync_continue" => show(crate::sync::sync_continue(&repo(), false).await),
             "sync_continue_anyway" => show(crate::sync::sync_continue(&repo(), true).await),
             "sync_abort" => show(crate::sync::sync_abort(&repo()).await),
@@ -362,6 +461,14 @@ pub(crate) mod tests {
                 Err(e) => emit_err(e),
             },
             "lock_fix" => emit(&crate::push_lock::fix(first).await),
+            // Coverage read while the submodules' pieces are re-applied (a lock
+            // job's last step, a Repair), in one process as in the app,
+            // PROBE_ARGS rounds times: the readings that called a sound lock or
+            // block broken, and what the re-applying could not write.
+            // Its own function, boxed: written inline, this op's futures sat in
+            // this function's debug frame, which lies under every live
+            // `invoke` — and an Update's Continue overflowed the 2 MiB stack.
+            "coverage_while_covering" => Box::pin(coverage_while_covering(first.parse().unwrap_or(10))).await,
             "lock_helper_status" => emit(&crate::push_lock::helper_status().await),
             "lock_uninstall" => emit(&crate::push_lock::uninstall_all().await),
             "doctor_locks" => match crate::doctor::check_push_locks().await {
@@ -391,6 +498,22 @@ pub(crate) mod tests {
                     std::time::Duration::from_secs(20),
                 ) {
                     Ok(out) => emit(&serde_json::json!({ "output": out })),
+                    Err(e) => emit_err(e),
+                }
+            }
+            // PROBE_ARGS = "<cols>x<rows>,<cols>x<rows>,<line>": the line run in a
+            // shell opened at the first size, and again after a resize to the
+            // second — what the shell itself reports each time.
+            "term_resized" => {
+                let size = |s: &str| -> (u16, u16) {
+                    let (c, r) = s.split_once('x').unwrap_or(("80", "24"));
+                    (c.trim().parse().unwrap_or(80), r.trim().parse().unwrap_or(24))
+                };
+                let first_size = size(first);
+                let second_size = size(a.get(1).map(|s| s.as_str()).unwrap_or(""));
+                let line = a.iter().skip(2).cloned().collect::<Vec<_>>().join(",");
+                match crate::terminal::run_resized(&repo(), &line, first_size, second_size, std::time::Duration::from_secs(20)) {
+                    Ok((before, after)) => emit(&serde_json::json!({ "first": before, "second": after })),
                     Err(e) => emit_err(e),
                 }
             }
@@ -442,6 +565,10 @@ pub(crate) mod tests {
                 Ok(m) => emit(&serde_json::json!({ "message": m })),
                 Err(e) => emit_err(e),
             },
+            "guard_email" => match crate::commit_audit::hooks_dir(std::path::Path::new(&repo())) {
+                Ok(h) => emit(&crate::commit_audit::guard_email_in(&h.dir)),
+                Err(e) => emit_err(e),
+            },
             "guard_uninstall" => match crate::commit_audit::uninstall_guard(&repo()) {
                 Ok(m) => emit(&serde_json::json!({ "message": m })),
                 Err(e) => emit_err(e),
@@ -466,6 +593,12 @@ pub(crate) mod tests {
         if let Ok(path) = std::env::var("PROBE_TRACE_FILE") {
             let trace = crate::sparse::progress_trace().lock().map(|t| t.clone()).unwrap_or_default();
             let _ = std::fs::write(path, serde_json::to_string(&trace).unwrap_or_else(|_| "[]".into()));
+        }
+        // What a poll for this path would read now that the op is over: an
+        // entry left behind would open the next download on this one's line.
+        if let (Ok(file), Ok(path)) = (std::env::var("PROBE_LEFT_FILE"), std::env::var("PROBE_LEFT_FOR")) {
+            let left = crate::sparse::clone_progress(&path);
+            let _ = std::fs::write(file, serde_json::to_string(&left).unwrap_or_else(|_| "null".into()));
         }
     }
 }

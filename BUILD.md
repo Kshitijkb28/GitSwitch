@@ -9,15 +9,21 @@ codebase builds installers for **Windows, macOS, and Linux**.
 # Run the full app from source (dev, hot-reload) ...... npm run tauri dev   [native]
 # Build a production app for THIS machine's OS ........ npm run tauri build [native]
 # Build Linux installers on any machine ............... docker compose run --rm builder
+# Run the app in Docker (any machine), in a browser ... docker compose up app   -> localhost:6080
+# Run `tauri dev` in Docker on this checkout .......... docker compose up dev   -> localhost:6080
 # Build ALL three OSes' installers .................... git tag vX.Y.Z && git push --tags  (CI)
 ```
 
-> To **run** GitSwitch from the codebase, use `npm run tauri dev` — Docker is a
-> *build* tool here, not a run tool (a container has no display for a GUI app).
+> To **run** GitSwitch from the codebase, use `npm run tauri dev` — or, with
+> nothing but Docker installed, `docker compose up dev`.
 
-> **Docker note:** Docker cannot *run* GitSwitch — a container has no display,
-> and this is a GUI app. Docker is only used here to **build the Linux
-> installer** reproducibly. See [Linux via Docker](#linux-via-docker).
+> **Docker note:** a container has no display of its own, so Docker runs
+> GitSwitch on a virtual one and shows it in your browser: `docker compose up
+> app` (the built app — the image needs no checkout, so it runs on any Docker
+> host) or `docker compose up dev` (`tauri dev` on this checkout), then open
+> http://localhost:6080/vnc.html. The screen is served on localhost only. The
+> app in a container uses the container's git, keys and folders — mount the
+> folders you want it to manage. See [Linux via Docker](#linux-via-docker).
 
 ---
 
@@ -28,11 +34,27 @@ and run it:
 
 | OS | File | How to install |
 |----|------|----------------|
-| **macOS** | `GitSwitch_x.y.z_universal.dmg` | Open the `.dmg`, drag GitSwitch to Applications |
-| **Windows** | `GitSwitch_x.y.z_x64-setup.exe` or `.msi` | Run it, click through the installer |
-| **Linux (Debian/Ubuntu)** | `git-switch_x.y.z_amd64.deb` | `sudo dpkg -i *.deb` |
-| **Linux (any distro)** | `git-switch_x.y.z_amd64.AppImage` | `chmod +x *.AppImage && ./*.AppImage` |
-| **Linux (Fedora/RHEL)** | `git-switch-x.y.z.x86_64.rpm` | `sudo rpm -i *.rpm` |
+| **macOS** | `GitSwitch_x.y.z_universal.dmg` | Open the `.dmg`, drag GitSwitch to Applications, then see [First open on macOS](#first-open-on-macos) |
+| **Windows** | `GitSwitch_x.y.z_x64-setup.exe` or `GitSwitch_x.y.z_x64_en-US.msi` | Run it, click through the installer — SmartScreen asks once, see [Installing](#installing) |
+| **Linux (Debian/Ubuntu)** | `GitSwitch_x.y.z_amd64.deb` | `sudo apt install ./GitSwitch_x.y.z_amd64.deb` (pulls in the WebKit/GTK libraries; `dpkg -i` does not) |
+| **Linux (any distro)** | `GitSwitch_x.y.z_amd64.AppImage` | `chmod +x GitSwitch_*.AppImage && ./GitSwitch_*.AppImage` |
+| **Linux (Fedora/RHEL)** | `GitSwitch-x.y.z-1.x86_64.rpm` | `sudo dnf install ./GitSwitch-x.y.z-1.x86_64.rpm` |
+
+### First open on macOS
+
+The build is sealed but not notarized (that needs a paid Apple Developer ID),
+so the first time it is opened macOS asks for confirmation:
+
+- **macOS 15 and later:** open GitSwitch once and click **Done**, then
+  **System Settings → Privacy & Security**, find "GitSwitch was blocked…",
+  click **Open Anyway**, then **Open**.
+- **macOS 14 and earlier:** Control-click GitSwitch in Applications → **Open**
+  → **Open**.
+- If macOS says the app **is damaged** (a build from before the app was
+  sealed): `xattr -dr com.apple.quarantine /Applications/GitSwitch.app`, then
+  open it again.
+
+After that it opens like any other app.
 
 ### Runtime requirements (must exist on the user's machine)
 
@@ -69,7 +91,10 @@ npm run tauri build -- --target universal-apple-darwin
 npm install
 npm run tauri build         # -> src-tauri\target\release\bundle\{msi,nsis}\
 ```
-(Needs the "Desktop development with C++" workload from Visual Studio Build Tools.)
+(Needs the "Desktop development with C++" workload from Visual Studio Build Tools.
+No bash is needed: the sidecars are built by `cargo run -p gitswitch-sidecars`,
+which `npm run tauri dev` and `npm run tauri build` run themselves, from
+PowerShell or cmd alike.)
 
 ### Linux (native)
 ```bash
@@ -116,8 +141,9 @@ parallel. Two ways to trigger it:
 - **Manual:** Actions tab → "Build installers" → Run workflow → download the
   per-OS artifacts.
 
-This is the recommended path, because macOS installers can only be built on
-macOS and Windows installers on Windows.
+This is the recommended path: macOS installers can only be built on macOS,
+and CI builds all three at once. (The Windows installer can also be
+cross-built with Docker — see [Testing on Windows](#6-testing-on-windows).)
 
 ## 4. macOS: build + install in one step
 
@@ -144,9 +170,20 @@ To ship signed updates from CI:
 
 ## 6. Testing on Windows
 
-The `.exe` / `.msi` come from the CI workflow (Windows installers can only be
-built on Windows). Grab them from the draft Release, or from the run's
-artifacts if it was triggered manually.
+The `.exe` / `.msi` come from the CI workflow. Grab them from the draft
+Release, or from the run's artifacts if it was triggered manually.
+
+The `.exe` can also be cross-built from a Linux or macOS machine that has
+Docker (no Windows needed): the image brings the Windows SDK through
+cargo-xwin and packages the installer with NSIS.
+
+```bash
+docker build -f scripts/docker/Dockerfile.windows -t gitswitch-win .
+docker run --rm -v "$PWD/dist-windows:/out" gitswitch-win
+# -> dist-windows/GitSwitch_x.y.z_x64-setup.exe
+```
+
+The result is unsigned either way (SmartScreen asks once, see Installing).
 
 ### Installing
 

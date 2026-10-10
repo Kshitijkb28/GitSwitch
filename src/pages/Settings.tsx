@@ -8,6 +8,7 @@ import { useToast } from "../components/Toast";
 import { getCustomClientId, setOAuthClientId } from "../lib/oauth";
 import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
+import { notePushChanged } from "../lib/console";
 import { RefreshButton } from "../components/RefreshButton";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -56,6 +57,7 @@ export function Settings() {
     setLockMessage(null);
     try {
       const r = await job();
+      if (r.outcome === "applied") notePushChanged();
       setLockMessage(
         r.outcome === "applied"
           ? r.message

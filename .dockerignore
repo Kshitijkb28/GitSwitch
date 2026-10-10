@@ -7,3 +7,7 @@ src-tauri/target
 *.dmg
 *.app
 **/.DS_Store
+**/node_modules
+.claude
+src-tauri/binaries
+vscode-extension/out

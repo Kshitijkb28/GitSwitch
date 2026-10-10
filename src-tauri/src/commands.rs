@@ -29,7 +29,7 @@ pub fn get_profiles() -> Result<Vec<Profile>, AppError> {
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
-pub fn create_profile(
+pub async fn create_profile(
     app: tauri::AppHandle,
     name: String,
     git_name: String,
@@ -40,6 +40,7 @@ pub fn create_profile(
     signing_enabled: Option<bool>,
     remote_patterns: Option<Vec<String>>,
     github_login: Option<String>,
+    push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
     let profile = profiles::create_profile(
         name,
@@ -51,15 +52,56 @@ pub fn create_profile(
         signing_enabled.unwrap_or(false),
         remote_patterns.unwrap_or_default(),
         github_login,
+        push_over_ssh,
     )?;
     git_config::apply_git_config()?;
+    // A guard in these folders that expected another profile's email.
+    log_guards(commit_audit::refresh_guards(&profile.directories).await);
     crate::tray::update_active_label(&app);
     Ok(profile)
 }
 
+/// A profile saved, its config written, and every identity guard in its old
+/// and new folders brought in line with the email that now owns them — the
+/// command without the tray, so the verification probe can run it.
+#[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
+pub(crate) async fn update_profile_core(
+    id: String,
+    name: Option<String>,
+    git_name: Option<String>,
+    git_email: Option<String>,
+    ssh_key_path: Option<String>,
+    directories: Option<Vec<String>>,
+    allow_push: Option<bool>,
+    signing_enabled: Option<bool>,
+    remote_patterns: Option<Vec<String>>,
+    github_login: Option<String>,
+    push_over_ssh: Option<bool>,
+) -> Result<Profile, AppError> {
+    let before = profiles::load_profiles()?.profiles.into_iter().find(|p| p.id == id);
+    let profile = profiles::update_profile(
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login, push_over_ssh,
+    )?;
+    git_config::apply_git_config()?;
+    // Only an email or a folder change can leave a guard expecting the wrong email.
+    let changed = before.as_ref().is_none_or(|b| b.git_email != profile.git_email || b.directories != profile.directories);
+    if changed {
+        let mut dirs = profile.directories.clone();
+        dirs.extend(before.map(|b| b.directories).unwrap_or_default());
+        log_guards(commit_audit::refresh_guards(&dirs).await);
+    }
+    Ok(profile)
+}
+
+fn log_guards(lines: Vec<String>) {
+    for line in lines {
+        eprintln!("GitSwitch: {}", line);
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
-pub fn update_profile(
+pub async fn update_profile(
     app: tauri::AppHandle,
     id: String,
     name: Option<String>,
@@ -71,20 +113,23 @@ pub fn update_profile(
     signing_enabled: Option<bool>,
     remote_patterns: Option<Vec<String>>,
     github_login: Option<String>,
+    push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
-    let profile = profiles::update_profile(
-        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login,
-    )?;
-    git_config::apply_git_config()?;
+    let profile = update_profile_core(
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login, push_over_ssh,
+    )
+    .await?;
     crate::tray::update_active_label(&app);
     Ok(profile)
 }
 
 #[tauri::command]
-pub fn delete_profile(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
-    credentials::delete_token(&id).ok();
+pub async fn delete_profile(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
+    let dirs = profiles::load_profiles()?.profiles.into_iter().find(|p| p.id == id).map(|p| p.directories).unwrap_or_default();
     profiles::delete_profile(id)?;
     git_config::apply_git_config()?;
+    // A parent folder's profile may own these repositories now.
+    log_guards(commit_audit::refresh_guards(&dirs).await);
     crate::tray::update_active_label(&app);
     Ok(())
 }
@@ -142,26 +187,40 @@ pub async fn gh_logout(account: String) -> Result<String, AppError> {
     gh_cli::gh_logout(&account).await
 }
 
-/// Automate "Step 2": register a local key's public half on a specific gh account.
+/// Automate "Step 2": register a local key's public half on a specific
+/// account — a gh login, or a sign-in kept here ("signin:<login>").
 /// `key_path` is the PRIVATE key path; we read `<key_path>.pub`.
 #[tauri::command]
-pub async fn gh_register_ssh_key(
-    account: String,
-    key_path: String,
-    title: String,
-) -> Result<String, AppError> {
-    let token = gh_cli::gh_get_token(&account).await?;
+pub async fn gh_register_ssh_key(account: String, key_path: String) -> Result<String, AppError> {
+    let signin = credentials::signin_login(&account).map(str::to_string);
+    let token = match &signin {
+        Some(login) => credentials::signin_token(login)?.ok_or_else(|| AppError::NotFound(format!("The sign-in for {} is not kept on this computer any more — sign in again on the GitHub page.", login)))?,
+        None => gh_cli::gh_get_token(&account).await?,
+    };
+    let account = signin.clone().unwrap_or(account);
     let public_key = ssh_keys::get_public_key(&key_path)?;
-
-    match github::upload_ssh_key(&token, &title, &public_key).await {
-        Ok(k) => Ok(format!("Registered '{}' on {}", k.title, account)),
-        Err(AppError::Command(msg))
-            if msg.contains("already in use") || msg.contains("key is already") =>
-        {
-            Ok(format!("Key already registered on {}", account))
+    let title = ssh_keys::key_title(ssh_keys::computer_name().as_deref());
+    let (status, body, scope) = github::post_ssh_key(&token, &title, &public_key).await?;
+    // A kept sign-in is renewed on the GitHub page, not with gh.
+    if signin.is_some() {
+        match status {
+            401 => return Err(AppError::Command(format!("GitHub no longer accepts the sign-in kept for {} — sign in again on the GitHub page.", account))),
+            403 | 404 => return Err(AppError::Command(format!("The sign-in kept for {} may not add SSH keys — sign in again on the GitHub page, which asks GitHub for that.", account))),
+            _ => {}
         }
-        Err(e) => Err(e),
     }
+    // "Already in use" is a success only when THIS account holds the key:
+    // otherwise it is the wrong-account case the whole flow exists for.
+    let (mine, holder) = if status == 422 {
+        let material = |k: &str| k.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        let wanted = material(&public_key);
+        let mine = github::list_ssh_keys_github(&token).await.ok().map(|keys| keys.iter().any(|k| material(&k.key) == wanted));
+        let holder = if mine == Some(false) { ssh_keys::resolve_key_account(&key_path).await.ok().flatten() } else { None };
+        (mine, holder)
+    } else {
+        (None, None)
+    };
+    github::key_upload_outcome(&account, status, &body, scope.as_deref(), mine, holder.as_deref())
 }
 
 /// Automate "Step 5": which GitHub account does this key authenticate as?
@@ -197,6 +256,18 @@ pub async fn doctor_check_repos() -> Result<Vec<Finding>, AppError> {
 #[tauri::command]
 pub async fn changes_push_identity(repo_path: String, refresh: bool) -> Result<crate::push_identity::PushIdentity, AppError> {
     crate::push_identity::push_identity(&repo_path, refresh).await
+}
+
+/// Doctor, on request: can the account each repository pushes as see it on GitHub?
+#[tauri::command]
+pub async fn doctor_check_repo_access() -> Result<Vec<Finding>, AppError> {
+    doctor::check_repo_access().await
+}
+
+/// One of Doctor's own repairs, by the fix id its finding carries.
+#[tauri::command]
+pub async fn doctor_apply_fix(fix: String) -> Result<String, AppError> {
+    doctor::apply_fix(&fix).await
 }
 
 /// Doctor's repair for a `local-override` finding.
@@ -329,14 +400,28 @@ pub async fn convert_repos_to_ssh(directory: String) -> Result<Vec<RemoteChange>
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
 }
 
+/// Keep a "Sign in with GitHub": its token in the system's credential store,
+/// its login in GitSwitch's list. Asked of GitHub first: the login kept is
+/// the one GitHub names for the token, never one the page passes.
 #[tauri::command]
-pub fn store_github_token(profile_id: String, token: String) -> Result<(), AppError> {
-    credentials::store_token(&profile_id, &token)
+pub async fn github_signin_keep(token: String) -> Result<GitHubUser, AppError> {
+    let user = github::verify_token(&token).await?;
+    credentials::keep_signin_token(&user.login, &token)?;
+    credentials::remember_signin(&user.login, user.id)?;
+    Ok(user)
 }
 
+/// Forget a kept sign-in: the token and the login.
 #[tauri::command]
-pub fn get_github_token(profile_id: String) -> Result<Option<String>, AppError> {
-    credentials::get_token(&profile_id)
+pub fn github_signin_forget(login: String) -> Result<(), AppError> {
+    credentials::forget_signin_token(&login)?;
+    credentials::forget_signin(&login)
+}
+
+/// The sign-ins kept here, newest first (no token is read to list them).
+#[tauri::command]
+pub fn github_signins() -> Vec<credentials::KeptSignIn> {
+    credentials::kept_signins()
 }
 
 #[tauri::command]
@@ -524,6 +609,13 @@ pub async fn history_authors(repo_path: String, rev: String) -> Result<Vec<git_h
         .map_err(|e| AppError::Command(format!("task failed: {}", e)))?
 }
 
+/// The page a gitswitch:// link asked for before the page listened (the link
+/// that started the app); the page asks once, as soon as it listens.
+#[tauri::command]
+pub fn deep_link_take(pending: tauri::State<'_, crate::deep_link::Pending>) -> Option<&'static str> {
+    pending.take()
+}
+
 /// Live progress of a clone into `dest_path`, while it runs.
 #[tauri::command]
 pub async fn clone_progress(dest_path: String) -> Option<sparse::CloneProgress> {
@@ -668,6 +760,13 @@ pub async fn changes_repair_push_block(repo_path: String) -> Result<PushState, A
     git_status::repair_push_block_for(&repo_path).await
 }
 
+/// How far the repository's push block or lock reaches into its submodules.
+#[tauri::command]
+pub async fn changes_push_coverage(repo_path: String) -> Result<crate::push_guard::PushCoverage, AppError> {
+    let state = git_status::push_state_for(&repo_path).await?;
+    Ok(crate::push_guard::coverage(&repo_path, &state).await)
+}
+
 /// Stage the named files. Never "everything" by accident: an empty list is an
 /// error, and staging all is a separate command.
 #[tauri::command]
@@ -721,9 +820,10 @@ pub async fn changes_pull(
     mode: String,
     with_lfs: bool,
     autostash: bool,
+    source: Option<String>,
 ) -> Result<OpResult, AppError> {
     let mode = git_ops::PullMode::parse(&mode)?;
-    git_ops::pull(&repo_path, mode, with_lfs, autostash).await
+    git_ops::pull(&repo_path, mode, with_lfs, autostash, source.as_deref()).await
 }
 
 /// Every gitlink in the repo with its real state — where it moved, what is
@@ -736,6 +836,14 @@ pub async fn changes_submodules(repo_path: String) -> Result<Vec<SubmoduleInfo>,
 #[tauri::command]
 pub async fn changes_submodule_update(repo_path: String, paths: Option<Vec<String>>) -> Result<OpResult, AppError> {
     git_ops::submodule_update(&repo_path, paths).await
+}
+
+/// Check out, in the named submodules, the commit this repository records for
+/// each — a go-back's "Align submodules" and a row's "Check out <commit>".
+/// Local only.
+#[tauri::command]
+pub async fn changes_submodule_align(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
+    Box::pin(crate::tree::align_submodules(&repo_path, paths)).await
 }
 
 /// Are this repo's large files really here, or still LFS pointer stubs?
@@ -831,8 +939,9 @@ pub async fn changes_sync_run(
     stash: bool,
     bundles: bool,
     fingerprint: Vec<(String, String)>,
+    with_lfs: Option<bool>,
 ) -> Result<OpResult, AppError> {
-    crate::sync::sync_run(&repo_path, crate::sync::RunOptions { stash, bundles, fingerprint }).await
+    crate::sync::sync_run(&repo_path, crate::sync::RunOptions { stash, bundles, with_lfs: with_lfs.unwrap_or(false), fingerprint }).await
 }
 
 /// Resume a paused sync after conflicts were resolved and staged.

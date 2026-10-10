@@ -167,7 +167,7 @@ export function CommitAudit() {
               <p className="text-xs text-zinc-500 font-mono truncate mt-1">{a.path}</p>
               <p className="text-xs text-zinc-500 mt-1">
                 should commit as{" "}
-                <span className="text-emerald-400 font-mono">{a.expected_email}</span>
+                <span className="text-emerald-400 font-mono break-all">{a.expected_email}</span>
               </p>
             </div>
             <div className="flex items-center gap-2 shrink-0 ml-auto">
@@ -196,12 +196,11 @@ export function CommitAudit() {
                   </>
                 )}
               </Button>
-              {a.unpushed_count > 0 && (
+              {a.unpushed_count > 0 && !a.fix_blocker && (
                 <Button
                   size="sm"
                   onClick={() => setConfirmFix(a)}
-                  disabled={busy !== null || a.dirty}
-                  title={a.dirty ? "Commit or stash your changes first" : undefined}
+                  disabled={busy !== null}
                 >
                   {busy === a.path ? (
                     <>
@@ -231,11 +230,13 @@ export function CommitAudit() {
                 >
                   {c.author_email}
                 </span>
-                <span className="shrink-0">
+                <span className="shrink-0 inline-flex items-center gap-1">
                   {c.pushed ? (
                     <Badge variant="default">pushed</Badge>
-                  ) : (
+                  ) : c.on_head ? (
                     <Badge variant="warning">local</Badge>
+                  ) : (
+                    <Badge variant="warning">on {c.branches?.[0] ?? "another branch"}</Badge>
                   )}
                 </span>
               </div>
@@ -247,6 +248,33 @@ export function CommitAudit() {
             )}
           </div>
 
+          {a.unpushed_count > 0 && a.fix_blocker && (
+            <div className="mt-3 flex items-start gap-2 flex-wrap">
+              <p className="text-xs text-amber-300/90 break-words flex-1 min-w-0">{a.fix_blocker}</p>
+              {a.fix_blocker.includes("user.email") && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={async () => {
+                    try {
+                      await api.doctorUnsetLocal(a.path, "user.email");
+                      await scan();
+                    } catch (e) {
+                      setError(String(e));
+                    }
+                  }}
+                >
+                  Remove this repository's user.email
+                </Button>
+              )}
+            </div>
+          )}
+          {a.other_branch_count > 0 && (
+            <p className="text-xs text-zinc-500 mt-3">
+              {a.other_branch_count} of these {a.other_branch_count === 1 ? "is" : "are"} on another
+              branch — check it out to fix {a.other_branch_count === 1 ? "it" : "them"} there.
+            </p>
+          )}
           {a.pushed_count > 0 && (
             <p className="text-xs text-zinc-600 mt-3">
               {a.pushed_count} of these {a.pushed_count === 1 ? "is" : "are"} already
@@ -269,7 +297,7 @@ export function CommitAudit() {
             {confirmFix?.unpushed_count === 1 ? "" : "s"}
           </strong>{" "}
           in <span className="font-mono text-zinc-300">{confirmFix?.repo_name}</span> to{" "}
-          <span className="font-mono text-emerald-400">{confirmFix?.expected_email}</span>.
+          <span className="font-mono text-emerald-400 break-all">{confirmFix?.expected_email}</span>.
         </p>
         <ul className="text-xs text-zinc-500 space-y-1.5 mb-4 list-disc pl-5">
           <li>Only commits that haven't been pushed are touched.</li>

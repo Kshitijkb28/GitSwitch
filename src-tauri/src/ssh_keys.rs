@@ -114,15 +114,76 @@ pub async fn test_ssh_connection_with_key(key_path: &str) -> Result<String, AppE
     }
 }
 
+/// This computer's name, as people know it: `Ann-PC`, not `Ann-PC.local`.
+pub fn computer_name() -> Option<String> {
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        // SAFETY: the buffer is valid for its length, and gethostname writes
+        // a NUL-terminated name into it (truncated if it does not fit).
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc != 0 {
+            return None;
+        }
+        let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+        let name = String::from_utf8_lossy(&buf[..end]).to_string();
+        Some(name).filter(|n| !n.trim().is_empty())
+    }
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").ok().filter(|n| !n.trim().is_empty())
+    }
+}
+
+/// The title a key gets on GitHub: which computer it came from.
+pub fn key_title(computer: Option<&str>) -> String {
+    match computer.map(|c| c.trim().trim_end_matches(".local")).filter(|c| !c.is_empty()) {
+        Some(c) => format!("GitSwitch ({})", c),
+        None => "GitSwitch".into(),
+    }
+}
+
 /// Is this private key protected by a passphrase?
 /// Asking ssh-keygen for the public half with an empty passphrase succeeds only
 /// when the key is unencrypted. `-P ""` guarantees it can never prompt.
+/// Only a key ssh-keygen says needs a passphrase counts: one it cannot read
+/// for another reason (permissions, a format it does not know) is not
+/// "passphrase-protected", and must not be reported as such.
 pub fn key_has_passphrase(key_path: &str) -> bool {
     crate::spawn::command("ssh-keygen")
         .args(["-y", "-P", "", "-f", key_path])
         .output()
-        .map(|o| !o.status.success())
+        .map(|o| !o.status.success() && String::from_utf8_lossy(&o.stderr).to_lowercase().contains("passphrase"))
         .unwrap_or(false)
+}
+
+/// Whether ssh-agent holds this key: `ssh-add -L` lists its public half.
+/// None when that cannot be told (no agent, no .pub, ssh-add missing).
+pub async fn agent_holds_key(key_path: &str) -> Option<bool> {
+    let material = crate::signing::pubkey_material(key_path).ok()?;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::spawn::async_command("ssh-add").arg("-L").output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    match out.status.code() {
+        Some(0) => Some(String::from_utf8_lossy(&out.stdout).lines().any(|l| {
+            let mut w = l.split_whitespace();
+            matches!((w.next(), w.next()), (Some(t), Some(k)) if format!("{} {}", t, k) == material)
+        })),
+        // "The agent has no identities."
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// github.com refused a key that needs a passphrase, which the probe could
+/// not give it (it runs with BatchMode and no ssh config, so the keychain the
+/// config names cannot unlock it): that says nothing about the key's account.
+pub(crate) fn rejected_because_locked(has_passphrase: bool, in_agent: Option<bool>) -> bool {
+    has_passphrase && in_agent != Some(true)
 }
 
 async fn probe_key_account(key_path: &str) -> Result<Option<String>, AppError> {
@@ -280,5 +341,31 @@ mod tests {
         ] {
             assert_eq!(interpret_ssh_probe(out), None, "should be indeterminate: {out:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod locked_key_tests {
+    use super::*;
+
+    #[test]
+    fn a_locked_key_is_not_called_unregistered() {
+        assert!(rejected_because_locked(true, Some(false)));
+        assert!(rejected_because_locked(true, None));
+        assert!(!rejected_because_locked(true, Some(true)));
+        assert!(!rejected_because_locked(false, None));
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    #[test]
+    fn a_key_is_titled_after_the_computer_it_came_from() {
+        assert_eq!(key_title(Some("Ann-PC.local")), "GitSwitch (Ann-PC)");
+        assert_eq!(key_title(Some("build-box")), "GitSwitch (build-box)");
+        assert_eq!(key_title(None), "GitSwitch");
+        assert_eq!(key_title(Some("  ")), "GitSwitch");
     }
 }
