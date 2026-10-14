@@ -26,7 +26,7 @@ const status = {
   has_submodules: true,
   stash_count: 2,
 };
-const PAGES = ["Profiles", "SSH Keys", "GitHub Auth", "Repositories", "Clone", "Repository", "Auto Assign", "Doctor", "Commit Audit", "Settings"];
+const PAGES = ["Profiles", "SSH Keys", "GitHub Auth", "Repositories", "Clone", "Repository", "Ports", "Auto Assign", "Doctor", "Commit Audit", "Settings"];
 
 // The app's own content-security policy, served with the page: anything the
 // built app does that the policy forbids shows up here as a violation.
@@ -125,6 +125,17 @@ try {
             case "list_remote_repos_page": return Promise.resolve({ listing: { account: "a", login: "me", suggested_profile_id: null, repos: [], sso_hidden_orgs: 0, truncated: false }, page: 1, per_page: 10, has_more: false });
             case "history_branches": return Promise.resolve([{ name: "main", is_current: true, is_remote: false, upstream: "origin/main", ahead: 0, behind: 0, tip: "aaa", short_tip: "aaa", last_author: "Me", last_date: "2026-01-01T00:00:00Z", subject: "x" }]);
             case "history_page": return Promise.resolve({ commits: [], total: 0, has_more: false });
+            // The Repository page's copies row: two copies with long labels, so the sweep measures the worst line.
+            case "workspace_info": return Promise.resolve({ path: "/repos/gitswitch", name: "gitswitch", id: "a1b2c3d4", kind: "clone", asked_path: "/repos/gitswitch", offset: 0, compose_project: null, remote: "releaseengineeringautomation/platforminfrastructureteamnotifications", copies: [
+              { path: "/repos/gitswitch", label: "releaseengineeringautomationandplatforminfrastructure/gitswitch", id: "a1b2c3d4", offset: 0, kind: "clone", is_this: true, profile_name: "Kirmada", branch: "main", detached: false, unborn: false, changed: 3 },
+              { path: "/Users/me/Documents/releaseengineeringautomationandplatforminfrastructureteamnotifications/gitswitch", label: "releaseengineeringautomationandplatforminfrastructureteamnotifications/gitswitch", id: "2f9c1a7b", offset: 100, kind: "clone", is_this: false, profile_name: "Kirmada", branch: "main", detached: false, unborn: false, changed: 1 },
+            ], note: { level: "amber", text: "Both copies have main checked out with uncommitted changes (releaseengineeringautomationandplatforminfrastructure/gitswitch: 3 files, releaseengineeringautomationandplatforminfrastructureteamnotifications/gitswitch: 1 file). Commits made in both will diverge and the second push will be refused — work on a branch per copy." }, env: [], banner: "", warnings: [], not_automated: "GitSwitch only tells you about the other copy — it never switches a branch, edits a port in your project, or renames containers that are already running. Those are your decisions." });
+            // The Ports page: a long folder and a long container name, so the sweep measures the worst row.
+            case "ports_list": return Promise.resolve({ os: "macos", docker: "ok", took_ms: 120, notes: ["Processes of other users (including root) are listed from netstat; GitSwitch cannot inspect their folder or stop them."], rows: [
+              { key: "tcp:18789:725", proto: "tcp", port: 18789, addresses: ["127.0.0.1", "::1"], scope: "loopback", pid: 725, name: "node", exe: "/opt/homebrew/bin/node", cwd: "/Users/me/Documents/releaseengineeringautomationandplatforminfrastructureteamnotifications/workspace/apps/web", started_at: "2026-10-11T01:00:00+05:30", user: "me", ours: true, workspace: "abc12345", clone: { path: "/Users/me/Documents/Acme/gitswitch", name: "gitswitch", profile_name: "Kirmada" }, container: null, killable: true, why_not: null },
+              { key: "tcp:8080:2842", proto: "tcp", port: 8080, addresses: ["*"], scope: "all", pid: 2842, name: "com.docker.backend", exe: null, cwd: null, started_at: null, user: "me", ours: false, workspace: null, clone: null, container: { id: "f50b929f94ba", name: "releaseengineeringautomationandplatforminfrastructure-proxy-1", project: "releaseengineeringautomationandplatforminfrastructure", service: "proxy", working_dir: "/Users/me/x", container_port: 80 }, killable: false, why_not: "Published by Docker — stop the container instead." },
+              { key: "tcp:8021:1", proto: "tcp", port: 8021, addresses: ["127.0.0.1", "::1"], scope: "loopback", pid: 1, name: "launchd", exe: "/sbin/launchd", cwd: null, started_at: null, user: "root", ours: false, workspace: null, clone: null, container: null, killable: false, why_not: "A system process (pid 1) — not stoppable from here." },
+            ] });
             // The SSH Key Wizard's Test step, failing on a key whose path has no
             // break opportunity (underscores only: a hyphen would hide the bug).
             case "generate_ssh_key": return Promise.resolve([window.__LONG_KEY__, window.__LONG_KEY__ + ".pub"]);

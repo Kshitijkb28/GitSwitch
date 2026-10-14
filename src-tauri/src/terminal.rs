@@ -36,8 +36,8 @@ struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
-    /// The shell's process id, for the test that proves none is left behind.
-    #[allow(dead_code)]
+    /// The shell's process id: the Ports page refuses to stop it, and the
+    /// test that proves none is left behind reads it.
     pid: Option<u32>,
 }
 
@@ -52,6 +52,12 @@ impl Drop for Session {
 fn sessions() -> &'static Mutex<HashMap<String, Session>> {
     static S: OnceLock<Mutex<HashMap<String, Session>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The pids of every shell the drawer has open: the Ports page must never
+/// offer to stop one (closing the drawer is how).
+pub(crate) fn shell_pids() -> Vec<u32> {
+    sessions().lock().map(|m| m.values().filter_map(|s| s.pid).collect()).unwrap_or_default()
 }
 
 fn app_dir() -> Option<PathBuf> {
@@ -315,6 +321,14 @@ where
         None => shim.to_string_lossy().to_string(),
     };
     cmd.env("PATH", path);
+    // The workspace: what tells this checkout apart from another copy of the
+    // same project — its id, port offset and (for a later copy) Compose
+    // project name — exported so every server and agent started here
+    // inherits them.
+    let ws = crate::workspace::env_for(repo_path);
+    for (k, v) in &ws.env {
+        cmd.env(k, v);
+    }
 
     let child = pair
         .slave
@@ -336,6 +350,9 @@ where
 
     let id = uuid::Uuid::new_v4().to_string();
     let done_id = id.clone();
+    // One dim line before the shell's first prompt: which workspace this is
+    // and what it was given, so a port already taken has an explanation.
+    sink(format!("\u{1b}[2m{}\u{1b}[0m\r\n", ws.banner));
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = [0u8; 8192];
@@ -446,6 +463,14 @@ pub fn close_all() {
 /// the real shim, which is the only way to prove the guards actually fire.
 #[allow(dead_code)] // driven by the test-only probe, which the app build omits
 pub fn run_once(repo_path: &str, script: &str, timeout: Duration) -> Result<String, AppError> {
+    run_once_with_prelude(repo_path, script, timeout).map(|(_, out)| out)
+}
+
+/// `run_once`, and also what the shell showed before the line was typed —
+/// the workspace banner and the first prompt — so a suite can check the
+/// banner is the first thing a person sees.
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+pub fn run_once_with_prelude(repo_path: &str, script: &str, timeout: Duration) -> Result<(String, String), AppError> {
     let collected = Arc::new(Mutex::new(String::new()));
     let last = Arc::new(Mutex::new(Instant::now()));
     let out = collected.clone();
@@ -476,9 +501,8 @@ pub fn run_once(repo_path: &str, script: &str, timeout: Duration) -> Result<Stri
         }
     };
     settle(Duration::from_millis(350), Duration::from_secs(5));
-    if let Ok(mut s) = collected.lock() {
-        s.clear(); // the banner and the first prompt are not the answer
-    }
+    // The banner and the first prompt are not the answer — but they are the prelude.
+    let prelude = collected.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
 
     write(&id, script)?;
     write(&id, "\n")?;
@@ -487,7 +511,7 @@ pub fn run_once(repo_path: &str, script: &str, timeout: Duration) -> Result<Stri
     let _ = write(&id, "exit\n");
     std::thread::sleep(Duration::from_millis(120));
     close(&id);
-    Ok(collected.lock().map(|s| s.clone()).unwrap_or_default())
+    Ok((prelude, collected.lock().map(|s| s.clone()).unwrap_or_default()))
 }
 
 /// Open a shell at one size, run a line, resize it, run the line again, and

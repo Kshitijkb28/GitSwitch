@@ -110,7 +110,8 @@ fn git_text(dir: &std::path::Path, args: &[&str]) -> Option<String> {
 
 /// origin's URL, or — in a clone whose remote is called something else —
 /// the first remote's.
-fn get_origin(dir: &std::path::Path) -> Option<String> {
+/// The origin's URL as stored — or the first remote's, when there is no origin.
+pub(crate) fn get_origin(dir: &std::path::Path) -> Option<String> {
     git_text(dir, &["remote", "get-url", "origin"]).or_else(|| {
         let first = git_text(dir, &["remote"])?.lines().next()?.trim().to_string();
         git_text(dir, &["remote", "get-url", &first])

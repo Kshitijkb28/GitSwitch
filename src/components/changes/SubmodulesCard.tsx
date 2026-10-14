@@ -502,7 +502,7 @@ export function SubmodulesCard({
             variant="ghost"
             disabled={busy}
             onClick={() => onUpdate(missing.map((s) => s.path))}
-            title="git submodule update --init for the never-initialised ones only — populated submodules are left exactly as they are"
+            title={`git submodule update --init for ${missing.map((s) => s.path).join(", ")} — populated submodules are left exactly as they are`}
           >
             <Download size={13} />
             Download missing ({fetchable})
@@ -543,6 +543,27 @@ export function SubmodulesCard({
                 {interrupted > 0 && ` (${interrupted} download${interrupted === 1 ? "" : "s"} interrupted — Download finishes ${interrupted === 1 ? "it" : "them"})`}
                 {" — Download missing fetches them (git submodule update --init)."}
               </p>
+              <ul className="mt-1 space-y-0.5" aria-label="Submodules not downloaded yet">
+                {missing.map((s) => (
+                  <li key={`${repoPath}/${s.path}`} className="flex items-center gap-2 text-xs min-w-0">
+                    <span className="font-mono text-zinc-300 break-all min-w-0" title={s.summary}>
+                      {s.path}
+                    </span>
+                    <span className="text-zinc-500 shrink-0">{s.state === "incomplete" ? "download interrupted" : "not downloaded"}</span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={busy}
+                      onClick={() => onUpdate([s.path])}
+                      className="ml-auto px-2 py-0.5 shrink-0"
+                      title={`git submodule update --init for ${s.path} only: downloads it at the commit this repository records`}
+                    >
+                      <Download size={12} />
+                      Download
+                    </Button>
+                  </li>
+                ))}
+              </ul>
             </div>
           </div>
         </div>

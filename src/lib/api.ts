@@ -17,6 +17,150 @@ export async function deepLinkTake(): Promise<string | null> {
   return invoke("deep_link_take");
 }
 
+// --- Ports: every listening port, who holds it, and stopping it --------------
+
+/** The repository in a profile folder a process runs inside. */
+export interface CloneRef {
+  path: string;
+  name: string;
+  profile_name: string;
+}
+
+/** The container a port is published by, and its Compose project when it has one. */
+export interface ContainerRef {
+  id: string;
+  name: string;
+  project: string | null;
+  service: string | null;
+  working_dir: string | null;
+  container_port: number | null;
+}
+
+/** "copy 2 of 2": which copy of its project a clone is, and the others' names. */
+export interface CopyRef {
+  rank: number;
+  of: number;
+  others: string[];
+}
+
+/** One listening port with everything the OS says about its holder. */
+export interface Listener {
+  key: string;
+  proto: "tcp" | "udp";
+  port: number;
+  addresses: string[];
+  scope: "loopback" | "all" | "lan";
+  pid: number | null;
+  name: string | null;
+  exe: string | null;
+  cwd: string | null;
+  started_at: string | null;
+  user: string | null;
+  /** Started from a GitSwitch terminal. */
+  ours: boolean;
+  workspace: string | null;
+  clone: CloneRef | null;
+  copy: CopyRef | null;
+  container: ContainerRef | null;
+  killable: boolean;
+  /** When not killable: why, in plain words. */
+  why_not: string | null;
+}
+
+export interface PortsReport {
+  os: "macos" | "linux" | "windows";
+  rows: Listener[];
+  /** What this listing could not see, one sentence each. */
+  notes: string[];
+  docker: "ok" | "missing" | "unavailable" | "timeout" | "skipped";
+  took_ms: number;
+}
+
+export interface KillOutcome {
+  pid: number;
+  ended: boolean;
+  how: "term" | "kill" | "taskkill" | "taskkill-force";
+  group: boolean;
+  message: string;
+}
+
+export interface ContainerStopOutcome {
+  stopped: string[];
+  message: string;
+}
+
+export async function portsList(): Promise<PortsReport> {
+  return invoke("ports_list");
+}
+
+/** `name` is what the page listed: a pid reused by another program is refused. */
+export async function portsKill(pid: number, force: boolean, name: string): Promise<KillOutcome> {
+  return invoke("ports_kill", { pid, force, name });
+}
+
+export async function portsContainerStop(id: string, project: string | null): Promise<ContainerStopOutcome> {
+  return invoke("ports_container_stop", { id, project });
+}
+
+/** One checkout of a project among the copies of it on this machine. */
+export interface WorkspaceCopy {
+  path: string;
+  /** The folder name, with a parent prepended while two copies share one. */
+  label: string;
+  id: string;
+  offset: number;
+  kind: "clone" | "worktree";
+  is_this: boolean;
+  profile_name: string | null;
+  branch: string | null;
+  detached: boolean;
+  unborn: boolean;
+  /** Tracked files changed (untracked left out); null when unreadable. */
+  changed: number | null;
+}
+
+export interface WorkspaceNote {
+  level: "amber";
+  text: string;
+}
+
+/**
+ * What tells this checkout apart from another copy of the same project: its
+ * id, port offset and Compose project name (the drawer exports them), the
+ * other copies, and the note when two copies share a branch with changes.
+ */
+export interface WorkspaceInfo {
+  /** The workspace's top folder (a submodule resolves to its superproject's). */
+  path: string;
+  name: string;
+  id: string;
+  kind: "clone" | "worktree";
+  asked_path: string;
+  offset: number;
+  /** Set for every copy but the first; the first keeps Compose's own name. */
+  compose_project: string | null;
+  /** "owner/name" for GitHub, else the remote's address; null without a remote. */
+  remote: string | null;
+  /** Every copy, this one included; by offset, then path. */
+  copies: WorkspaceCopy[];
+  note: WorkspaceNote | null;
+  /** What the drawer exports, as [name, value]. */
+  env: [string, string][];
+  banner: string;
+  warnings: string[];
+  /** The sentence about what is left to the person. */
+  not_automated: string;
+}
+
+export async function workspaceInfo(path: string): Promise<WorkspaceInfo> {
+  return invoke("workspace_info", { path });
+}
+
+/** The person chose this checkout's port offset (0..60000); one another copy uses is refused. */
+export async function workspaceSetOffset(path: string, offset: number): Promise<WorkspaceInfo> {
+  return invoke("workspace_set_offset", { path, offset });
+}
+
 export async function createProfile(params: {
   name: string;
   gitName: string;
@@ -649,6 +793,8 @@ export interface LocalClones {
   org_ssh_users: Record<string, string>;
   /** "owner/name" (lowercase) -> the folder a clone is still writing it into */
   cloning?: Record<string, string>;
+  /** "owner/name" (lowercase) -> every local copy, for repositories cloned more than once */
+  copies?: Record<string, string[]>;
 }
 
 /** Which repos are on this machine right now — local disk only, no network. */

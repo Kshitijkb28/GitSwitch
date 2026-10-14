@@ -5,7 +5,8 @@ import { whyDisabled } from "../changes/PullControl";
 import { agoLabel } from "../changes/BranchCard";
 import type { GitJob } from "../../lib/gitJobs";
 import { progressLine } from "../../lib/gitJobs";
-import type { PullMode, RemotePeek, RepoStatus, SubmoduleInfo } from "../../lib/api";
+import type { PullMode, RemotePeek, RepoStatus, SubmoduleInfo, WorkspaceInfo } from "../../lib/api";
+import { WorkspaceCopies } from "./WorkspaceCopies";
 
 /** What the strip's buttons do — supplied by the Changes tab, which owns the operations. */
 export type StripActions = {
@@ -60,6 +61,8 @@ interface Props {
   onPeekDismiss: () => void;
   /** Opens the Update drawer: a fetch, then the plan — nothing runs until "Update now". */
   onPreview: () => void;
+  /** The other copies of this project on this machine; null inside a submodule scope, or before the read. */
+  workspace: WorkspaceInfo | null;
 }
 
 /**
@@ -112,6 +115,7 @@ export function StatusStrip({
   onPeek,
   onPeekDismiss,
   onPreview,
+  workspace,
 }: Props) {
   if (!repoPath) return null;
   const noPreview = status ? whyNoPreview(status) : "Reading the repository…";
@@ -274,6 +278,8 @@ export function StatusStrip({
           )}
         </p>
       )}
+
+      <WorkspaceCopies info={workspace} />
 
       {peek && (
         <div className={`flex flex-wrap items-center gap-2 text-xs ${peek.changed ? "text-amber-200" : "text-zinc-400"}`}>

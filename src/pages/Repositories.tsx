@@ -153,6 +153,8 @@ export function Repositories() {
     local ? local.clones[r.full_name.toLowerCase()] ?? null : r.local_path;
   /** The folder a clone of this repository is still being written into. */
   const cloningPathOf = (r: api.RemoteRepo) => local?.cloning?.[r.full_name.toLowerCase()] ?? null;
+  /** Every local copy of this repository — two or more when it is cloned twice. */
+  const copiesOf = (r: api.RemoteRepo) => local?.copies?.[r.full_name.toLowerCase()] ?? [];
   // While a clone runs, the list is read again until it is done.
   const anyCloning = Object.keys(local?.cloning ?? {}).length > 0;
   useEffect(() => {
@@ -529,8 +531,9 @@ export function Repositories() {
                       {timeAgo(r.pushed_at)}
                       {r.default_branch && <> · {r.default_branch}</>}
                       {localPath ? (
-                        <span className="text-emerald-400/80" title={localPath}>
-                          {" "}· cloned at {shortPath(localPath)}
+                        <span className="text-emerald-400/80" title={copiesOf(r).length > 1 ? copiesOf(r).join("\n") : localPath}>
+                          {" "}· cloned {copiesOf(r).length > 1 ? `×${copiesOf(r).length} · ` : "at "}
+                          {shortPath(localPath)}
                         </span>
                       ) : cloningPath ? (
                         <span className="text-sky-300/80" title={cloningPath}>

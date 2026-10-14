@@ -14,7 +14,9 @@ use crate::github::{self, GitHubKey, GitHubUser, RepoPermissions};
 use crate::remote_repos::{self, LocalClones, RepoAccount, RepoListing};
 use crate::repo_scan::{self, ScannedRepo};
 use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
+use crate::ports;
 use crate::profiles::{self, Profile};
+use crate::workspace;
 use crate::signing;
 use crate::sparse::{self, CertInfo, CloneResult, DestinationStatus, SparseInfo, SparseSetResult};
 use crate::submodules::{self, SubmoduleInfo};
@@ -609,6 +611,39 @@ pub async fn history_authors(repo_path: String, rev: String) -> Result<Vec<git_h
         .map_err(|e| AppError::Command(format!("task failed: {}", e)))?
 }
 
+/// Every listening port on this machine, who holds it, and where it runs from.
+#[tauri::command]
+pub async fn ports_list() -> Result<ports::PortsReport, AppError> {
+    ports::list().await
+}
+
+/// Stop the process holding a port; `name` is what the page listed, so a
+/// pid reused by another program is refused.
+#[tauri::command]
+pub async fn ports_kill(pid: u32, force: bool, name: String) -> Result<ports::KillOutcome, AppError> {
+    ports::kill(pid, force, &name).await
+}
+
+/// This checkout's workspace: its id, port offset and Compose project, the
+/// other copies of the same project among the profile folders, and the note
+/// when two of them share a branch with changes. Assigns what is missing.
+#[tauri::command]
+pub async fn workspace_info(path: String) -> Result<workspace::WorkspaceInfo, AppError> {
+    workspace::info(&path).await
+}
+
+/// The person chose this checkout's port offset.
+#[tauri::command]
+pub async fn workspace_set_offset(path: String, offset: u32) -> Result<workspace::WorkspaceInfo, AppError> {
+    workspace::set_offset(&path, offset).await
+}
+
+/// Stop a container, or every container of a Compose project.
+#[tauri::command]
+pub async fn ports_container_stop(id: String, project: Option<String>) -> Result<ports::ContainerStopOutcome, AppError> {
+    ports::container_stop(&id, project.as_deref()).await
+}
+
 /// The page a gitswitch:// link asked for before the page listened (the link
 /// that started the app); the page asks once, as soon as it listens.
 #[tauri::command]
@@ -896,6 +931,9 @@ pub async fn terminal_open(
     rows: u16,
     on_output: tauri::ipc::Channel<String>,
 ) -> Result<String, AppError> {
+    // The checkout gets its workspace keys before the shell starts, so what
+    // the shell exports is what the Repository page shows.
+    workspace::ensure_assigned(&repo_path).await;
     crate::terminal::open(&repo_path, cols, rows, on_output)
 }
 

@@ -48,6 +48,43 @@ for folders that still use HTTPS.
   matches the hidden value as well as the label, so two clones with the same
   name are told apart by their path. Long lists are rendered fifty rows at a
   time and grow as you scroll, so a few hundred repositories open instantly.
+- **Ports** — every port something is listening on, with the process that holds
+  it, the folder it runs from, and the repository and profile that folder belongs
+  to. Two copies of one project collide through what one of them left running —
+  a dev server, a database, a Compose project — and an AI agent in the other copy
+  then finds "something already on this port"; here the person sees which copy it
+  was and stops the right one. **Stop** asks first and sends the polite signal to
+  the whole process group (a dev server's children go with it); a process that
+  ignores it gets **Force stop**. A port published by Docker is stopped through
+  Docker (its container, or its whole Compose project), never by ending Docker
+  Desktop's own process, which is what holds the socket. What may not be stopped
+  from here is named with the reason: root's processes (with the `sudo kill` to
+  run), the system's own, GitSwitch itself and the drawer's shell. On macOS the
+  listing is `lsof` + `netstat` + `ps`; on Linux `ss` + `/proc`; on Windows one
+  PowerShell query — the Linux and Windows listings are unit-tested against their
+  documented formats and have not yet been seen by a person.
+- **Workspaces** — a repository cloned twice (to work in both with AI agents,
+  say) gets a separate identity per copy: an eight-character id kept in the
+  copy's own `.git/config` (a rename or move keeps it; nothing is pushed), a
+  port offset (the older copy keeps 0, the next takes 100, and so on — or change
+  it on the Repository page, where the workspace line also counts what listens
+  from this copy and links to those ports), and — for every copy but the first
+  — a Compose project name of its own,
+  so the first copy's containers and volumes keep their names. The terminal
+  drawer exports them (`GITSWITCH_WORKSPACE`, `GITSWITCH_WORKSPACE_PATH`,
+  `GITSWITCH_WORKSPACE_NAME`, `GITSWITCH_PORT_OFFSET`, and `COMPOSE_PROJECT_NAME`
+  only for a later copy) and prints one dim line saying what the shell got, so
+  a dev server or agent started there can take `$GITSWITCH_PORT_OFFSET` into
+  account and `docker compose up` lands in this copy's own project. The
+  Repository page names the other copies with their branch and changes, and
+  warns when two copies have the same branch checked out with uncommitted
+  changes in both — commits made in both diverge, and the second push is
+  refused. GitSwitch only tells you about the other copy — it never switches a
+  branch, edits a port in your project, or renames containers that are already
+  running. Those are your decisions. A `docker compose up` from your own
+  Terminal in a later copy still uses Compose's default name: the page shows
+  the `export COMPOSE_PROJECT_NAME=…` to paste. A linked worktree is a
+  workspace of its own; a submodule belongs to its superproject's.
 - **Doctor** — one click finds the things that silently send commits to the
   wrong account: an `~/.ssh/config` block pinning one key for github.com, SSH
   keys not registered on any account, hand-written `includeIf` rules fighting
