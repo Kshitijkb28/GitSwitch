@@ -1970,6 +1970,8 @@ try {
     await page.waitForFunction(() => document.body.innerText.includes("Download missing"), { timeout: 8000 }).catch(() => null);
     const dl = await button(page, "Download missing");
     const dlState = dl ? await dl.evaluate((e) => ({ disabled: e.disabled, text: e.innerText.trim() })) : null;
+    const listed = await page.evaluate(() => [...document.querySelectorAll('[aria-label="Submodules not downloaded yet"] li')].map((li) => li.innerText.replace(/\s+/g, " ").trim()));
+    ok("the card names the submodule that is not downloaded yet", listed.length === 1 && listed[0].startsWith("libs/sub not downloaded"), JSON.stringify(listed));
     await dl?.click();
     await page.waitForFunction(() => document.body.innerText.includes("Submodules 37%"), { timeout: 8000 }).catch(() => null);
     const s = await text(page);
@@ -1987,6 +1989,10 @@ try {
     const s = await text(page);
     ok("an interrupted download is counted among the ones to download, not the populated", s.includes("Download missing (1)") && s.includes("1 not downloaded yet"), s.slice(s.indexOf("Submodules"), s.indexOf("Submodules") + 300).replace(/\s+/g, " "));
     ok("  and says what happened to it", s.includes("1 download interrupted — Download finishes it"), s.slice(s.indexOf("not downloaded"), s.indexOf("not downloaded") + 200).replace(/\s+/g, " "));
+    const named = await page.evaluate(() => [...document.querySelectorAll('[aria-label="Submodules not downloaded yet"] li')].map((li) => li.innerText.replace(/\s+/g, " ").trim()));
+    ok("  and names it, with its own Download", named.length === 1 && named[0].startsWith("half download interrupted") && named[0].endsWith("Download"), JSON.stringify(named));
+    const title = await page.evaluate(() => [...document.querySelectorAll("button[title]")].map((b) => b.title).find((t) => t.startsWith("git submodule update --init for half ")) ?? "");
+    ok("  Download missing's tooltip names what it fetches", title.includes("half"), title);
     await page.close();
   }
   {

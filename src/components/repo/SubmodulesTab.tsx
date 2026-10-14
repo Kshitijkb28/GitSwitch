@@ -175,7 +175,7 @@ export function SubmodulesTab({ repoPath, scope, visible, busy, refreshKey, onWo
                   variant="secondary"
                   disabled={busy}
                   onClick={() => onInitialise(missing.map((s) => s.path))}
-                  title={`git submodule update --init for the ${missing.length} submodule(s) not downloaded yet — populated ones are left alone`}
+                  title={`git submodule update --init for ${missing.map((s) => s.path).join(", ")} — populated ones are left alone`}
                 >
                   <Download size={13} />
                   Download missing ({missing.length})
