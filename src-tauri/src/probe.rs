@@ -183,6 +183,8 @@ pub(crate) mod tests {
             "repo_accounts" => forward!(c::repo_accounts, args),
             "gh_list_accounts" => forward!(c::gh_list_accounts, args),
             "gh_logout" => forward!(c::gh_logout, args, account),
+            "gh_auth_accounts" => forward!(c::gh_auth_accounts, args),
+            "gh_auth_switch" => forward!(c::gh_auth_switch, args, host, login),
             "apply_git_config" => reply(c::apply_git_config()),
             "history_list_repos" => forward!(c::history_list_repos, args),
             "path_exists" => {

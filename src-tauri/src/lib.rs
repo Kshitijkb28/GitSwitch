@@ -115,6 +115,8 @@ pub fn run() {
             commands::gh_list_accounts,
             commands::gh_get_token,
             commands::gh_logout,
+            commands::gh_auth_accounts,
+            commands::gh_auth_switch,
             commands::gh_register_ssh_key,
             commands::resolve_key_account,
             commands::convert_repos_to_ssh,

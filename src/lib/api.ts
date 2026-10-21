@@ -239,6 +239,23 @@ export async function ghLogout(account: string): Promise<string> {
   return invoke("gh_logout", { account });
 }
 
+/** One login of the GitHub CLI: its host, and whether gh itself uses it (null from a gh that does not say). */
+export interface GhAccount {
+  host: string;
+  login: string;
+  active: boolean | null;
+  scopes: string[] | null;
+}
+
+export async function ghAuthAccounts(): Promise<GhAccount[]> {
+  return invoke("gh_auth_accounts");
+}
+
+/** `gh auth switch --hostname <host> --user <login>`: the sentence gh's listing confirms. */
+export async function ghAuthSwitch(host: string, login: string): Promise<string> {
+  return invoke("gh_auth_switch", { host, login });
+}
+
 export async function ghRegisterSshKey(
   account: string,
   keyPath: string
