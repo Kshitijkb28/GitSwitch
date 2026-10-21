@@ -982,6 +982,19 @@ fn seconds_since(path: &Path) -> Option<u64> {
 
 /// Everything the Changes page needs about one repository, in one call.
 pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
+    repo_status_with(repo_path, true).await
+}
+
+/// The same reading without measuring push access (`push` is left empty):
+/// for the per-submodule statuses behind the Changes tab's sections, which
+/// show files and never push access — the coverage read measures that for
+/// every submodule in one go. Measuring it here too cost eleven git runs per
+/// submodule on every refresh.
+pub async fn repo_status_lite(repo_path: &str) -> Result<RepoStatus, AppError> {
+    repo_status_with(repo_path, false).await
+}
+
+async fn repo_status_with(repo_path: &str, measure_push: bool) -> Result<RepoStatus, AppError> {
     let repo = PathBuf::from(repo_path);
     if !repo.is_dir() {
         return Err(AppError::NotFound(format!(
@@ -1103,8 +1116,11 @@ pub async fn repo_status(repo_path: &str) -> Result<RepoStatus, AppError> {
     };
 
     let identity = read_identity(&repo, &paths.hooks).await;
-    let push =
-        Box::pin(crate::push_guard::push_state(&repo, &paths.hooks, identity.profile_id.as_deref())).await;
+    let push = if measure_push {
+        Box::pin(crate::push_guard::push_state(&repo, &paths.hooks, identity.profile_id.as_deref())).await
+    } else {
+        crate::push_guard::PushState::default()
+    };
 
     // Amending a published commit would require a force-push, which this app
     // never does — so the UI must know before offering the checkbox.

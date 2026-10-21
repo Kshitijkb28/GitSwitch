@@ -938,7 +938,7 @@ pub async fn submodule_statuses(repo_path: &str) -> Result<Vec<SubmoduleStatus>,
         let mut tasks = Vec::new();
         for (recorded, path, name, listed, sub_dir) in chunk.iter().cloned() {
             tasks.push(tokio::spawn(async move {
-                let status = crate::git_status::repo_status(&sub_dir.to_string_lossy()).await;
+                let status = crate::git_status::repo_status_lite(&sub_dir.to_string_lossy()).await;
                 (recorded, path, name, listed, status)
             }));
         }

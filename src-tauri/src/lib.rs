@@ -64,7 +64,13 @@ fn fix_path_env() {
     let current = std::env::var("PATH").unwrap_or_default();
     let mut parts: Vec<String> = Vec::new();
     for p in extra {
-        parts.push(p.to_string());
+        // Only folders that exist: on macOS `/home` is an automounter trigger,
+        // so a PATH entry under it made every child process the app started
+        // (thousands of git runs per page) wake automountd and query Open
+        // Directory for the Linuxbrew home that is not there.
+        if std::path::Path::new(p).is_dir() {
+            parts.push(p.to_string());
+        }
     }
     for p in current.split(':') {
         if !p.is_empty() && !parts.iter().any(|x| x == p) {
