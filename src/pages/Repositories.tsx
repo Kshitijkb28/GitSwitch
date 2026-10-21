@@ -34,7 +34,17 @@ const PAGE_SIZE = 25;
 const listingCache = new Map<string, { listing: api.RepoListing; fetchedAt: number }>();
 // A listing can take a while for big accounts — never ask GitHub twice at once
 // for the same account (double mounts, quick account flips back and forth).
-const inflight = new Map<string, Promise<api.RepoListing>>();
+// A visit that joins a load already running is painted too: it gets what has
+// arrived so far at once, then every page as it lands. Without that, leaving
+// the page and coming back while the rest was still loading showed the
+// spinner until the very last page — the first repositories were in hand
+// all along.
+interface InflightLoad {
+  promise: Promise<api.RepoListing>;
+  partial: { listing: api.RepoListing; more: boolean } | null;
+  listeners: Set<(listing: api.RepoListing, moreComing: boolean) => void>;
+}
+const inflight = new Map<string, InflightLoad>();
 
 // The local scan is cheap but not free (it walks the profile folders), and
 // several things ask for it at once — mount, account change, window focus.
@@ -89,12 +99,20 @@ function fetchListing(
   onPartial: (listing: api.RepoListing, moreComing: boolean) => void
 ): Promise<api.RepoListing> {
   const running = inflight.get(key);
-  if (running && !force) return running;
-  const p = loadProgressively(key, onPartial).finally(() => {
-    if (inflight.get(key) === p) inflight.delete(key);
+  if (running && !force) {
+    running.listeners.add(onPartial);
+    if (running.partial) onPartial(running.partial.listing, running.partial.more);
+    return running.promise;
+  }
+  const entry: InflightLoad = { promise: Promise.resolve() as unknown as Promise<api.RepoListing>, partial: null, listeners: new Set([onPartial]) };
+  entry.promise = loadProgressively(key, (listing, more) => {
+    entry.partial = { listing, more };
+    for (const paint of entry.listeners) paint(listing, more);
+  }).finally(() => {
+    if (inflight.get(key) === entry) inflight.delete(key);
   });
-  inflight.set(key, p);
-  return p;
+  inflight.set(key, entry);
+  return entry.promise;
 }
 
 function timeAgo(iso: string | null): string {

@@ -3306,6 +3306,25 @@ try {
     ok("  then bob's repositories appear, signed in as bob", s.includes("bob / b-1") && s.includes("signed in as bob") && !s.includes("alice / a-1"));
     await page.close();
   }
+  {
+    // Leaving the page and coming back while the rest is still loading: the
+    // visit joins the load already running and paints what has arrived.
+    const page = await openReposPage(browser, server, { restDelay: 3000 });
+    await page.waitForFunction(() => document.body.innerText.includes("alice / a-1"), { timeout: 5000 });
+    const nav = (name) => page.evaluate((n) => [...document.querySelectorAll("a")].find((a) => a.textContent.trim() === n).click(), name);
+    await nav("Profiles");
+    await sleep(200);
+    await nav("Repositories");
+    await sleep(300);
+    let s = await text(page);
+    ok("coming back while the rest still loads shows the first repositories at once", s.includes("alice / a-1") && s.includes("alice / a-10"), s.slice(0, 300));
+    ok("  and says more are loading, not the empty-list spinner", s.includes("loading more…") && !s.includes("Loading every repository this account can reach"));
+    ok("  without asking GitHub again", (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "list_remote_repos_page" && c.args.perPage === 10).length)) === 1);
+    await page.waitForFunction(() => !document.body.innerText.includes("loading more…"), { timeout: 6000 });
+    s = await text(page);
+    ok("  then the rest arrives on this visit too", s.includes("of 30"));
+    await page.close();
+  }
 
   section("Clone page: progress after the main download");
   {
@@ -4844,6 +4863,35 @@ try {
         .some((s) => s.scrollWidth > s.clientWidth + 1)
     );
     ok("  and a long path inside a submodule truncates", truncated);
+    await page.close();
+  }
+
+  section("A fetch flag going stale is not a move: no full-page reload");
+  {
+    // The page re-reads everything (submodules, workspace, history) when the
+    // repository moved — and once when a fetch just happened. The "fetched a
+    // moment ago" flag expiring ten seconds later used to count as a move too,
+    // so every fetch cost two full reloads, hundreds of git runs each.
+    const page = await open({ ...SCENARIOS.submodules, last_fetch_secs: 2 }, { submodules: SUBMODULES, submoduleStatuses: SUB_STATUSES, workspace: WORKSPACE_TWO });
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "workspace_info"), { timeout: 4000 });
+    await sleep(4200); // past the focus refresh's minimum interval
+    const reloads = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "workspace_info").length);
+    const statuses = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status" && c.args.repoPath === "/repos/gitswitch").length);
+    const before = await reloads();
+    const readsBefore = await statuses();
+    // The flag has expired by the next read; coming back to the window re-reads the status.
+    await page.evaluate(() => { window.__SCENARIO__ = { ...window.__SCENARIO__, last_fetch_secs: 25 }; });
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status" && c.args.repoPath === "/repos/gitswitch").length > n, { timeout: 4000 }, readsBefore);
+    await sleep(600);
+    ok("the status was re-read on return", (await statuses()) > readsBefore);
+    ok("  but the flag expiring did not reload the whole page", (await reloads()) === before, `workspace_info read ${(await reloads()) - before} more time(s)`);
+    // A fetch that just happened is a move worth one reload.
+    await sleep(4200);
+    await page.evaluate(() => { window.__SCENARIO__ = { ...window.__SCENARIO__, last_fetch_secs: 1 }; });
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "workspace_info").length > n, { timeout: 4000 }, before).catch(() => null);
+    ok("  a fresh fetch reloads the page once", (await reloads()) === before + 1, `workspace_info read ${(await reloads()) - before} more time(s)`);
     await page.close();
   }
 } finally {

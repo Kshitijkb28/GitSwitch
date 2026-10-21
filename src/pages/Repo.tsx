@@ -69,6 +69,8 @@ export function Repo() {
   /** Bumped when the repository visibly moved, so the History tab re-reads. */
   const [reloadKey, setReloadKey] = useState(0);
   const lastMoveKey = useRef("");
+  /** Whether the last status read came within ten seconds of a fetch. */
+  const lastFresh = useRef(false);
   /** The Update drawer: preview, blockers, Update now. */
   // The Update drawer, and the repository it was opened for: it shows only
   // while that repository is the one on screen.
@@ -251,9 +253,18 @@ export function Repo() {
     // backend sees would be thrown away against it.
     if (!loading) reconcilePlan(pathRef.current, s);
     if (s) {
-      const key = `${s.path}|${s.head_oid ?? ""}|${s.ahead}|${s.behind}|${s.upstream ?? ""}|${s.stash_count}|${s.conflicted_count}|${s.last_fetch_secs !== null && s.last_fetch_secs < 10 ? "fresh" : ""}`;
-      if (lastMoveKey.current && lastMoveKey.current !== key) setReloadKey((k) => k + 1);
+      const key = `${s.path}|${s.head_oid ?? ""}|${s.ahead}|${s.behind}|${s.upstream ?? ""}|${s.stash_count}|${s.conflicted_count}`;
+      // A fetch a moment ago may have moved the remote refs: one re-read. The
+      // flag going stale ten seconds later is not a move — re-reading on that
+      // edge too doubled every fetch into two full-page reloads, hundreds of
+      // git runs each on a repository with submodules.
+      const fresh = s.last_fetch_secs !== null && s.last_fetch_secs < 10;
+      const first = lastMoveKey.current === "";
+      const moved = lastMoveKey.current !== key;
+      const fetched = fresh && !lastFresh.current;
+      if (!first && (moved || fetched)) setReloadKey((k) => k + 1);
       lastMoveKey.current = key;
+      lastFresh.current = fresh;
     }
   }, []);
   const [actionsReady, setActionsReady] = useState(false);
