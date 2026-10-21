@@ -391,6 +391,18 @@ case "$1 $2" in
     if [ -z "$host" ] && [ "$n" -gt 1 ]; then echo "unable to determine which account to log out of, please specify --hostname and --user" >&2; exit 1; fi
     if [ -n "$host" ]; then grep -v "to $host account $user " "$status" > "$status.new"; else grep -v "account $user " "$status" > "$status.new"; fi
     mv "$status.new" "$status"; exit 0 ;;
+  "auth switch")
+    echo "$*" >> "$GH_FAKE_DIR/gh-calls.txt"
+    if [ -n "${GH_TOKEN:-}" ]; then echo "The value of the GH_TOKEN environment variable is being used for authentication." >&2; exit 1; fi
+    shift 2; host=""; user=""
+    while [ $# -gt 0 ]; do case "$1" in --hostname) host="$2"; shift 2;; --user) user="$2"; shift 2;; *) shift;; esac; done
+    if ! grep -q "to $host account $user " "$status"; then echo "no accounts matched that criteria" >&2; exit 1; fi
+    # The chosen login becomes the host's active account; the host's others are told so too.
+    awk -v host="$host" -v user="$user" '
+      /^  - Active account:/ { if (cur == host) next }
+      /Logged in to / { cur = $5; print; if (cur == host) print "  - Active account: " (($7 == user) ? "true" : "false"); next }
+      { print }' "$status" > "$status.new"
+    mv "$status.new" "$status"; exit 0 ;;
 esac
 exit 1
 FAKEGH
@@ -407,6 +419,20 @@ ok "  the other account is still signed in" "$(ghx gh_list_accounts '{}' | jqf v
 ok "an account already signed out elsewhere counts as removed" "$(ghx gh_logout '{"account":"carol"}' | jqf value)" "already signed out"
 OUT=$( PATH="$GHB:$PATH" GH_FAKE_DIR="$SB" GH_TOKEN=x pinvoke gh_logout '{"account":"bob"}' )
 ok "a refusal reaches the person in gh's own words" "$(printf '%s' "$OUT" | jqf error)" "GH_TOKEN"
+
+section "Making another GitHub CLI account the active one"
+printf '  ✓ Logged in to github.com account alice (keyring)\n  - Active account: true\n  ✓ Logged in to github.com account bob (keyring)\n  - Active account: false\n  ✓ Logged in to ghe.example.com account alice (keyring)\n' > "$SB/gh-status.txt"
+: > "$SB/gh-calls.txt"
+actives() { "$PY" -c "import sys,json; print(','.join(a['host']+'/'+a['login']+'='+str(a['active']) for a in json.load(sys.stdin)['value']))"; }
+ok "the listing says which login gh uses on each host" "$(ghx gh_auth_accounts '{}' | actives)" "github.com/alice=True,github.com/bob=False,ghe.example.com/alice=None"
+OUT=$(ghx gh_auth_switch '{"host":"github.com","login":"bob"}')
+ok "making bob active answers in a sentence" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf value)" "True:bob is now the GitHub CLI's active account on github.com"
+ok "  gh was asked by host and login" "$(cat "$SB/gh-calls.txt")" "auth switch --hostname github.com --user bob"
+ok "  and gh's listing now says so" "$(ghx gh_auth_accounts '{}' | actives)" "github.com/alice=False,github.com/bob=True,ghe.example.com/alice=None"
+ok "a login gh does not have is refused in gh's words" "$(ghx gh_auth_switch '{"host":"github.com","login":"zed"}' | jqf error)" "no accounts matched"
+ok "  and so is something that is not a login at all" "$(ghx gh_auth_switch '{"host":"github.com","login":"-u"}' | jqf error)" "Not a login"
+OUT=$( PATH="$GHB:$PATH" GH_FAKE_DIR="$SB" GH_TOKEN=x pinvoke gh_auth_switch '{"host":"github.com","login":"alice"}' )
+ok "a GH_TOKEN in the app's own environment does not reach gh (it would refuse)" "$(printf '%s' "$OUT" | jqf value)" "alice is now the GitHub CLI's active account"
 
 section "An account's own addresses come back with it, when the token may read them"
 "$PY" - "$SB/emails-api.log" > "$SB/emails-api-port" <<'PYAPI' &

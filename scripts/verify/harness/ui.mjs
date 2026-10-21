@@ -618,6 +618,9 @@ async function openClonePage(browser, server, opts = {}) {
 async function openAuthPage(browser, server, opts = {}) {
   const cfg = {
     ghAccounts: opts.ghAccounts ?? [],
+    /** The login gh itself uses; null → gh's listing says nothing about it (the page shows the plain list). */
+    ghActive: opts.ghActive ?? null,
+    switchError: opts.switchError ?? null,
     code: { device_code: "dc", user_code: "ABCD-1234", verification_uri: "https://github.com/login/device", expires_in: opts.expires ?? 120, interval: 1 },
     codeHold: opts.codeHold ?? false,
     polls: opts.polls ?? [],
@@ -637,6 +640,7 @@ async function openAuthPage(browser, server, opts = {}) {
       sessionStorage.setItem("__seeded__", "1");
     }
     let accounts = [...cfg.ghAccounts];
+    let active = cfg.ghActive;
     let polls = 0;
     let verifies = 0;
     window.__HELD__ = {};
@@ -656,6 +660,13 @@ async function openAuthPage(browser, server, opts = {}) {
             if (cfg.logoutError) return Promise.reject(cfg.logoutError);
             accounts = accounts.filter((a) => a !== args.account);
             return Promise.resolve(`Removed ${args.account} from the GitHub CLI`);
+          case "gh_auth_accounts":
+            if (active === null) return Promise.resolve([]);
+            return Promise.resolve(accounts.map((login) => ({ host: "github.com", login, active: login === active, scopes: null })));
+          case "gh_auth_switch":
+            if (cfg.switchError) return Promise.reject(cfg.switchError);
+            active = args.login;
+            return Promise.resolve(`${args.login} is now the GitHub CLI's active account on ${args.host}`);
           case "github_device_code":
             return cfg.codeHold
               ? new Promise((res, rej) => { window.__HELD__.code = { res: () => res(cfg.code), rej }; })
@@ -3465,6 +3476,50 @@ try {
       const s = await text(page);
       ok("a successful removal closes the dialog", !s.includes("Remove GitHub Account?"));
       ok("  and the list is read again, without the account", (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "gh_list_accounts").length)) >= 2 && !s.includes("alice") && s.includes("bob"));
+      await page.close();
+    }
+  }
+
+  section("GitHub CLI accounts: making another one active");
+  {
+    // The row of one login: the box holding its login and its buttons.
+    const rowOf = (page, login) =>
+      page.evaluate((l) => {
+        const span = [...document.querySelectorAll("span.font-mono")].find((s) => s.textContent.trim().startsWith(l) && s.closest('[class*="rounded-lg"]')?.innerText.includes("Use this account"));
+        return span ? span.closest('[class*="rounded-lg"]').innerText.replace(/\s+/g, " ") : "";
+      }, login);
+    const makeActive = (page, login) => page.evaluate((l) => document.querySelector(`button[title^="gh auth switch --hostname github.com --user ${l}"]`)?.click(), login);
+    {
+      const page = await openAuthPage(browser, server, { ghAccounts: ["alice", "bob"], ghActive: "alice" });
+      await page.waitForFunction(() => document.body.innerText.includes("Make active"), { timeout: 4000 });
+      ok("the login gh uses carries the Active badge and no switch", (await rowOf(page, "alice")).includes("Active") && !(await rowOf(page, "alice")).includes("Make active"), await rowOf(page, "alice"));
+      ok("  the other login offers Make active", (await rowOf(page, "bob")).includes("Make active") && !(await rowOf(page, "bob")).includes("Active "), await rowOf(page, "bob"));
+      ok("  and the card says what the active account is for", (await text(page)).includes("GitSwitch always says which account it is using"));
+      await makeActive(page, "bob");
+      await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "gh_auth_switch"), { timeout: 4000 });
+      const asked = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "gh_auth_switch")?.args ?? null);
+      ok("clicking it asks gh for that login on its host", JSON.stringify(asked) === JSON.stringify({ host: "github.com", login: "bob" }), JSON.stringify(asked));
+      await page.waitForFunction(() => document.body.innerText.includes("is now the GitHub CLI's active account"), { timeout: 4000 }).catch(() => null);
+      await sleep(300);
+      ok("  the badge moves to it", (await rowOf(page, "bob")).includes("Active") && !(await rowOf(page, "alice")).includes("Active"), `${await rowOf(page, "alice")} | ${await rowOf(page, "bob")}`);
+      ok("  and gh's own sentence is shown", (await text(page)).includes("bob is now the GitHub CLI's active account on github.com"));
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { ghAccounts: ["alice", "bob"], ghActive: "alice", switchError: "Command execution error: gh could not make bob active on github.com: boom" });
+      await page.waitForFunction(() => document.body.innerText.includes("Make active"), { timeout: 4000 });
+      await makeActive(page, "bob");
+      await page.waitForFunction(() => document.body.innerText.includes("gh could not make bob active"), { timeout: 4000 }).catch(() => null);
+      const s = await text(page);
+      ok("a switch gh refuses says why under the card", s.includes("gh could not make bob active on github.com: boom") && !s.includes("Command execution error"), s.slice(0, 200));
+      ok("  and the badge stays where it was", (await rowOf(page, "alice")).includes("Active") && (await rowOf(page, "bob")).includes("Make active"));
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { ghAccounts: ["alice", "bob"] });
+      await page.waitForFunction(() => document.body.innerText.includes("Use this account"), { timeout: 4000 });
+      const s = await text(page);
+      ok("a gh that does not say which account is active shows neither badge nor switch", !s.includes("Make active") && !s.includes("Active") && s.includes("alice") && s.includes("bob"));
       await page.close();
     }
   }

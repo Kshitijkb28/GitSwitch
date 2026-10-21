@@ -203,9 +203,76 @@ pub async fn gh_get_token(account: &str) -> Result<String, AppError> {
     Ok(token)
 }
 
+/// A host or login is one plain word: gh would read anything starting with
+/// `-` as a flag, and a space or newline is not part of any login.
+fn plain_word(kind: &str, value: &str) -> Result<(), AppError> {
+    if value.is_empty() || value.starts_with('-') || value.chars().any(char::is_whitespace) {
+        return Err(AppError::Config(format!("Not a {}: {:?}", kind, value)));
+    }
+    Ok(())
+}
+
+/// The argv of the switch, host and login named explicitly: with more than
+/// two logins on a host gh would otherwise ask at a prompt no one can see.
+pub(crate) fn switch_args(host: &str, login: &str) -> Result<Vec<String>, AppError> {
+    plain_word("host", host)?;
+    plain_word("login", login)?;
+    Ok(vec!["auth".into(), "switch".into(), "--hostname".into(), host.into(), "--user".into(), login.into()])
+}
+
+/// Make `login` the account gh itself uses on `host` — what `gh` commands in
+/// a terminal, `gh auth refresh`, and git's HTTPS credential helper (`gh auth
+/// git-credential`) act as from now on. GitSwitch's own reads name their
+/// account (`gh auth token --user`), so nothing in the app changes with it.
+/// `GH_TOKEN`/`GITHUB_TOKEN` are kept from the child: gh refuses to manage
+/// accounts while one is set, and the app may have inherited one from the
+/// terminal that started it.
+pub async fn gh_auth_switch(host: &str, login: &str) -> Result<String, AppError> {
+    let args = switch_args(host, login)?;
+    let output = crate::spawn::async_command("gh")
+        .args(&args)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .output()
+        .await
+        .map_err(gh_error)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(AppError::Command(format!("gh could not make {} active on {}: {}", login, host, stderr)));
+    }
+    // gh's exit code says it ran; its own listing says what is active now.
+    let now = gh_auth_status().await?;
+    let active = now
+        .iter()
+        .find(|a| a.host.eq_ignore_ascii_case(host) && a.login.eq_ignore_ascii_case(login))
+        .and_then(|a| a.active);
+    match active {
+        Some(true) | None => Ok(format!("{} is now the GitHub CLI's active account on {}", login, host)),
+        Some(false) => {
+            let says = now
+                .iter()
+                .find(|a| a.host.eq_ignore_ascii_case(host) && a.active == Some(true))
+                .map(|a| a.login.clone())
+                .unwrap_or_else(|| "no account".into());
+            Err(AppError::Command(format!("gh switched, but still reports {} as the active account on {}", says, host)))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_switch_names_host_and_login_and_refuses_what_is_not_a_word() {
+        assert_eq!(
+            switch_args("github.com", "bob-work").unwrap(),
+            vec!["auth", "switch", "--hostname", "github.com", "--user", "bob-work"]
+        );
+        for (host, login) in [("github.com", "-u"), ("github.com", ""), ("github.com", "bob work"), ("", "bob"), ("-h", "bob"), ("git hub.com", "bob")] {
+            assert!(switch_args(host, login).is_err(), "{host:?} {login:?} must be refused");
+        }
+    }
 
     const STATUS: &str = "github.com\n  \u{1b}[32m✓\u{1b}[0m Logged in to github.com account alice-dev (keyring)\n  - Active account: true\n  - Git operations protocol: ssh\n  - Token: gho_************************************\n  - Token scopes: 'gist', 'read:org', 'repo'\n\n  ✓ Logged in to github.com account bob-work (keyring)\n  - Active account: false\n  - Git operations protocol: https\n  - Token: gho_************************************\n  - Token scopes: none\n\n  ✓ Logged in to github.com account carol-fg (GH_TOKEN)\n  - Active account: false\n  - Token: github_pat_************************************\n\nghe.example.com\n  ✓ Logged in to ghe.example.com account alice-dev (keyring)\n  X Failed to log in to github.com account dave (keyring)\n";
 

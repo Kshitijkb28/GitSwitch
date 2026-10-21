@@ -274,6 +274,9 @@ for folders that still use HTTPS.
   in one click (via `gh`), test the connection, delete old keys.
 - **GitHub sign-in** — device-flow OAuth *and* instant sign-in via your
   existing GitHub CLI (`gh`) logins; autofill profile name/email from an account.
+  The page shows which login `gh` itself uses (the one git's HTTPS credential
+  helper acts as) and can make another one active — `gh auth switch`, without a
+  terminal. GitSwitch's own reads always name their account.
 - **Tray icon**, toast feedback, and a Settings view of the managed gitconfig.
   Pages remember where you were (selected repo, branch, filters) between visits.
 

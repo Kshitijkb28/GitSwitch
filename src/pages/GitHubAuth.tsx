@@ -5,6 +5,8 @@ import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { Modal } from "../components/Modal";
+import { Badge } from "../components/Badge";
+import { useToast } from "../components/Toast";
 import { getEffectiveClientId } from "../lib/oauth";
 import { copyText } from "../lib/clipboard";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -49,12 +51,37 @@ export function GitHubAuth() {
 
   const [ghRefreshing, setGhRefreshing] = useState(false);
   const [ghLoading, setGhLoading] = useState(true);
+  /** gh's listing with hosts and the active flag; empty when only the login list could be read. */
+  const [ghRows, setGhRows] = useState<api.GhAccount[]>([]);
+  /** "<host>/<login>" while gh switches to it. */
+  const [ghSwitching, setGhSwitching] = useState<string | null>(null);
+  const [ghSwitchError, setGhSwitchError] = useState<string | null>(null);
+  const toast = useToast();
+
+  /** gh's own listing — host and active flag per login — when it answers; the bare login list otherwise. */
+  async function readGhAccounts(): Promise<{ logins: string[]; rows: api.GhAccount[] }> {
+    try {
+      const rows = await api.ghAuthAccounts();
+      const logins: string[] = [];
+      for (const r of rows) if (!logins.includes(r.login)) logins.push(r.login);
+      if (logins.length) return { logins, rows };
+    } catch {
+      /* the plain list below says what it can */
+    }
+    return { logins: await api.ghListAccounts(), rows: [] };
+  }
 
   function loadGhAccounts() {
     setGhLoading(true);
-    api.ghListAccounts()
-      .then(setGhAccounts)
-      .catch(() => setGhAccounts([]))
+    readGhAccounts()
+      .then(({ logins, rows }) => {
+        setGhAccounts(logins);
+        setGhRows(rows);
+      })
+      .catch(() => {
+        setGhAccounts([]);
+        setGhRows([]);
+      })
       .finally(() => setGhLoading(false));
   }
 
@@ -63,12 +90,31 @@ export function GitHubAuth() {
     setSignins(rememberedSignIns());
     void loadKept();
     try {
-      const accts = await api.ghListAccounts();
-      setGhAccounts(accts);
+      const { logins, rows } = await readGhAccounts();
+      setGhAccounts(logins);
+      setGhRows(rows);
     } catch {
       setGhAccounts([]);
+      setGhRows([]);
     } finally {
       setTimeout(() => setGhRefreshing(false), 400);
+    }
+  }
+
+  /** `gh auth switch`: the account gh itself uses from now on. The listing is re-read afterwards. */
+  async function makeGhActive(host: string, login: string) {
+    setGhSwitching(`${host}/${login}`);
+    setGhSwitchError(null);
+    try {
+      const said = await api.ghAuthSwitch(host, login);
+      toast.success(said);
+      const { logins, rows } = await readGhAccounts();
+      setGhAccounts(logins);
+      setGhRows(rows);
+    } catch (e) {
+      setGhSwitchError(String(e).replace(/^Command execution error: /, ""));
+    } finally {
+      setGhSwitching(null);
     }
   }
 
@@ -399,15 +445,48 @@ export function GitHubAuth() {
               </p>
             ) : (
             <div className="space-y-1.5">
-              {ghAccounts.map((acct) => (
+              {ghAccounts.map((acct) => {
+                // The login's hosts as gh lists them; an older gh says nothing about what is active.
+                const hosts = ghRows.filter((r) => r.login === acct);
+                const activeOn = hosts.filter((r) => r.active === true).map((r) => r.host);
+                const inactiveOn = hosts.filter((r) => r.active === false);
+                const otherHosts = hosts.map((r) => r.host).filter((h) => h !== "github.com");
+                return (
                 <div
                   key={acct}
                   className="flex items-center justify-between gap-3 px-3 py-2 rounded-lg bg-zinc-800/70 border border-zinc-700/50"
                 >
-                  <span className="text-sm text-zinc-200 font-mono truncate min-w-0">
+                  <span className="text-sm text-zinc-200 font-mono truncate min-w-0" title={hosts.map((r) => r.host).join(", ")}>
                     {acct}
+                    {otherHosts.length > 0 && <span className="text-zinc-500"> · {otherHosts.join(", ")}</span>}
                   </span>
                   <div className="flex items-center gap-1 shrink-0">
+                    {activeOn.length > 0 && (
+                      <span title={`gh and git's HTTPS credential helper use this account on ${activeOn.join(", ")}`}>
+                        <Badge variant="success">Active</Badge>
+                      </span>
+                    )}
+                    {inactiveOn.map((r) => (
+                      <Button
+                        key={r.host}
+                        size="sm"
+                        variant="ghost"
+                        disabled={ghSwitching !== null || ghBusy !== null}
+                        onClick={() => void makeGhActive(r.host, acct)}
+                        title={`gh auth switch --hostname ${r.host} --user ${acct} — the account gh and git's HTTPS credential helper use from now on; GitSwitch itself always names the account it uses`}
+                      >
+                        {ghSwitching === `${r.host}/${acct}` ? (
+                          <>
+                            <Loader2 size={14} className="animate-spin" />
+                            Switching…
+                          </>
+                        ) : hosts.length > 1 ? (
+                          `Make active on ${r.host}`
+                        ) : (
+                          "Make active"
+                        )}
+                      </Button>
+                    ))}
                     <Button
                       size="sm"
                       variant="secondary"
@@ -432,8 +511,20 @@ export function GitHubAuth() {
                     </button>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
+            )}
+            {ghSwitchError && (
+              <p className="text-sm text-red-400 mt-3 break-words" role="alert">
+                {ghSwitchError}
+              </p>
+            )}
+            {ghRows.some((r) => r.active !== null) && (
+              <p className="text-xs text-zinc-500 mt-3">
+                The active account is what <span className="font-mono">gh</span> and git's HTTPS credential helper use on their own;
+                GitSwitch always says which account it is using.
+              </p>
             )}
           </Card>
 

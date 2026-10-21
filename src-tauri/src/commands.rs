@@ -189,6 +189,18 @@ pub async fn gh_logout(account: String) -> Result<String, AppError> {
     gh_cli::gh_logout(&account).await
 }
 
+/// Every gh login with its host and whether gh itself uses it (the active one).
+#[tauri::command]
+pub async fn gh_auth_accounts() -> Result<Vec<gh_cli::GhAccount>, AppError> {
+    gh_cli::gh_auth_status().await
+}
+
+/// Make a login the GitHub CLI's active account on a host.
+#[tauri::command]
+pub async fn gh_auth_switch(host: String, login: String) -> Result<String, AppError> {
+    gh_cli::gh_auth_switch(&host, &login).await
+}
+
 /// Automate "Step 2": register a local key's public half on a specific
 /// account — a gh login, or a sign-in kept here ("signin:<login>").
 /// `key_path` is the PRIVATE key path; we read `<key_path>.pub`.
