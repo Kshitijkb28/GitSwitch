@@ -136,7 +136,19 @@ export function propose(
   } else {
     const readers = profiles.filter((p) => cellOf(rk, p)?.state === "visible");
     const isPrivate = Object.values(cells(rk)).some((c) => c.state === "visible" && c.private === true);
-    if (readers.length === 0) return none(failedNote || (asked.size ? "no account can see it" : "no account was asked"));
+    if (readers.length === 0) {
+      if (failedNote) return none(failedNote);
+      if (!asked.size) return none("no account was asked");
+      // An account that sees it, but no profile uses: say which, so the fix is plain.
+      const seers = Object.entries(cells(rk))
+        .filter(([, c]) => c.state === "visible")
+        .map(([l]) => matrix.accounts.find((a) => a.login.toLowerCase() === l)?.login ?? l);
+      return none(
+        seers.length
+          ? `only ${seers.join(", ")} can see it, and no profile uses ${seers.length === 1 ? "that account" : "those accounts"}`
+          : "not found by any of your accounts: deleted, renamed, or private to an account not signed in here"
+      );
+    }
     if (!isPrivate) return none(withFailed("anyone can read it, and no profile can push"));
     if (readers.length > 1) return none(withFailed("several profiles can read it, and none can push"));
     pick = readers[0];

@@ -2307,3 +2307,212 @@ export async function terminalResize(id: string, cols: number, rows: number): Pr
 export async function terminalClose(id: string): Promise<void> {
   return invoke("terminal_close", { id });
 }
+
+// --- GitHub: pull requests, reviews, merging, collaborators ---
+// Each call names the account to act as (a RepoAccount key); the token stays in Rust.
+
+export interface AccountAccess {
+  account: string;
+  login: string;
+  source: string;
+  permission: "admin" | "push" | "read" | "none" | "unknown";
+  private: boolean | null;
+  why: string | null;
+}
+
+export interface RepoContext {
+  owner: string | null;
+  name: string | null;
+  not_github: string | null;
+  accounts: AccountAccess[];
+  suggested: string | null;
+  profile_login: string | null;
+}
+
+export type PullState = "open" | "merged" | "closed" | "all";
+export type PullScope = "created" | "review_requested" | "assigned" | "involves";
+
+export interface PullItem {
+  repo: string;
+  number: number;
+  title: string;
+  author: string;
+  draft: boolean;
+  state: "open" | "merged" | "closed";
+  created_at: string;
+  updated_at: string;
+  merged_at: string | null;
+  closed_at: string | null;
+  head_ref: string | null;
+  base_ref: string | null;
+  comments: number | null;
+  labels: string[];
+  html_url: string;
+}
+
+export interface PullPage {
+  items: PullItem[];
+  next_page: number | null;
+  total: number | null;
+}
+
+export interface PullReview {
+  login: string;
+  state: string;
+  submitted_at: string | null;
+}
+
+export interface PullCheck {
+  name: string;
+  state: "success" | "failure" | "pending" | "neutral" | "skipped";
+  url: string | null;
+}
+
+export interface PullDetail {
+  repo: string;
+  number: number;
+  title: string;
+  body: string;
+  author: string;
+  state: "open" | "merged" | "closed";
+  draft: boolean;
+  merged_by: string | null;
+  merged_at: string | null;
+  mergeable: boolean | null;
+  mergeable_state: string;
+  head_ref: string;
+  head_sha: string;
+  head_repo: string | null;
+  base_ref: string;
+  default_branch: string;
+  additions: number;
+  deletions: number;
+  changed_files: number;
+  commits: number;
+  comments: number;
+  created_at: string;
+  updated_at: string;
+  html_url: string;
+  merge_methods: ("merge" | "squash" | "rebase")[];
+  merge_methods_known: boolean;
+  can_push: boolean;
+  is_admin: boolean;
+  viewer: string;
+  reviews: PullReview[];
+  checks: PullCheck[];
+  notes: string[];
+  can_delete_branch: boolean;
+}
+
+export interface PullFile {
+  path: string;
+  previous_path: string | null;
+  status: string;
+  additions: number;
+  deletions: number;
+  diff: FileDiff;
+}
+
+export interface PullFiles {
+  files: PullFile[];
+  truncated: boolean;
+}
+
+export interface PullCommit {
+  sha: string;
+  title: string;
+  author: string;
+  date: string | null;
+}
+
+export interface MergeOutcome {
+  merged: boolean;
+  sha: string;
+  message: string;
+  branch_deleted: boolean | null;
+  branch_note: string | null;
+}
+
+export interface Collaborator {
+  login: string;
+  role: string;
+  is_owner: boolean;
+}
+
+export interface Invitation {
+  id: number;
+  login: string;
+  role: string;
+  created_at: string;
+  inviter: string | null;
+}
+
+export interface People {
+  collaborators: Collaborator[];
+  invitations: Invitation[] | null;
+  note: string | null;
+}
+
+export interface AddOutcome {
+  status: "invited" | "added";
+  message: string;
+  invitation_id: number | null;
+}
+
+export async function githubRepoContext(repoPath: string | null, repo: string | null = null): Promise<RepoContext> {
+  return invoke("github_repo_context", { repoPath, repo });
+}
+
+export async function githubPulls(account: string, owner: string, name: string, state: PullState, page = 1): Promise<PullPage> {
+  return invoke("github_pulls", { account, owner, name, state, page });
+}
+
+export async function githubPullsSearch(account: string, scope: PullScope, state: PullState, repo: string | null, page = 1): Promise<PullPage> {
+  return invoke("github_pulls_search", { account, scope, state, repo, page });
+}
+
+export async function githubPull(account: string, owner: string, name: string, number: number): Promise<PullDetail> {
+  return invoke("github_pull", { account, owner, name, number });
+}
+
+export async function githubPullFiles(account: string, owner: string, name: string, number: number): Promise<PullFiles> {
+  return invoke("github_pull_files", { account, owner, name, number });
+}
+
+export async function githubPullCommits(account: string, owner: string, name: string, number: number): Promise<PullCommit[]> {
+  return invoke("github_pull_commits", { account, owner, name, number });
+}
+
+export async function githubPullReview(account: string, owner: string, name: string, number: number, event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT", body: string): Promise<PullReview> {
+  return invoke("github_pull_review", { account, owner, name, number, event, body });
+}
+
+export async function githubPullMerge(
+  account: string,
+  owner: string,
+  name: string,
+  number: number,
+  method: "merge" | "squash" | "rebase",
+  sha: string,
+  title: string | null,
+  message: string | null,
+  deleteBranch: boolean
+): Promise<MergeOutcome> {
+  return invoke("github_pull_merge", { account, owner, name, number, method, sha, title, message, deleteBranch });
+}
+
+export async function githubCollaborators(account: string, owner: string, name: string): Promise<People> {
+  return invoke("github_collaborators", { account, owner, name });
+}
+
+export async function githubCollaboratorAdd(account: string, owner: string, name: string, username: string, permission: "pull" | "triage" | "push" | "maintain" | "admin"): Promise<AddOutcome> {
+  return invoke("github_collaborator_add", { account, owner, name, username, permission });
+}
+
+export async function githubCollaboratorRemove(account: string, owner: string, name: string, username: string): Promise<void> {
+  return invoke("github_collaborator_remove", { account, owner, name, username });
+}
+
+export async function githubInvitationCancel(account: string, owner: string, name: string, id: number): Promise<void> {
+  return invoke("github_invitation_cancel", { account, owner, name, id });
+}

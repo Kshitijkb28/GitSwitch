@@ -101,8 +101,21 @@ for folders that still use HTTPS.
   folders beside your profile folders and any place you add. It passes over
   hidden, media and package folders and network drives, and does not follow
   links. It asks GitHub which of your accounts can reach each clone and
-  proposes the profile whose account can; you add them in one click, or let the
+  proposes the profile whose account can. Tick the ones to add (select all,
+  only the clear matches, filter, search, one profile for all the ticked ones,
+  hide the ones you never want offered) and add them in one click, or let the
   clear matches be added straight away. Undo takes them off again.
+- **Pull requests** (a sidebar page, and the **GitHub** tab on the Repository
+  page) — a repository's pull requests, or the ones across repositories you
+  opened, are asked to review, are assigned or are involved in: open, merged,
+  closed or all, with Refresh. Open one to read its files with their diffs, its
+  commits, checks and reviews; approve, ask for changes or comment; and merge
+  it (merge commit, squash or rebase) with the commit you reviewed — if someone
+  pushed since, GitHub refuses and nothing unreviewed is merged — optionally
+  deleting its branch. The GitHub tab also lists the repository's
+  collaborators and pending invitations, invites someone by username with a
+  role, and removes access. You act as one of your accounts (the profile's own
+  by default); its token never leaves the app's Rust side.
 - **Clone** — clone over SSH as the right account. The destination folder's
   profile decides the key, or pick one with **Clone as** (the new folder is then
   added to that profile). Downloads submodules with the same result as

@@ -122,7 +122,7 @@ pub struct LocalClones {
 
 #[derive(Debug, Serialize)]
 pub struct RepoAccount {
-    /// "gh:<account>" or "profile:<profile id>"
+    /// "gh:<login>" or "signin:<login>"
     pub key: String,
     pub label: String,
     pub source: String,

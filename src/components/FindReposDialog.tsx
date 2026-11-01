@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { CheckCircle2, Folder, FolderPlus, Link2, Loader2, ScanSearch, Square, Undo2, X } from "lucide-react";
+import { CheckCircle2, EyeOff, FolderPlus, Link2, Loader2, ScanSearch, Search as SearchIcon, Square, Undo2, X } from "lucide-react";
 import { open as pickFolder } from "@tauri-apps/plugin-dialog";
 import { Modal } from "./Modal";
 import { Button } from "./Button";
 import { Badge } from "./Badge";
 import { Select } from "./Select";
 import { Checkbox } from "./Checkbox";
+import { Input } from "./Input";
 import { useToast } from "./Toast";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
@@ -18,9 +19,16 @@ type Phase = "intro" | "looking" | "checking" | "ready" | "adding";
 interface Row {
   repo: api.FoundRepo;
   proposal: Proposal;
-  /** The profile picked; "" = don't add. */
+  /** The profile picked; "" = none yet. */
   choice: string;
+  /** Ticked: added on Add (when it has a profile). */
+  selected: boolean;
 }
+
+/** Which filter chip a row falls under — by what was proposed, so rows don't jump as picks change. */
+type Kind = "clear" | "choose" | "offline";
+const kindOf = (r: Row): Kind => (r.proposal.clear && r.proposal.profileId ? "clear" : !r.repo.owner ? "offline" : "choose");
+const KIND_LABEL: Record<"all" | Kind, string> = { all: "All", clear: "Clear match", choose: "Needs a choice", offline: "Not on GitHub" };
 
 /**
  * The last repositories added and how to take them off again — kept while the
@@ -88,6 +96,12 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
   const [stopped, setStopped] = useState(false);
   const [added, setAdded] = useState(lastAdded);
   const [showPlaces, setShowPlaces] = useState(false);
+  /** Rows the user never wants offered (a tutorial clone…): remembered, never added unasked. */
+  const [hidden, setHidden] = usePersistedState<string[]>("findrepos.hidden", []);
+  const [showHidden, setShowHidden] = useState(false);
+  const [filter, setFilter] = useState<"all" | Kind>("all");
+  const [query, setQuery] = useState("");
+  const [bulkNote, setBulkNote] = useState<string | null>(null);
   /** The search running now; anything an earlier one (stopped, or the dialog closed) answers is dropped. */
   const current = useRef<string | null>(null);
 
@@ -108,6 +122,7 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
   const home = found?.home ?? null;
   const short = (p: string) => (home && isWithin(p, home) ? `~${normPath(p).slice(normPath(home).length) || ""}` : p);
   const profileName = (profs: Profile[], id: string) => profs.find((p) => p.id === id)?.name ?? "a profile";
+  const isHidden = (path: string) => hidden.some((h) => normPath(h) === normPath(path));
 
   async function add(list: Row[], profs: Profile[]): Promise<Set<string>> {
     if (list.length === 0) return new Set();
@@ -146,6 +161,9 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
     setSearched(true);
     lastAdded = null;
     setAdded(null);
+    setFilter("all");
+    setQuery("");
+    setBulkNote(null);
     setPhase("looking");
     const poll = window.setInterval(() => {
       api
@@ -187,13 +205,18 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
           /* no hints: the rows stay as they are */
         }
       }
-      const all: Row[] = f.repos.map((r, i) => ({ repo: r, proposal: proposals[i], choice: proposals[i].profileId }));
+      const all: Row[] = f.repos.map((r, i) => ({
+        repo: r,
+        proposal: proposals[i],
+        choice: proposals[i].profileId,
+        selected: !!proposals[i].profileId && !isHidden(r.path),
+      }));
       setProfiles(profs);
       setLogins(ls);
       setMatrix(m);
       setRows(all);
       if (autoAdd) {
-        const clear = all.filter((r) => r.proposal.clear && r.choice);
+        const clear = all.filter((r) => r.proposal.clear && r.choice && !isHidden(r.repo.path));
         if (clear.length && live()) {
           const done = await add(clear, profs);
           setRows(all.filter((r) => !done.has(r.repo.path)));
@@ -282,7 +305,55 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
   }
 
   const busy = phase === "looking" || phase === "checking" || phase === "adding";
-  const chosen = rows.filter((r) => r.choice);
+
+  // Selection: what is ticked, what the chips and the search show, and what Add takes.
+  const unhidden = rows.filter((r) => !isHidden(r.repo.path));
+  const hiddenCount = rows.length - unhidden.length;
+  const shown = showHidden ? rows : unhidden;
+  const q = query.trim().toLowerCase();
+  const matches = (r: Row) =>
+    !q || [baseName(r.repo.path), short(r.repo.path), r.repo.owner ? `${r.repo.owner}/${r.repo.name}` : r.repo.remote_url].some((t) => t.toLowerCase().includes(q));
+  const listed = shown.filter((r) => (filter === "all" || kindOf(r) === filter) && matches(r));
+  const selectable = listed.filter((r) => !isHidden(r.repo.path));
+  const picked = unhidden.filter((r) => r.selected);
+  const chosen = picked.filter((r) => r.choice);
+  const needProfile = picked.length - chosen.length;
+  const allShownPicked = selectable.length > 0 && selectable.every((r) => r.selected);
+  const count = (k: "all" | Kind) => (k === "all" ? unhidden.length : unhidden.filter((r) => kindOf(r) === k).length);
+
+  const setRow = (path: string, patch: Partial<Row>) => setRows((all) => all.map((x) => (x.repo.path === path ? { ...x, ...patch } : x)));
+  function pickShown(on: boolean) {
+    const paths = new Set(selectable.map((r) => r.repo.path));
+    setRows((all) => all.map((x) => (paths.has(x.repo.path) ? { ...x, selected: on } : x)));
+    setBulkNote(null);
+  }
+  function pickClear() {
+    setRows((all) => all.map((x) => ({ ...x, selected: kindOf(x) === "clear" && !!x.choice && !isHidden(x.repo.path) })));
+    setBulkNote(null);
+  }
+  /** One profile for every ticked row that can take it; a row git already ties to another profile keeps that one. */
+  function setProfileForPicked(id: string) {
+    if (!id) return;
+    const kept: Row[] = [];
+    const next = rows.map((x) => {
+      if (!x.selected || isHidden(x.repo.path)) return x;
+      if (x.proposal.only && x.proposal.profileId && x.proposal.profileId !== id) {
+        kept.push(x);
+        return x;
+      }
+      return { ...x, choice: id };
+    });
+    setRows(next);
+    const set = picked.length - kept.length;
+    setBulkNote(
+      `${plural(set, "repository", "repositories")} set to ${profileName(profiles, id)}.` +
+        (kept.length ? ` ${kept.length} kept the profile git already uses for ${kept.length === 1 ? "it" : "them"}: ${kept.map((k) => baseName(k.repo.path)).join(", ")}.` : "")
+    );
+  }
+  function hide(path: string, on: boolean) {
+    setHidden((h) => (on ? (h.some((x) => normPath(x) === normPath(path)) ? h : [...h, path]) : h.filter((x) => normPath(x) !== normPath(path))));
+    if (on) setRow(path, { selected: false });
+  }
   const loginShown = (l: string) => matrix?.accounts.find((a) => a.login.toLowerCase() === l)?.login ?? l;
 
   function badges(r: api.FoundRepo) {
@@ -327,7 +398,7 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
       return l ? `${p.name} (${l})` : p.name;
     };
     const offered = r.proposal.only && r.proposal.profileId ? profiles.filter((p) => p.id === r.proposal.profileId) : profiles;
-    return [{ value: "", label: "Don't add" }, ...offered.map((p) => ({ value: p.id, label: label(p) }))];
+    return offered.map((p) => ({ value: p.id, label: label(p) }));
   }
 
   const statusLine = (() => {
@@ -514,44 +585,152 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
           {rows.length > 0 && (
             <div className="space-y-2">
               <p className="text-xs text-zinc-500 uppercase tracking-wider">
-                {plural(rows.length, "repository", "repositories")} no profile's folders hold
+                {plural(unhidden.length, "repository", "repositories")} no profile's folders hold
                 {found && found.already_listed > 0 ? ` · ${found.already_listed} more already listed` : ""}
+                {hiddenCount > 0 && (
+                  <>
+                    {` · ${hiddenCount} hidden · `}
+                    <button type="button" className="normal-case tracking-normal text-zinc-400 hover:text-zinc-200 cursor-pointer" onClick={() => setShowHidden((v) => !v)}>
+                      {showHidden ? "hide them again" : "show them"}
+                    </button>
+                  </>
+                )}
               </p>
-              <div className="space-y-1.5">
-                {rows.map((r) => (
-                  <div
-                    key={r.repo.path}
-                    data-find-row={r.repo.path}
-                    className="flex items-start gap-3 px-3 py-2.5 rounded-lg bg-zinc-800/50 border border-zinc-700/50 min-w-0 flex-wrap sm:flex-nowrap"
-                  >
-                    <Folder size={15} className="text-zinc-500 shrink-0 mt-0.5" />
-                    <div className="min-w-0 flex-1">
-                      <p className="text-zinc-200 font-medium truncate" title={r.repo.path}>
-                        {baseName(r.repo.path)}
-                        <span className="text-xs text-zinc-500 font-mono font-normal"> · {short(r.repo.path)}</span>
-                      </p>
-                      <p className="text-xs text-zinc-500 font-mono truncate">
-                        {r.repo.owner ? `${r.repo.owner}/${r.repo.name}` : r.repo.remote_url || "no remote"}
-                      </p>
-                      {badges(r.repo)}
-                      <p className="text-xs text-zinc-400 mt-1">{commitsLine(r)}</p>
-                      <p className="text-xs text-zinc-500">{r.proposal.reason}</p>
-                      {r.proposal.note && <p className="text-xs text-amber-300/90">{r.proposal.note}</p>}
-                      {r.proposal.warnOther && r.choice && r.choice !== r.proposal.profileId && (
-                        <p className="text-xs text-amber-300/90">This {r.proposal.warnOther}.</p>
-                      )}
-                    </div>
-                    <div className="w-full sm:w-48 shrink-0">
-                      <Select
-                        value={r.choice}
-                        onChange={(v) => setRows((all) => all.map((x) => (x.repo.path === r.repo.path ? { ...x, choice: v } : x)))}
-                        placeholder="Don't add"
-                        disabled={busy}
-                        options={options(r)}
-                      />
-                    </div>
+
+              <div className="flex items-center gap-x-4 gap-y-2 flex-wrap">
+                <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+                  <Checkbox
+                    checked={allShownPicked}
+                    onChange={pickShown}
+                    disabled={busy || selectable.length === 0}
+                    aria-label={filter === "all" && !q ? "Select all" : "Select all shown"}
+                  />
+                  <span data-find-picked>
+                    {picked.length} of {unhidden.length} selected
+                  </span>
+                </label>
+                <button type="button" className="text-xs text-emerald-400 hover:text-emerald-300 cursor-pointer disabled:opacity-50" onClick={pickClear} disabled={busy}>
+                  Select clear matches
+                </button>
+                <button type="button" className="text-xs text-zinc-400 hover:text-zinc-200 cursor-pointer disabled:opacity-50" onClick={() => pickShown(false)} disabled={busy}>
+                  Select none
+                </button>
+                {rows.length > 8 && (
+                  <div className="relative flex-1 min-w-[10rem]">
+                    <SearchIcon size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-500 pointer-events-none" />
+                    <Input
+                      value={query}
+                      onChange={(e) => setQuery(e.target.value)}
+                      placeholder="Filter by name, folder or owner"
+                      aria-label="Filter repositories"
+                      className="!py-1 pl-8 text-xs"
+                    />
                   </div>
+                )}
+              </div>
+
+              <div className="inline-flex rounded-lg bg-zinc-800/80 p-0.5 flex-wrap" role="group" aria-label="Show">
+                {(["all", "clear", "choose", "offline"] as const).map((k) => (
+                  <button
+                    key={k}
+                    type="button"
+                    data-find-chip={k}
+                    aria-pressed={filter === k}
+                    onClick={() => setFilter(k)}
+                    className={`px-3 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                      filter === k ? "bg-zinc-700 text-emerald-400" : "text-zinc-400 hover:text-zinc-200"
+                    }`}
+                  >
+                    {KIND_LABEL[k]} <span className="text-zinc-500">{count(k)}</span>
+                  </button>
                 ))}
+              </div>
+
+              {picked.length > 0 && (
+                <div data-find-bulk className="flex items-center gap-2 flex-wrap rounded-lg border border-zinc-700/60 bg-zinc-800/40 px-3 py-2">
+                  <span className="text-xs text-zinc-300">Set profile for the {plural(picked.length, "selected one", "selected")}:</span>
+                  <div className="w-56">
+                    <Select
+                      value=""
+                      onChange={setProfileForPicked}
+                      placeholder="Pick a profile"
+                      disabled={busy}
+                      options={profiles.map((p) => {
+                        const l = logins[p.id]?.display ?? loginOf(logins, p);
+                        return { value: p.id, label: l ? `${p.name} (${l})` : p.name };
+                      })}
+                    />
+                  </div>
+                  {bulkNote && <p className="text-xs text-zinc-400 basis-full" role="status">{bulkNote}</p>}
+                </div>
+              )}
+
+              {listed.length === 0 && <p className="text-xs text-zinc-500">Nothing here matches.</p>}
+              <div className="space-y-1.5">
+                {listed.map((r) => {
+                  const off = isHidden(r.repo.path);
+                  const name = baseName(r.repo.path);
+                  return (
+                    <div
+                      key={r.repo.path}
+                      data-find-row={r.repo.path}
+                      className={`flex items-start gap-3 px-3 py-2.5 rounded-lg border min-w-0 flex-wrap sm:flex-nowrap ${
+                        r.selected ? "bg-zinc-800/70 border-emerald-500/30" : "bg-zinc-800/40 border-zinc-700/50"
+                      } ${off ? "opacity-60" : ""}`}
+                    >
+                      <Checkbox
+                        className="mt-0.5"
+                        checked={r.selected}
+                        onChange={(on) => {
+                          setRow(r.repo.path, { selected: on });
+                          setBulkNote(null);
+                        }}
+                        disabled={busy || off}
+                        aria-label={`Select ${name}`}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-zinc-200 font-medium truncate" title={r.repo.path}>
+                          {name}
+                          <span className="text-xs text-zinc-500 font-mono font-normal"> · {short(r.repo.path)}</span>
+                        </p>
+                        <p className="text-xs text-zinc-500 font-mono truncate">
+                          {r.repo.owner ? `${r.repo.owner}/${r.repo.name}` : r.repo.remote_url || "no remote"}
+                        </p>
+                        {badges(r.repo)}
+                        <p className="text-xs text-zinc-400 mt-1">{commitsLine(r)}</p>
+                        <p className="text-xs text-zinc-500">{r.proposal.reason}</p>
+                        {r.proposal.note && <p className="text-xs text-amber-300/90">{r.proposal.note}</p>}
+                        {r.proposal.warnOther && r.choice && r.choice !== r.proposal.profileId && (
+                          <p className="text-xs text-amber-300/90">This {r.proposal.warnOther}.</p>
+                        )}
+                        {r.selected && !r.choice && <p className="text-xs text-amber-300/90">Pick a profile for it, or it is skipped.</p>}
+                      </div>
+                      <div className="w-full sm:w-48 shrink-0 space-y-1">
+                        <Select
+                          value={r.choice}
+                          onChange={(v) => {
+                            setRow(r.repo.path, { choice: v, selected: !!v && !off });
+                            setBulkNote(null);
+                          }}
+                          placeholder="Pick a profile"
+                          disabled={busy || off}
+                          options={options(r)}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => hide(r.repo.path, !off)}
+                          disabled={busy}
+                          aria-label={off ? `Show ${name} again` : `Hide ${name}`}
+                          title={off ? "Offer it again" : "Don't offer this one again"}
+                          className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer flex items-center gap-1"
+                        >
+                          <EyeOff size={12} />
+                          {off ? "Show again" : "Hide"}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -559,6 +738,11 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
         </div>
         {phase !== "intro" && (
           <div className="flex items-center justify-end gap-2 pt-4 flex-wrap shrink-0">
+            {rows.length > 0 && needProfile > 0 && (
+              <span className="text-xs text-amber-300/90 w-full text-right">
+                {needProfile} selected {needProfile === 1 ? "has" : "have"} no profile and {needProfile === 1 ? "is" : "are"} skipped
+              </span>
+            )}
             <Button variant="secondary" onClick={() => void run()} disabled={busy}>
               <ScanSearch size={16} />
               Search again

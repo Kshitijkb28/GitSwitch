@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, useNavigate, useParams } from "react-router-dom";
-import { GitBranch, Box, GitGraph, FileDiff, GitPullRequestArrow, ScanSearch, SquareTerminal } from "lucide-react";
+import { GitBranch, Box, GitGraph, FileDiff, GitPullRequest, GitPullRequestArrow, ScanSearch, SquareTerminal } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
@@ -12,6 +12,7 @@ import { HistoryTab } from "../components/repo/HistoryTab";
 import { SubmodulesTab } from "../components/repo/SubmodulesTab";
 import { UpdateDrawer } from "../components/repo/UpdateDrawer";
 import { FindReposDialog } from "../components/FindReposDialog";
+import { GitHubTab } from "../components/repo/GitHubTab";
 import { markMoved, reconcilePlan } from "../lib/updatePlan";
 import { useRepoSelection } from "../lib/repoSelection";
 import { usePersistedState } from "../lib/persist";
@@ -23,8 +24,8 @@ import { open as pickFolder } from "@tauri-apps/plugin-dialog";
 import * as api from "../lib/api";
 import type { PullMode, RepoRef, RepoStatus, SubmoduleInfo } from "../lib/api";
 
-type Tab = "changes" | "history" | "submodules";
-const TABS: Tab[] = ["changes", "history", "submodules"];
+type Tab = "changes" | "history" | "submodules" | "github";
+const TABS: Tab[] = ["changes", "history", "submodules", "github"];
 
 /** "staging ↑2 ↓1" — the submodule's own branch against its own upstream. */
 function subLabel(m: SubmoduleInfo): string {
@@ -607,8 +608,8 @@ export function Repo() {
         <div role="tablist" aria-label="Repository tabs" className="flex flex-wrap items-center gap-1 border-b border-zinc-800">
           {TABS.filter((t) => t !== "submodules" || gitlinks > 0 || sel.sub).map((t) => {
             const active = tab === t;
-            const label = t === "changes" ? "Changes" : t === "history" ? "History" : "Submodules";
-            const Icon = t === "changes" ? FileDiff : t === "history" ? GitGraph : Box;
+            const label = t === "changes" ? "Changes" : t === "history" ? "History" : t === "github" ? "GitHub" : "Submodules";
+            const Icon = t === "changes" ? FileDiff : t === "history" ? GitGraph : t === "github" ? GitPullRequest : Box;
             const badge =
               t === "changes" && status
                 ? status.conflicted_count > 0
@@ -713,6 +714,8 @@ export function Repo() {
           setDrawerFor(canonicalJoin(sel.path, ""));
         }}
       />
+
+      {sel.effectivePath && <GitHubTab repoPath={sel.effectivePath} visible={tab === "github"} reloadKey={reloadKey} />}
 
       {/* Only with the status of the repository the drawer is for: right
           after a scope change the page still holds the previous one's. */}

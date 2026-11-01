@@ -5,7 +5,10 @@ mod doctor;
 mod elevate;
 mod error;
 mod find_clones;
+mod gh_api;
 mod gh_cli;
+mod gh_repo;
+mod pulls;
 mod git_advice;
 mod git_config;
 mod git_exec;
@@ -219,6 +222,18 @@ pub fn run() {
             commands::find_repos_progress,
             commands::find_repos_cancel,
             commands::repo_access_matrix,
+            commands::github_repo_context,
+            commands::github_pulls,
+            commands::github_pulls_search,
+            commands::github_pull,
+            commands::github_pull_files,
+            commands::github_pull_commits,
+            commands::github_pull_review,
+            commands::github_pull_merge,
+            commands::github_collaborators,
+            commands::github_collaborator_add,
+            commands::github_collaborator_remove,
+            commands::github_invitation_cancel,
             commands::profile_folders_add,
             commands::profile_folders_remove,
             commands::sparse_clone,
