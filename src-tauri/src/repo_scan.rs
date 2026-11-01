@@ -90,7 +90,7 @@ pub(crate) fn mask_token(url: &str) -> String {
     crate::cmdlog::redact(url)
 }
 
-fn git_text(dir: &std::path::Path, args: &[&str]) -> Option<String> {
+pub(crate) fn git_text(dir: &std::path::Path, args: &[&str]) -> Option<String> {
     let started = std::time::Instant::now();
     let d = dir.to_string_lossy().to_string();
     let out = crate::spawn::command("git").arg("-C").arg(&d).args(args).output().ok()?;
@@ -118,15 +118,20 @@ pub(crate) fn get_origin(dir: &std::path::Path) -> Option<String> {
     })
 }
 
-fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
-    let root_path = PathBuf::from(root);
-    if !root_path.is_dir() {
-        return Err(AppError::Config(format!("Folder not found: {}", root)));
-    }
+/// Folders the walk passes over — unless one is itself a repository (a
+/// project called `build`, say).
+pub(crate) fn noise_folder(name: &str) -> bool {
+    name.starts_with('.') || matches!(name, "node_modules" | "target" | "Library" | "dist" | "build")
+}
 
+/// The repositories under `root`, as folders: up to five levels down, noise
+/// folders passed over, a repository's own subfolders never entered, a clone
+/// still being written left out. Nothing is asked of git — the Repository
+/// page's list and Find repositories' "already listed" are this same walk.
+pub(crate) fn walk_repo_dirs(root: &std::path::Path) -> Vec<PathBuf> {
     const MAX_DEPTH: u32 = 5;
-    let mut repos = Vec::new();
-    let mut stack = vec![(root_path, 0u32)];
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0u32)];
 
     while let Some((dir, depth)) = stack.pop() {
         if dir.join(".git").exists() {
@@ -134,22 +139,7 @@ fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
             if crate::sparse::clone_running_at(&dir.to_string_lossy()) {
                 continue;
             }
-            let (remote_url, owner, name) = match get_origin(&dir) {
-                Some(url) => {
-                    let (o, n) = parse_github_owner_name(&url).unwrap_or_default();
-                    (mask_token(&url), o, n)
-                }
-                None => (String::new(), String::new(), String::new()),
-            };
-            // The raw value: `get-url --push` would apply a push block's rewrite.
-            let push_url = git_text(&dir, &["config", "--get", "remote.origin.pushurl"]).map(|u| mask_token(&u)).filter(|u| *u != remote_url);
-            repos.push(ScannedRepo {
-                path: dir.to_string_lossy().to_string(),
-                remote_url,
-                push_url,
-                owner,
-                name,
-            });
+            out.push(dir);
             // Don't descend into a repo's own subfolders.
             continue;
         }
@@ -163,18 +153,43 @@ fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
                     continue;
                 }
                 let dirname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                // Noise folders are not walked into — but one that is itself a
-                // repository (a project called `build`, say) is still one.
-                let noise = dirname.starts_with('.')
-                    || matches!(dirname, "node_modules" | "target" | "Library" | "dist" | "build");
-                if noise && !path.join(".git").exists() {
+                if noise_folder(dirname) && !path.join(".git").exists() {
                     continue;
                 }
                 stack.push((path, depth + 1));
             }
         }
     }
+    out
+}
 
+/// One repository folder as the scan reports it: its origin (masked), the
+/// GitHub owner/name behind it, and its own push URL.
+pub(crate) fn scanned_repo(dir: &std::path::Path) -> ScannedRepo {
+    let (remote_url, owner, name) = match get_origin(dir) {
+        Some(url) => {
+            let (o, n) = parse_github_owner_name(&url).unwrap_or_default();
+            (mask_token(&url), o, n)
+        }
+        None => (String::new(), String::new(), String::new()),
+    };
+    // The raw value: `get-url --push` would apply a push block's rewrite.
+    let push_url = git_text(dir, &["config", "--get", "remote.origin.pushurl"]).map(|u| mask_token(&u)).filter(|u| *u != remote_url);
+    ScannedRepo {
+        path: dir.to_string_lossy().to_string(),
+        remote_url,
+        push_url,
+        owner,
+        name,
+    }
+}
+
+fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
+    let root_path = PathBuf::from(root);
+    if !root_path.is_dir() {
+        return Err(AppError::Config(format!("Folder not found: {}", root)));
+    }
+    let mut repos: Vec<ScannedRepo> = walk_repo_dirs(&root_path).iter().map(|d| scanned_repo(d)).collect();
     repos.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(repos)
 }

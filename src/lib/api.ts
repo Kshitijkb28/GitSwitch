@@ -644,6 +644,118 @@ export async function checkRepoAccess(
   return invoke("check_repo_access", { token, owner, repo });
 }
 
+// --- Find repositories: clones no profile folder holds ------------------------
+
+/** Where a repository's commits get their email from today. */
+export interface CommitsAs {
+  profile_id: string | null;
+  /**
+   * folder: a profile folder holds it, deeper than the page looks · rule: a
+   * profile's remote rule · gitdir: a worktree (or separate git folder), which
+   * follows where its git folder is · default: the default profile · local:
+   * the repository sets its own email · none: no email at all.
+   */
+  via: "folder" | "rule" | "gitdir" | "default" | "local" | "none";
+}
+
+/** A repository the Repository page does not list. */
+export interface FoundRepo extends ScannedRepo {
+  /** The GitHub repository pushes go to (the push URL's, else the origin's); empty when that is not GitHub. */
+  push_owner: string;
+  push_name: string;
+  /** `.git` is a file: a worktree or a separate git folder. */
+  gitdir_elsewhere: boolean;
+  commits_as: CommitsAs;
+}
+
+export interface FoundClones {
+  /** The home folder, for showing paths under it as `~/…`. */
+  home: string | null;
+  /** The places searched, in order. */
+  roots: string[];
+  repos: FoundRepo[];
+  /** Repositories found that the Repository page lists already. */
+  already_listed: number;
+  truncated: { place: string; why: string }[];
+  /** Folders at the top of a place that could not be read (a macOS privacy refusal, say). */
+  unreadable: string[];
+  rejected: { place: string; why: string }[];
+  /** Linked folders near the home folder that lead somewhere not searched. */
+  linked: { from: string; to: string }[];
+  cancelled: boolean;
+}
+
+export interface FindProgress {
+  /** "looking" while folders are walked, "checking" while GitHub is asked. */
+  phase: string;
+  folders: number;
+  found: number;
+  checked: number;
+  total: number;
+  place: string;
+}
+
+/** One account and one repository. */
+export interface AccessCell {
+  state: "visible" | "invisible" | "unknown";
+  push: boolean;
+  admin: boolean;
+  /** Only the accounts it was shared with can read it. */
+  private: boolean | null;
+  why: string | null;
+}
+
+export interface AccessMatrix {
+  /** Every account asked, as GitHub spells its login. */
+  accounts: { login: string; source: string }[];
+  /** Accounts whose token could not be read or is not accepted. */
+  problems: { account: string; why: string }[];
+  /** "owner/name" (lowercase) -> login (lowercase) -> the answer. */
+  access: Record<string, Record<string, AccessCell>>;
+  cancelled: boolean;
+}
+
+export interface FolderChange {
+  profile_id: string;
+  path: string;
+}
+
+export interface FolderAdded extends FolderChange {
+  /** The email the repository's identity guard expected before, when it has one. */
+  guard_was: string | null;
+}
+
+export interface FoldersAdded {
+  added: FolderAdded[];
+  failed: (FolderChange & { why: string })[];
+}
+
+export async function findUnlistedRepos(scanId: string, extraRoots: string[]): Promise<FoundClones> {
+  return invoke("find_unlisted_repos", { scanId, extraRoots });
+}
+
+export async function findReposProgress(scanId: string): Promise<FindProgress | null> {
+  return invoke("find_repos_progress", { scanId });
+}
+
+export async function findReposCancel(scanId: string): Promise<void> {
+  return invoke("find_repos_cancel", { scanId });
+}
+
+/** What every signed-in account (GitHub CLI and GitSwitch sign-ins) may do with each "owner/name". */
+export async function repoAccessMatrix(scanId: string, repos: string[]): Promise<AccessMatrix> {
+  return invoke("repo_access_matrix", { scanId, repos });
+}
+
+export async function profileFoldersAdd(changes: FolderChange[]): Promise<FoldersAdded> {
+  return invoke("profile_folders_add", { changes });
+}
+
+/** Undo of profileFoldersAdd: hand back what it returned. */
+export async function profileFoldersRemove(changes: FolderAdded[]): Promise<FolderChange[]> {
+  return invoke("profile_folders_remove", { changes });
+}
+
 export interface SparseInfo {
   path: string;
   branch: string;

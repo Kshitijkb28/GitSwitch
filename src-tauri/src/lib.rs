@@ -4,6 +4,7 @@ mod credentials;
 mod doctor;
 mod elevate;
 mod error;
+mod find_clones;
 mod gh_cli;
 mod git_advice;
 mod git_config;
@@ -214,6 +215,12 @@ pub fn run() {
             commands::changes_push_identity,
             commands::scan_repos,
             commands::check_repo_access,
+            commands::find_unlisted_repos,
+            commands::find_repos_progress,
+            commands::find_repos_cancel,
+            commands::repo_access_matrix,
+            commands::profile_folders_add,
+            commands::profile_folders_remove,
             commands::sparse_clone,
             commands::full_clone,
             commands::repo_accounts,

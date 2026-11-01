@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, useNavigate, useParams } from "react-router-dom";
-import { GitBranch, Box, GitGraph, FileDiff, GitPullRequestArrow, SquareTerminal } from "lucide-react";
+import { GitBranch, Box, GitGraph, FileDiff, GitPullRequestArrow, ScanSearch, SquareTerminal } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
@@ -11,6 +11,7 @@ import { ChangesTab } from "../components/repo/ChangesTab";
 import { HistoryTab } from "../components/repo/HistoryTab";
 import { SubmodulesTab } from "../components/repo/SubmodulesTab";
 import { UpdateDrawer } from "../components/repo/UpdateDrawer";
+import { FindReposDialog } from "../components/FindReposDialog";
 import { markMoved, reconcilePlan } from "../lib/updatePlan";
 import { useRepoSelection } from "../lib/repoSelection";
 import { usePersistedState } from "../lib/persist";
@@ -50,6 +51,8 @@ export function Repo() {
   const [loadingRepos, setLoadingRepos] = useState(true);
   /** Folders opened by hand, outside every profile's folders. */
   const [extraRepos, setExtraRepos] = useState<string[]>([]);
+  /** Find repositories: clones no profile's folders hold, added to the right profile. */
+  const [findOpen, setFindOpen] = useState(false);
   const [subs, setSubs] = useState<SubmoduleInfo[]>([]);
   /** Every gitlink, populated or not — whether the repository has submodules at all. */
   const [gitlinkPaths, setGitlinkPaths] = useState<string[]>([]);
@@ -496,6 +499,15 @@ export function Repo() {
           <Button
             variant="secondary"
             size="sm"
+            onClick={() => setFindOpen(true)}
+            title="Look for clones on this computer that no profile's folders hold, and add each to the profile whose GitHub account can reach it"
+          >
+            <ScanSearch size={14} />
+            Find repositories
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={async () => {
               const dir = await pickFolder({ directory: true, multiple: false, title: "Open a repository" });
               if (typeof dir === "string" && dir) {
@@ -714,6 +726,8 @@ export function Repo() {
           onRemedy={remedy}
         />
       )}
+
+      <FindReposDialog open={findOpen} onClose={() => setFindOpen(false)} onAdded={() => void loadRepos()} />
     </div>
   );
 }

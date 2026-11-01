@@ -2,6 +2,7 @@ use crate::commit_audit::{self, RepoAudit};
 use crate::credentials;
 use crate::doctor::{self, Finding};
 use crate::error::AppError;
+use crate::find_clones;
 use crate::gh_cli;
 use crate::git_config;
 use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, FetchResult, MergeInfo, RepoRef, SyncStatus};
@@ -312,6 +313,113 @@ pub async fn check_repo_access(
     repo: String,
 ) -> Result<Option<RepoPermissions>, AppError> {
     github::repo_permission(&token, &owner, &repo).await
+}
+
+// --- Find repositories: clones no profile folder holds ---
+
+/// The clones on this computer the Repository page does not list: under the
+/// places asked for, the folders that hold profile folders, the home folder.
+#[tauri::command]
+pub async fn find_unlisted_repos(scan_id: String, extra_roots: Vec<String>) -> Result<find_clones::FoundClones, AppError> {
+    find_clones::find_unlisted(scan_id, extra_roots).await
+}
+
+/// How far a search has got: folders looked at, repositories found,
+/// questions to GitHub answered.
+#[tauri::command]
+pub fn find_repos_progress(scan_id: String) -> Option<find_clones::FindProgress> {
+    find_clones::progress(&scan_id)
+}
+
+/// Stop a search wherever it is: the walk, or the questions to GitHub.
+#[tauri::command]
+pub fn find_repos_cancel(scan_id: String) {
+    find_clones::cancel(&scan_id)
+}
+
+/// What each signed-in account may do with each of these "owner/name"s.
+#[tauri::command]
+pub async fn repo_access_matrix(scan_id: String, repos: Vec<String>) -> Result<find_clones::AccessMatrix, AppError> {
+    find_clones::access_matrix(scan_id, repos).await
+}
+
+/// Each folder added to its profile, the store read afresh for each — a clone
+/// finishing or another page saving meanwhile loses nothing — then the config
+/// written once and the identity guards in those folders brought in line.
+/// What each guard expected before is returned, for Undo.
+pub(crate) async fn profile_folders_add_core(changes: Vec<find_clones::FolderChange>) -> Result<find_clones::FoldersAdded, AppError> {
+    let paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+    let before: Vec<Option<String>> = tokio::task::spawn_blocking(move || paths.iter().map(|p| find_clones::guard_expects(p)).collect())
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?;
+    let mut out = find_clones::FoldersAdded::default();
+    let mut touched = Vec::new();
+    for (c, guard_was) in changes.into_iter().zip(before) {
+        match profiles::add_folders(&c.profile_id, std::slice::from_ref(&c.path)) {
+            Ok(stored) => {
+                let path = stored.into_iter().next().unwrap_or(c.path);
+                touched.push(path.clone());
+                out.added.push(find_clones::FolderAdded { profile_id: c.profile_id, path, guard_was });
+            }
+            Err(e) => out.failed.push(find_clones::FolderFailed { profile_id: c.profile_id, path: c.path, why: e.to_string() }),
+        }
+    }
+    if !touched.is_empty() {
+        git_config::apply_git_config()?;
+        log_guards(commit_audit::refresh_guards(&touched).await);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn profile_folders_add(app: tauri::AppHandle, changes: Vec<find_clones::FolderChange>) -> Result<find_clones::FoldersAdded, AppError> {
+    let out = profile_folders_add_core(changes).await?;
+    crate::tray::update_active_label(&app);
+    Ok(out)
+}
+
+/// Undo of an add: each folder taken off its profile again, the config
+/// written, and a guard that expected another email before the add expects
+/// it again (with no profile owning the repository any more, the guards'
+/// own refresh leaves a guard as it is).
+pub(crate) async fn profile_folders_remove_core(changes: Vec<find_clones::FolderAdded>) -> Result<Vec<find_clones::FolderChange>, AppError> {
+    let mut removed = Vec::new();
+    for c in &changes {
+        for path in profiles::remove_folders(&c.profile_id, std::slice::from_ref(&c.path))? {
+            removed.push(find_clones::FolderChange { profile_id: c.profile_id.clone(), path });
+        }
+    }
+    if !removed.is_empty() {
+        git_config::apply_git_config()?;
+        let dirs: Vec<String> = removed.iter().map(|r| r.path.clone()).collect();
+        log_guards(commit_audit::refresh_guards(&dirs).await);
+    }
+    let restore: Vec<(String, String)> = changes.into_iter().filter_map(|c| c.guard_was.map(|e| (c.path, e))).collect();
+    let lines = tokio::task::spawn_blocking(move || {
+        let mut lines = Vec::new();
+        for (path, email) in restore {
+            let Some(now) = find_clones::guard_expects(&path) else { continue };
+            if now.trim().eq_ignore_ascii_case(email.trim()) {
+                continue;
+            }
+            match commit_audit::install_guard(&path, &email) {
+                Ok(_) => lines.push(format!("{}: the identity guard expects {} again (was {})", path, email, now)),
+                Err(e) => lines.push(format!("{}: the identity guard could not be put back to {}: {}", path, email, e)),
+            }
+        }
+        lines
+    })
+    .await
+    .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?;
+    log_guards(lines);
+    Ok(removed)
+}
+
+#[tauri::command]
+pub async fn profile_folders_remove(app: tauri::AppHandle, changes: Vec<find_clones::FolderAdded>) -> Result<Vec<find_clones::FolderChange>, AppError> {
+    let out = profile_folders_remove_core(changes).await?;
+    crate::tray::update_active_label(&app);
+    Ok(out)
 }
 
 /// Sparse checkout: partial-clone a repo (blob:none, no checkout).

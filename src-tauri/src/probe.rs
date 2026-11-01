@@ -281,6 +281,22 @@ pub(crate) mod tests {
             "ports_container_stop" => forward!(c::ports_container_stop, args, id, project),
             "workspace_info" => forward!(c::workspace_info, args, path),
             "workspace_set_offset" => forward!(c::workspace_set_offset, args, path, offset),
+            // Find repositories
+            "find_unlisted_repos" => forward!(c::find_unlisted_repos, args, scan_id, extra_roots),
+            "find_repos_progress" => {
+                let scan_id: String = match arg(&args, "scan_id") { Ok(v) => v, Err(e) => return reply_err(e) };
+                reply(Ok::<_, crate::error::AppError>(c::find_repos_progress(scan_id)))
+            }
+            "find_repos_cancel" => {
+                let scan_id: String = match arg(&args, "scan_id") { Ok(v) => v, Err(e) => return reply_err(e) };
+                c::find_repos_cancel(scan_id);
+                reply(Ok::<_, crate::error::AppError>(()))
+            }
+            "repo_access_matrix" => forward!(c::repo_access_matrix, args, scan_id, repos),
+            // The commands update the tray too, which needs the app: their cores.
+            "profile_folders_add" => forward!(c::profile_folders_add_core, args, changes),
+            "profile_folders_remove" => forward!(c::profile_folders_remove_core, args, changes),
+            "install_commit_guard" => forward!(c::install_commit_guard, args, repo_path, expected_email),
             // These take a `tauri::AppHandle` (tray label updates) and cannot run outside the app.
             "create_profile" | "update_profile" | "delete_profile" | "set_default_profile" | "sparse_clone"
             | "full_clone" => reply_err(format!(
@@ -343,6 +359,23 @@ pub(crate) mod tests {
                 drop(guard);
                 let after = crate::remote_repos::local_clones().await.ok();
                 emit(&serde_json::json!({ "during": during, "picker": picker, "after": after }));
+            }
+            // Folders added to one profile from many threads at once (PROBE_REPO =
+            // the profile id, PROBE_ARGS = the folders): the store must keep
+            // every one, whatever order the writes land in.
+            "profile_add_concurrently" => {
+                let id = std::env::var("PROBE_REPO").unwrap_or_default();
+                let threads: Vec<_> = a
+                    .iter()
+                    .cloned()
+                    .map(|dir| {
+                        let id = id.clone();
+                        std::thread::spawn(move || crate::profiles::add_folders(&id, &[dir]).map_err(|e| e.to_string()))
+                    })
+                    .collect();
+                let errors: Vec<String> = threads.into_iter().filter_map(|t| t.join().ok().and_then(|r| r.err())).collect();
+                let dirs = crate::profiles::load_profiles().ok().and_then(|s| s.profiles.into_iter().find(|p| p.id == id)).map(|p| p.directories).unwrap_or_default();
+                emit(&serde_json::json!({ "directories": dirs, "errors": errors }));
             }
             // Saves a profile with the folders and email given, as the app's
             // update_profile command does (which also updates the tray, and
