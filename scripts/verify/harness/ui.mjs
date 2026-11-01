@@ -117,6 +117,11 @@ async function openPage(browser, server, scenario, opts = {}) {
     ports: opts.ports ?? null,
     /** workspace_set_offset refuses with this message (a clash with another copy). */
     offsetRefusal: opts.offsetRefusal ?? null,
+    /**
+     * Find repositories: {result, profiles, keyLogins, matrix, hints, pick, hold}.
+     * `hold`: find_unlisted_repos answers only when the test calls window.__RELEASE_FIND__().
+     */
+    find: opts.find ?? null,
   };
   // Named, so another engine can be handed the very same bridge (webkit.sh).
   const bridge = (
@@ -431,6 +436,31 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve([]);
             case "doctor_check_repo_access":
               return Promise.resolve([{ id: "remote-not-reachable:/work/app", severity: "warning", title: "@octo cannot see acme/app", detail: "GitHub answered for @octo: not found, with the repo scope.", fix: null, fix_label: null }]);
+            // Find repositories
+            case "find_unlisted_repos": {
+              const empty = { home: "/Users/me", roots: ["/Users/me"], repos: [], already_listed: 0, truncated: [], unreadable: [], rejected: [], linked: [], cancelled: false };
+              const result = window.__FOUND__ ?? (cfg.find && cfg.find.result) ?? empty;
+              if (cfg.find && cfg.find.hold) return new Promise((res) => { window.__RELEASE_FIND__ = () => res(result); });
+              return Promise.resolve(result);
+            }
+            case "find_repos_progress":
+              return Promise.resolve({ phase: "looking", folders: 1536, found: 0, checked: 0, total: 0, place: "/Users/me/code" });
+            case "find_repos_cancel":
+              return Promise.resolve(null);
+            case "get_profiles":
+              return Promise.resolve(cfg.find ? cfg.find.profiles ?? [] : null);
+            case "resolve_key_account":
+              return Promise.resolve(((cfg.find && cfg.find.keyLogins) || {})[args.keyPath] ?? null);
+            case "repo_access_matrix":
+              return Promise.resolve((cfg.find && cfg.find.matrix) || { accounts: [], problems: [], access: {}, cancelled: false });
+            case "local_clone_index":
+              return Promise.resolve({ clones: {}, owner_profiles: (cfg.find && cfg.find.hints) || {}, org_ssh_users: {} });
+            case "profile_folders_add":
+              return Promise.resolve({ added: args.changes.map((c) => ({ ...c, guard_was: null })), failed: [] });
+            case "profile_folders_remove":
+              return Promise.resolve(args.changes.map((c) => ({ profile_id: c.profile_id, path: c.path })));
+            case "plugin:dialog|open":
+              return Promise.resolve((cfg.find && cfg.find.pick) || null);
             default:
               return Promise.resolve(null);
           }
@@ -4948,6 +4978,197 @@ try {
     await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "workspace_info").length > n, { timeout: 4000 }, before).catch(() => null);
     ok("  a fresh fetch reloads the page once", (await reloads()) === before + 1, `workspace_info read ${(await reloads()) - before} more time(s)`);
     await page.close();
+  }
+
+  // --- Find repositories --------------------------------------------------
+  {
+    const at = "2026-01-01T00:00:00Z";
+    const prof = (id, name, key, isDefault, over = {}) => ({ id, name, git_name: name, git_email: `${id}@example.test`, ssh_key_path: key, is_default: isDefault, allow_push: true, signing_enabled: false, directories: [], remote_patterns: [], github_login: null, created_at: at, updated_at: at, ...over });
+    const PROFILES = [prof("pp", "Personal", "/Users/me/.ssh/id_me", true), prof("pw", "Work", "/Users/me/.ssh/id_work", false, { remote_patterns: ["acme-rules/"] })];
+    const fr = (name, over = {}) => {
+      const owner = over.owner ?? "x";
+      return { path: `/Users/me/code/${name}`, remote_url: owner ? `git@github.com:${owner}/${name}.git` : "", owner, name: owner ? name : "", push_owner: owner, push_name: owner ? name : "", gitdir_elsewhere: false, commits_as: { profile_id: "pp", via: "default" }, ...over };
+    };
+    const FOUND = {
+      home: "/Users/me",
+      roots: ["/clones", "/w", "/Users/me"],
+      already_listed: 3,
+      truncated: [],
+      unreadable: [],
+      rejected: [],
+      linked: [],
+      cancelled: false,
+      repos: [
+        fr("feature-wt", { owner: "me-home", gitdir_elsewhere: true }),
+        fr("local-only", { owner: "" }),
+        fr("mine", { owner: "me-home" }),
+        fr("public-lib", { owner: "vercel" }),
+        fr("ruled", { owner: "acme-rules", commits_as: { profile_id: "pw", via: "rule" } }),
+        fr("shared", { owner: "orgx" }),
+        fr("sso", { owner: "bigorg" }),
+        fr("tool", { owner: "acme" }),
+      ],
+    };
+    const V = (push, priv) => ({ state: "visible", push, admin: false, private: priv, why: null });
+    const INV = { state: "invisible", push: false, admin: false, private: null, why: null };
+    const MATRIX = {
+      accounts: [{ login: "Me-Home", source: "GitHub CLI" }, { login: "me-work", source: "GitHub CLI" }],
+      problems: [],
+      access: {
+        "me-home/mine": { "me-home": V(true, true), "me-work": INV },
+        "acme/tool": { "me-home": INV, "me-work": V(true, true) },
+        "vercel/public-lib": { "me-home": V(false, false), "me-work": V(false, false) },
+        "bigorg/sso": { "me-home": INV, "me-work": { state: "unknown", push: false, admin: false, private: null, why: "single sign-on: the token is not authorized for this organization" } },
+        "orgx/shared": { "me-home": V(true, false), "me-work": V(true, false) },
+      },
+      cancelled: false,
+    };
+    const FIND = { result: FOUND, profiles: PROFILES, keyLogins: { "/Users/me/.ssh/id_me": "Me-Home", "/Users/me/.ssh/id_work": "me-work" }, matrix: MATRIX, hints: { orgx: "pw" } };
+    const calls = (page, cmd) => page.evaluate((cmd) => window.__CALLS__.filter((c) => c.cmd === cmd).map((c) => c.args), cmd);
+    const rowText = (page, name) => page.evaluate((name) => [...document.querySelectorAll("[data-find-row]")].find((r) => r.dataset.findRow.endsWith(`/${name}`))?.innerText ?? "", name);
+    const rowNames = (page) => page.evaluate(() => [...document.querySelectorAll("[data-find-row]")].map((r) => r.dataset.findRow.split("/").pop()));
+    const openFind = async (page) => {
+      await (await button(page, "Find repositories"))?.click();
+      await page.waitForFunction(() => document.body.innerText.includes("Looking in your home folder"), { timeout: 4000 });
+    };
+    const closeFind = (page) => page.evaluate(() => [...document.querySelectorAll("h2")].find((h) => h.innerText === "Find repositories")?.parentElement.querySelector("button")?.click());
+    /** A button inside the Find repositories dialog, by its label (exact, else the first starting with it). */
+    const findButton = (page, label, press) =>
+      page.evaluate(
+        (label, press) => {
+          const box = [...document.querySelectorAll("h2")].find((h) => h.innerText === "Find repositories")?.closest(".relative");
+          const all = box ? [...box.querySelectorAll("button")] : [];
+          const b = all.find((x) => x.innerText.trim() === label) ?? all.find((x) => x.innerText.trim().startsWith(label));
+          if (b && press) b.click();
+          return !!b;
+        },
+        label,
+        press
+      );
+    const press = (page, label) => findButton(page, label, true);
+    const has = (page, label) => findButton(page, label, false);
+    const waitRows = (page, n) => page.waitForFunction((n) => document.querySelectorAll("[data-find-row]").length === n, { timeout: 6000 }, n).catch(() => null);
+
+    section("Find repositories: clones no profile's folders hold, each proposed to the profile whose account can reach it");
+    {
+      const page = await open(SCENARIOS.clean, { find: FIND, storage: { "sparse.parentDir": "/clones", "autoassign.root": "/w" } });
+      ok("the Repository page has a Find repositories button", !!(await button(page, "Find repositories")));
+      await openFind(page);
+      await sleep(300);
+      ok("the first time, it says what it will read and searches only when asked", (await has(page, "Search")) && (await calls(page, "find_unlisted_repos")).length === 0, await text(page));
+      await press(page, "Search");
+      await waitRows(page, 8);
+      const args = (await calls(page, "find_unlisted_repos"))[0] ?? {};
+      ok("  the search takes the Clone page's and Auto Assign's remembered folders", JSON.stringify(args.extraRoots) === JSON.stringify(["/clones", "/w"]) && !!args.scanId, JSON.stringify(args));
+      ok("  GitHub is asked about each origin once", JSON.stringify(((await calls(page, "repo_access_matrix"))[0] ?? {}).repos?.slice().sort()) === JSON.stringify(["acme-rules/ruled", "acme/tool", "bigorg/sso", "me-home/mine", "orgx/shared", "vercel/public-lib"]), JSON.stringify(await calls(page, "repo_access_matrix")));
+      const mine = await rowText(page, "mine");
+      ok("a repository only one profile's account can push to is proposed to that profile", mine.includes("push · Me-Home") && mine.includes("Personal (Me-Home)"), mine);
+      const tool = await rowText(page, "tool");
+      ok("  and the row says whose email it commits with now, and after", tool.includes("push · me-work") && tool.includes("Commits as Personal · after adding: Work"), tool);
+      const pub = await rowText(page, "public-lib");
+      ok("a public repository nobody can push to is not proposed", pub.includes("anyone can read it") && pub.includes("Don't add"), pub);
+      const sso = await rowText(page, "sso");
+      ok("a check GitHub could not answer proposes nothing and says why", sso.includes("check failed · me-work: single sign-on") && sso.includes("Don't add"), sso);
+      ok("a repository that is not on GitHub says so", (await rowText(page, "local-only")).includes("not on GitHub"));
+      const ruled = await rowText(page, "ruled");
+      ok("a clone a remote rule already gives a profile is proposed to that profile", ruled.includes("Work's remote rule") && ruled.includes("Work (me-work)"), ruled);
+      const wt = await rowText(page, "feature-wt");
+      ok("a worktree is offered only the profile its git folder already gives it", wt.includes("a worktree: it commits as Personal") && wt.includes("Personal"), wt);
+      const shared = await rowText(page, "shared");
+      ok("an organisation's repository several profiles can push to: its other clones' profile is preselected", shared.includes("several profiles can push · your other orgx clones use Work") && shared.includes("Work (me-work)"), shared);
+      const fits = await page.evaluate(() => {
+        const box = [...document.querySelectorAll("h2")].find((h) => h.innerText === "Find repositories")?.closest(".relative");
+        const rows = [...document.querySelectorAll("[data-find-row]")];
+        return !!box && box.getBoundingClientRect().right <= window.innerWidth && rows.every((r) => r.scrollWidth <= r.clientWidth + 1);
+      });
+      ok("  the dialog and its rows fit the window", fits);
+      const listedBefore = (await calls(page, "history_list_repos")).length;
+      await press(page, "Add 5 repositories to their profiles");
+      await page.waitForFunction(() => document.body.innerText.includes("Added 5 repositories"), { timeout: 4000 }).catch(() => null);
+      const added = (await calls(page, "profile_folders_add"))[0]?.changes ?? [];
+      ok(
+        "Add puts each chosen repository under its profile, and nothing else",
+        JSON.stringify(added.map((c) => `${c.path.split("/").pop()}:${c.profile_id}`)) === JSON.stringify(["feature-wt:pp", "mine:pp", "ruled:pw", "shared:pw", "tool:pw"]),
+        JSON.stringify(added)
+      );
+      ok("  the Repository page reads its list again", (await calls(page, "history_list_repos")).length > listedBefore);
+      ok("  what was not added stays for review", JSON.stringify(await rowNames(page)) === JSON.stringify(["local-only", "public-lib", "sso"]), JSON.stringify(await rowNames(page)));
+      await press(page, "Undo");
+      await sleep(400);
+      const removed = (await calls(page, "profile_folders_remove"))[0]?.changes ?? [];
+      ok("Undo takes exactly those off again", removed.length === 5 && removed.every((c) => added.some((a) => a.path === c.path && a.profile_id === c.profile_id)), JSON.stringify(removed));
+      await page.close();
+    }
+
+    section("Find repositories: clear matches added straight away, with Undo after closing");
+    {
+      const page = await open(SCENARIOS.clean, { find: FIND, storage: { "findrepos.autoAdd": true, "findrepos.searched": true } });
+      await openFind(page);
+      await page.waitForFunction(() => document.body.innerText.includes("Added 4 repositories"), { timeout: 6000 }).catch(() => null);
+      const added = (await calls(page, "profile_folders_add"))[0]?.changes ?? [];
+      ok("once searched before, opening searches at once", (await calls(page, "find_unlisted_repos")).length === 1);
+      ok("  the clear ones are added without a click — and the preselected guess is not", JSON.stringify(added.map((c) => c.path.split("/").pop())) === JSON.stringify(["feature-wt", "mine", "ruled", "tool"]), JSON.stringify(added));
+      ok("  the rest wait for review", JSON.stringify(await rowNames(page)) === JSON.stringify(["local-only", "public-lib", "shared", "sso"]), JSON.stringify(await rowNames(page)));
+      await closeFind(page);
+      await sleep(300);
+      await openFind(page);
+      await sleep(400);
+      ok("opened again, it shows what was added with Undo, and does not search over it", (await text(page)).includes("Added 4 repositories") && (await has(page, "Undo")) && (await calls(page, "find_unlisted_repos")).length === 1);
+      await press(page, "Undo");
+      await sleep(400);
+      ok("  Undo takes those four off", ((await calls(page, "profile_folders_remove"))[0]?.changes ?? []).length === 4);
+      await page.close();
+    }
+
+    section("Find repositories: closing while it searches adds nothing");
+    {
+      const page = await open(SCENARIOS.clean, { find: { ...FIND, hold: true }, storage: { "findrepos.autoAdd": true, "findrepos.searched": true } });
+      await openFind(page);
+      await page.waitForFunction(() => typeof window.__RELEASE_FIND__ === "function", { timeout: 4000 }).catch(() => null);
+      await page.waitForFunction(() => document.body.innerText.includes("1,536 folders"), { timeout: 3000 }).catch(() => null);
+      ok("while it looks, it says how far it has got", (await text(page)).includes("Looking for repositories · 1,536 folders"), await text(page));
+      await closeFind(page);
+      await sleep(200);
+      ok("closing stops the search", (await calls(page, "find_repos_cancel")).length === 1);
+      await page.evaluate(() => window.__RELEASE_FIND__());
+      await sleep(600);
+      ok("  and what it found after that is not added", (await calls(page, "profile_folders_add")).length === 0 && (await calls(page, "repo_access_matrix")).length === 0);
+      await page.close();
+    }
+
+    section("Find repositories: nothing new, and the places it could not search");
+    {
+      const NONE = { ...FOUND, repos: [], already_listed: 7 };
+      const page = await open(SCENARIOS.clean, { find: { ...FIND, result: NONE, pick: "/extra/place" }, storage: { "findrepos.searched": true } });
+      await openFind(page);
+      await page.waitForFunction(() => document.body.innerText.includes("already on the Repository page"), { timeout: 4000 }).catch(() => null);
+      ok("when every repository is listed already, it says so with the count", (await text(page)).includes("Every repository in these places is already on the Repository page (7)."));
+      await page.evaluate(() => {
+        window.__FOUND__ = {
+          home: "/Users/me", roots: ["/Users/me"], repos: [], already_listed: 0, cancelled: false,
+          truncated: [{ place: "/Users/me", why: "stopped after 30 seconds" }],
+          unreadable: ["/Users/me/Desktop"],
+          rejected: [{ place: "relative/x", why: "not a full path" }],
+          linked: [{ from: "/Users/me/code", to: "/Volumes/SSD/code" }],
+        };
+      });
+      await press(page, "Search again");
+      await page.waitForFunction(() => document.body.innerText.includes("Look there too"), { timeout: 4000 }).catch(() => null);
+      const t2 = await text(page);
+      ok("a place cut short says where and why", t2.includes("~: stopped after 30 seconds"), t2);
+      ok("  a folder it could not read is named", t2.includes("Could not read ~/Desktop"), t2);
+      ok("  a place asked for that is not usable says why", t2.includes("Not searched: relative/x (not a full path)"), t2);
+      ok("  a linked folder that leads elsewhere is offered", t2.includes("~/code is a link to /Volumes/SSD/code, which was not searched."), t2);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Look there too")?.click());
+      await sleep(500);
+      const last = (await calls(page, "find_unlisted_repos")).pop() ?? {};
+      ok("Look there too searches it, and remembers it", (last.extraRoots ?? []).includes("/Volumes/SSD/code") && (await page.evaluate(() => localStorage.getItem("gitswitch:findrepos.places") ?? "")).includes("/Volumes/SSD/code"), JSON.stringify(last));
+      await press(page, "Also look in…");
+      await sleep(500);
+      const again = (await calls(page, "find_unlisted_repos")).pop() ?? {};
+      ok("Also look in… adds the folder picked and searches again", (again.extraRoots ?? []).includes("/extra/place"), JSON.stringify(again));
+      await page.close();
+    }
   }
 } finally {
   await browser.close();

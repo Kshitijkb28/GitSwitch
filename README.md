@@ -95,6 +95,14 @@ for folders that still use HTTPS.
   picker. A folder can belong to only one profile (auto-deduplicated).
 - **Auto Assign** — scan a folder tree, check which of your GitHub accounts
   actually has access to each repo, and map them to the right profile.
+- **Find repositories** (on the Repository page) — finds the clones on this
+  computer that no profile's folders hold, which the page therefore does not
+  list: under your home folder, the Clone page's and Auto Assign's folders, the
+  folders beside your profile folders and any place you add. It passes over
+  hidden, media and package folders and network drives, and does not follow
+  links. It asks GitHub which of your accounts can reach each clone and
+  proposes the profile whose account can; you add them in one click, or let the
+  clear matches be added straight away. Undo takes them off again.
 - **Clone** — clone over SSH as the right account. The destination folder's
   profile decides the key, or pick one with **Clone as** (the new folder is then
   added to that profile). Downloads submodules with the same result as

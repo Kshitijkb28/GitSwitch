@@ -245,11 +245,78 @@ pub fn load_profiles() -> Result<ProfileStore, AppError> {
     Ok(store)
 }
 
+/// One writer of the store at a time. Every change reads the store, changes
+/// it and writes it back; two at once would each write back what the other
+/// never saw — a clone finishing while Find repositories adds folders, say,
+/// would put the profile back as it was when the clone began.
+fn store_writer() -> std::sync::MutexGuard<'static, ()> {
+    static WRITER: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    WRITER.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Written whole or not at all: to a file beside it, then renamed over it,
+/// so a crash or a full disk mid-write never leaves half a store. Where the
+/// rename is refused (a file another program holds open on Windows), the
+/// store is written in place as before.
 pub fn save_profiles(store: &ProfileStore) -> Result<(), AppError> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let path = get_store_path()?;
     let content = serde_json::to_string_pretty(store)?;
-    fs::write(&path, content)?;
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmp = path.with_file_name(format!("profiles.json.{}-{}.tmp", std::process::id(), n));
+    fs::write(&tmp, &content)?;
+    if fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+        fs::write(&path, content)?;
+    }
     Ok(())
+}
+
+/// Add folders to one profile: the store read afresh under the writer lock,
+/// so whatever another change added meanwhile stays. Each folder is stored as
+/// the disk spells it (`~` expanded), taken from any other profile that had
+/// it (a folder belongs to one profile), and returned as stored — one entry
+/// per folder given, in order.
+pub fn add_folders(id: &str, folders: &[String]) -> Result<Vec<String>, AppError> {
+    let _writer = store_writer();
+    let mut store = load_profiles()?;
+    let stored: Vec<String> = folders.iter().map(|f| crate::paths::disk_spelling(&expand_tilde(f))).collect();
+    let profile = store
+        .profiles
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or_else(|| AppError::NotFound(format!("Profile {} not found", id)))?;
+    let mut dirs = profile.directories.clone();
+    dirs.extend(stored.iter().cloned());
+    let dirs = stored_folders(&dirs);
+    validate_fields(&profile.name, &profile.git_name, &profile.git_email, profile.ssh_key_path.as_deref(), &dirs)?;
+    profile.directories = dirs;
+    profile.updated_at = Utc::now();
+    dedupe_directories(&mut store, id, &stored);
+    save_profiles(&store)?;
+    Ok(stored)
+}
+
+/// Take folders off one profile, the store read afresh under the writer lock.
+/// A folder matches however it is spelled or linked. The folders removed, as
+/// they were stored.
+pub fn remove_folders(id: &str, folders: &[String]) -> Result<Vec<String>, AppError> {
+    let _writer = store_writer();
+    let mut store = load_profiles()?;
+    let profile = store
+        .profiles
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or_else(|| AppError::NotFound(format!("Profile {} not found", id)))?;
+    let gone: Vec<crate::paths::FolderId> = folders.iter().map(|f| crate::paths::FolderId::of(&expand_tilde(f))).collect();
+    let (removed, kept): (Vec<String>, Vec<String>) =
+        profile.directories.iter().cloned().partition(|d| gone.iter().any(|g| g.same(&crate::paths::FolderId::of(d))));
+    if !removed.is_empty() {
+        profile.directories = kept;
+        profile.updated_at = Utc::now();
+        save_profiles(&store)?;
+    }
+    Ok(removed)
 }
 
 #[allow(clippy::too_many_arguments)] // one value per field of the form
@@ -265,6 +332,7 @@ pub fn create_profile(
     github_login: Option<String>,
     push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
+    let _writer = store_writer();
     let mut store = load_profiles()?;
 
     let is_default = store.profiles.is_empty();
@@ -318,6 +386,7 @@ pub fn update_profile(
     github_login: Option<String>,
     push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
+    let _writer = store_writer();
     let mut store = load_profiles()?;
 
     let profile = store
@@ -375,6 +444,7 @@ pub fn update_profile(
 }
 
 pub fn delete_profile(id: String) -> Result<(), AppError> {
+    let _writer = store_writer();
     let mut store = load_profiles()?;
     let initial_len = store.profiles.len();
     store.profiles.retain(|p| p.id != id);
@@ -393,6 +463,7 @@ pub fn delete_profile(id: String) -> Result<(), AppError> {
 }
 
 pub fn set_default_profile(id: String) -> Result<Profile, AppError> {
+    let _writer = store_writer();
     let mut store = load_profiles()?;
 
     let target = store

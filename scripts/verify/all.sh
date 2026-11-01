@@ -46,6 +46,7 @@ fi
 run "Changes sandbox"     bash "$HERE/sandbox.sh"
 run "Regression"          bash "$HERE/regression.sh"
 run "Identity (gitconfig round-trip)" bash "$HERE/identity.sh"
+run "Find repositories"   bash "$HERE/findrepos.sh"
 run "Submodules"          bash "$HERE/submodules.sh"
 run "Git LFS"             bash "$HERE/lfs.sh"
 run "Sync"                bash "$HERE/sync.sh"

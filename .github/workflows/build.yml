@@ -81,6 +81,7 @@ jobs:
           bash scripts/verify/sandbox.sh
           bash scripts/verify/regression.sh
           bash scripts/verify/identity.sh
+          bash scripts/verify/findrepos.sh
           bash scripts/verify/submodules.sh
           bash scripts/verify/lfs.sh
           bash scripts/verify/sync.sh

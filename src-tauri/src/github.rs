@@ -271,6 +271,16 @@ pub async fn repo_access(token: &str, owner: &str, repo: &str) -> Result<RepoAcc
 }
 
 async fn repo_access_at(api: &str, token: &str, owner: &str, repo: &str) -> Result<RepoAccess, AppError> {
+    repo_access_detail_at(api, token, owner, repo).await.map(|(access, _)| access)
+}
+
+/// `repo_access`, and whether GitHub calls the repository private — only the
+/// accounts it was shared with can read it — when the account can see it.
+pub async fn repo_access_detail(token: &str, owner: &str, repo: &str) -> Result<(RepoAccess, Option<bool>), AppError> {
+    repo_access_detail_at(&crate::remote_repos::api_base(), token, owner, repo).await
+}
+
+async fn repo_access_detail_at(api: &str, token: &str, owner: &str, repo: &str) -> Result<(RepoAccess, Option<bool>), AppError> {
     let client = http_client()?;
     let resp = client
         .get(format!("{}/repos/{}/{}", api, owner, repo))
@@ -283,16 +293,13 @@ async fn repo_access_at(api: &str, token: &str, owner: &str, repo: &str) -> Resu
     let status = resp.status().as_u16();
     let header = |n: &str| resp.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
     let (scopes, sso) = (header("x-oauth-scopes"), header("x-github-sso"));
-    let perms = if (200..300).contains(&status) {
-        resp.json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|b| b.get("permissions").cloned())
-            .and_then(|p| serde_json::from_value::<RepoPermissions>(p).ok())
-    } else {
-        None
-    };
-    Ok(classify_access(status, scopes.as_deref(), sso.as_deref(), perms))
+    let body = if (200..300).contains(&status) { resp.json::<serde_json::Value>().await.ok() } else { None };
+    let perms = body
+        .as_ref()
+        .and_then(|b| b.get("permissions").cloned())
+        .and_then(|p| serde_json::from_value::<RepoPermissions>(p).ok());
+    let private = body.as_ref().and_then(|b| b.get("private")).and_then(|v| v.as_bool());
+    Ok((classify_access(status, scopes.as_deref(), sso.as_deref(), perms), private))
 }
 
 pub async fn list_ssh_keys_github(token: &str) -> Result<Vec<GitHubKey>, AppError> {

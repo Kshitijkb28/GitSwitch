@@ -1688,9 +1688,9 @@ async fn clone_as_profile(
     if let Some(p) = chosen.as_ref() {
         let already = folder_profile.as_ref().is_some_and(|f| f.id == p.id);
         if !already {
-            let mut dirs = p.directories.clone();
-            dirs.push(dest_str.clone());
-            profiles::update_profile(p.id.clone(), None, None, None, None, Some(dirs), None, None, None, None, None)
+            // The store as it is now, not as it was when the clone began: a
+            // folder added to this profile meanwhile must stay.
+            profiles::add_folders(&p.id, std::slice::from_ref(&dest_str))
                 .and_then(|_| crate::git_config::apply_git_config())
                 .map_err(|e| {
                     AppError::Config(format!(
