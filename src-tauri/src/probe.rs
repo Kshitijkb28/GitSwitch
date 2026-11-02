@@ -293,6 +293,18 @@ pub(crate) mod tests {
                 reply(Ok::<_, crate::error::AppError>(()))
             }
             "repo_access_matrix" => forward!(c::repo_access_matrix, args, scan_id, repos),
+            "github_repo_context" => forward!(c::github_repo_context, args, repo_path, repo),
+            "github_pulls" => forward!(c::github_pulls, args, account, owner, name, state, page),
+            "github_pulls_search" => forward!(c::github_pulls_search, args, account, scope, state, repo, page),
+            "github_pull" => forward!(c::github_pull, args, account, owner, name, number),
+            "github_pull_files" => forward!(c::github_pull_files, args, account, owner, name, number),
+            "github_pull_commits" => forward!(c::github_pull_commits, args, account, owner, name, number),
+            "github_pull_review" => forward!(c::github_pull_review, args, account, owner, name, number, event, body),
+            "github_pull_merge" => forward!(c::github_pull_merge, args, account, owner, name, number, method, sha, title, message, delete_branch),
+            "github_collaborators" => forward!(c::github_collaborators, args, account, owner, name),
+            "github_collaborator_add" => forward!(c::github_collaborator_add, args, account, owner, name, username, permission),
+            "github_collaborator_remove" => forward!(c::github_collaborator_remove, args, account, owner, name, username),
+            "github_invitation_cancel" => forward!(c::github_invitation_cancel, args, account, owner, name, id),
             // The commands update the tray too, which needs the app: their cores.
             "profile_folders_add" => forward!(c::profile_folders_add_core, args, changes),
             "profile_folders_remove" => forward!(c::profile_folders_remove_core, args, changes),

@@ -3,7 +3,7 @@ import { Routes, Route, NavLink, Navigate, useLocation, useNavigate } from "reac
 import { listen } from "@tauri-apps/api/event";
 import { readPersisted, writePersisted } from "./lib/persist";
 import { deepLinkTake } from "./lib/api";
-import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequestArrow, SquareTerminal, Network } from "lucide-react";
+import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequest, GitPullRequestArrow, SquareTerminal, Network } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
 import { ProfileForm } from "./pages/ProfileForm";
@@ -17,10 +17,11 @@ import { Doctor } from "./pages/Doctor";
 import { CommitAudit } from "./pages/CommitAudit";
 import { Repo } from "./pages/Repo";
 import { Ports } from "./pages/Ports";
+import { Pulls } from "./pages/Pulls";
 import { ConsoleDrawer } from "./components/console/ConsoleDrawer";
 import { toggleConsole, useConsole } from "./lib/console";
 
-const REPO_TABS = ["changes", "history", "submodules"];
+const REPO_TABS = ["changes", "history", "submodules", "github"];
 
 /** The Repository page's tab the person was last on. */
 function rememberedRepoTab(): string {
@@ -58,7 +59,7 @@ function App() {
   }, []);
   // The tab on screen is remembered, so the sidebar's Repository and /repo
   // bring the person back to it after another page.
-  const repoTabHere = /^\/repo\/(changes|history|submodules)\/?$/.exec(location.pathname)?.[1] ?? null;
+  const repoTabHere = /^\/repo\/(changes|history|submodules|github)\/?$/.exec(location.pathname)?.[1] ?? null;
   useEffect(() => {
     if (repoTabHere) writePersisted("repo.tab", repoTabHere);
   }, [repoTabHere]);
@@ -100,6 +101,9 @@ function App() {
           </SidebarLink>
           <SidebarLink to="/repos" icon={<BookMarked size={18} />}>
             Repositories
+          </SidebarLink>
+          <SidebarLink to="/pulls" icon={<GitPullRequest size={18} />}>
+            Pull requests
           </SidebarLink>
           <SidebarLink to="/sparse" icon={<GitBranch size={18} />}>
             Clone
@@ -156,6 +160,7 @@ function App() {
           <Route path="/ssh" element={<SSHWizard />} />
           <Route path="/github" element={<GitHubAuth />} />
           <Route path="/repos" element={<Repositories />} />
+          <Route path="/pulls" element={<Pulls />} />
           <Route path="/sparse" element={<SparseClone />} />
           <Route path="/repo/:tab" element={<Repo />} />
           <Route path="/repo" element={<Navigate to={`/repo/${rememberedRepoTab()}`} replace />} />

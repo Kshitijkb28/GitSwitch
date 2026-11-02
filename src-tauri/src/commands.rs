@@ -3,7 +3,10 @@ use crate::credentials;
 use crate::doctor::{self, Finding};
 use crate::error::AppError;
 use crate::find_clones;
+use crate::gh_api::Gh;
 use crate::gh_cli;
+use crate::gh_repo;
+use crate::pulls;
 use crate::git_config;
 use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, FetchResult, MergeInfo, RepoRef, SyncStatus};
 use crate::git_remote::{self, RemoteChange};
@@ -313,6 +316,86 @@ pub async fn check_repo_access(
     repo: String,
 ) -> Result<Option<RepoPermissions>, AppError> {
     github::repo_permission(&token, &owner, &repo).await
+}
+
+// --- GitHub: pull requests, reviews, merging, collaborators ---
+// Every command names the account to act as ("gh:<login>" / "signin:<login>");
+// its token is looked up in Rust and never reaches the page.
+
+/// The GitHub repository behind a clone (or "owner/name"), and what each account may do there.
+#[tauri::command]
+pub async fn github_repo_context(repo_path: Option<String>, repo: Option<String>) -> Result<gh_repo::RepoContext, AppError> {
+    gh_repo::context(repo_path, repo).await
+}
+
+/// One page of a repository's pull requests: open, merged, closed (unmerged) or all.
+#[tauri::command]
+pub async fn github_pulls(account: String, owner: String, name: String, state: String, page: u32) -> Result<pulls::PullPage, AppError> {
+    pulls::list(&Gh::for_account(&account).await?, &owner, &name, &state, page).await
+}
+
+/// Pull requests across repositories: created by, review requested of, assigned to, or involving the account.
+#[tauri::command]
+pub async fn github_pulls_search(account: String, scope: String, state: String, repo: Option<String>, page: u32) -> Result<pulls::PullPage, AppError> {
+    pulls::search(&Gh::for_account(&account).await?, &scope, &state, repo.as_deref(), page).await
+}
+
+#[tauri::command]
+pub async fn github_pull(account: String, owner: String, name: String, number: u64) -> Result<pulls::PullDetail, AppError> {
+    pulls::detail(&Gh::for_account(&account).await?, &owner, &name, number).await
+}
+
+#[tauri::command]
+pub async fn github_pull_files(account: String, owner: String, name: String, number: u64) -> Result<pulls::PullFiles, AppError> {
+    pulls::files(&Gh::for_account(&account).await?, &owner, &name, number).await
+}
+
+#[tauri::command]
+pub async fn github_pull_commits(account: String, owner: String, name: String, number: u64) -> Result<Vec<pulls::PullCommit>, AppError> {
+    pulls::commits(&Gh::for_account(&account).await?, &owner, &name, number).await
+}
+
+/// Approve, ask for changes, or comment on a pull request.
+#[tauri::command]
+pub async fn github_pull_review(account: String, owner: String, name: String, number: u64, event: String, body: String) -> Result<pulls::Review, AppError> {
+    pulls::review(&Gh::for_account(&account).await?, &owner, &name, number, &event, &body).await
+}
+
+/// Merge with the head commit that was reviewed (GitHub refuses if it moved since).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn github_pull_merge(
+    account: String,
+    owner: String,
+    name: String,
+    number: u64,
+    method: String,
+    sha: String,
+    title: Option<String>,
+    message: Option<String>,
+    delete_branch: bool,
+) -> Result<pulls::MergeOutcome, AppError> {
+    pulls::merge(&Gh::for_account(&account).await?, &owner, &name, number, &method, &sha, title.as_deref(), message.as_deref(), delete_branch).await
+}
+
+#[tauri::command]
+pub async fn github_collaborators(account: String, owner: String, name: String) -> Result<gh_repo::People, AppError> {
+    gh_repo::people(&Gh::for_account(&account).await?, &owner, &name).await
+}
+
+#[tauri::command]
+pub async fn github_collaborator_add(account: String, owner: String, name: String, username: String, permission: String) -> Result<gh_repo::AddOutcome, AppError> {
+    gh_repo::add(&Gh::for_account(&account).await?, &owner, &name, &username, &permission).await
+}
+
+#[tauri::command]
+pub async fn github_collaborator_remove(account: String, owner: String, name: String, username: String) -> Result<(), AppError> {
+    gh_repo::remove(&Gh::for_account(&account).await?, &owner, &name, &username).await
+}
+
+#[tauri::command]
+pub async fn github_invitation_cancel(account: String, owner: String, name: String, id: u64) -> Result<(), AppError> {
+    gh_repo::cancel_invitation(&Gh::for_account(&account).await?, &owner, &name, id).await
 }
 
 // --- Find repositories: clones no profile folder holds ---

@@ -26,7 +26,7 @@ const status = {
   has_submodules: true,
   stash_count: 2,
 };
-const PAGES = ["Profiles", "SSH Keys", "GitHub Auth", "Repositories", "Clone", "Repository", "Ports", "Auto Assign", "Doctor", "Commit Audit", "Settings"];
+const PAGES = ["Profiles", "SSH Keys", "GitHub Auth", "Repositories", "Pull requests", "Clone", "Repository", "Ports", "Auto Assign", "Doctor", "Commit Audit", "Settings"];
 
 // The app's own content-security policy, served with the page: anything the
 // built app does that the policy forbids shows up here as a violation.
@@ -98,6 +98,11 @@ try {
           if (window.__AUTO__ && cmd in auto) return Promise.resolve(auto[cmd]);
           switch (cmd) {
             case "audit_commits": return Promise.resolve(audit);
+            // GitHub: long names, so the sweep measures the worst rows.
+            case "repo_accounts": return Promise.resolve([{ key: "gh:releaseengineeringautomation", label: "releaseengineeringautomation", source: "GitHub CLI" }]);
+            case "github_repo_context": return Promise.resolve({ owner: "releaseengineeringautomation", name: "platforminfrastructureteamnotifications", not_github: null, profile_login: null, suggested: "gh:releaseengineeringautomation", accounts: [{ account: "gh:releaseengineeringautomation", login: "releaseengineeringautomation", source: "GitHub CLI", permission: "admin", private: true, why: null }] });
+            case "github_pulls":
+            case "github_pulls_search": return Promise.resolve({ items: [{ repo: "releaseengineeringautomation/platforminfrastructureteamnotifications", number: 12345, title: "Releaseengineeringautomationandplatforminfrastructureteamnotifications rework of everything", author: "releaseengineeringautomation", draft: false, state: "open", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", merged_at: null, closed_at: null, head_ref: "feature/releaseengineeringautomationandplatforminfrastructureteam", base_ref: "main", comments: 3, labels: ["enhancement", "needs-review"], html_url: "" }], next_page: null, total: 1 });
             case "doctor_check_profiles": return Promise.resolve([{ id: "folder-missing", severity: "warning", title: "Folder assigned to \"Long\" doesn't exist", detail: "/Users/me/Documents/releaseengineeringautomationandplatforminfrastructureteamnotifications/workspace is not a directory.", fix: null, fix_label: null }]);
             case "get_profiles": return Promise.resolve(profiles);
             case "history_list_repos": return Promise.resolve(repos);
@@ -165,7 +170,7 @@ try {
     await cspCheck(page, "first load");
 
     // The Repository page's other tabs are swept as pages of their own.
-    const STOPS = PAGES.flatMap((n) => (n === "Repository" ? [n, "tab:History", "tab:Submodules"] : [n]));
+    const STOPS = PAGES.flatMap((n) => (n === "Repository" ? [n, "tab:History", "tab:Submodules", "tab:GitHub"] : [n]));
     for (const stop of STOPS) {
       const name = stop.replace(/^tab:/, "");
       // Counted before the click: React runs a page's first effects inside the

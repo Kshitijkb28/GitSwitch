@@ -122,6 +122,12 @@ async function openPage(browser, server, scenario, opts = {}) {
      * `hold`: find_unlisted_repos answers only when the test calls window.__RELEASE_FIND__().
      */
     find: opts.find ?? null,
+    /**
+     * GitHub (the Repository page's GitHub tab and the Pull requests page):
+     * {context, accounts, pulls, search, detail, files, commits, people, reviewRefuse, mergeRefuse}.
+     * Merging, inviting and removing change it, as GitHub would.
+     */
+    gh: opts.gh ?? null,
   };
   // Named, so another engine can be handed the very same bridge (webkit.sh).
   const bridge = (
@@ -461,6 +467,62 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(args.changes.map((c) => ({ profile_id: c.profile_id, path: c.path })));
             case "plugin:dialog|open":
               return Promise.resolve((cfg.find && cfg.find.pick) || null);
+            // GitHub: pull requests, reviews, merging, collaborators
+            case "github_repo_context":
+              return cfg.gh ? Promise.resolve(cfg.gh.context) : Promise.reject("Command execution error: no GitHub here");
+            case "repo_accounts":
+              return Promise.resolve(cfg.gh ? cfg.gh.accounts ?? [] : []);
+            case "github_pulls": {
+              const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
+              const all = gh.pulls.filter((p) => !(gh.merged && p.number === gh.detail.number && args.state === "open")).map((p) => (gh.merged && p.number === gh.detail.number ? { ...p, state: "merged" } : p));
+              const want = all.filter((p) => args.state === "all" || p.state === args.state);
+              const per = 2;
+              const page = args.page || 1;
+              return Promise.resolve({ items: want.slice((page - 1) * per, page * per), next_page: page * per < want.length ? page + 1 : null, total: null });
+            }
+            case "github_pulls_search": {
+              const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
+              return Promise.resolve({ items: gh.search.filter((p) => args.state === "all" || p.state === args.state).filter((p) => !args.repo || p.repo === args.repo), next_page: null, total: gh.search.length });
+            }
+            case "github_pull": {
+              const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
+              const d = { ...gh.detail, ...(gh.details?.[args.number] ?? {}), number: args.number, repo: `${args.owner}/${args.name}` };
+              return Promise.resolve(gh.merged && args.number === gh.detail.number ? { ...d, state: "merged", merged_by: "work-me", merged_at: new Date().toISOString() } : d);
+            }
+            case "github_pull_files":
+              return Promise.resolve(cfg.gh.files);
+            case "github_pull_commits":
+              return Promise.resolve(cfg.gh.commits);
+            case "github_pull_review":
+              if (cfg.gh.reviewRefuse && args.event === "APPROVE") return Promise.reject(`Command execution error: ${cfg.gh.reviewRefuse}`);
+              return Promise.resolve({ login: "work-me", state: args.event === "APPROVE" ? "APPROVED" : args.event === "COMMENT" ? "COMMENTED" : "CHANGES_REQUESTED", submitted_at: null });
+            case "github_pull_merge": {
+              if (cfg.gh.mergeRefuse) return Promise.reject(`Command execution error: ${cfg.gh.mergeRefuse}`);
+              const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
+              gh.merged = true;
+              return Promise.resolve({ merged: true, sha: "m3rg3d", message: "merged", branch_deleted: args.deleteBranch ? true : null, branch_note: args.deleteBranch ? `Branch ${gh.detail.head_ref} deleted.` : null });
+            }
+            case "github_collaborators": {
+              const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
+              return Promise.resolve(gh.people);
+            }
+            case "github_collaborator_add": {
+              const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
+              gh.people.invitations = [...(gh.people.invitations ?? []), { id: 90, login: args.username, role: args.permission, created_at: new Date().toISOString(), inviter: "work-me" }];
+              return Promise.resolve({ status: "invited", message: `Invited ${args.username} — they get access once they accept the invitation GitHub sends them.`, invitation_id: 90 });
+            }
+            case "github_collaborator_remove": {
+              const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
+              gh.people.collaborators = gh.people.collaborators.filter((c) => c.login !== args.username);
+              return Promise.resolve(null);
+            }
+            case "github_invitation_cancel": {
+              const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
+              gh.people.invitations = gh.people.invitations.filter((i) => i.id !== args.id);
+              return Promise.resolve(null);
+            }
+            case "plugin:opener|open_url":
+              return Promise.resolve(null);
             default:
               return Promise.resolve(null);
           }
@@ -5066,9 +5128,9 @@ try {
       const tool = await rowText(page, "tool");
       ok("  and the row says whose email it commits with now, and after", tool.includes("push · me-work") && tool.includes("Commits as Personal · after adding: Work"), tool);
       const pub = await rowText(page, "public-lib");
-      ok("a public repository nobody can push to is not proposed", pub.includes("anyone can read it") && pub.includes("Don't add"), pub);
+      ok("a public repository nobody can push to is not proposed", pub.includes("anyone can read it") && pub.includes("Pick a profile"), pub);
       const sso = await rowText(page, "sso");
-      ok("a check GitHub could not answer proposes nothing and says why", sso.includes("check failed · me-work: single sign-on") && sso.includes("Don't add"), sso);
+      ok("a check GitHub could not answer proposes nothing and says why", sso.includes("check failed · me-work: single sign-on") && sso.includes("Pick a profile"), sso);
       ok("a repository that is not on GitHub says so", (await rowText(page, "local-only")).includes("not on GitHub"));
       const ruled = await rowText(page, "ruled");
       ok("a clone a remote rule already gives a profile is proposed to that profile", ruled.includes("Work's remote rule") && ruled.includes("Work (me-work)"), ruled);
@@ -5167,6 +5229,319 @@ try {
       await sleep(500);
       const again = (await calls(page, "find_unlisted_repos")).pop() ?? {};
       ok("Also look in… adds the folder picked and searches again", (again.extraRoots ?? []).includes("/extra/place"), JSON.stringify(again));
+      await page.close();
+    }
+
+    section("Find repositories: tick what to add — select all, clear matches, filter chips, search, one profile for the ticked ones, hide");
+    {
+      const NINE = { ...FIND, result: { ...FOUND, repos: [...FOUND.repos, fr("zeta-extra", { owner: "me-home" })] } };
+      const page = await open(SCENARIOS.clean, { find: NINE, storage: { "findrepos.searched": true } });
+      await openFind(page);
+      await waitRows(page, 9);
+      const picked = () => page.evaluate(() => document.querySelector("[data-find-picked]")?.innerText ?? "");
+      const tick = (name) => page.evaluate((name) => document.querySelector(`input[aria-label="Select ${name}"]`)?.click(), name);
+      const chip = (k) => page.evaluate((k) => document.querySelector(`[data-find-chip="${k}"]`)?.click(), k);
+      const chipText = (k) => page.evaluate((k) => document.querySelector(`[data-find-chip="${k}"]`)?.innerText ?? "", k);
+      ok("rows with a proposed profile start ticked; the count says so", (await picked()) === "5 of 9 selected", await picked());
+      ok("  the chips count clear matches, rows needing a choice and rows not on GitHub", (await chipText("clear")) === "Clear match 4" && (await chipText("offline")) === "Not on GitHub 1" && (await chipText("choose")) === "Needs a choice 4", [await chipText("clear"), await chipText("choose"), await chipText("offline")].join(" | "));
+      await chip("offline");
+      await sleep(150);
+      ok("a chip shows only its rows", JSON.stringify(await rowNames(page)) === JSON.stringify(["local-only"]), JSON.stringify(await rowNames(page)));
+      await chip("all");
+      await press(page, "Select none");
+      await sleep(150);
+      ok("Select none unticks everything, and Add has nothing to add", (await picked()) === "0 of 9 selected" && (await has(page, "Add 0 repositories to their profiles")));
+      await press(page, "Select clear matches");
+      await sleep(150);
+      ok("Select clear matches ticks exactly the clear ones", (await picked()) === "4 of 9 selected", await picked());
+      await page.evaluate(() => document.querySelector('input[aria-label="Select all"]')?.click());
+      await sleep(150);
+      ok("Select all ticks every row", (await picked()) === "9 of 9 selected", await picked());
+      await page.evaluate(() => document.querySelector('input[aria-label="Select all"]')?.click());
+      await sleep(150);
+      ok("  and unticks them again", (await picked()) === "0 of 9 selected", await picked());
+
+      const filterBox = await page.$('input[aria-label="Filter repositories"]');
+      ok("with more than eight rows there is a filter box", !!filterBox);
+      await filterBox?.type("zeta");
+      await sleep(150);
+      ok("  typing filters the rows by name, folder or owner", JSON.stringify(await rowNames(page)) === JSON.stringify(["zeta-extra"]), JSON.stringify(await rowNames(page)));
+      await page.evaluate(() => document.querySelector('input[aria-label="Select all shown"]')?.click());
+      await sleep(150);
+      ok("  Select all then ticks only the rows shown", (await picked()) === "1 of 9 selected", await picked());
+      await filterBox?.click({ clickCount: 3 });
+      await page.keyboard.press("Backspace");
+      await sleep(150);
+
+      await tick("feature-wt");
+      await tick("public-lib");
+      await sleep(150);
+      ok("ticking rows adds them to the count", (await picked()) === "3 of 9 selected", await picked());
+      ok("  a ticked row with no profile says it will be skipped, and so does the footer", (await rowText(page, "public-lib")).includes("Pick a profile for it, or it is skipped") && (await text(page)).includes("2 selected have no profile and are skipped"), await rowText(page, "public-lib"));
+      await page.evaluate(() => [...document.querySelectorAll("[data-find-bulk] button")].find((b) => b.innerText.trim() === "Pick a profile")?.click());
+      await sleep(150);
+      await page.evaluate(() => [...document.querySelectorAll("[data-find-bulk] button")].find((b) => b.innerText.trim().startsWith("Work"))?.click());
+      await sleep(200);
+      const note = await page.evaluate(() => document.querySelector("[data-find-bulk] [role=status]")?.innerText ?? "");
+      ok("one profile for the ticked rows: set where it can be, kept where git already ties the row to another", note.includes("2 repositories set to Work") && note.includes("1 kept the profile git already uses for it: feature-wt"), note);
+      ok("  the rows show it", (await rowText(page, "public-lib")).includes("Work (me-work)") && (await rowText(page, "feature-wt")).includes("Personal"), await rowText(page, "public-lib"));
+
+      await page.evaluate(() => document.querySelector('button[aria-label="Hide sso"]')?.click());
+      await sleep(200);
+      ok("Hide takes a row off the list, and remembers it", !(await rowNames(page)).includes("sso") && (await page.evaluate(() => localStorage.getItem("gitswitch:findrepos.hidden") ?? "")).includes("/sso") && (await text(page)).toLowerCase().includes("1 hidden"), JSON.stringify(await rowNames(page)));
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "show them")?.click());
+      await sleep(150);
+      ok("  show them brings it back greyed, with Show again", (await rowNames(page)).includes("sso") && (await rowText(page, "sso")).includes("Show again"));
+
+      await press(page, "Add 3 repositories to their profiles");
+      await page.waitForFunction(() => document.body.innerText.includes("Added 3 repositories"), { timeout: 4000 }).catch(() => null);
+      const added = ((await calls(page, "profile_folders_add"))[0]?.changes ?? []).map((c) => `${c.path.split("/").pop()}:${c.profile_id}`);
+      ok("Add takes only the ticked rows that have a profile", JSON.stringify(added) === JSON.stringify(["feature-wt:pp", "public-lib:pw", "zeta-extra:pw"]), JSON.stringify(added));
+      await page.close();
+
+      const again = await open(SCENARIOS.clean, { find: FIND, storage: { "findrepos.searched": true, "findrepos.autoAdd": true, "findrepos.hidden": ["/Users/me/code/mine"] } });
+      await openFind(again);
+      await again.waitForFunction(() => document.body.innerText.includes("Added 3 repositories"), { timeout: 6000 }).catch(() => null);
+      const auto = ((await calls(again, "profile_folders_add"))[0]?.changes ?? []).map((c) => c.path.split("/").pop());
+      ok("a hidden row is never added straight away", JSON.stringify(auto) === JSON.stringify(["feature-wt", "ruled", "tool"]), JSON.stringify(auto));
+      await again.close();
+    }
+  }
+
+  // --- GitHub: pull requests, review & merge, collaborators -----------------
+  {
+    const PR = (n, state, extra = {}) => ({
+      repo: "acme/app", number: n, title: `PR ${n}`, author: "me-home", draft: false, state, created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-30T00:00:00Z",
+      merged_at: state === "merged" ? "2026-10-20T00:00:00Z" : null, closed_at: state === "open" ? null : "2026-10-20T00:00:00Z", head_ref: `feat/${n}`, base_ref: "main",
+      comments: null, labels: [], html_url: `https://github.com/acme/app/pull/${n}`, ...extra,
+    });
+    const DETAIL = {
+      repo: "acme/app", number: 1, title: "PR 1", body: "Adds the thing.", author: "me-home", state: "open", draft: false, merged_by: null, merged_at: null,
+      mergeable: true, mergeable_state: "clean", head_ref: "feat/1", head_sha: "abc1234def5678", head_repo: "acme/app", base_ref: "main", default_branch: "main",
+      additions: 3, deletions: 1, changed_files: 2, commits: 2, comments: 1, created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-30T00:00:00Z",
+      html_url: "https://github.com/acme/app/pull/1", merge_methods: ["merge", "squash"], merge_methods_known: true, can_push: true, is_admin: true, viewer: "work-me",
+      reviews: [{ login: "pal", state: "APPROVED", submitted_at: "2026-10-29T00:00:00Z" }], checks: [{ name: "build", state: "success", url: null }, { name: "lint", state: "failure", url: null }],
+      notes: [], can_delete_branch: true,
+    };
+    const GH = {
+      context: {
+        owner: "acme", name: "app", not_github: null, profile_login: "work-me", suggested: "gh:work-me",
+        accounts: [
+          { account: "gh:me-home", login: "me-home", source: "GitHub CLI", permission: "read", private: true, why: null },
+          { account: "gh:work-me", login: "work-me", source: "GitHub CLI", permission: "admin", private: true, why: null },
+        ],
+      },
+      accounts: [{ key: "gh:me-home", label: "me-home", source: "GitHub CLI" }, { key: "gh:work-me", label: "work-me", source: "GitHub CLI" }],
+      pulls: [PR(1, "open"), PR(2, "open", { draft: true, title: "Draft thing" }), PR(3, "merged"), PR(4, "closed"), PR(5, "merged", { title: "Old fix" })],
+      search: [PR(9, "open", { repo: "other/lib", title: "Elsewhere", head_ref: null, base_ref: null, comments: 2, author: "pal" }), PR(10, "merged", { repo: "acme/app", title: "Mine merged", head_ref: null, base_ref: null })],
+      detail: DETAIL,
+      details: { 2: { draft: true, title: "Draft thing", head_ref: "feat/2" } },
+      files: { truncated: false, files: [
+        { path: "src/a.txt", previous_path: null, status: "modified", additions: 1, deletions: 1, diff: { path: "src/a.txt", staged: false, lines: [{ kind: "hunk", text: "@@ -1 +1 @@" }, { kind: "del", text: "-old line" }, { kind: "add", text: "+new line" }], is_binary: false, truncated: false, total_lines: 3, added: 1, removed: 1, empty_reason: null } },
+        { path: "logo.png", previous_path: null, status: "added", additions: 0, deletions: 0, diff: { path: "logo.png", staged: false, lines: [], is_binary: false, truncated: false, total_lines: 0, added: 0, removed: 0, empty_reason: "GitHub shows no diff for this file (binary, or too large)." } },
+      ] },
+      commits: [{ sha: "c1aaaaaaaa", title: "first", author: "me-home", date: null }, { sha: "c2bbbbbbbb", title: "second", author: "pal", date: null }],
+      people: { collaborators: [{ login: "acme", role: "admin", is_owner: true }, { login: "pal", role: "write", is_owner: false }], invitations: [{ id: 77, login: "newbie", role: "write", created_at: "2026-10-30T00:00:00Z", inviter: "work-me" }], note: null },
+    };
+    const gcalls = (page, cmd) => page.evaluate((cmd) => window.__CALLS__.filter((c) => c.cmd === cmd).map((c) => c.args), cmd);
+    const pullRows = (page) => page.evaluate(() => [...document.querySelectorAll("[data-pull-row]")].map((r) => r.dataset.pullRow));
+    const clickText = (page, sel, label) => page.evaluate((sel, label) => { const b = [...document.querySelectorAll(sel)].find((x) => x.innerText.trim() === label); b?.click(); return !!b; }, sel, label);
+    const pill = (page, label) => clickText(page, "[role=group] button", label);
+    const inPanel = (page, label) => page.evaluate((label) => { const d = document.querySelector('[role=dialog][aria-label^="Pull request"]'); const b = d && [...d.querySelectorAll("button")].find((x) => x.innerText.trim() === label); if (b && !b.disabled) b.click(); return b ? (b.disabled ? "disabled" : "clicked") : "missing"; }, label);
+    const panelText = (page) => page.evaluate(() => document.querySelector('[role=dialog][aria-label^="Pull request"]')?.innerText ?? "");
+    const openTab = async (page) => {
+      await page.evaluate(() => [...document.querySelectorAll('[role=tab]')].find((t) => t.innerText.trim() === "GitHub")?.click());
+      await page.waitForFunction(() => document.querySelectorAll("[data-pull-row]").length > 0, { timeout: 5000 }).catch(() => null);
+    };
+
+    section("GitHub tab: the open repository's pull requests, as the profile's account — filters, Load more, Refresh, another account");
+    {
+      const page = await open(SCENARIOS.clean, { gh: GH });
+      ok("the Repository page has a GitHub tab", await page.evaluate(() => [...document.querySelectorAll('[role=tab]')].some((t) => t.innerText.trim() === "GitHub")));
+      ok("  nothing is asked of GitHub before the tab is opened", (await gcalls(page, "github_repo_context")).length === 0);
+      await openTab(page);
+      ok("opening it asks which account can act on the open repository", JSON.stringify((await gcalls(page, "github_repo_context"))[0]) === JSON.stringify({ repoPath: "/repos/gitswitch", repo: null }), JSON.stringify(await gcalls(page, "github_repo_context")));
+      const t = await text(page);
+      ok("  it acts as the profile's own account, and says what it may do", t.includes("acme/app") && t.includes("work-me · admin · this profile"), t.slice(0, 600));
+      ok("  the open pull requests, as that account", JSON.stringify((await gcalls(page, "github_pulls"))[0]) === JSON.stringify({ account: "gh:work-me", owner: "acme", name: "app", state: "open", page: 1 }) && JSON.stringify(await pullRows(page)) === JSON.stringify(["acme/app#1", "acme/app#2"]), JSON.stringify(await gcalls(page, "github_pulls")));
+      ok("  a draft says so", (await page.evaluate(() => document.querySelector('[data-pull-row="acme/app#2"]')?.innerText ?? "")).includes("Draft"));
+      await pill(page, "Merged");
+      await sleep(250);
+      ok("Merged: only the merged ones", (await gcalls(page, "github_pulls")).at(-1)?.state === "merged" && JSON.stringify(await pullRows(page)) === JSON.stringify(["acme/app#3", "acme/app#5"]), JSON.stringify(await pullRows(page)));
+      await pill(page, "Closed");
+      await sleep(250);
+      ok("Closed: the ones closed without merging", JSON.stringify(await pullRows(page)) === JSON.stringify(["acme/app#4"]), JSON.stringify(await pullRows(page)));
+      await pill(page, "All");
+      await sleep(250);
+      ok("All: the first page, and Load more", (await pullRows(page)).length === 2 && !!(await button(page, "Load more")));
+      await (await button(page, "Load more"))?.click();
+      await sleep(250);
+      ok("  Load more asks for the next page and adds it", (await gcalls(page, "github_pulls")).at(-1)?.page === 2 && (await pullRows(page)).length === 4, JSON.stringify(await pullRows(page)));
+      await page.type('input[aria-label="Filter pull requests"]', "old fix");
+      await sleep(150);
+      ok("the filter box narrows what is loaded", JSON.stringify(await pullRows(page)) === JSON.stringify([]) || JSON.stringify(await pullRows(page)) === JSON.stringify(["acme/app#5"]), JSON.stringify(await pullRows(page)));
+      await page.click('input[aria-label="Filter pull requests"]', { clickCount: 3 });
+      await page.keyboard.press("Backspace");
+      const before = (await gcalls(page, "github_pulls")).length;
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Refresh" && b.title === "Read the pull requests again")?.click());
+      await sleep(250);
+      ok("Refresh reads the list again", (await gcalls(page, "github_pulls")).length === before + 1);
+      ok("  the state picked is remembered", (await page.evaluate(() => localStorage.getItem("gitswitch:github.pullState"))) === '"all"');
+      await pill(page, "Open");
+      await sleep(200);
+      // Act as the other account.
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("work-me · admin"))?.click());
+      await sleep(100);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("me-home · can read"))?.click());
+      await sleep(250);
+      ok("another account picked: the list is asked as it, and the pick is remembered for this repository", (await gcalls(page, "github_pulls")).at(-1)?.account === "gh:me-home" && (await page.evaluate(() => localStorage.getItem("gitswitch:github.actingAs") ?? "")).includes('"acme/app":"gh:me-home"'), JSON.stringify((await gcalls(page, "github_pulls")).at(-1)));
+      await page.close();
+
+      const notGh = await open(SCENARIOS.clean, { gh: { ...GH, context: { owner: null, name: null, not_github: "Its remote (https://gitlab.com/x/y.git) is not on GitHub.", accounts: [], suggested: null, profile_login: null } } });
+      await notGh.evaluate(() => [...document.querySelectorAll('[role=tab]')].find((t) => t.innerText.trim() === "GitHub")?.click());
+      await sleep(400);
+      ok("a repository whose remote is not on GitHub says so, and asks nothing more", (await text(notGh)).includes("is not on GitHub. Pull requests and collaborators are for repositories on GitHub.") && (await gcalls(notGh, "github_pulls")).length === 0);
+      await notGh.close();
+    }
+
+    section("Pull request: files with diffs, commits, checks and reviews; a review; merging with the reviewed commit");
+    {
+      const page = await open(SCENARIOS.clean, { gh: GH });
+      await openTab(page);
+      await page.evaluate(() => document.querySelector('[data-pull-row="acme/app#1"]')?.click());
+      await page.waitForFunction(() => (document.querySelector('[role=dialog][aria-label^="Pull request"]')?.innerText ?? "").includes("No conflicts"), { timeout: 5000 }).catch(() => null);
+      let pt = await panelText(page);
+      ok("a row opens the pull request, as the account acting", JSON.stringify((await gcalls(page, "github_pull"))[0]) === JSON.stringify({ account: "gh:work-me", owner: "acme", name: "app", number: 1 }));
+      ok("  what it merges, where, and its size", pt.includes("me-home wants to merge 2 commits into main from feat/1") && pt.includes("+3") && pt.includes("−1"), pt.slice(0, 400));
+      ok("  whether it can be merged, its checks and its reviews", pt.includes("No conflicts with the base branch") && pt.toLowerCase().includes("checks · 1 of 2 passed") && /pal\s+approved/.test(pt) && pt.includes("Adds the thing."), pt.slice(200, 1200));
+      ok("  the files are read only when asked for", (await gcalls(page, "github_pull_files")).length === 0);
+      await clickText(page, '[role=dialog] [role=tab]', "Files (2)");
+      await page.waitForFunction(() => document.querySelectorAll("[data-pull-file]").length === 2, { timeout: 4000 }).catch(() => null);
+      ok("Files: each changed file with its size", (await gcalls(page, "github_pull_files")).length === 1 && (await panelText(page)).includes("2 files changed"));
+      await page.evaluate(() => document.querySelector('[data-pull-file="src/a.txt"] button')?.click());
+      await sleep(150);
+      pt = await panelText(page);
+      ok("  a file opens to its diff", pt.includes("-old line") && pt.includes("+new line"), pt.slice(0, 900));
+      await page.evaluate(() => [...document.querySelectorAll("[role=dialog] button")].find((b) => b.innerText.trim() === "Expand all")?.click());
+      await sleep(150);
+      ok("  Expand all opens every file, and a file without a diff says why", (await panelText(page)).includes("GitHub shows no diff for this file (binary, or too large)."));
+      await clickText(page, '[role=dialog] [role=tab]', "Commits (2)");
+      await sleep(250);
+      ok("Commits: each with its first line and author", (await panelText(page)).includes("first") && (await panelText(page)).includes("c2bbbbb"));
+
+      await page.type('textarea[aria-label="Review comment"]', "Nice work");
+      await inPanel(page, "Comment");
+      await sleep(250);
+      ok("a comment is sent as a review, with its words", JSON.stringify((await gcalls(page, "github_pull_review")).at(-1)) === JSON.stringify({ account: "gh:work-me", owner: "acme", name: "app", number: 1, event: "COMMENT", body: "Nice work" }), JSON.stringify(await gcalls(page, "github_pull_review")));
+      ok("  Request changes waits for words", (await inPanel(page, "Request changes")) === "disabled");
+
+      // Merge: squash, delete the branch.
+      await page.evaluate(() => { const d = document.querySelector('[role=dialog][aria-label^="Pull request"]'); [...d.querySelectorAll("section[aria-label=Merge] button")].find((b) => b.innerText.includes("Create a merge commit"))?.click(); });
+      await sleep(100);
+      await page.evaluate(() => [...document.querySelectorAll("section[aria-label=Merge] button")].find((b) => b.innerText.trim() === "Squash and merge")?.click());
+      await page.evaluate(() => document.querySelector('input[aria-label="Delete the branch after merging"]')?.click());
+      await sleep(100);
+      ok("the merge methods are the ones the repository allows", !(await panelText(page)).includes("Rebase and merge"));
+      await inPanel(page, "Merge");
+      await sleep(200);
+      const confirm = await page.evaluate(() => [...document.querySelectorAll("h2")].find((h) => h.innerText === "Merge pull request #1?")?.parentElement?.parentElement?.innerText ?? "");
+      ok("Merge asks first: what goes where, how, as whom, and only the reviewed commit", confirm.includes("feat/1 goes into main of acme/app by squashing, as @work-me") && confirm.includes("(up to abc1234)") && confirm.includes("The branch feat/1 is deleted afterwards."), confirm);
+      ok("  nothing was merged before confirming", (await gcalls(page, "github_pull_merge")).length === 0);
+      const listBefore = (await gcalls(page, "github_pulls")).length;
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Merge #1")?.click());
+      await page.waitForFunction(() => (document.querySelector('[role=dialog][aria-label^="Pull request"]')?.innerText ?? "").includes("Merged by work-me"), { timeout: 4000 }).catch(() => null);
+      const m = (await gcalls(page, "github_pull_merge"))[0] ?? {};
+      ok("  confirmed: merged by squashing, with the reviewed commit and title, the branch deleted", m.method === "squash" && m.sha === "abc1234def5678" && m.title === "PR 1 (#1)" && m.deleteBranch === true, JSON.stringify(m));
+      ok("  the pull request reads merged, and the list is read again", (await panelText(page)).includes("Merged by work-me") && (await gcalls(page, "github_pulls")).length > listBefore, `${(await gcalls(page, "github_pulls")).length} > ${listBefore}; ${(await panelText(page)).slice(0, 300)}`);
+      ok("  a merged one offers no review or merge", (await inPanel(page, "Merge")) === "missing" && (await inPanel(page, "Comment")) === "missing");
+      await page.evaluate(() => document.querySelector('button[aria-label="Close pull request"]')?.click());
+      await sleep(200);
+      ok("closing it goes back to the list, now without it open", !(await panelText(page)) && JSON.stringify(await pullRows(page)) === JSON.stringify(["acme/app#2"]), JSON.stringify(await pullRows(page)));
+      await page.evaluate(() => document.querySelector('[data-pull-row="acme/app#2"]')?.click());
+      await page.waitForFunction(() => (document.querySelector('[role=dialog][aria-label^="Pull request"]')?.innerText ?? "").includes("draft"), { timeout: 4000 }).catch(() => null);
+      ok("a draft cannot be merged, and says why", (await inPanel(page, "Merge")) === "disabled" && (await panelText(page)).includes("A draft cannot be merged."));
+      await page.close();
+
+      const own = await open(SCENARIOS.clean, { gh: { ...GH, detail: { ...DETAIL, author: "work-me", mergeable: false, mergeable_state: "dirty" }, reviewRefuse: "x" } });
+      await openTab(own);
+      await own.evaluate(() => document.querySelector('[data-pull-row="acme/app#1"]')?.click());
+      await own.waitForFunction(() => (document.querySelector('[role=dialog][aria-label^="Pull request"]')?.innerText ?? "").includes("conflicts"), { timeout: 4000 }).catch(() => null);
+      ok("on your own pull request Approve and Request changes are not offered, and why", (await inPanel(own, "Approve")) === "missing" && (await inPanel(own, "Request changes")) === "missing" && (await panelText(own)).includes("only lets them comment"));
+      ok("conflicts: said, and Merge waits", (await panelText(own)).includes("This branch has conflicts with main") && (await inPanel(own, "Merge")) === "disabled");
+      await own.close();
+
+      const refuse = await open(SCENARIOS.clean, { gh: { ...GH, detail: { ...DETAIL, author: "pal" }, reviewRefuse: "GitHub does not let @work-me approve their own pull request.", mergeRefuse: "New commits were pushed to this branch after you reviewed it, so nothing was merged. Refresh, look at them, and merge again." } });
+      await openTab(refuse);
+      await refuse.evaluate(() => document.querySelector('[data-pull-row="acme/app#1"]')?.click());
+      await refuse.waitForFunction(() => (document.querySelector('[role=dialog][aria-label^="Pull request"]')?.innerText ?? "").includes("No conflicts"), { timeout: 4000 }).catch(() => null);
+      await inPanel(refuse, "Approve");
+      await sleep(250);
+      ok("a refused review shows GitHub's reason in the panel", (await panelText(refuse)).includes("does not let @work-me approve"));
+      await inPanel(refuse, "Merge");
+      await sleep(150);
+      await refuse.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Merge #1")?.click());
+      await sleep(300);
+      ok("a refused merge says why, and the pull request stays open", (await panelText(refuse)).includes("New commits were pushed to this branch after you reviewed it") && (await inPanel(refuse, "Merge")) === "clicked");
+      await refuse.close();
+    }
+
+    section("Collaborators: who it is shared with, invite with a role, remove after asking, cancel an invitation; a non-admin sees why not");
+    {
+      const page = await open(SCENARIOS.clean, { gh: GH });
+      await openTab(page);
+      await pill(page, "Collaborators");
+      await page.waitForFunction(() => document.querySelectorAll("[data-collaborator]").length > 0, { timeout: 4000 }).catch(() => null);
+      const t = await text(page);
+      ok("the collaborators with their roles, the owner marked, and the invitations waiting", t.includes("Collaborators · 2") && (await page.evaluate(() => document.querySelector('[data-collaborator="acme"]')?.innerText ?? "")).includes("owner") && (await page.evaluate(() => document.querySelector('[data-invitation="newbie"]')?.innerText ?? "")).includes("write"), t.slice(0, 800));
+      ok("  the section picked is remembered", (await page.evaluate(() => localStorage.getItem("gitswitch:github.section"))) === '"people"');
+      await page.type('input[aria-label="GitHub username to invite"]', "friend");
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Write")?.click());
+      await sleep(100);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Maintain")?.click());
+      await sleep(100);
+      await (await button(page, "Invite"))?.click();
+      await sleep(300);
+      ok("Invite sends the username and the role picked, then shows the invitation", JSON.stringify((await gcalls(page, "github_collaborator_add"))[0]) === JSON.stringify({ account: "gh:work-me", owner: "acme", name: "app", username: "friend", permission: "maintain" }) && !!(await page.$('[data-invitation="friend"]')), JSON.stringify(await gcalls(page, "github_collaborator_add")));
+      await page.evaluate(() => document.querySelector('button[aria-label="Remove pal"]')?.click());
+      await sleep(150);
+      ok("Remove asks first, and nothing is removed yet", (await text(page)).includes("pal loses access to acme/app") && (await gcalls(page, "github_collaborator_remove")).length === 0);
+      await (await button(page, "Remove access"))?.click();
+      await sleep(300);
+      ok("  confirmed: removed", JSON.stringify((await gcalls(page, "github_collaborator_remove"))[0]) === JSON.stringify({ account: "gh:work-me", owner: "acme", name: "app", username: "pal" }) && !(await page.$('[data-collaborator="pal"]')));
+      await page.evaluate(() => document.querySelector('button[aria-label="Cancel the invitation for newbie"]')?.click());
+      await sleep(300);
+      ok("cancelling an invitation takes it away", (await gcalls(page, "github_invitation_cancel"))[0]?.id === 77 && !(await page.$('[data-invitation="newbie"]')));
+      await page.close();
+
+      const reader = await open(SCENARIOS.clean, { gh: { ...GH, context: { ...GH.context, suggested: "gh:me-home", profile_login: "me-home" } } });
+      await openTab(reader);
+      await pill(reader, "Collaborators");
+      await sleep(400);
+      ok("an account that is not an admin: inviting and removing are greyed, and it says why", (await text(reader)).includes("Only an admin of this repository can change who has access") && (await reader.$eval('input[aria-label="GitHub username to invite"]', (i) => i.disabled)));
+      await reader.close();
+    }
+
+    section("Pull requests page: across repositories, by whose and by state; a row opens it as that account");
+    {
+      const page = await open(SCENARIOS.clean, { gh: GH });
+      await page.evaluate(() => [...document.querySelectorAll("nav a, aside a, a")].find((a) => a.innerText.trim() === "Pull requests")?.click());
+      await page.waitForFunction(() => document.querySelectorAll("[data-pull-row]").length > 0, { timeout: 5000 }).catch(() => null);
+      ok("the sidebar has a Pull requests page", (await text(page)).includes("Across every repository your account works on"));
+      ok("  it asks for the ones waiting for the first account's review, open", JSON.stringify((await gcalls(page, "github_pulls_search"))[0]) === JSON.stringify({ account: "gh:me-home", scope: "review_requested", state: "open", repo: null, page: 1 }), JSON.stringify(await gcalls(page, "github_pulls_search")));
+      ok("  each row names its repository", (await page.evaluate(() => document.querySelector('[data-pull-row="other/lib#9"]')?.innerText ?? "")).includes("other/lib #9 by pal"));
+      await pill(page, "Created by me");
+      await sleep(200);
+      await pill(page, "Merged");
+      await sleep(200);
+      const last = (await gcalls(page, "github_pulls_search")).at(-1) ?? {};
+      ok("whose and which state change the search", last.scope === "created" && last.state === "merged" && JSON.stringify(await pullRows(page)) === JSON.stringify(["acme/app#10"]), JSON.stringify(last));
+      await page.type('input[aria-label="Only in repository"]', "acme/app");
+      await page.keyboard.press("Enter");
+      await sleep(200);
+      ok("one repository only", (await gcalls(page, "github_pulls_search")).at(-1)?.repo === "acme/app");
+      await page.evaluate(() => document.querySelector('[data-pull-row="acme/app#10"]')?.click());
+      await sleep(400);
+      ok("a row opens the pull request, as the account picked", JSON.stringify((await gcalls(page, "github_pull")).at(-1)) === JSON.stringify({ account: "gh:me-home", owner: "acme", name: "app", number: 10 }));
       await page.close();
     }
   }
