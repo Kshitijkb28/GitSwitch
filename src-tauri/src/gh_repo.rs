@@ -161,7 +161,7 @@ pub struct People {
     pub note: Option<String>,
 }
 
-fn role_of(v: &Value) -> String {
+pub(crate) fn role_of(v: &Value) -> String {
     if let Some(r) = v.get("role_name").and_then(|r| r.as_str()).filter(|r| !r.is_empty()) {
         return r.to_string();
     }

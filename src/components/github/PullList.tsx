@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import { GitBranch, Loader2, MessageSquare, Search as SearchIcon } from "lucide-react";
 import * as api from "../../lib/api";
 import { Button } from "../Button";
@@ -11,9 +11,10 @@ export type PullSource = { kind: "repo"; owner: string; name: string } | { kind:
 const sourceKey = (s: PullSource) => (s.kind === "repo" ? `repo:${s.owner}/${s.name}` : `search:${s.scope}:${s.repo ?? ""}`);
 
 /**
- * Pull requests, newest activity first: one repository's, or a search across
- * repositories. Open / Merged / Closed / All, a filter over what is loaded,
- * Refresh, and Load more. A row opens the pull request.
+ * Pull requests, newest activity first: one repository's, or a search (whose:
+ * created by, review asked of, assigned to, involving the account — in one
+ * repository or across them). Open / Merged / Closed / All, a filter over what
+ * is loaded, Refresh, and Load more. A row opens the pull request.
  */
 export function PullList({
   account,
@@ -22,8 +23,7 @@ export function PullList({
   onState,
   onOpen,
   reloadKey = 0,
-  toolbar,
-  onRefresh,
+  hideRefresh = false,
 }: {
   account: string;
   source: PullSource;
@@ -32,10 +32,8 @@ export function PullList({
   onOpen: (item: api.PullItem) => void;
   /** Bumped by the owner to read the list again (after a merge…). */
   reloadKey?: number;
-  /** More controls before the state pills (the page's scope picker…). */
-  toolbar?: ReactNode;
-  /** Refresh pressed: whatever else the owner read should be read again too. */
-  onRefresh?: () => void;
+  /** The page has its own Refresh that reads this list again too (through reloadKey). */
+  hideRefresh?: boolean;
 }) {
   const [items, setItems] = useState<api.PullItem[]>([]);
   const [next, setNext] = useState<number | null>(null);
@@ -96,25 +94,18 @@ export function PullList({
   const shown = q
     ? items.filter((i) => [`#${i.number}`, i.title, i.author, i.head_ref ?? "", i.repo, ...i.labels].some((t) => t.toLowerCase().includes(q)))
     : items;
-  const showRepo = source.kind === "search";
+  // A search across repositories names each row's repository; one repository's list need not.
+  const showRepo = source.kind === "search" && !source.repo;
 
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-x-3 gap-y-2 flex-wrap">
-        {toolbar}
         <Segmented label="Pull request state" value={state} onChange={onState} options={STATE_OPTIONS} />
         <div className="relative flex-1 min-w-[12rem]">
           <SearchIcon size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-500 pointer-events-none" />
           <Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter by title, number, author or branch" aria-label="Filter pull requests" className="!py-1.5 pl-8 text-sm" />
         </div>
-        <RefreshButton
-          onClick={() => {
-            onRefresh?.();
-            void load();
-          }}
-          busy={loading}
-          title="Read the pull requests again"
-        />
+        {!hideRefresh && <RefreshButton onClick={() => void load()} busy={loading} title="Read the pull requests again" />}
       </div>
 
       {error && (

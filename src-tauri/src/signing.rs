@@ -99,6 +99,27 @@ pub fn write_allowed_signers(profiles: &[Profile]) -> Result<usize, AppError> {
     Ok(count)
 }
 
+/// Whether ~/.ssh/allowed_signers holds GitSwitch's block.
+pub(crate) fn has_managed_signers() -> bool {
+    fs::read_to_string(allowed_signers_path()).is_ok_and(|c| c.lines().any(|l| l.trim() == BEGIN))
+}
+
+/// Take GitSwitch's block out of ~/.ssh/allowed_signers; hand-written entries
+/// stay. A file left with nothing in it is removed. False when there was no block.
+pub fn remove_managed_signers() -> Result<bool, AppError> {
+    if !has_managed_signers() {
+        return Ok(false);
+    }
+    let path = allowed_signers_path();
+    let rest = strip_managed(&fs::read_to_string(&path)?);
+    if rest.trim().is_empty() {
+        fs::remove_file(&path)?;
+    } else {
+        fs::write(&path, format!("{}\n", rest))?;
+    }
+    Ok(true)
+}
+
 /// The gitconfig stanza that turns on SSH commit signing for one profile.
 /// `user.signingkey` points at the PUBLIC key — that's what gpg.format=ssh wants.
 pub fn signing_config_block(profile: &Profile) -> Option<String> {

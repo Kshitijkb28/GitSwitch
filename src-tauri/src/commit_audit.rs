@@ -4,7 +4,7 @@ use crate::repo_scan;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-const MARKER: &str = "GitSwitch identity guard";
+pub(crate) const MARKER: &str = "GitSwitch identity guard";
 const MAX_COMMITS_PER_REPO: usize = 60;
 
 #[derive(Debug, Serialize, Clone)]

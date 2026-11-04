@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ScanSearch,
   FolderOpen,
   Loader2,
   CheckCircle2,
   Folder,
+  Square,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Button } from "../components/Button";
@@ -34,6 +35,28 @@ interface RepoRow {
   failedLogins: string[];
   currentProfileId: string | null;
   proposedProfileId: string;
+  /** Which chip it is under — from the proposal, so a row doesn't jump while its pick is changed. */
+  kind: Kind;
+}
+
+/** To assign (new, or moving to another profile) · already in a profile · nothing to assign it to. */
+type Kind = "assign" | "assigned" | "none";
+const kindOf = (current: string | null, proposed: string): Kind =>
+  proposed && proposed !== current ? "assign" : current ? "assigned" : "none";
+const KIND_LABEL: Record<"all" | Kind, string> = { all: "All", assign: "To assign", assigned: "Already assigned", none: "Not assignable" };
+
+function newScanId(): string {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return `scan-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+}
+
+/** The part of `path` below `root`, in the path's own spelling ("" when it is the root). */
+function below(path: string, root: string): string | null {
+  if (!root || !isWithin(path, root)) return null;
+  return path.slice(normPath(root).length).replace(/^[\\/]+/, "");
 }
 
 function currentProfileFor(repoPath: string, profiles: Profile[]): Profile | null {
@@ -61,6 +84,24 @@ export function AutoAssign() {
   const [loginSources, setLoginSources] = useState<Record<string, "key" | "saved" | null>>({});
   const [rows, setRows] = useState<RepoRow[]>([]);
   const [error, setError] = useState<string | null>(null);
+  /** Where the walk is, while it walks. */
+  const [progress, setProgress] = useState<api.FindProgress | null>(null);
+  /** The folder the shown results come from, and how many folders were taken up. */
+  const [scanned, setScanned] = useState<{ root: string; folders: number } | null>(null);
+  const [stopped, setStopped] = useState(false);
+  const [filter, setFilter] = useState<"all" | Kind>("all");
+  /** The scan running now; whatever an earlier one (stopped, or the page left) answers is dropped. */
+  const current = useRef<string | null>(null);
+
+  // Leaving the page stops the walk.
+  useEffect(
+    () => () => {
+      const id = current.current;
+      current.current = null;
+      if (id) api.findReposCancel(id).catch(() => {});
+    },
+    []
+  );
 
   async function browseRoot() {
     const dir = await open({ directory: true, multiple: false, title: "Folder to scan for repos" });
@@ -74,11 +115,41 @@ export function AutoAssign() {
     }
     setError(null);
     setRows([]);
+    setScanned(null);
+    setStopped(false);
+    setProgress(null);
+    setFilter("all");
+    const id = newScanId();
+    current.current = id;
+    const live = () => current.current === id;
     try {
-      // 1. Find repos
+      // 1. Find repos — watched, so the page says where it is, and can stop.
       setPhase("scanning");
-      setStatusLine("Scanning for git repositories…");
-      const repos = await api.scanRepos(root);
+      setStatusLine(`Searching ${root}`);
+      const poll = window.setInterval(() => {
+        api
+          .findReposProgress(id)
+          .then((p) => {
+            if (live() && p && !Array.isArray(p)) setProgress(p);
+          })
+          .catch(() => {});
+      }, 300);
+      let scan: api.TrackedScan;
+      try {
+        scan = await api.scanReposTracked(id, root);
+      } finally {
+        window.clearInterval(poll);
+      }
+      if (!live()) return;
+      setProgress(null);
+      if (scan.cancelled) {
+        setPhase("idle");
+        setStatusLine("");
+        setStopped(true);
+        return;
+      }
+      setScanned({ root: scan.root, folders: scan.folders });
+      const repos = scan.repos;
       if (repos.length === 0) {
         setPhase("ready");
         setStatusLine("");
@@ -90,6 +161,7 @@ export function AutoAssign() {
       setPhase("resolving");
       setStatusLine("Resolving which account each profile's SSH key belongs to…");
       const profs = await api.getProfiles();
+      if (!live()) return;
       setProfiles(profs);
       // The key first — it is who git authenticates as; without a key the
       // check can use (none, or one locked by a passphrase), the GitHub
@@ -111,6 +183,7 @@ export function AutoAssign() {
           sources[p.id] = byKey ? "key" : saved ? "saved" : null;
         })
       );
+      if (!live()) return;
       setProfileLogins(logins);
       setLoginSources(sources);
 
@@ -135,6 +208,7 @@ export function AutoAssign() {
       } catch {
         accounts = [];
       }
+      if (!live()) return;
       if (accounts.length === 0) {
         throw new Error(
           "No GitHub CLI accounts available — sign in with `gh auth login` so access can be checked."
@@ -151,6 +225,7 @@ export function AutoAssign() {
       const failedByKey: Record<string, string[]> = {};
       let done = 0;
       for (const key of uniqueKeys) {
+        if (!live()) return;
         const [owner, name] = key.split("/");
         const perKey: Record<string, api.RepoPermissions | null> = {};
         const failed: string[] = [];
@@ -209,17 +284,32 @@ export function AutoAssign() {
           failedLogins,
           currentProfileId: current?.id ?? null,
           proposedProfileId: proposed,
+          kind: kindOf(current?.id ?? null, proposed),
         };
       });
 
+      if (!live()) return;
       setRows(newRows);
       setPhase("ready");
       setStatusLine("");
     } catch (e) {
+      if (!live()) return;
       setError(String(e));
       setPhase("idle");
       setStatusLine("");
+      setProgress(null);
     }
+  }
+
+  /** Stop the walk (and drop whatever it, or the checks after it, answer later). */
+  function stop() {
+    const id = current.current;
+    current.current = null;
+    if (id) api.findReposCancel(id).catch(() => {});
+    setPhase("idle");
+    setStatusLine("");
+    setProgress(null);
+    setStopped(true);
   }
 
   function setRowProfile(path: string, profileId: string) {
@@ -263,10 +353,10 @@ export function AutoAssign() {
       // Refresh state so rows show as aligned.
       setProfiles(profs);
       setRows((rs) =>
-        rs.map((r) => ({
-          ...r,
-          currentProfileId: currentProfileFor(r.repo.path, profs)?.id ?? null,
-        }))
+        rs.map((r) => {
+          const now = currentProfileFor(r.repo.path, profs)?.id ?? null;
+          return { ...r, currentProfileId: now, kind: kindOf(now, r.proposedProfileId) };
+        })
       );
       setPhase("ready");
     } catch (e) {
@@ -280,6 +370,28 @@ export function AutoAssign() {
     phase === "resolving" ||
     phase === "checking" ||
     phase === "applying";
+
+  const profileLabel = (id: string | null) => {
+    const p = profiles.find((x) => x.id === id);
+    if (!p) return "a profile";
+    return profileLogins[p.id] ? `${p.name} (${profileLogins[p.id]})` : p.name;
+  };
+  const shownRoot = scanned?.root ?? root;
+  /** "client/widgets" for a repository under the folder searched; the whole path otherwise. */
+  const where = (path: string) => {
+    const rest = below(path, shownRoot);
+    return rest === null ? path : rest || ".";
+  };
+  const count = (k: "all" | Kind) => (k === "all" ? rows.length : rows.filter((r) => r.kind === k).length);
+  const listed = filter === "all" ? rows : rows.filter((r) => r.kind === filter);
+
+  const progressLine = (() => {
+    if (phase !== "scanning") return statusLine;
+    if (progress?.phase === "reading") return `Reading ${progress.total} repositor${progress.total === 1 ? "y" : "ies"} found in ${root} · ${progress.checked}/${progress.total}`;
+    const n = progress?.folders ?? 0;
+    const f = progress?.found ?? 0;
+    return `Searching ${root}${n ? ` · ${n.toLocaleString()} folder${n === 1 ? "" : "s"}` : ""}${f ? ` · ${f} found` : ""}`;
+  })();
 
   return (
     <div className="space-y-6">
@@ -323,19 +435,41 @@ export function AutoAssign() {
             )}
           </Button>
         </div>
-        {busy && statusLine && (
-          <p className="text-xs text-zinc-500 mt-3 flex items-center gap-2">
-            <Loader2 size={12} className="animate-spin text-emerald-400" />
-            {statusLine}
-          </p>
+        {busy && progressLine && (
+          <div className="mt-3 space-y-1" data-autoassign-progress>
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs text-zinc-500 flex items-center gap-2 min-w-0" role="status">
+                <Loader2 size={12} className="animate-spin text-emerald-400 shrink-0" />
+                <span className="truncate" title={progressLine}>
+                  {progressLine}
+                </span>
+              </p>
+              {phase !== "applying" && (
+                <Button size="sm" variant="ghost" onClick={stop}>
+                  <Square size={12} />
+                  Stop
+                </Button>
+              )}
+            </div>
+            {phase === "scanning" && progress?.place && (
+              <p className="text-xs text-zinc-600 font-mono truncate pl-5" title={progress.place} data-autoassign-place>
+                in {where(progress.place)}
+              </p>
+            )}
+          </div>
         )}
+        {stopped && !busy && <p className="text-xs text-zinc-400 mt-3">Stopped. Nothing was changed — Scan to search again.</p>}
       </Card>
 
       {rows.length > 0 && (
         <Card>
           <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
-            <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">
+            <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider min-w-0" data-autoassign-found={rows.length}>
               {rows.length} repo{rows.length === 1 ? "" : "s"} found
+              <span className="normal-case tracking-normal font-normal text-zinc-400">
+                {" "}
+                in <span className="font-mono text-zinc-300 break-all">{shownRoot}</span>
+              </span>
             </h2>
             <Button
               size="sm"
@@ -353,14 +487,40 @@ export function AutoAssign() {
             </Button>
           </div>
 
+          {scanned && (
+            <p className="text-xs text-zinc-500 -mt-1 mb-3">
+              Searched {scanned.folders.toLocaleString()} folder{scanned.folders === 1 ? "" : "s"}, up to five levels deep. Hidden folders, node_modules, target, dist,
+              build and Library are passed over, and a repository's own folders are not searched.
+            </p>
+          )}
+
+          <div className="inline-flex rounded-lg bg-zinc-800/80 p-0.5 flex-wrap mb-3" role="group" aria-label="Show">
+            {(["all", "assign", "assigned", "none"] as const).map((k) => (
+              <button
+                key={k}
+                type="button"
+                data-autoassign-chip={k}
+                aria-pressed={filter === k}
+                onClick={() => setFilter(k)}
+                className={`px-3 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                  filter === k ? "bg-zinc-700 text-emerald-400" : "text-zinc-400 hover:text-zinc-200"
+                }`}
+              >
+                {KIND_LABEL[k]} <span className="text-zinc-500">{count(k)}</span>
+              </button>
+            ))}
+          </div>
+          {listed.length === 0 && <p className="text-xs text-zinc-500 mb-2">None here.</p>}
+
           <div className="space-y-1.5">
-            {rows.map((r) => {
+            {listed.map((r) => {
               const aligned =
                 r.proposedProfileId !== "" && r.proposedProfileId === r.currentProfileId;
               const accessEntries = Object.entries(r.access).filter(([, p]) => p !== null);
               return (
                 <div
                   key={r.repo.path}
+                  data-autoassign-row={r.repo.path}
                   className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-zinc-800/50 border border-zinc-700/50 min-w-0 flex-wrap lg:flex-nowrap"
                 >
                   <Folder size={15} className="text-zinc-500 shrink-0" />
@@ -373,6 +533,36 @@ export function AutoAssign() {
                         ? `${r.repo.owner}/${r.repo.name}`
                         : r.repo.remote_url || "no remote"}
                     </p>
+                    <p className="text-xs font-mono truncate" title={r.repo.path} data-autoassign-path>
+                      {(() => {
+                        // The whole path, the folder searched dimmed: where it is, at a glance.
+                        const rest = below(r.repo.path, shownRoot);
+                        if (!rest) return <span className="text-zinc-500">{r.repo.path}</span>;
+                        return (
+                          <>
+                            <span className="text-zinc-600">{r.repo.path.slice(0, r.repo.path.length - rest.length)}</span>
+                            <span className="text-zinc-400">{rest}</span>
+                          </>
+                        );
+                      })()}
+                    </p>
+                    {r.currentProfileId && (
+                      <p className="mt-1">
+                        {aligned ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30" data-autoassign-status="aligned">
+                            Already in {profileLabel(r.currentProfileId)}
+                          </span>
+                        ) : r.proposedProfileId && r.proposedProfileId !== r.currentProfileId ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] bg-amber-500/15 text-amber-300 border border-amber-500/30" data-autoassign-status="move">
+                            In {profileLabel(r.currentProfileId)} now → Apply moves it to {profileLabel(r.proposedProfileId)}
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] bg-zinc-700/50 text-zinc-300 border border-zinc-600/60" data-autoassign-status="in">
+                            In {profileLabel(r.currentProfileId)}
+                          </span>
+                        )}
+                      </p>
+                    )}
                   </div>
 
                   {/* Below 1024 px the reasons get a line of their own rather than disappearing. */}

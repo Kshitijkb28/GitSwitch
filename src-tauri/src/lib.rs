@@ -50,6 +50,8 @@ mod deep_link;
 mod ports;
 mod workspace;
 mod tray;
+mod uninstall;
+mod apps;
 
 /// macOS/Linux GUI apps launched from Finder/the dock inherit a minimal PATH that
 /// omits Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`). Tools like `gh` live
@@ -189,6 +191,20 @@ pub fn run() {
             commands::changes_repair_push_lock,
             commands::push_lock_helper_status,
             commands::push_lock_uninstall,
+            commands::uninstall_plan,
+            commands::uninstall_prepare,
+            commands::uninstall_finish,
+            commands::apps_list,
+            commands::apps_size,
+            commands::apps_prepare,
+            commands::apps_uninstall,
+            commands::apps_status,
+            commands::apps_check_gone,
+            commands::apps_scan,
+            commands::apps_delete,
+            commands::apps_sessions,
+            commands::apps_forget,
+            commands::apps_open_uninstaller,
             commands::push_lock_fix,
             commands::push_lock_finish_manual,
             commands::doctor_check_push_locks,
@@ -217,6 +233,7 @@ pub fn run() {
             commands::doctor_check_repo_access,
             commands::changes_push_identity,
             commands::scan_repos,
+            commands::scan_repos_tracked,
             commands::check_repo_access,
             commands::find_unlisted_repos,
             commands::find_repos_progress,
@@ -225,6 +242,7 @@ pub fn run() {
             commands::github_repo_context,
             commands::github_pulls,
             commands::github_pulls_search,
+            commands::github_pull_repos,
             commands::github_pull,
             commands::github_pull_files,
             commands::github_pull_commits,

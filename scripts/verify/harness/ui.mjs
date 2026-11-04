@@ -474,12 +474,17 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(cfg.gh ? cfg.gh.accounts ?? [] : []);
             case "github_pulls": {
               const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
-              const all = gh.pulls.filter((p) => !(gh.merged && p.number === gh.detail.number && args.state === "open")).map((p) => (gh.merged && p.number === gh.detail.number ? { ...p, state: "merged" } : p));
+              const all = gh.pulls
+                .filter((p) => p.repo === `${args.owner}/${args.name}`)
+                .filter((p) => !(gh.merged && p.number === gh.detail.number && args.state === "open"))
+                .map((p) => (gh.merged && p.number === gh.detail.number ? { ...p, state: "merged" } : p));
               const want = all.filter((p) => args.state === "all" || p.state === args.state);
               const per = 2;
               const page = args.page || 1;
               return Promise.resolve({ items: want.slice((page - 1) * per, page * per), next_page: page * per < want.length ? page + 1 : null, total: null });
             }
+            case "github_pull_repos":
+              return Promise.resolve(cfg.gh.pullRepos ?? { login: "me-home", repos: [], truncated: false, notes: [] });
             case "github_pulls_search": {
               const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
               return Promise.resolve({ items: gh.search.filter((p) => args.state === "all" || p.state === args.state).filter((p) => !args.repo || p.repo === args.repo), next_page: null, total: gh.search.length });
@@ -880,15 +885,28 @@ const PORT_ROWS = [
   { key: "tcp:5000:999", proto: "tcp", port: 5000, addresses: ["*"], scope: "all", pid: 999, name: "python3", exe: "/usr/bin/python3", cwd: "/Users/me/Documents/releaseengineeringautomationandplatforminfrastructureteamnotifications/workspace/apps/web/server", started_at: null, user: "me", ours: false, workspace: null, clone: null, container: null, killable: true, why_not: null },
 ];
 
-/** Auto Assign against a mocked backend: a profile with a key, one with only a saved account. */
+/**
+ * Auto Assign against a mocked backend: a profile with a key, one with only a saved account.
+ * opts: repos (what the scan finds), dirs ({profileId: folders}), hold (the scan answers only
+ * when window.__RELEASE_SCAN__() is called), push ({"owner/name": [logins that can push]}).
+ */
 async function openAutoAssignPage(browser, server, opts = {}) {
   const page = await browser.newPage();
   await page.setViewport({ width: opts.width ?? 900, height: 900 });
-  await page.evaluateOnNewDocument(() => {
+  const cfg = {
+    repos: opts.repos ?? [
+      { path: "/w/widgets", remote_url: "git@github.com:acme/widgets.git", owner: "acme", name: "widgets" },
+      { path: "/w/secret", remote_url: "git@github.com:acme/secret.git", owner: "acme", name: "secret" },
+    ],
+    dirs: opts.dirs ?? {},
+    hold: opts.hold ?? false,
+    push: opts.push ?? { "acme/widgets": ["acme-bot"] },
+  };
+  await page.evaluateOnNewDocument((cfg) => {
     window.__CALLS__ = [];
     localStorage.clear();
     localStorage.setItem("gitswitch:autoassign.root", JSON.stringify("/w"));
-    const prof = (id, name, key, login, isDefault) => ({ id, name, git_name: name, git_email: `${id}@example.test`, ssh_key_path: key, is_default: isDefault, allow_push: true, signing_enabled: false, directories: [], remote_patterns: [], github_login: login, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" });
+    const prof = (id, name, key, login, isDefault) => ({ id, name, git_name: name, git_email: `${id}@example.test`, ssh_key_path: key, is_default: isDefault, allow_push: true, signing_enabled: false, directories: cfg.dirs[id] ?? [], remote_patterns: [], github_login: login, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" });
     window.__TAURI_INTERNALS__ = {
       invoke: (cmd, args) => {
         window.__CALLS__.push({ cmd, args });
@@ -896,10 +914,18 @@ async function openAutoAssignPage(browser, server, opts = {}) {
           case "get_profiles":
             return Promise.resolve([prof("p1", "Personal", "/k", null, true), prof("pk", "Bot", null, "acme-bot", false)]);
           case "scan_repos":
-            return Promise.resolve([
-              { path: "/w/widgets", remote_url: "git@github.com:acme/widgets.git", owner: "acme", name: "widgets" },
-              { path: "/w/secret", remote_url: "git@github.com:acme/secret.git", owner: "acme", name: "secret" },
-            ]);
+            return Promise.resolve(cfg.repos);
+          case "scan_repos_tracked": {
+            const done = { root: args.root, repos: cfg.repos, folders: 42, cancelled: false };
+            if (!cfg.hold) return Promise.resolve(done);
+            return new Promise((res) => {
+              window.__RELEASE_SCAN__ = (v) => res(v ?? done);
+            });
+          }
+          case "find_repos_progress":
+            return Promise.resolve({ phase: "looking", folders: 1234, found: 1, checked: 0, total: 0, place: "/w/client/deep/folder" });
+          case "find_repos_cancel":
+            return Promise.resolve(null);
           case "resolve_key_account":
             return Promise.resolve("me-personal");
           case "gh_list_accounts":
@@ -909,7 +935,7 @@ async function openAutoAssignPage(browser, server, opts = {}) {
           case "verify_github_token":
             return Promise.resolve({ id: 1, login: String(args.token).slice(2), name: null, email: null, avatar_url: "" });
           case "check_repo_access":
-            return Promise.resolve(args.repo === "widgets" && args.token === "t-acme-bot" ? { admin: false, push: true, pull: true } : null);
+            return Promise.resolve((cfg.push[`${args.owner}/${args.repo}`] ?? []).includes(String(args.token).slice(2)) ? { admin: false, push: true, pull: true } : null);
           case "update_profile":
             return Promise.resolve({});
           default:
@@ -917,9 +943,95 @@ async function openAutoAssignPage(browser, server, opts = {}) {
         }
       },
     };
-  });
+  }, cfg);
   await page.goto(`${server.url}/auto-assign`, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => document.body.innerText.includes("Auto Assign"), { timeout: 5000 });
+  return page;
+}
+
+/** The Uninstall tab (or Settings, for GitSwitch's own uninstall) against a mocked backend. */
+async function openUninstallPage(browser, server, opts = {}) {
+  const page = await browser.newPage();
+  await page.setViewport({ width: opts.width ?? 1100, height: 900 });
+  const app = (id, name, extra = {}) => ({ id, name, version: "1.0", publisher: null, location: `/Applications/${name}.app`, source: "app", size: null, date: null, notes: [], blocked: null, is_self: false, ...extra });
+  const cfg = {
+    platform: opts.platform ?? "macos",
+    apps: opts.apps ?? [
+      app("mac:/Applications/Foo Writer.app", "Foo Writer", { size: 5000000 }),
+      app("mac:/Applications/Bar Tool.app", "Bar Tool", { size: 9000000 }),
+      app("mac:/Applications/Xcode.app", "Xcode", { blocked: "GitSwitch's git comes from it (xcode-select points into it)." }),
+      app("mac:/Applications/GitSwitch.app", "GitSwitch", { is_self: true }),
+    ],
+    packages: opts.packages ?? [],
+    sessions: opts.sessions ?? [],
+    prepared: opts.prepared ?? {},
+    uninstall: opts.uninstall ?? { state: "gone", message: null },
+    status: opts.status ?? [],
+    checkGone: opts.checkGone ?? { state: "gone", message: null },
+    scan: opts.scan ?? {
+      scan: "scan-1",
+      notes: ["macOS still keeps the installer's record \"com.acme.pkg\". To forget it: sudo pkgutil --forget com.acme.pkg"],
+      items: [
+        { id: "l0", path: "/Users/me/Library/Caches/com.acme.foowriter", place: "~/Library/Caches", kind: "folder", size: 3000, size_complete: true, confidence: "high", reason: "named after its id com.acme.foowriter", admin: false, command: null },
+        { id: "l1", path: "/Users/me/Library/Preferences/com.acme.foowriter.plist", place: "~/Library/Preferences", kind: "file", size: 10, size_complete: true, confidence: "high", reason: "com.acme.foowriter.plist", admin: false, command: null },
+        { id: "l2", path: "/Users/me/Library/Application Support/Foo Writer", place: "~/Library/Application Support", kind: "folder", size: 100, size_complete: false, confidence: "medium", reason: "named like the app (Foo Writer)", admin: false, command: null },
+        { id: "l3", path: "/Library/Application Support/com.acme.foowriter", place: "/Library/Application Support", kind: "folder", size: null, size_complete: false, confidence: "high", reason: "named after its id com.acme.foowriter", admin: true, command: "sudo rm -rf '/Library/Application Support/com.acme.foowriter'" },
+      ],
+    },
+    plan: opts.plan ?? null,
+    selfPrepare: opts.selfPrepare ?? { outcome: "done", message: "GitSwitch's changes are taken back.", command: null, done: ["Removed GitSwitch's block from ~/.gitconfig (a backup is beside it)"], problems: [] },
+  };
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    const preparedFor = (id) => {
+      const a = [...cfg.apps, ...cfg.packages].find((x) => x.id === id);
+      return { session: "sess-" + a.name.replace(/\W/g, ""), app: a, method: `${a.location} is moved to the Trash.`, command: null, facts: ["Bundle id: com.acme.thing"], also_removed: [], blocked: null, running: false, warnings: [], vendor_uninstaller: null, ...(cfg.prepared[id] ?? {}) };
+    };
+    window.__TAURI_INTERNALS__ = {
+      transformCallback: () => 1,
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args });
+        switch (cmd) {
+          case "apps_list":
+            return Promise.resolve({ platform: cfg.platform, notes: [], apps: args.kind === "packages" ? cfg.packages : cfg.apps });
+          case "apps_sessions":
+            return Promise.resolve(cfg.sessions);
+          case "apps_size":
+            return Promise.resolve([1234, true]);
+          case "apps_prepare":
+            return Promise.resolve(preparedFor(args.id));
+          case "apps_uninstall":
+            return Promise.resolve(cfg.uninstall);
+          case "apps_status":
+            return Promise.resolve(cfg.status.length ? cfg.status.shift() : { state: "uninstalling", message: "The uninstaller is open — follow its steps." });
+          case "apps_check_gone":
+            return Promise.resolve(cfg.checkGone);
+          case "apps_scan":
+            return Promise.resolve(cfg.scan);
+          case "apps_delete":
+            return Promise.resolve(args.ids.map((id) => ({ id, outcome: "trashed", message: "Moved to the Trash." })));
+          case "apps_forget":
+          case "apps_open_uninstaller":
+            return Promise.resolve(null);
+          case "get_current_git_config":
+            return Promise.resolve("");
+          case "push_lock_helper_status":
+            return Promise.resolve({ supported: false, locks: [], installed: false, helper: "missing" });
+          case "uninstall_plan":
+            return Promise.resolve(cfg.plan);
+          case "uninstall_prepare":
+            return Promise.resolve(cfg.selfPrepare);
+          case "uninstall_finish":
+            return Promise.resolve({ how: "/Applications/GitSwitch.app is moved to the Trash once GitSwitch has quit.", manual: null, log: "/tmp/gitswitch-uninstall.log" });
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}${opts.path ?? "/uninstall"}`, { waitUntil: "networkidle0" });
+  await page.waitForFunction(() => document.body.innerText.includes(location.pathname === "/settings" ? "Settings" : "Uninstall"), { timeout: 5000 });
   return page;
 }
 
@@ -3862,7 +3974,7 @@ try {
   {
     const page = await openAutoAssignPage(browser, server, { width: 900 });
     await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Scan")?.click());
-    await page.waitForFunction(() => document.body.innerText.includes("2 repos found"), { timeout: 8000 }).catch(() => null);
+    await page.waitForFunction(() => !!document.querySelector('[data-autoassign-found="2"]'), { timeout: 8000 }).catch(() => null);
     await sleep(300);
     const t = await text(page);
     ok("a profile without an SSH key is proposed through its saved GitHub account", t.includes("Bot (acme-bot · saved account)"), t.slice(t.indexOf("repos found"), t.indexOf("repos found") + 300));
@@ -3873,6 +3985,64 @@ try {
     const upd = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "update_profile").map((c) => c.args));
     ok("Apply assigns it to that profile", upd.some((a) => a.id === "pk" && (a.directories ?? []).includes("/w/widgets")), JSON.stringify(upd));
     await page.close();
+  }
+
+  section("Auto Assign: where it searches, each repository's path, and the ones already added labelled with their profile and account");
+  {
+    const page = await openAutoAssignPage(browser, server, { width: 1100, hold: true });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Scan")?.click());
+    await page.waitForFunction(() => (document.querySelector("[data-autoassign-progress]")?.innerText ?? "").includes("1,234 folders"), { timeout: 4000 }).catch(() => null);
+    const prog = await page.evaluate(() => document.querySelector("[data-autoassign-progress]")?.innerText ?? "");
+    ok("while it walks it says where: the folder, how many folders, how many found", prog.includes("Searching /w · 1,234 folders · 1 found"), prog);
+    ok("  and the folder it is in now, below the one searched", (await page.evaluate(() => document.querySelector("[data-autoassign-place]")?.innerText ?? "")) === "in client/deep/folder");
+    const scanArgs = (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "scan_repos_tracked").map((c) => c.args)))[0] ?? {};
+    ok("  the scan is asked for that folder, under an id progress is polled with", scanArgs.root === "/w" && !!scanArgs.scanId && (await page.evaluate((id) => window.__CALLS__.some((c) => c.cmd === "find_repos_progress" && c.args.scanId === id), scanArgs.scanId)), JSON.stringify(scanArgs));
+    await (await button(page, "Stop"))?.click();
+    await sleep(200);
+    ok("Stop cancels that scan, and says nothing was changed", (await page.evaluate((id) => window.__CALLS__.some((c) => c.cmd === "find_repos_cancel" && c.args.scanId === id), scanArgs.scanId)) && (await text(page)).includes("Stopped. Nothing was changed"));
+    await page.evaluate(() => window.__RELEASE_SCAN__?.());
+    await sleep(400);
+    ok("  what the stopped scan answers later is dropped", !(await page.$("[data-autoassign-found]")) && (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "get_profiles").length)) === 0);
+    await page.close();
+
+    const REPOS = [
+      { path: "/w/widgets", remote_url: "git@github.com:acme/widgets.git", owner: "acme", name: "widgets" },
+      { path: "/w/secret", remote_url: "git@github.com:acme/secret.git", owner: "acme", name: "secret" },
+      { path: "/w/team/tool", remote_url: "git@github.com:acme/tool.git", owner: "acme", name: "tool" },
+      { path: "/w/moved", remote_url: "git@github.com:acme/moved.git", owner: "acme", name: "moved" },
+      { path: "/w/local", remote_url: "", owner: "", name: "" },
+    ];
+    const full = await openAutoAssignPage(browser, server, {
+      width: 1100,
+      repos: REPOS,
+      dirs: { p1: ["/w/secret"], pk: ["/w/widgets", "/w/moved"] },
+      push: { "acme/widgets": ["acme-bot"], "acme/tool": ["me-personal"], "acme/moved": ["me-personal"] },
+    });
+    await full.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Scan")?.click());
+    await full.waitForFunction(() => !!document.querySelector('[data-autoassign-found="5"]'), { timeout: 8000 }).catch(() => null);
+    const head = await full.evaluate(() => document.querySelector("[data-autoassign-found]")?.innerText ?? "");
+    ok("the results say how many and in which folder", head.endsWith("in /w") && /5 repos found/i.test(head), head);
+    ok("  and what the search passed over", (await text(full)).includes("Searched 42 folders, up to five levels deep."));
+    const row = (p) => full.evaluate((p) => document.querySelector(`[data-autoassign-row="${p}"]`)?.innerText.replace(/\s+/g, " ") ?? "", p);
+    const path = (p) => full.evaluate((p) => document.querySelector(`[data-autoassign-row="${p}"] [data-autoassign-path]`)?.innerText ?? "", p);
+    ok("each repository shows its whole path, the folder searched dimmed", (await path("/w/team/tool")) === "/w/team/tool" && (await path("/w/widgets")) === "/w/widgets" && (await full.evaluate(() => document.querySelector('[data-autoassign-row="/w/team/tool"] [data-autoassign-path] .text-zinc-400')?.innerText)) === "team/tool");
+    ok("  with the whole path on hover", (await full.evaluate(() => document.querySelector('[data-autoassign-row="/w/team/tool"] [data-autoassign-path]')?.getAttribute("title"))) === "/w/team/tool");
+    ok("one already in the right profile: 'Already in Bot (acme-bot)', and the check", (await row("/w/widgets")).includes("Already in Bot (acme-bot)") && !!(await full.$('[data-autoassign-row="/w/widgets"] [aria-label="already assigned correctly"]')), await row("/w/widgets"));
+    ok("one in a profile that nothing can be checked for: 'In Personal (me-personal)'", (await row("/w/secret")).includes("In Personal (me-personal)") && !(await row("/w/secret")).includes("Already in"), await row("/w/secret"));
+    ok("one in a profile whose account cannot push to it: says where it is and where Apply moves it", (await row("/w/moved")).includes("In Bot (acme-bot) now → Apply moves it to Personal (me-personal)"), await row("/w/moved"));
+    ok("  one in no profile has no such label", !(await row("/w/team/tool")).includes("Already in") && !(await row("/w/team/tool")).includes(" now →"));
+    const chip = (k) => full.evaluate((k) => document.querySelector(`[data-autoassign-chip="${k}"]`)?.innerText ?? "", k);
+    ok("the chips count: to assign, already assigned, not assignable", (await chip("all")) === "All 5" && (await chip("assign")) === "To assign 2" && (await chip("assigned")) === "Already assigned 2" && (await chip("none")) === "Not assignable 1", [await chip("all"), await chip("assign"), await chip("assigned"), await chip("none")].join(" | "));
+    await full.evaluate(() => document.querySelector('[data-autoassign-chip="assigned"]')?.click());
+    await sleep(150);
+    ok("  a chip shows only its rows", JSON.stringify(await full.evaluate(() => [...document.querySelectorAll("[data-autoassign-row]")].map((r) => r.dataset.autoassignRow))) === JSON.stringify(["/w/widgets", "/w/secret"]));
+    await full.evaluate(() => document.querySelector('[data-autoassign-chip="all"]')?.click());
+    await sleep(150);
+    await full.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("Apply 2 assignments"))?.click());
+    await sleep(500);
+    const upd = await full.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "update_profile").map((c) => c.args));
+    ok("Apply is as before: the two to assign go to the profile whose account can push", upd.length === 1 && upd[0].id === "p1" && JSON.stringify(upd[0].directories) === JSON.stringify(["/w/secret", "/w/team/tool", "/w/moved"]), JSON.stringify(upd));
+    await full.close();
   }
 
   section("Leaving a page and coming back keeps where you were");
@@ -5306,6 +5476,39 @@ try {
       ok("a hidden row is never added straight away", JSON.stringify(auto) === JSON.stringify(["feature-wt", "ruled", "tool"]), JSON.stringify(auto));
       await again.close();
     }
+
+    section("Find repositories: the ones a profile's folder already holds are shown too, labelled with the profile and its account");
+    {
+      const LISTED = [
+        { path: "/Users/me/work/api", profile_id: "pw", profile_name: "Work", github_login: null },
+        { path: "/Users/me/code/site", profile_id: "pp", profile_name: "Personal", github_login: "Me-Home" },
+      ];
+      const page = await open(SCENARIOS.clean, { find: { ...FIND, result: { ...FOUND, already_listed: 2, listed: LISTED } }, storage: { "findrepos.searched": true } });
+      await openFind(page);
+      await waitRows(page, 8);
+      const added = () => page.evaluate(() => [...document.querySelectorAll("[data-find-listed]")].map((r) => r.innerText.replace(/\s+/g, " ").trim()));
+      const a1 = await added();
+      ok("they are listed after the others, each saying which profile and account it is with", JSON.stringify(a1) === JSON.stringify(["api · ~/work/api Already in Work (me-work)", "site · ~/code/site Already in Personal (Me-Home)"]), JSON.stringify(a1));
+      ok("  they take no part in choosing: no checkbox, no picker, not counted", (await page.$$('[data-find-listed] input, [data-find-listed] button')).length === 0 && (await page.evaluate(() => document.querySelector("[data-find-picked]")?.innerText)) === "5 of 8 selected");
+      ok("  a chip shows only them", (await page.evaluate(() => document.querySelector('[data-find-chip="added"]')?.innerText)) === "Already added 2");
+      await page.evaluate(() => document.querySelector('[data-find-chip="added"]')?.click());
+      await sleep(150);
+      ok("  with nothing else, and no 'Nothing here matches'", (await rowNames(page)).length === 0 && (await added()).length === 2 && !(await text(page)).includes("Nothing here matches"));
+      await page.evaluate(() => document.querySelector('[data-find-chip="clear"]')?.click());
+      await sleep(150);
+      ok("  another chip leaves them out", (await added()).length === 0);
+      await press(page, "Add 5 repositories to their profiles");
+      await page.waitForFunction(() => document.body.innerText.includes("Added 5 repositories"), { timeout: 4000 }).catch(() => null);
+      ok("adding is as before: the five chosen, none of these", ((await calls(page, "profile_folders_add"))[0]?.changes ?? []).length === 5);
+      await page.close();
+
+      const all = await open(SCENARIOS.clean, { find: { ...FIND, result: { ...FOUND, repos: [], already_listed: 2, listed: LISTED } }, storage: { "findrepos.searched": true } });
+      await openFind(all);
+      await all.waitForFunction(() => document.querySelectorAll("[data-find-listed]").length === 2, { timeout: 4000 }).catch(() => null);
+      const t = await text(all);
+      ok("when every repository is added already, it says so and lists them, with the account the profile names", t.includes("Every repository in these places is already on the Repository page (2).") && t.includes("Already in Personal (Me-Home)") && t.includes("Already in Work"), t.slice(0, 900));
+      await all.close();
+    }
   }
 
   // --- GitHub: pull requests, review & merge, collaborators -----------------
@@ -5521,29 +5724,244 @@ try {
       await reader.close();
     }
 
-    section("Pull requests page: across repositories, by whose and by state; a row opens it as that account");
+    section("Pull requests page: the account's repositories with their counts, each repository's own pull requests — whose, state, Refresh");
     {
-      const page = await open(SCENARIOS.clean, { gh: GH });
-      await page.evaluate(() => [...document.querySelectorAll("nav a, aside a, a")].find((a) => a.innerText.trim() === "Pull requests")?.click());
-      await page.waitForFunction(() => document.querySelectorAll("[data-pull-row]").length > 0, { timeout: 5000 }).catch(() => null);
-      ok("the sidebar has a Pull requests page", (await text(page)).includes("Across every repository your account works on"));
-      ok("  it asks for the ones waiting for the first account's review, open", JSON.stringify((await gcalls(page, "github_pulls_search"))[0]) === JSON.stringify({ account: "gh:me-home", scope: "review_requested", state: "open", repo: null, page: 1 }), JSON.stringify(await gcalls(page, "github_pulls_search")));
-      ok("  each row names its repository", (await page.evaluate(() => document.querySelector('[data-pull-row="other/lib#9"]')?.innerText ?? "")).includes("other/lib #9 by pal"));
-      await pill(page, "Created by me");
+      const REPO = (repo, open, to_review, mine, extra = {}) => ({ repo, private: true, archived: false, fork: false, pushed_at: "2026-10-30T00:00:00Z", permission: "admin", open, to_review, mine, affiliated: true, ...extra });
+      const PULL_REPOS = {
+        login: "me-home",
+        truncated: false,
+        notes: ["Some organizations' repositories are hidden: they use single sign-on."],
+        repos: [REPO("acme/app", 2, 1, 1), REPO("other/lib", null, 0, 1, { affiliated: false, private: false, permission: null }), REPO("quiet/repo", 0, 0, 0, { archived: true })],
+      };
+      const LIB_PULL = PR(7, "open", { repo: "other/lib", title: "Lib fix", author: "me-home" });
+      const G = { ...GH, pullRepos: PULL_REPOS, pulls: [...GH.pulls, LIB_PULL], search: [...GH.search, { ...LIB_PULL, head_ref: null, base_ref: null }] };
+      const repoRows = (page) => page.evaluate(() => [...document.querySelectorAll("[data-pull-repo]")].map((r) => r.dataset.pullRepo));
+      const repoRow = (page, r) => page.evaluate((r) => document.querySelector(`[data-pull-repo="${r}"]`)?.innerText.replace(/\s+/g, " ").trim() ?? "", r);
+      const pickRepo = (page, r) => page.evaluate((r) => document.querySelector(`[data-pull-repo="${r}"]`)?.click(), r);
+      const groupPill = (page, group, label) => page.evaluate((group, label) => { const b = [...document.querySelectorAll(`[role=group][aria-label="${group}"] button`)].find((x) => x.innerText.trim().startsWith(label)); b?.click(); return !!b; }, group, label);
+      const toPulls = async (page) => {
+        await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim() === "Pull requests")?.click());
+        await page.waitForFunction(() => document.querySelectorAll("[data-pull-repo]").length > 0, { timeout: 5000 }).catch(() => null);
+        await sleep(300);
+      };
+
+      const page = await open(SCENARIOS.clean, { gh: G });
+      await toPulls(page);
+      ok("the sidebar has a Pull requests page that lists repositories", (await text(page)).includes("Your repositories and their pull requests"));
+      ok("  the account's repositories are asked once, for the first account", JSON.stringify(await gcalls(page, "github_pull_repos")) === JSON.stringify([{ account: "gh:me-home" }]), JSON.stringify(await gcalls(page, "github_pull_repos")));
+      ok("  the ones with open pull requests, busiest first; one without is left out until All", JSON.stringify(await repoRows(page)) === JSON.stringify(["acme/app", "other/lib"]), JSON.stringify(await repoRows(page)));
+      const app = await repoRow(page, "acme/app");
+      ok("  each says how many are open, asking you for a review, and yours", app.includes("2 open") && app.includes("1 to review") && app.includes("1 yours"), app);
+      ok("  someone else's repository known from a pull request of yours shows only what is known", (await repoRow(page, "other/lib")) === "other/lib 1 yours", await repoRow(page, "other/lib"));
+      ok("  what was withheld is said under the list", (await text(page)).includes("Some organizations' repositories are hidden"));
+      ok("the first repository is picked, and only its pull requests are asked, as the account", JSON.stringify((await gcalls(page, "github_pulls")).at(-1)) === JSON.stringify({ account: "gh:me-home", owner: "acme", name: "app", state: "open", page: 1 }) && JSON.stringify(await pullRows(page)) === JSON.stringify(["acme/app#1", "acme/app#2"]), JSON.stringify(await gcalls(page, "github_pulls")));
+      ok("  its header names it and what the account may do", (await page.evaluate(() => document.querySelector('[aria-label="Pull requests of the repository"] h2')?.innerText ?? "")) === "acme/app" && (await text(page)).includes("admin"));
+      await pickRepo(page, "other/lib");
+      await sleep(300);
+      ok("another repository: its own pull requests, and the pick is remembered for this account", JSON.stringify((await gcalls(page, "github_pulls")).at(-1)) === JSON.stringify({ account: "gh:me-home", owner: "other", name: "lib", state: "open", page: 1 }) && JSON.stringify(await pullRows(page)) === JSON.stringify(["other/lib#7"]) && (await page.evaluate(() => localStorage.getItem("gitswitch:pulls.repoByAccount") ?? "")).includes('"gh:me-home":"other/lib"'), JSON.stringify(await pullRows(page)));
+      await groupPill(page, "Whose pull requests", "Review requested");
+      await sleep(300);
+      ok("whose: a search in this repository only, and the rows need not repeat its name", JSON.stringify((await gcalls(page, "github_pulls_search")).at(-1)) === JSON.stringify({ account: "gh:me-home", scope: "review_requested", state: "open", repo: "other/lib", page: 1 }) && (await page.evaluate(() => document.querySelector('[data-pull-row="other/lib#7"]')?.innerText ?? "")).includes("#7 by me-home") && !(await page.evaluate(() => document.querySelector('[data-pull-row="other/lib#7"]')?.innerText ?? "")).includes("other/lib #7"), JSON.stringify((await gcalls(page, "github_pulls_search")).at(-1)));
+      ok("  the pick is remembered", (await page.evaluate(() => localStorage.getItem("gitswitch:pulls.whose"))) === '"review_requested"');
+      await groupPill(page, "Whose pull requests", "Everyone's");
+      await groupPill(page, "Pull request state", "Merged");
+      await sleep(300);
+      ok("state: the repository's merged ones", (await gcalls(page, "github_pulls")).at(-1)?.state === "merged" && (await gcalls(page, "github_pulls")).at(-1)?.name === "lib");
+      await groupPill(page, "Pull request state", "Open");
+      await groupPill(page, "Which repositories", "To review");
       await sleep(200);
-      await pill(page, "Merged");
+      ok("To review: only the repositories asking you for a review", JSON.stringify(await repoRows(page)) === JSON.stringify(["acme/app"]), JSON.stringify(await repoRows(page)));
+      await groupPill(page, "Which repositories", "All");
       await sleep(200);
-      const last = (await gcalls(page, "github_pulls_search")).at(-1) ?? {};
-      ok("whose and which state change the search", last.scope === "created" && last.state === "merged" && JSON.stringify(await pullRows(page)) === JSON.stringify(["acme/app#10"]), JSON.stringify(last));
-      await page.type('input[aria-label="Only in repository"]', "acme/app");
-      await page.keyboard.press("Enter");
-      await sleep(200);
-      ok("one repository only", (await gcalls(page, "github_pulls_search")).at(-1)?.repo === "acme/app");
-      await page.evaluate(() => document.querySelector('[data-pull-row="acme/app#10"]')?.click());
+      ok("All: every repository, archived ones marked", JSON.stringify(await repoRows(page)) === JSON.stringify(["acme/app", "other/lib", "quiet/repo"]) && !!(await page.$('[data-pull-repo="quiet/repo"] [aria-label="archived"]')), JSON.stringify(await repoRows(page)));
+      await page.type('input[aria-label="Filter repositories"]', "quiet");
+      await sleep(150);
+      ok("  the filter box narrows the repositories", JSON.stringify(await repoRows(page)) === JSON.stringify(["quiet/repo"]), JSON.stringify(await repoRows(page)));
+      await pickRepo(page, "quiet/repo");
+      await sleep(300);
+      ok("  a repository without open pull requests says so", (await text(page)).includes("No open pull requests."));
+      await page.click('input[aria-label="Filter repositories"]', { clickCount: 3 });
+      await page.keyboard.press("Backspace");
+      await pickRepo(page, "acme/app");
+      await sleep(300);
+      const marks = { repos: (await gcalls(page, "github_pull_repos")).length, accounts: (await gcalls(page, "repo_accounts")).length, pulls: (await gcalls(page, "github_pulls")).length };
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Refresh")?.click());
       await sleep(400);
-      ok("a row opens the pull request, as the account picked", JSON.stringify((await gcalls(page, "github_pull")).at(-1)) === JSON.stringify({ account: "gh:me-home", owner: "acme", name: "app", number: 10 }));
+      ok("one Refresh reads the accounts, the repositories and the list again", (await gcalls(page, "github_pull_repos")).length === marks.repos + 1 && (await gcalls(page, "repo_accounts")).length === marks.accounts + 1 && (await gcalls(page, "github_pulls")).length === marks.pulls + 1, JSON.stringify(marks));
+      ok("  and the list has no Refresh of its own here", (await page.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Refresh").length)) === 1);
+      await page.evaluate(() => document.querySelector('[data-pull-row="acme/app#1"]')?.click());
+      await sleep(400);
+      ok("a pull request opens to review and merge, as the account picked", JSON.stringify((await gcalls(page, "github_pull")).at(-1)) === JSON.stringify({ account: "gh:me-home", owner: "acme", name: "app", number: 1 }) && (await panelText(page)).includes("me-home wants to merge"));
       await page.close();
+
+      const gone = await open(SCENARIOS.clean, { gh: G, storage: { "pulls.repoByAccount": { "gh:me-home": "gone/repo" }, "pulls.whose": "nonsense", "pulls.repoFilter": "open" } });
+      await toPulls(gone);
+      ok("a remembered repository that is gone: the first one is shown, and the gone one is never asked for", JSON.stringify((await gcalls(gone, "github_pulls")).map((c) => `${c.owner}/${c.name}`)) === JSON.stringify(["acme/app"]), JSON.stringify(await gcalls(gone, "github_pulls")));
+      ok("  an unknown remembered 'whose' falls back to everyone's", (await gcalls(gone, "github_pulls_search")).length === 0);
+      await gone.close();
+
+      const none = await open(SCENARIOS.clean, { gh: { ...G, pullRepos: { ...PULL_REPOS, notes: [], repos: [REPO("quiet/repo", 0, 0, 0)] } } });
+      await none.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.trim() === "Pull requests")?.click());
+      await none.waitForFunction(() => document.body.innerText.includes("has an open pull request"), { timeout: 5000 }).catch(() => null);
+      ok("no repository with open pull requests: said, nothing asked, and All is offered", (await text(none)).includes("None of @me-home's 1 repositories has an open pull request.") && (await gcalls(none, "github_pulls")).length === 0 && !!(await button(none, "Show all repositories")));
+      await (await button(none, "Show all repositories"))?.click();
+      await sleep(300);
+      ok("  Show all lists it and shows its pull requests", JSON.stringify(await repoRows(none)) === JSON.stringify(["quiet/repo"]) && (await gcalls(none, "github_pulls")).at(-1)?.name === "repo");
+      await none.close();
     }
+  }
+
+  section("Uninstall tab: the apps, one uninstalled step by step, then only its leftovers — ids sent, never paths");
+  {
+    const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+    const rows = (page) => page.evaluate(() => [...document.querySelectorAll("[data-app-row]")].map((r) => r.getAttribute("data-app-row")));
+    const page = await openUninstallPage(browser, server);
+    await page.waitForFunction(() => document.querySelectorAll("[data-app-row]").length === 4, { timeout: 5000 }).catch(() => null);
+    ok("the apps are listed by name", JSON.stringify(await rows(page)) === JSON.stringify(["Bar Tool", "Foo Writer", "GitSwitch", "Xcode"]), JSON.stringify(await rows(page)));
+    await page.evaluate(() => [...document.querySelectorAll('[aria-label="Sort"] button')].find((b) => b.innerText === "Size").click());
+    await sleep(200);
+    ok("  by size, the biggest first", (await rows(page)).slice(0, 2).join() === "Bar Tool,Foo Writer");
+    await page.type('input[aria-label="Find an app"]', "foo");
+    await sleep(200);
+    ok("  the search narrows them", JSON.stringify(await rows(page)) === JSON.stringify(["Foo Writer"]));
+    await page.evaluate(() => { const i = document.querySelector('input[aria-label="Find an app"]'); const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set; set.call(i, ""); i.dispatchEvent(new Event("input", { bubbles: true })); });
+    await sleep(200);
+    ok("one GitSwitch can't remove says why, and its button is off", await page.evaluate(() => { const r = document.querySelector('[data-app-row="Xcode"]'); return r.innerText.includes("Not removable here: GitSwitch's git comes from it") && r.querySelector("[data-app-uninstall]").disabled; }));
+    await page.evaluate(() => document.querySelector('[data-app-row="GitSwitch"] [data-app-uninstall]').click());
+    await sleep(300);
+    ok("GitSwitch's own row opens its own uninstall", (await calls(page, "uninstall_plan")).length === 1 && (await calls(page, "apps_prepare")).length === 0);
+    await page.keyboard.press("Escape");
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Cancel")?.click());
+    await sleep(200);
+
+    await page.evaluate(() => document.querySelector('[data-app-row="Foo Writer"] [data-app-uninstall]').click());
+    await page.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
+    const prep = await calls(page, "apps_prepare");
+    ok("the confirm step asks for the app by its id only", prep.length === 1 && JSON.stringify(prep[0]) === JSON.stringify({ id: "mac:/Applications/Foo Writer.app" }), JSON.stringify(prep));
+    ok("  and says what will happen", (await text(page)).includes("/Applications/Foo Writer.app is moved to the Trash."));
+    await page.evaluate(() => document.querySelector("[data-flow-go]").click());
+    await page.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    ok("uninstalled with the session, nothing else", JSON.stringify(await calls(page, "apps_uninstall")) === JSON.stringify([{ session: "sess-FooWriter" }]));
+    ok("  no registry choice on a Mac", !(await page.$("[data-flow-registry]")));
+    await page.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await page.waitForFunction(() => document.querySelector('[data-flow-stage="leftovers"]'), { timeout: 5000 }).catch(() => null);
+    ok("its leftovers are asked for with the session", JSON.stringify(await calls(page, "apps_scan")) === JSON.stringify([{ session: "sess-FooWriter", registry: false }]));
+    const ticks = await page.evaluate(() => [...document.querySelectorAll("[data-leftover]")].map((l) => [l.getAttribute("data-leftover"), l.querySelector('input[type="checkbox"]').checked]));
+    ok("the sure ones are ticked, the maybe is not", JSON.stringify(ticks) === JSON.stringify([["l2", false], ["l0", true], ["l1", true]]) || JSON.stringify(ticks.sort()) === JSON.stringify([["l0", true], ["l1", true], ["l2", false]]), JSON.stringify(ticks));
+    ok("the administrator's one has a command and no checkbox", await page.evaluate(() => { const a = document.querySelector('[data-leftover-admin="l3"]'); return !!a && !a.querySelector('input[type="checkbox"]') && a.innerText.includes("sudo rm -rf"); }));
+    ok("  the notes are shown", (await text(page)).includes("sudo pkgutil --forget com.acme.pkg"));
+    ok("the button counts what is ticked", (await text(page)).includes("Move 2 to the Trash"));
+    await page.evaluate(() => document.querySelector('[data-leftover="l2"] input[type="checkbox"]').click());
+    await sleep(150);
+    ok("  ticking the maybe counts it", (await text(page)).includes("Move 3 to the Trash"));
+    await page.evaluate(() => document.querySelector("[data-flow-delete]").click());
+    await page.waitForFunction(() => document.querySelector('[data-flow-stage="done"]'), { timeout: 5000 }).catch(() => null);
+    const del = await calls(page, "apps_delete");
+    ok("deleting sends the scan and the ticked ids — never a path", del.length === 1 && del[0].scan === "scan-1" && JSON.stringify([...del[0].ids].sort()) === JSON.stringify(["l0", "l1", "l2"]) && !JSON.stringify(del).includes("/"), JSON.stringify(del));
+    ok("  and says what happened to each", (await page.$$('[data-result="trashed"]')).length === 3);
+    await page.close();
+
+    const run = await openUninstallPage(browser, server, { prepared: { "mac:/Applications/Foo Writer.app": { running: true } } });
+    await run.evaluate(() => document.querySelector('[data-app-row="Foo Writer"] [data-app-uninstall]').click());
+    await run.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
+    ok("a running app: quit it first, the button is off", (await text(run)).includes("Foo Writer is running. Quit it first.") && (await run.evaluate(() => document.querySelector("[data-flow-go]").disabled)));
+    await run.close();
+
+    const still = await openUninstallPage(browser, server, { uninstall: { state: "still-installed", message: "Another copy with the same id is installed at /Users/me/Applications/Foo Writer.app — its files are its own." } });
+    await still.evaluate(() => document.querySelector('[data-app-row="Foo Writer"] [data-app-uninstall]').click());
+    await still.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
+    await still.evaluate(() => document.querySelector("[data-flow-go]").click());
+    await still.waitForFunction(() => document.querySelector('[data-flow-stage="still"]'), { timeout: 5000 }).catch(() => null);
+    ok("still installed (another copy): said, and no leftovers are looked for", (await text(still)).includes("Another copy with the same id") && (await calls(still, "apps_scan")).length === 0);
+    await still.close();
+
+    const resumed = await openUninstallPage(browser, server, { sessions: [{ session: "sess-old", name: "Old App", state: "gone", started: 1760000000 }] });
+    ok("an uninstall not finished (a restart in between) is offered", (await text(resumed)).includes("Old App") && (await text(resumed)).includes("its leftovers were not looked at"));
+    await (await button(resumed, "Continue")).click();
+    await resumed.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    await resumed.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await sleep(300);
+    ok("  Continue looks for that one's leftovers", JSON.stringify(await calls(resumed, "apps_scan")) === JSON.stringify([{ session: "sess-old", registry: false }]));
+    await resumed.close();
+  }
+
+  section("Uninstall tab on Windows and Ubuntu: the uninstaller followed, the registry only when asked, apt's extra packages confirmed");
+  {
+    const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+    const win = await openUninstallPage(browser, server, {
+      platform: "windows",
+      apps: [{ id: "win:HKLM64:7-Zip", name: "7-Zip 23.01 (x64)", version: "23.01", publisher: "Igor Pavlov", location: "C:\\Program Files\\7-Zip", source: "exe", size: 5800000, date: null, notes: [], blocked: null, is_self: false }],
+      prepared: { "win:HKLM64:7-Zip": { method: "Its own uninstaller opens; follow its steps.", command: '"C:\\Program Files\\7-Zip\\Uninstall.exe"' } },
+      uninstall: { state: "uninstalling", message: "The uninstaller is open — follow its steps." },
+      status: [{ state: "uninstalling", message: "The uninstaller is open — follow its steps." }, { state: "gone", message: null }],
+    });
+    await win.evaluate(() => document.querySelector("[data-app-uninstall]").click());
+    await win.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
+    ok("the exact command that runs is shown", (await text(win)).includes('"C:\\Program Files\\7-Zip\\Uninstall.exe"'));
+    await win.evaluate(() => document.querySelector("[data-flow-go]").click());
+    await win.waitForFunction(() => document.querySelector('[data-flow-stage="running"]'), { timeout: 5000 }).catch(() => null);
+    ok("while the uninstaller runs, it is followed, and \"It's finished\" is offered", (await text(win)).includes("follow its steps") && !!(await button(win, "It's finished — check")));
+    await win.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 8000 }).catch(() => null);
+    ok("  it moves on when the uninstaller is done", !!(await win.$('[data-flow-stage="gone"]')) && (await calls(win, "apps_status")).length >= 2);
+    ok("the registry is a choice, off by default", await win.evaluate(() => { const r = document.querySelector("[data-flow-registry] input"); return !!r && !r.checked; }));
+    await win.evaluate(() => document.querySelector("[data-flow-registry] input").click());
+    await win.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await sleep(300);
+    ok("  ticked, the scan includes it", JSON.stringify(await calls(win, "apps_scan")) === JSON.stringify([{ session: "sess-7Zip2301x64", registry: true }]));
+    ok("  and Windows' word is used", (await text(win)).includes("to the Recycle Bin"));
+    await win.close();
+
+    const deb = { id: "deb:xterm", name: "XTerm", version: "379", publisher: null, location: "package xterm", source: "deb", size: 1400000, date: null, notes: [], blocked: null, is_self: false };
+    const lin = await openUninstallPage(browser, server, {
+      platform: "linux",
+      apps: [deb],
+      packages: [{ ...deb, id: "pkg:libfoo1", name: "libfoo1", source: "package" }],
+      prepared: { "deb:xterm": { method: "The package xterm and the 1 other package(s) listed are removed; the system asks for your password.", command: "pkexec env DEBIAN_FRONTEND=noninteractive dpkg -r xterm xterm-extra", also_removed: ["xterm-extra"] } },
+    });
+    ok("Ubuntu shows Apps and All packages", (await text(lin)).includes("All packages"));
+    await lin.evaluate(() => document.querySelector("[data-app-uninstall]").click());
+    await lin.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
+    ok("what apt would also remove is shown, and Uninstall waits for a yes", (await text(lin)).includes("xterm-extra") && (await lin.evaluate(() => document.querySelector("[data-flow-go]").disabled)));
+    await lin.evaluate(() => document.querySelector("[data-flow-also] input").click());
+    await sleep(150);
+    ok("  ticked \"Remove them too\": it can go", !(await lin.evaluate(() => document.querySelector("[data-flow-go]").disabled)));
+    await lin.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Cancel").click());
+    await sleep(200);
+    await lin.evaluate(() => [...document.querySelectorAll('[aria-label="What to list"] button')].find((b) => b.innerText === "All packages").click());
+    await sleep(300);
+    ok("All packages asks for every package", (await calls(lin, "apps_list")).some((a) => a.kind === "packages") && (await text(lin)).includes("libfoo1"));
+    ok("  with a warning about what packages are", (await text(lin)).includes("the system's own packages can't be removed here"));
+    await lin.close();
+  }
+
+  section("Settings › Uninstall GitSwitch: what is taken back and what is kept, the locks refused stops everything");
+  {
+    const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+    const plan = { platform: "macos", app: { kind: "trash", bundle: "/Applications/GitSwitch.app", trash: "/Users/me/.Trash" }, how: "/Applications/GitSwitch.app is moved to the Trash once GitSwitch has quit.", gitconfig: "/Users/me/.gitconfig", signers: null, repos: ["/w/one", "/w/two"], lock_helper: true, locks: ["/w/two"], signins: ["me-home"], data: ["/Users/me/Library/Application Support/com.gitswitch.app"] };
+    const page = await openUninstallPage(browser, server, { path: "/settings", plan });
+    await page.evaluate(() => document.querySelector("[data-uninstall-open]").click());
+    await page.waitForFunction(() => document.querySelector("[data-uninstall-now]"), { timeout: 5000 }).catch(() => null);
+    const t = await text(page);
+    ok("the dialog lists what is taken back now", t.includes("The push locks (1) and the lock helper") && t.includes("in 2 repositories") && t.includes("/Users/me/.gitconfig") && t.includes("@me-home"));
+    ok("  what goes once GitSwitch has quit", t.includes("com.gitswitch.app") && t.includes("moved to the Trash once GitSwitch has quit"));
+    ok("  and what is kept", t.includes("Your SSH keys") && t.includes("Your repositories and their files"));
+    await page.evaluate(() => document.querySelector('[aria-label="Keep my profiles and sign-ins"]').click());
+    await sleep(150);
+    const kept = await text(page);
+    ok("keeping data moves the sign-ins and data to Kept", !kept.includes("@me-home") && !kept.includes("com.gitswitch.app") && kept.includes("Your profiles, settings and GitHub sign-ins"));
+    await page.evaluate(() => document.querySelector("[data-uninstall-go]").click());
+    await page.waitForFunction(() => document.querySelector("[data-uninstall-closing]"), { timeout: 5000 }).catch(() => null);
+    ok("it takes back, then removes — both told to keep the data", JSON.stringify(await calls(page, "uninstall_prepare")) === JSON.stringify([{ keepData: true }]) && JSON.stringify(await calls(page, "uninstall_finish")) === JSON.stringify([{ keepData: true }]));
+    ok("  and says what happens next", (await text(page)).includes("moved to the Trash once GitSwitch has quit"));
+    await page.close();
+
+    const refused = await openUninstallPage(browser, server, { path: "/settings", plan, selfPrepare: { outcome: "stopped", message: "The push locks were not removed (cancelled), so nothing was uninstalled.", command: "sudo /x/helper --job /x/job.json", done: [], problems: [] } });
+    await refused.evaluate(() => document.querySelector("[data-uninstall-open]").click());
+    await refused.waitForFunction(() => document.querySelector("[data-uninstall-go]"), { timeout: 5000 }).catch(() => null);
+    await refused.evaluate(() => document.querySelector("[data-uninstall-go]").click());
+    await refused.waitForFunction(() => document.querySelector("[data-uninstall-stopped]"), { timeout: 5000 }).catch(() => null);
+    ok("the locks refused: stopped, with the command, and nothing removed", (await text(refused)).includes("nothing was uninstalled") && (await text(refused)).includes("sudo /x/helper") && (await calls(refused, "uninstall_finish")).length === 0);
+    await refused.close();
   }
 } finally {
   await browser.close();

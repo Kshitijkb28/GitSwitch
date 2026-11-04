@@ -636,6 +636,19 @@ export async function scanRepos(root: string): Promise<ScannedRepo[]> {
   return invoke("scan_repos", { root });
 }
 
+/** A folder scan the page can watch (findReposProgress) and stop (findReposCancel) by its id. */
+export interface TrackedScan {
+  root: string;
+  repos: ScannedRepo[];
+  folders: number;
+  /** Stopped before it ended: repos is then empty. */
+  cancelled: boolean;
+}
+
+export async function scanReposTracked(scanId: string, root: string): Promise<TrackedScan> {
+  return invoke("scan_repos_tracked", { scanId, root });
+}
+
 export async function checkRepoAccess(
   token: string,
   owner: string,
@@ -668,6 +681,15 @@ export interface FoundRepo extends ScannedRepo {
   commits_as: CommitsAs;
 }
 
+/** A repository found that a profile's folder already holds. */
+export interface ListedRepo {
+  path: string;
+  profile_id: string;
+  profile_name: string;
+  /** The GitHub account the profile names, when it names one. */
+  github_login: string | null;
+}
+
 export interface FoundClones {
   /** The home folder, for showing paths under it as `~/…`. */
   home: string | null;
@@ -676,6 +698,8 @@ export interface FoundClones {
   repos: FoundRepo[];
   /** Repositories found that the Repository page lists already. */
   already_listed: number;
+  /** Those repositories, each with the profile the Repository page shows it under. */
+  listed?: ListedRepo[];
   truncated: { place: string; why: string }[];
   /** Folders at the top of a place that could not be read (a macOS privacy refusal, say). */
   unreadable: string[];
@@ -2515,4 +2539,207 @@ export async function githubCollaboratorRemove(account: string, owner: string, n
 
 export async function githubInvitationCancel(account: string, owner: string, name: string, id: number): Promise<void> {
   return invoke("github_invitation_cancel", { account, owner, name, id });
+}
+
+/** One of the account's repositories on the Pull requests page, with its counts. */
+export interface PullRepo {
+  /** "owner/name" */
+  repo: string;
+  private: boolean;
+  archived: boolean;
+  fork: boolean;
+  pushed_at: string | null;
+  /** admin | maintain | write | triage | read */
+  permission: string | null;
+  /** Open pull requests; null when they could not be counted. */
+  open: number | null;
+  /** Open pull requests asking this account for a review; null when the count failed. */
+  to_review: number | null;
+  /** Open pull requests this account opened; null when the count failed. */
+  mine: number | null;
+  /** False: someone else's repository, known through a pull request of yours or a review asked of you. */
+  affiliated: boolean;
+}
+
+export interface PullRepos {
+  login: string;
+  repos: PullRepo[];
+  truncated: boolean;
+  notes: string[];
+}
+
+export async function githubPullRepos(account: string): Promise<PullRepos> {
+  return invoke("github_pull_repos", { account });
+}
+
+// ---- Uninstalling GitSwitch ----
+
+export type AppRemoval =
+  | { kind: "trash"; bundle: string; trash: string }
+  | { kind: "nsis"; uninstaller: string }
+  | { kind: "deb"; package: string }
+  | { kind: "rpm"; package: string }
+  | { kind: "app-image"; file: string }
+  | { kind: "manual"; reason: string };
+
+export interface UninstallPlan {
+  platform: "macos" | "windows" | "linux";
+  app: AppRemoval;
+  how: string;
+  gitconfig: string | null;
+  signers: string | null;
+  repos: string[];
+  lock_helper: boolean;
+  locks: string[];
+  signins: string[];
+  data: string[];
+}
+
+export interface UninstallPrepare {
+  outcome: "done" | "stopped";
+  message: string;
+  command: string | null;
+  done: string[];
+  problems: string[];
+}
+
+export interface UninstallFinish {
+  how: string;
+  manual: string | null;
+  log: string;
+}
+
+export async function uninstallPlan(): Promise<UninstallPlan> {
+  return invoke("uninstall_plan");
+}
+
+export async function uninstallPrepare(keepData: boolean): Promise<UninstallPrepare> {
+  return invoke("uninstall_prepare", { keepData });
+}
+
+/** Starts the removal and quits GitSwitch about 1.5 s later. */
+export async function uninstallFinish(keepData: boolean): Promise<UninstallFinish> {
+  return invoke("uninstall_finish", { keepData });
+}
+
+// ---- The Uninstall tab: apps on this computer, and their leftovers ----
+
+export interface InstalledApp {
+  id: string;
+  name: string;
+  version: string | null;
+  publisher: string | null;
+  location: string | null;
+  /** app | app-store | homebrew | msi | exe | store | deb | snap | flatpak | appimage | package */
+  source: string;
+  size: number | null;
+  date: number | null;
+  notes: string[];
+  blocked: string | null;
+  is_self: boolean;
+}
+
+export interface AppList {
+  platform: "macos" | "windows" | "linux";
+  apps: InstalledApp[];
+  notes: string[];
+}
+
+export interface AppPrepared {
+  session: string;
+  app: InstalledApp;
+  method: string;
+  command: string | null;
+  facts: string[];
+  also_removed: string[];
+  blocked: string | null;
+  running: boolean;
+  warnings: string[];
+  vendor_uninstaller: string | null;
+}
+
+export interface AppProgress {
+  /** uninstalling | gone | still-installed | failed */
+  state: string;
+  message: string | null;
+}
+
+export interface Leftover {
+  id: string;
+  path: string;
+  place: string;
+  /** file | folder | registry | launch-agent | package-settings | link */
+  kind: string;
+  size: number | null;
+  size_complete: boolean;
+  confidence: "high" | "medium";
+  reason: string;
+  admin: boolean;
+  command: string | null;
+}
+
+export interface LeftoverScan {
+  scan: string;
+  items: Leftover[];
+  notes: string[];
+}
+
+export interface LeftoverDeleted {
+  id: string;
+  /** trashed | removed | gone | changed | refused | needs-admin | protected | failed */
+  outcome: string;
+  message: string;
+}
+
+export interface UninstallSessionSummary {
+  session: string;
+  name: string;
+  state: string;
+  started: number;
+}
+
+export async function appsList(kind: "apps" | "packages"): Promise<AppList> {
+  return invoke("apps_list", { kind });
+}
+
+/** [bytes, counted completely] */
+export async function appsSize(id: string): Promise<[number, boolean]> {
+  return invoke("apps_size", { id });
+}
+
+export async function appsPrepare(id: string): Promise<AppPrepared> {
+  return invoke("apps_prepare", { id });
+}
+
+export async function appsUninstall(session: string): Promise<AppProgress> {
+  return invoke("apps_uninstall", { session });
+}
+
+export async function appsStatus(session: string): Promise<AppProgress> {
+  return invoke("apps_status", { session });
+}
+
+export async function appsCheckGone(session: string): Promise<AppProgress> {
+  return invoke("apps_check_gone", { session });
+}
+
+export async function appsScan(session: string, registry: boolean): Promise<LeftoverScan> {
+  return invoke("apps_scan", { session, registry });
+}
+
+/** Only the scan's ids travel — the backend knows what each one is. */
+export async function appsDelete(scan: string, ids: string[]): Promise<LeftoverDeleted[]> {
+  return invoke("apps_delete", { scan, ids });
+}
+
+export async function appsSessions(): Promise<UninstallSessionSummary[]> {
+  return invoke("apps_sessions");
+}
+
+export async function appsForget(session: string): Promise<void> {
+  return invoke("apps_forget", { session });
+}
+
+export async function appsOpenUninstaller(session: string): Promise<void> {
+  return invoke("apps_open_uninstaller", { session });
 }

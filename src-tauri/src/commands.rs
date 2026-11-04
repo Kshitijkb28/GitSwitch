@@ -307,6 +307,13 @@ pub async fn scan_repos(root: String) -> Result<Vec<ScannedRepo>, AppError> {
     repo_scan::scan_repos(root).await
 }
 
+/// Auto Assign's scan: the same, watched through `find_repos_progress` and
+/// stopped through `find_repos_cancel` with the same id.
+#[tauri::command]
+pub async fn scan_repos_tracked(scan_id: String, root: String) -> Result<repo_scan::TrackedScan, AppError> {
+    repo_scan::scan_tracked(scan_id, root).await
+}
+
 /// Auto-assign: what access does this token's account have on owner/repo?
 /// None = the account can't even see the repo.
 #[tauri::command]
@@ -332,6 +339,13 @@ pub async fn github_repo_context(repo_path: Option<String>, repo: Option<String>
 #[tauri::command]
 pub async fn github_pulls(account: String, owner: String, name: String, state: String, page: u32) -> Result<pulls::PullPage, AppError> {
     pulls::list(&Gh::for_account(&account).await?, &owner, &name, &state, page).await
+}
+
+/// The account's repositories for the Pull requests page, each with its open
+/// pull requests, the ones asking the account for a review and the ones it opened.
+#[tauri::command]
+pub async fn github_pull_repos(account: String) -> Result<pulls::PullRepos, AppError> {
+    pulls::repos(&Gh::for_account(&account).await?).await
 }
 
 /// Pull requests across repositories: created by, review requested of, assigned to, or involving the account.
@@ -972,6 +986,94 @@ pub async fn push_lock_helper_status() -> HelperStatus {
 #[tauri::command]
 pub async fn push_lock_uninstall() -> JobOutcome {
     push_lock::uninstall_all().await
+}
+
+/// The Uninstall tab: the installed apps (`kind` "packages": Ubuntu's every package).
+#[tauri::command]
+pub async fn apps_list(kind: String) -> Result<crate::apps::AppList, AppError> {
+    Box::pin(crate::apps::list(kind)).await
+}
+
+/// An app's size, counted within a few seconds: (bytes, complete).
+#[tauri::command]
+pub async fn apps_size(id: String) -> Result<(u64, bool), AppError> {
+    crate::apps::size(id).await
+}
+
+/// The confirm step: what identifies the app is recorded, and how it will go is said.
+#[tauri::command]
+pub async fn apps_prepare(id: String) -> Result<crate::apps::Prepared, AppError> {
+    Box::pin(crate::apps::prepare(id)).await
+}
+
+#[tauri::command]
+pub async fn apps_uninstall(session: String) -> Result<crate::apps::Progress, AppError> {
+    Box::pin(crate::apps::uninstall(session)).await
+}
+
+#[tauri::command]
+pub async fn apps_status(session: String) -> Result<crate::apps::Progress, AppError> {
+    Box::pin(crate::apps::status(session)).await
+}
+
+/// "It's finished": is the app really gone?
+#[tauri::command]
+pub async fn apps_check_gone(session: String) -> Result<crate::apps::Progress, AppError> {
+    Box::pin(crate::apps::check_gone(session)).await
+}
+
+/// The removed app's leftovers (Windows: `registry` adds its keys under HKCU).
+#[tauri::command]
+pub async fn apps_scan(session: String, registry: bool) -> Result<crate::apps::LeftoverScan, AppError> {
+    Box::pin(crate::apps::scan(session, registry)).await
+}
+
+/// Move the ticked leftovers (ids from the scan) to the Trash.
+#[tauri::command]
+pub async fn apps_delete(scan: String, ids: Vec<String>) -> Result<Vec<crate::apps::Deleted>, AppError> {
+    Box::pin(crate::apps::delete(scan, ids)).await
+}
+
+#[tauri::command]
+pub fn apps_sessions() -> Vec<crate::apps::SessionSummary> {
+    crate::apps::sessions()
+}
+
+#[tauri::command]
+pub fn apps_forget(session: String) -> Result<(), AppError> {
+    crate::apps::forget(session)
+}
+
+#[tauri::command]
+pub fn apps_open_uninstaller(session: String) -> Result<(), AppError> {
+    crate::apps::open_vendor_uninstaller(session)
+}
+
+/// What uninstalling GitSwitch would take back and remove, read now.
+#[tauri::command]
+pub async fn uninstall_plan() -> crate::uninstall::UninstallPlan {
+    Box::pin(crate::uninstall::plan()).await
+}
+
+/// Uninstalling, first step: take back what GitSwitch wrote outside its own
+/// folders (push locks behind the administrator prompt, repositories,
+/// ~/.gitconfig, allowed_signers, sign-ins unless `keep_data`).
+#[tauri::command]
+pub async fn uninstall_prepare(keep_data: bool) -> crate::uninstall::PrepareReport {
+    Box::pin(crate::uninstall::prepare(keep_data)).await
+}
+
+/// Uninstalling, last step: start the script that removes the data folders
+/// (unless `keep_data`) and the app once it has quit — then quit.
+#[tauri::command]
+pub async fn uninstall_finish(app: tauri::AppHandle, keep_data: bool) -> Result<crate::uninstall::FinishReport, AppError> {
+    let report = crate::uninstall::finish(keep_data)?;
+    tauri::async_runtime::spawn(async move {
+        // Long enough for the page to say what happens next.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        app.exit(0);
+    });
+    Ok(report)
 }
 
 /// Doctor's `lock-*` fixes.

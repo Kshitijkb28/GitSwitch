@@ -112,6 +112,16 @@ pub struct Linked {
     pub to: String,
 }
 
+/// A repository found that a profile's folder already holds.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct ListedRepo {
+    pub path: String,
+    pub profile_id: String,
+    pub profile_name: String,
+    /// The GitHub account the profile names, when it names one.
+    pub github_login: Option<String>,
+}
+
 #[derive(Debug, Serialize, Default)]
 pub struct FoundClones {
     /// The home folder, for showing paths under it as `~/…`.
@@ -121,6 +131,9 @@ pub struct FoundClones {
     pub repos: Vec<FoundRepo>,
     /// Repositories found that the Repository page lists already.
     pub already_listed: usize,
+    /// Those same repositories, each with the profile the Repository page
+    /// shows it under (`already_listed` of them, by path).
+    pub listed: Vec<ListedRepo>,
     /// Places cut short, or not reached, and why.
     pub truncated: Vec<Cut>,
     /// Folders at the top of a place that could not be read — on macOS, a
@@ -141,6 +154,9 @@ pub(crate) struct Search {
     /// Repositories the page does not list, with whether `.git` is a file.
     pub candidates: Vec<(PathBuf, bool)>,
     pub already_listed: usize,
+    /// The repositories counted in `already_listed`, with the id of the
+    /// profile the Repository page shows each under.
+    pub listed: Vec<(PathBuf, String)>,
     pub truncated: Vec<Cut>,
     pub unreadable: Vec<String>,
     pub rejected: Vec<Rejected>,
@@ -183,7 +199,12 @@ impl ScanState {
         self.cancel.store(true, Ordering::SeqCst);
     }
 
-    fn set(&self, f: impl FnOnce(&mut FindProgress)) {
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> FindProgress {
+        self.progress.lock().map(|p| p.clone()).unwrap_or_default()
+    }
+
+    pub(crate) fn set(&self, f: impl FnOnce(&mut FindProgress)) {
         if let Ok(mut p) = self.progress.lock() {
             f(&mut p);
         }
@@ -199,8 +220,9 @@ fn registry() -> &'static Registry {
 
 /// The search with this id, made on first use. A Stop that arrives before
 /// the search itself makes it, cancelled, so the search ends as it starts.
-/// The sixteen most recent are kept.
-fn scan(id: &str) -> Arc<ScanState> {
+/// The sixteen most recent are kept. Auto Assign's folder scan uses the same
+/// registry, so one poll and one Stop serve both.
+pub(crate) fn scan(id: &str) -> Arc<ScanState> {
     let mut r = registry().lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, s)) = r.iter().find(|(k, _)| k == id) {
         return s.clone();
@@ -606,10 +628,12 @@ fn dot_git(dir: &Path) -> DotGit {
 }
 
 /// What the Repository page lists: its own walk of every profile folder
-/// (`repo_scan::walk_repo_dirs`), as paths and with links resolved.
-fn listed_set(profs: &[Profile]) -> (HashSet<String>, HashSet<String>) {
-    let mut paths = HashSet::new();
-    let mut reals = HashSet::new();
+/// (`repo_scan::walk_repo_dirs`), as paths and with links resolved — each with
+/// the profile the page shows it under: the deepest profile folder holding it,
+/// else the profile whose folder was walked first (`git_history::list_repos`).
+fn listed_set(profs: &[Profile]) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut paths = HashMap::new();
+    let mut reals = HashMap::new();
     for p in profs {
         for d in &p.directories {
             let dir = Path::new(d);
@@ -618,10 +642,11 @@ fn listed_set(profs: &[Profile]) -> (HashSet<String>, HashSet<String>) {
             }
             for r in crate::repo_scan::walk_repo_dirs(dir) {
                 let s = shown(&r);
+                let owner = crate::commit_audit::owning_profile(&s, profs).unwrap_or(p).id.clone();
                 if let Some(real) = crate::paths::real_form(&s) {
-                    reals.insert(real);
+                    reals.entry(real).or_insert_with(|| owner.clone());
                 }
-                paths.insert(crate::paths::norm(&s));
+                paths.entry(crate::paths::norm(&s)).or_insert(owner);
             }
         }
     }
@@ -665,8 +690,9 @@ pub(crate) fn search(home: Option<&Path>, extra: &[String], profs: &[Profile], s
         if !seen.insert(real.clone().unwrap_or_else(|| written.clone())) {
             continue;
         }
-        if listed.contains(&written) || real.as_ref().is_some_and(|r| listed_real.contains(r)) {
+        if let Some(owner) = listed.get(&written).or_else(|| real.as_ref().and_then(|r| listed_real.get(r))) {
             out.already_listed += 1;
+            out.listed.push((dir.clone(), owner.clone()));
             continue;
         }
         let elsewhere = match dot_git(&dir) {
@@ -755,6 +781,25 @@ fn describe(dir: &Path, elsewhere: bool, profs: &[Profile]) -> FoundRepo {
     FoundRepo { repo, push_owner, push_name, gitdir_elsewhere: elsewhere, commits_as }
 }
 
+/// The already-listed repositories found, by path, with their profile's name
+/// and account — no git asked.
+fn listed_repos(listed: &[(PathBuf, String)], profs: &[Profile]) -> Vec<ListedRepo> {
+    let mut out: Vec<ListedRepo> = listed
+        .iter()
+        .filter_map(|(dir, id)| {
+            let p = profs.iter().find(|p| &p.id == id)?;
+            Some(ListedRepo {
+                path: shown(dir),
+                profile_id: p.id.clone(),
+                profile_name: p.name.clone(),
+                github_login: p.github_login.as_deref().map(|l| l.trim().trim_start_matches('@').to_string()).filter(|l| !l.is_empty()),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
 /// The search, then git's word on each repository kept.
 pub(crate) fn find_in(home: Option<&Path>, extra: &[String], profs: &[Profile], scan: &ScanState, limits: Limits) -> FoundClones {
     let s = search(home, extra, profs, scan, limits);
@@ -763,6 +808,7 @@ pub(crate) fn find_in(home: Option<&Path>, extra: &[String], profs: &[Profile], 
         roots: s.roots.iter().map(|r| shown(r)).collect(),
         repos: Vec::new(),
         already_listed: s.already_listed,
+        listed: listed_repos(&s.listed, profs),
         truncated: s.truncated,
         unreadable: s.unreadable,
         rejected: s.rejected,
@@ -1114,9 +1160,37 @@ mod tests {
         let s = run(&home, &[shown(&mine.join("deep"))], &profs);
         assert_eq!(names(&s), vec!["v", "other"]);
         assert_eq!(s.already_listed, 1);
+        // The listed one is named, with the profile the page shows it under.
+        assert_eq!(s.listed.iter().map(|(p, id)| (crate::paths::base_name(&shown(p)), id.as_str())).collect::<Vec<_>>(), vec![("a".to_string(), "m")]);
         // Inside a profile folder, the folder decides whose it is.
         let v = s.candidates.iter().find(|(p, _)| p.ends_with("v")).unwrap();
         assert_eq!(folder_owner(&shown(&v.0), &profs).map(|p| p.id.as_str()), Some("m"));
+    }
+
+    #[test]
+    fn a_listed_repository_found_twice_is_listed_once_under_the_deepest_profile_folder() {
+        let t = tmp("listed-owner");
+        let home = t.join("home");
+        let outer = home.join("all");
+        let inner = outer.join("work");
+        repo(&inner.join("app"));
+        repo(&outer.join("tool"));
+        // Two profiles whose folders both hold app: the deeper one is whose it is.
+        let profs = vec![prof("outer", &[&outer], true), prof("inner", &[&inner], false)];
+        // Found from two places (the home folder and one added): counted once.
+        let s = run(&home, &[shown(&outer)], &profs);
+        assert!(names(&s).is_empty(), "{:?}", names(&s));
+        assert_eq!(s.already_listed, 2);
+        assert_eq!(s.listed.len(), s.already_listed);
+        let mut owners: Vec<(String, String)> = s.listed.iter().map(|(p, id)| (crate::paths::base_name(&shown(p)), id.clone())).collect();
+        owners.sort();
+        assert_eq!(owners, vec![("app".to_string(), "inner".to_string()), ("tool".to_string(), "outer".to_string())]);
+        // In the answer: by path, with the profile's name and account.
+        let mut named = profs.clone();
+        named[1].name = "Work".into();
+        named[1].github_login = Some(" @work-me ".into());
+        let found = listed_repos(&s.listed, &named);
+        assert_eq!(found.iter().map(|l| (crate::paths::base_name(&l.path), l.profile_name.as_str(), l.github_login.as_deref())).collect::<Vec<_>>(), vec![("tool".to_string(), "outer", None), ("app".to_string(), "Work", Some("work-me"))], "by path: all/tool before all/work/app");
     }
 
     #[cfg(unix)]

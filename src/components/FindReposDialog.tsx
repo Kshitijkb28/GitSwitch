@@ -28,7 +28,11 @@ interface Row {
 /** Which filter chip a row falls under — by what was proposed, so rows don't jump as picks change. */
 type Kind = "clear" | "choose" | "offline";
 const kindOf = (r: Row): Kind => (r.proposal.clear && r.proposal.profileId ? "clear" : !r.repo.owner ? "offline" : "choose");
-const KIND_LABEL: Record<"all" | Kind, string> = { all: "All", clear: "Clear match", choose: "Needs a choice", offline: "Not on GitHub" };
+/** The chips: the kinds above, and the repositories found that a profile's folder already holds. */
+type Chip = "all" | Kind | "added";
+const KIND_LABEL: Record<Chip, string> = { all: "All", clear: "Clear match", choose: "Needs a choice", offline: "Not on GitHub", added: "Already added" };
+/** Already-added repositories shown before "Show all". */
+const ADDED_SHOWN = 20;
 
 /**
  * The last repositories added and how to take them off again — kept while the
@@ -99,7 +103,8 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
   /** Rows the user never wants offered (a tutorial clone…): remembered, never added unasked. */
   const [hidden, setHidden] = usePersistedState<string[]>("findrepos.hidden", []);
   const [showHidden, setShowHidden] = useState(false);
-  const [filter, setFilter] = useState<"all" | Kind>("all");
+  const [filter, setFilter] = useState<Chip>("all");
+  const [allAdded, setAllAdded] = useState(false);
   const [query, setQuery] = useState("");
   const [bulkNote, setBulkNote] = useState<string | null>(null);
   /** The search running now; anything an earlier one (stopped, or the dialog closed) answers is dropped. */
@@ -162,6 +167,7 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
     lastAdded = null;
     setAdded(null);
     setFilter("all");
+    setAllAdded(false);
     setQuery("");
     setBulkNote(null);
     setPhase("looking");
@@ -319,7 +325,15 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
   const chosen = picked.filter((r) => r.choice);
   const needProfile = picked.length - chosen.length;
   const allShownPicked = selectable.length > 0 && selectable.every((r) => r.selected);
-  const count = (k: "all" | Kind) => (k === "all" ? unhidden.length : unhidden.filter((r) => kindOf(r) === k).length);
+  // Found, but a profile's folder holds them already: shown, labelled, never offered.
+  const addedBefore = found?.listed ?? [];
+  const chips: Chip[] = ["all", "clear", "choose", "offline", ...(addedBefore.length ? (["added"] as const) : [])];
+  const count = (k: Chip) => (k === "all" ? unhidden.length : k === "added" ? addedBefore.length : unhidden.filter((r) => kindOf(r) === k).length);
+  const addedLabel = (l: api.ListedRepo) => {
+    const login = logins[l.profile_id]?.display ?? l.github_login;
+    return `Already in ${l.profile_name}${login ? ` (${login})` : ""}`;
+  };
+  const showAdded = addedBefore.length > 0 && (rows.length === 0 || filter === "all" || filter === "added");
 
   const setRow = (path: string, patch: Partial<Row>) => setRows((all) => all.map((x) => (x.repo.path === path ? { ...x, ...patch } : x)));
   function pickShown(on: boolean) {
@@ -630,7 +644,7 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
               </div>
 
               <div className="inline-flex rounded-lg bg-zinc-800/80 p-0.5 flex-wrap" role="group" aria-label="Show">
-                {(["all", "clear", "choose", "offline"] as const).map((k) => (
+                {chips.map((k) => (
                   <button
                     key={k}
                     type="button"
@@ -665,7 +679,7 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
                 </div>
               )}
 
-              {listed.length === 0 && <p className="text-xs text-zinc-500">Nothing here matches.</p>}
+              {listed.length === 0 && filter !== "added" && <p className="text-xs text-zinc-500">Nothing here matches.</p>}
               <div className="space-y-1.5">
                 {listed.map((r) => {
                   const off = isHidden(r.repo.path);
@@ -732,6 +746,35 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
                   );
                 })}
               </div>
+            </div>
+          )}
+
+          {showAdded && (
+            <div className="space-y-1.5" aria-label="Already added">
+              <p className="text-xs text-zinc-500 uppercase tracking-wider">
+                Already on the Repository page · {addedBefore.length}
+              </p>
+              {(allAdded ? addedBefore : addedBefore.slice(0, ADDED_SHOWN)).map((l) => (
+                <div
+                  key={l.path}
+                  data-find-listed={l.path}
+                  className="flex items-center gap-3 px-3 py-2 rounded-lg bg-zinc-800/25 border border-zinc-700/40 min-w-0 flex-wrap sm:flex-nowrap"
+                >
+                  <CheckCircle2 size={15} className="text-emerald-500/70 shrink-0" />
+                  <p className="text-zinc-400 truncate min-w-0 flex-1" title={l.path}>
+                    {baseName(l.path)}
+                    <span className="text-xs text-zinc-600 font-mono"> · {short(l.path)}</span>
+                  </p>
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] bg-emerald-500/10 text-emerald-300/90 border border-emerald-500/25 shrink-0">
+                    {addedLabel(l)}
+                  </span>
+                </div>
+              ))}
+              {!allAdded && addedBefore.length > ADDED_SHOWN && (
+                <button type="button" className="text-xs text-emerald-400 hover:text-emerald-300 cursor-pointer" onClick={() => setAllAdded(true)}>
+                  Show all {addedBefore.length}
+                </button>
+              )}
             </div>
           )}
 

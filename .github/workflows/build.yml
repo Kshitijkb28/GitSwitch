@@ -82,6 +82,8 @@ jobs:
           bash scripts/verify/regression.sh
           bash scripts/verify/identity.sh
           bash scripts/verify/findrepos.sh
+          bash scripts/verify/uninstall.sh
+          bash scripts/verify/apps.sh
           bash scripts/verify/github.sh
           bash scripts/verify/submodules.sh
           bash scripts/verify/lfs.sh

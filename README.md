@@ -94,7 +94,10 @@ for folders that still use HTTPS.
 - **Profiles** — create/edit identities, assign folders with a native folder
   picker. A folder can belong to only one profile (auto-deduplicated).
 - **Auto Assign** — scan a folder tree, check which of your GitHub accounts
-  actually has access to each repo, and map them to the right profile.
+  actually has access to each repo, and map them to the right profile. While
+  it searches it shows the folder it is in (with Stop); each repository shows
+  its path, and one a profile already holds says so — "Already in Work
+  (work-me)", or where Apply would move it.
 - **Find repositories** (on the Repository page) — finds the clones on this
   computer that no profile's folders hold, which the page therefore does not
   list: under your home folder, the Clone page's and Auto Assign's folders, the
@@ -104,11 +107,14 @@ for folders that still use HTTPS.
   proposes the profile whose account can. Tick the ones to add (select all,
   only the clear matches, filter, search, one profile for all the ticked ones,
   hide the ones you never want offered) and add them in one click, or let the
-  clear matches be added straight away. Undo takes them off again.
+  clear matches be added straight away. Undo takes them off again. The clones
+  it finds that a profile already holds are listed too, with that profile and
+  its account.
 - **Pull requests** (a sidebar page, and the **GitHub** tab on the Repository
-  page) — a repository's pull requests, or the ones across repositories you
-  opened, are asked to review, are assigned or are involved in: open, merged,
-  closed or all, with Refresh. Open one to read its files with their diffs, its
+  page) — your account's repositories, each with how many pull requests are
+  open, ask you for a review or are yours; pick one to see its pull requests:
+  everyone's, or created by you, asking your review, assigned to you or
+  involving you — open, merged, closed or all, with Refresh. Open one to read its files with their diffs, its
   commits, checks and reviews; approve, ask for changes or comment; and merge
   it (merge commit, squash or rebase) with the commit you reviewed — if someone
   pushed since, GitHub refuses and nothing unreviewed is merged — optionally
@@ -116,6 +122,27 @@ for folders that still use HTTPS.
   collaborators and pending invitations, invites someone by username with a
   role, and removes access. You act as one of your accounts (the profile's own
   by default); its token never leaves the app's Rust side.
+- **Uninstall** (a sidebar page) — the apps on this computer: `.app` bundles
+  on macOS (App Store and Homebrew ones marked), the programs in "Installed
+  apps" and the Store apps on Windows, and on Ubuntu the apps in the menu
+  (.deb, Snap, Flatpak, AppImage) or every package. Uninstalling one goes step
+  by step: what will happen (the exact command on Windows and Ubuntu, and on
+  Ubuntu every other package apt would remove with it), then the app goes —
+  to the Trash on macOS, by its own uninstaller on Windows, by dpkg / snap /
+  flatpak on Ubuntu. Only once it is really gone does GitSwitch look for what
+  it left behind, and only in the places apps keep their data, only by its
+  exact id or name — never another app's folder, a sibling product's
+  (`…Chrome.canary`), a shared vendor folder, a generic name or anything
+  reached through a link. Sure ones are ticked, maybes are not; ticked ones go
+  to the Trash / Recycle Bin, each checked again first. What needs the
+  administrator is listed with its command, never deleted by GitSwitch. On
+  Windows the registry (your own HKCU settings) is an option, with a `.reg`
+  backup. GitSwitch itself and what it needs (git, its web view) are not
+  removed from here — **Settings › Uninstall GitSwitch** takes back
+  everything GitSwitch set up (its `~/.gitconfig` block, the guards and push
+  blocks in your repositories, the push locks behind the administrator prompt,
+  its sign-ins) and then removes the app, keeping your SSH keys and
+  repositories.
 - **Clone** — clone over SSH as the right account. The destination folder's
   profile decides the key, or pick one with **Clone as** (the new folder is then
   added to that profile). Downloads submodules with the same result as

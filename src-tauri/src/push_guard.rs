@@ -35,7 +35,7 @@ use std::sync::{Arc, OnceLock};
 /// helper of that name is installed, whose only job is to explain why.
 pub const BLOCK_SCHEME: &str = lc::BLOCK_SCHEME;
 const FLAG: &str = "gitswitch.pushBlocked";
-const HOOK_MARKER: &str = ">>> GitSwitch push guard >>>";
+pub(crate) const HOOK_MARKER: &str = ">>> GitSwitch push guard >>>";
 
 /// GitHub in every form git accepts, so a rewrite covers the common cases even
 /// before per-remote prefixes are added. Mirrors `git_config::push_block_section`

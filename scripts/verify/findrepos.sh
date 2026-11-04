@@ -60,6 +60,7 @@ ARGS=$("$PY" -c 'import json,sys; print(json.dumps({"scanId":"s1","extraRoots":[
 OUT=$(pinvoke find_unlisted_repos "$ARGS")
 ok "exactly the clones no profile folder lists: under home, in a place outside it, and one too deep inside a profile folder" "$(printf '%s' "$OUT" | names)" "['deep', 'forked', 'localid', 'mine', 'mine-feature', 'plain', 'proj', 'ruled', 'tool']"
 ok "  the one the Repository page lists is counted, not offered" "$(printf '%s' "$OUT" | jqf value.already_listed)" "1"
+ok "  and named, with the profile the Repository page shows it under and that profile's account" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json; v=json.load(sys.stdin)["value"]; print([(l["path"].replace("\\","/").rsplit("/",1)[-1], l["profile_name"], l["github_login"], l["profile_id"]) for l in v["listed"]])')" "[('listed', 'Work', 'work-me', '$WID')]"
 ok "  places that cannot be searched say why" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json; print([(r["place"].rsplit("/",1)[-1] if r["place"].startswith("/") else r["place"], r["why"]) for r in json.load(sys.stdin)["value"]["rejected"]])')" "[('relative/x', 'not a full path'), ('nope', 'not found')]"
 ok "  the places, in order: the ones asked for, then home" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json; print([r.replace(sys.argv[1], "~") for r in json.load(sys.stdin)["value"]["roots"]])' "$H")" "/elsewhere', '~/work/a', '~/code', '~']"
 ok "a clone outside every folder commits as the default profile" "$(printf '%s' "$OUT" | field mine "['commits_as']")" "{'profile_id': '$PID', 'via': 'default'}"
