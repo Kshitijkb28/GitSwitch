@@ -606,6 +606,382 @@ pub async fn merge(gh: &Gh, owner: &str, name: &str, number: u64, method: &str, 
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// The account's repositories, each with how many pull requests are open
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct PullRepo {
+    /// "owner/name"
+    pub repo: String,
+    pub private: bool,
+    pub archived: bool,
+    pub fork: bool,
+    pub pushed_at: Option<String>,
+    /// admin | maintain | write | triage | read; None when GitHub does not say.
+    pub permission: Option<String>,
+    /// Open pull requests; None when they could not be counted.
+    pub open: Option<u64>,
+    /// Open pull requests asking this account for a review; None when the count failed.
+    pub to_review: Option<u64>,
+    /// Open pull requests this account opened; None when the count failed.
+    pub mine: Option<u64>,
+    /// One of the account's repositories — false: known only through a pull
+    /// request it opened, or a review asked of it (someone else's repository).
+    pub affiliated: bool,
+}
+
+#[derive(Debug, Serialize, Default)]
+pub struct PullRepos {
+    pub login: String,
+    pub repos: Vec<PullRepo>,
+    /// There are more repositories than were read.
+    pub truncated: bool,
+    /// What could not be read, and why.
+    pub notes: Vec<String>,
+}
+
+/// Pages of 100 repositories read at most (GitHub's GraphQL list, or the REST one).
+const REPO_PAGES: usize = 10;
+/// The whole listing gives up after this long: pages are read one after another.
+const REPOS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+
+const REPOS_QUERY: &str = "query($cursor: String, $first: Int!) { viewer { login repositories(first: $first, after: $cursor, affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER], ownerAffiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER], orderBy: {field: PUSHED_AT, direction: DESC}) { pageInfo { hasNextPage endCursor } nodes { nameWithOwner isPrivate isArchived isFork pushedAt viewerPermission pullRequests(states: [OPEN]) { totalCount } } } } }";
+
+/// GitHub's permission words, as the rest of the app says them.
+pub(crate) fn permission_word(p: &str) -> Option<String> {
+    Some(
+        match p {
+            "ADMIN" => "admin",
+            "MAINTAIN" => "maintain",
+            "WRITE" => "write",
+            "TRIAGE" | "TRIAGE_PLUS" => "triage",
+            "READ" => "read",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// One page of GitHub's GraphQL repository list.
+#[derive(Debug, Default)]
+pub(crate) struct RepoPage {
+    pub repos: Vec<PullRepo>,
+    /// Where the next page starts, when there is one.
+    pub next: Option<String>,
+    pub login: Option<String>,
+    /// Why GitHub left repositories out of this page (as notes).
+    pub withheld: Vec<String>,
+}
+
+/// Why an organization's repositories were left out, in words.
+pub(crate) fn withheld_note(err: &Value, login: &str) -> String {
+    let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    let saml = err.get("extensions").and_then(|x| x.get("saml_failure")).and_then(|b| b.as_bool()).unwrap_or(false) || msg.contains("SAML");
+    if saml {
+        format!("Some organizations' repositories are hidden: they use single sign-on and @{}'s token is not authorized for them (GitHub › Settings › Applications, or `gh auth refresh -h github.com`).", login)
+    } else if msg.to_lowercase().contains("oauth app access restrictions") {
+        "Some organizations' repositories are hidden: the organization restricts which apps may read its data.".into()
+    } else {
+        format!("GitHub left some repositories out: {}", if msg.is_empty() { "no reason given" } else { msg })
+    }
+}
+
+/// A GraphQL page: its repositories (a repository GitHub withheld comes back
+/// as null, with an error saying why), and the next cursor. Err when the
+/// answer holds no repository list at all, with GitHub's first reason.
+pub(crate) fn parse_repo_page(json: &Value, login: &str) -> Result<RepoPage, String> {
+    let viewer = json.get("data").and_then(|d| d.get("viewer")).filter(|v| !v.is_null());
+    let errors: Vec<&Value> = json.get("errors").and_then(|e| e.as_array()).map(|a| a.iter().collect()).unwrap_or_default();
+    let Some(list) = viewer.and_then(|v| v.get("repositories")).filter(|r| !r.is_null()) else {
+        let why = errors.first().and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("GitHub answered without the repository list");
+        return Err(why.to_string());
+    };
+    let mut page = RepoPage { login: viewer.and_then(|v| v.get("login")).and_then(|l| l.as_str()).map(str::to_string), ..Default::default() };
+    let flag = |n: &Value, k: &str| n.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+    for n in list.get("nodes").and_then(|n| n.as_array()).into_iter().flatten() {
+        let repo = s(n, "nameWithOwner");
+        if n.is_null() || repo.is_empty() {
+            continue;
+        }
+        page.repos.push(PullRepo {
+            repo,
+            private: flag(n, "isPrivate"),
+            archived: flag(n, "isArchived"),
+            fork: flag(n, "isFork"),
+            pushed_at: opt_s(n, "pushedAt"),
+            permission: n.get("viewerPermission").and_then(|p| p.as_str()).and_then(permission_word),
+            open: n.get("pullRequests").and_then(|p| p.get("totalCount")).and_then(|c| c.as_u64()),
+            to_review: None,
+            mine: None,
+            affiliated: true,
+        });
+    }
+    let info = list.get("pageInfo");
+    if info.and_then(|i| i.get("hasNextPage")).and_then(|b| b.as_bool()).unwrap_or(false) {
+        page.next = info.and_then(|i| opt_s(i, "endCursor"));
+    }
+    for e in errors {
+        let note = withheld_note(e, login);
+        if !page.withheld.contains(&note) {
+            page.withheld.push(note);
+        }
+    }
+    Ok(page)
+}
+
+/// The account's repositories as read, before the counts of its own pull requests.
+#[derive(Debug, Default)]
+struct Listing {
+    repos: Vec<PullRepo>,
+    truncated: bool,
+    notes: Vec<String>,
+    login: Option<String>,
+}
+
+/// The repositories through GraphQL, with their open pull request counts.
+/// Ok(None): GraphQL could not be used — the REST list is the way.
+async fn graphql_listing(gh: &Gh, deadline: std::time::Instant) -> Result<Option<Listing>, AppError> {
+    let mut out = Listing::default();
+    let mut cursor: Option<String> = None;
+    for page_no in 0..REPO_PAGES {
+        if std::time::Instant::now() > deadline {
+            out.truncated = true;
+            out.notes.push(format!("Stopped after {} repositories: GitHub was slow to answer.", out.repos.len()));
+            break;
+        }
+        let mut reply = None;
+        // A page GitHub could not finish in time (502/504) is asked again, smaller.
+        for first in [100u32, 50] {
+            let r = gh.call(Method::POST, "/graphql", &[], Some(&json!({ "query": REPOS_QUERY, "variables": { "cursor": cursor, "first": first } }))).await?;
+            if r.status == 502 || r.status == 504 {
+                continue;
+            }
+            reply = Some(r);
+            break;
+        }
+        let Some(r) = reply else {
+            if page_no == 0 {
+                return Ok(None);
+            }
+            out.truncated = true;
+            out.notes.push(format!("Stopped after {} repositories: GitHub timed out on the rest.", out.repos.len()));
+            break;
+        };
+        if r.status == 401 {
+            return Err(gh.refused(&r, "list the account's repositories"));
+        }
+        if !r.ok() {
+            if page_no == 0 {
+                return Ok(None);
+            }
+            out.truncated = true;
+            out.notes.push(gh.refused(&r, "read more repositories").to_string());
+            break;
+        }
+        let page = match parse_repo_page(&r.json, &gh.login) {
+            Ok(p) => p,
+            Err(_) if page_no == 0 => return Ok(None),
+            Err(why) => {
+                out.truncated = true;
+                out.notes.push(format!("Stopped after {} repositories: {}", out.repos.len(), why));
+                break;
+            }
+        };
+        out.login = out.login.or(page.login);
+        for n in page.withheld {
+            if !out.notes.contains(&n) {
+                out.notes.push(n);
+            }
+        }
+        out.repos.extend(page.repos);
+        match page.next {
+            Some(c) => {
+                if page_no + 1 == REPO_PAGES {
+                    out.truncated = true;
+                }
+                cursor = Some(c);
+            }
+            None => break,
+        }
+    }
+    Ok(Some(out))
+}
+
+/// The REST list, when GraphQL cannot be used: the same repositories, without
+/// their counts.
+async fn rest_listing(gh: &Gh, deadline: std::time::Instant) -> Result<Listing, AppError> {
+    let mut out = Listing::default();
+    for page in 1..=REPO_PAGES {
+        if std::time::Instant::now() > deadline {
+            out.truncated = true;
+            break;
+        }
+        let q = [("per_page", "100".to_string()), ("page", page.to_string()), ("sort", "pushed".into()), ("affiliation", "owner,collaborator,organization_member".into())];
+        let r = gh.get("/user/repos", &q).await?;
+        if !r.ok() {
+            if page == 1 {
+                return Err(gh.refused(&r, "list the account's repositories"));
+            }
+            out.truncated = true;
+            out.notes.push(gh.refused(&r, "read more repositories").to_string());
+            break;
+        }
+        if r.sso().is_some_and(|h| crate::remote_repos::sso_hidden_org_count(h) > 0) {
+            let note = withheld_note(&json!({ "message": "SAML" }), &gh.login);
+            if !out.notes.contains(&note) {
+                out.notes.push(note);
+            }
+        }
+        for v in r.json.as_array().into_iter().flatten() {
+            let flag = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+            out.repos.push(PullRepo {
+                repo: s(v, "full_name"),
+                private: flag("private"),
+                archived: flag("archived"),
+                fork: flag("fork"),
+                pushed_at: opt_s(v, "pushed_at"),
+                permission: v.get("permissions").map(|_| crate::gh_repo::role_of(v)),
+                open: None,
+                to_review: None,
+                mine: None,
+                affiliated: true,
+            });
+        }
+        if !r.has_next {
+            break;
+        }
+        if page == REPO_PAGES {
+            out.truncated = true;
+        }
+    }
+    out.repos.retain(|r| !r.repo.is_empty());
+    Ok(out)
+}
+
+/// Open pull requests of one kind ("review_requested" or "created"), counted
+/// per repository from GitHub's search — one page of 100, and whether there
+/// were more than that.
+async fn count_by_repo(gh: &Gh, scope: &str) -> Result<(Vec<(String, u64)>, bool), AppError> {
+    let q = search_query(scope, "open", None)?;
+    let r = gh.get("/search/issues", &[("q", q), ("per_page", "100".into())]).await?;
+    if !r.ok() {
+        return Err(gh.refused(&r, "count the pull requests"));
+    }
+    let items = r.json.get("items").and_then(|i| i.as_array()).cloned().unwrap_or_default();
+    let more = r.json.get("total_count").and_then(|t| t.as_u64()).is_some_and(|t| t > items.len() as u64);
+    let mut counts: Vec<(String, u64)> = Vec::new();
+    for it in &items {
+        let repo = item_from_search(it).repo;
+        if repo.is_empty() {
+            continue;
+        }
+        match counts.iter_mut().find(|(r, _)| r.eq_ignore_ascii_case(&repo)) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((repo, 1)),
+        }
+    }
+    Ok((counts, more))
+}
+
+/// Put the counts on the repositories (adding the ones only a count knows),
+/// and sort: most reviews asked first, then most open, then latest push.
+pub(crate) fn merge_counts(mut repos: Vec<PullRepo>, to_review: Option<&[(String, u64)]>, mine: Option<&[(String, u64)]>) -> Vec<PullRepo> {
+    for r in &mut repos {
+        r.to_review = to_review.map(|_| 0);
+        r.mine = mine.map(|_| 0);
+    }
+    let add = |list: Option<&[(String, u64)]>, review: bool, repos: &mut Vec<PullRepo>| {
+        for (name, n) in list.into_iter().flatten() {
+            let i = match repos.iter().position(|r| r.repo.eq_ignore_ascii_case(name)) {
+                Some(i) => i,
+                None => {
+                    repos.push(PullRepo {
+                        repo: name.clone(),
+                        private: false,
+                        archived: false,
+                        fork: false,
+                        pushed_at: None,
+                        permission: None,
+                        open: None,
+                        to_review: to_review.map(|_| 0),
+                        mine: mine.map(|_| 0),
+                        affiliated: false,
+                    });
+                    repos.len() - 1
+                }
+            };
+            if review {
+                repos[i].to_review = Some(*n);
+            } else {
+                repos[i].mine = Some(*n);
+            }
+        }
+    };
+    add(to_review, true, &mut repos);
+    add(mine, false, &mut repos);
+    let busy = |r: &PullRepo| r.open.unwrap_or(0).max(r.mine.unwrap_or(0));
+    repos.sort_by(|a, b| {
+        b.to_review
+            .unwrap_or(0)
+            .cmp(&a.to_review.unwrap_or(0))
+            .then(busy(b).cmp(&busy(a)))
+            .then(b.pushed_at.cmp(&a.pushed_at))
+            .then(a.repo.to_lowercase().cmp(&b.repo.to_lowercase()))
+    });
+    repos
+}
+
+/// The account's repositories for the Pull requests page: each with its open
+/// pull requests, the ones asking the account for a review and the ones it
+/// opened. The two counts are asked while the list is read.
+pub async fn repos(gh: &Gh) -> Result<PullRepos, AppError> {
+    let deadline = std::time::Instant::now() + REPOS_DEADLINE;
+    let listing = async {
+        match graphql_listing(gh, deadline).await? {
+            Some(l) => Ok::<Listing, AppError>(l),
+            None => {
+                let mut l = rest_listing(gh, deadline).await?;
+                l.notes.insert(0, "Open pull requests could not be counted for each repository (GitHub's GraphQL list was not available); pick one to see them.".into());
+                Ok(l)
+            }
+        }
+    };
+    let (listing, review, mine) = tokio::join!(listing, count_by_repo(gh, "review_requested"), count_by_repo(gh, "created"));
+    let listing = listing?;
+    let mut notes = listing.notes;
+    let review = match review {
+        Ok((c, more)) => {
+            if more {
+                notes.push("\"To review\" counts the first 100 pull requests asking for your review.".into());
+            }
+            Some(c)
+        }
+        Err(e) => {
+            notes.push(format!("Pull requests asking for your review could not be counted: {}", e.to_string().trim_start_matches("Command execution error: ")));
+            None
+        }
+    };
+    let mine = match mine {
+        Ok((c, more)) => {
+            if more {
+                notes.push("\"Yours\" counts the first 100 of your open pull requests.".into());
+            }
+            Some(c)
+        }
+        Err(e) => {
+            notes.push(format!("Your own pull requests could not be counted: {}", e.to_string().trim_start_matches("Command execution error: ")));
+            None
+        }
+    };
+    Ok(PullRepos {
+        login: listing.login.unwrap_or_else(|| gh.login.clone()),
+        repos: merge_counts(listing.repos, review.as_deref(), mine.as_deref()),
+        truncated: listing.truncated,
+        notes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,6 +1047,55 @@ mod tests {
         assert!(f.diff.lines.is_empty() && f.diff.empty_reason.as_deref().unwrap().contains("binary, or too large"));
         let f = file_from(&json!({"filename": "n.txt", "previous_filename": "o.txt", "status": "renamed"}));
         assert_eq!((f.previous_path.as_deref(), f.diff.empty_reason.as_deref()), (Some("o.txt"), Some("Renamed only — no changed lines.")));
+    }
+
+    fn node(name: &str, open: u64, pushed: &str) -> Value {
+        json!({"nameWithOwner": name, "isPrivate": true, "isArchived": false, "isFork": false, "pushedAt": pushed, "viewerPermission": "WRITE", "pullRequests": {"totalCount": open}})
+    }
+
+    #[test]
+    fn a_graphql_page_reads_repositories_counts_and_what_github_withheld() {
+        let page = json!({
+            "data": {"viewer": {"login": "Me", "repositories": {"pageInfo": {"hasNextPage": true, "endCursor": "c1"}, "nodes": [node("me/app", 2, "2026-10-02T00:00:00Z"), Value::Null, json!({"nameWithOwner": "org/x", "viewerPermission": "TRIAGE_PLUS", "pullRequests": {"totalCount": 0}}), json!({"nameWithOwner": "org/y", "viewerPermission": null})]}}},
+            "errors": [{"type": "FORBIDDEN", "path": ["viewer", "repositories", "nodes", 1], "extensions": {"saml_failure": true}, "message": "Resource protected by organization SAML enforcement."}]
+        });
+        let p = parse_repo_page(&page, "me").unwrap();
+        assert_eq!(p.repos.iter().map(|r| (r.repo.as_str(), r.open, r.permission.as_deref())).collect::<Vec<_>>(), vec![("me/app", Some(2), Some("write")), ("org/x", Some(0), Some("triage")), ("org/y", None, None)]);
+        assert!(p.repos[0].private && p.repos[0].affiliated && p.repos[0].to_review.is_none());
+        assert_eq!((p.next.as_deref(), p.login.as_deref()), (Some("c1"), Some("Me")));
+        assert_eq!(p.withheld.len(), 1);
+        assert!(p.withheld[0].contains("single sign-on") && p.withheld[0].contains("@me"), "{}", p.withheld[0]);
+        // The last page has no cursor; an answer without the list says GitHub's reason.
+        let last = json!({"data": {"viewer": {"login": "Me", "repositories": {"pageInfo": {"hasNextPage": false, "endCursor": "c9"}, "nodes": []}}}});
+        assert_eq!(parse_repo_page(&last, "me").unwrap().next, None);
+        assert_eq!(parse_repo_page(&json!({"data": null, "errors": [{"message": "Something went wrong"}]}), "me").unwrap_err(), "Something went wrong");
+        assert!(parse_repo_page(&json!({"data": {"viewer": {"repositories": null}}}), "me").is_err());
+        assert!(withheld_note(&json!({"message": "Although you appear to have the correct authorization credentials, the `acme` organization has enabled OAuth App access restrictions"}), "me").contains("restricts which apps"));
+    }
+
+    #[test]
+    fn counts_go_on_their_repositories_and_the_busiest_come_first() {
+        let r = |name: &str, open: Option<u64>, pushed: &str| PullRepo { repo: name.into(), private: false, archived: false, fork: false, pushed_at: Some(pushed.into()), permission: None, open, to_review: None, mine: None, affiliated: true };
+        let repos = vec![r("me/quiet", Some(0), "2026-10-09"), r("me/busy", Some(5), "2026-10-01"), r("me/new", Some(1), "2026-10-08"), r("me/also-new", Some(1), "2026-10-08"), r("org/review", Some(1), "2026-09-01")];
+        let review = vec![("ORG/review".to_string(), 2)];
+        let mine = vec![("me/new".to_string(), 1), ("someone/lib".to_string(), 3)];
+        let out = merge_counts(repos.clone(), Some(&review), Some(&mine));
+        assert_eq!(
+            out.iter().map(|r| (r.repo.as_str(), r.open, r.to_review, r.mine, r.affiliated)).collect::<Vec<_>>(),
+            vec![
+                ("org/review", Some(1), Some(2), Some(0), true),
+                ("me/busy", Some(5), Some(0), Some(0), true),
+                ("someone/lib", None, Some(0), Some(3), false),
+                ("me/also-new", Some(1), Some(0), Some(0), true),
+                ("me/new", Some(1), Some(0), Some(1), true),
+                ("me/quiet", Some(0), Some(0), Some(0), true),
+            ]
+        );
+        // A count that failed stays unknown everywhere.
+        let out = merge_counts(repos, None, Some(&mine));
+        assert!(out.iter().all(|r| r.to_review.is_none()) && out.iter().any(|r| r.repo == "someone/lib" && r.mine == Some(3)));
+        assert_eq!(permission_word("ADMIN").as_deref(), Some("admin"));
+        assert_eq!(permission_word("NONE"), None);
     }
 }
 
@@ -817,6 +1242,56 @@ mod http_tests {
         let req = seen.lock().unwrap()[0].clone();
         assert!(first_line(&req).starts_with("POST /repos/o/r/pulls/2/reviews "));
         assert!(review(&Gh::at(&api, "t", "me"), "o", "r", 2, "REQUEST_CHANGES", "  ").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_graphql_list_reads_on_with_its_cursor_and_retries_a_slow_page_smaller() {
+        let page = |next: Option<&str>, names: &[&str]| {
+            let nodes: Vec<Value> = names.iter().map(|n| json!({"nameWithOwner": n, "pullRequests": {"totalCount": 1}})).collect();
+            json!({"data": {"viewer": {"login": "Me", "repositories": {"pageInfo": {"hasNextPage": next.is_some(), "endCursor": next}, "nodes": nodes}}}}).to_string()
+        };
+        let (api, seen) = github(vec![
+            reply("200 OK", &[], &page(Some("c1"), &["me/a", "me/b"])),
+            reply("504 Gateway Timeout", &[], "{}"),
+            reply("200 OK", &[], &page(None, &["me/c"])),
+        ]);
+        let gh = Gh::at(&api, "t", "me");
+        let l = graphql_listing(&gh, std::time::Instant::now() + std::time::Duration::from_secs(30)).await.unwrap().unwrap();
+        assert_eq!(l.repos.iter().map(|r| r.repo.as_str()).collect::<Vec<_>>(), vec!["me/a", "me/b", "me/c"]);
+        assert!(!l.truncated && l.login.as_deref() == Some("Me"));
+        let reqs = seen.lock().unwrap().clone();
+        let body = |i: usize| -> Value { serde_json::from_str(reqs[i].split("\r\n\r\n").nth(1).unwrap()).unwrap() };
+        assert!(first_line(&reqs[0]).starts_with("POST /graphql "));
+        assert_eq!((body(0)["variables"]["cursor"].clone(), body(0)["variables"]["first"].clone()), (Value::Null, json!(100)));
+        assert_eq!((body(1)["variables"]["cursor"].clone(), body(1)["variables"]["first"].clone()), (json!("c1"), json!(100)));
+        assert_eq!((body(2)["variables"]["cursor"].clone(), body(2)["variables"]["first"].clone()), (json!("c1"), json!(50)), "the slow page asked again, smaller");
+        assert!(body(0)["query"].as_str().unwrap().contains("pullRequests(states: [OPEN])"));
+    }
+
+    #[tokio::test]
+    async fn without_graphql_the_rest_list_is_used_and_a_rejected_token_is_said() {
+        let (api, _) = github(vec![reply("502 Bad Gateway", &[], "{}"), reply("502 Bad Gateway", &[], "{}")]);
+        assert!(graphql_listing(&Gh::at(&api, "t", "me"), std::time::Instant::now() + std::time::Duration::from_secs(30)).await.unwrap().is_none());
+        let (api, _) = github(vec![reply("200 OK", &[], r#"{"data": null, "errors": [{"message": "Your token has not been granted the required scopes"}]}"#)]);
+        assert!(graphql_listing(&Gh::at(&api, "t", "me"), std::time::Instant::now() + std::time::Duration::from_secs(30)).await.unwrap().is_none());
+        let (api, _) = github(vec![reply("401 Unauthorized", &[], r#"{"message": "Bad credentials"}"#)]);
+        let e = graphql_listing(&Gh::at(&api, "t", "me"), std::time::Instant::now() + std::time::Duration::from_secs(30)).await.unwrap_err().to_string();
+        assert!(e.contains("rejected @me's token"), "{}", e);
+        let (api, seen) = github(vec![reply("200 OK", &[("x-github-sso", "partial-results; organizations=1,2")], r#"[{"full_name": "me/a", "private": true, "permissions": {"admin": true, "push": true, "pull": true}}, {"full_name": "org/b", "permissions": {"pull": true}}]"#)]);
+        let l = rest_listing(&Gh::at(&api, "t", "me"), std::time::Instant::now() + std::time::Duration::from_secs(30)).await.unwrap();
+        assert_eq!(l.repos.iter().map(|r| (r.repo.as_str(), r.permission.as_deref(), r.open)).collect::<Vec<_>>(), vec![("me/a", Some("admin"), None), ("org/b", Some("read"), None)]);
+        assert!(l.notes.iter().any(|n| n.contains("single sign-on")));
+        assert!(first_line(&seen.lock().unwrap()[0]).starts_with("GET /user/repos?per_page=100&page=1&sort=pushed&affiliation=owner%2Ccollaborator%2Corganization_member "));
+    }
+
+    #[tokio::test]
+    async fn counts_come_from_one_search_page_per_kind() {
+        let items = r#"{"total_count": 3, "items": [{"repository_url": "https://api.github.com/repos/acme/app"}, {"repository_url": "https://api.github.com/repos/ACME/app"}, {"repository_url": "https://api.github.com/repos/me/x"}]}"#;
+        let (api, seen) = github(vec![reply("200 OK", &[], items)]);
+        let (counts, more) = count_by_repo(&Gh::at(&api, "t", "me"), "review_requested").await.unwrap();
+        assert_eq!((counts, more), (vec![("acme/app".to_string(), 2), ("me/x".to_string(), 1)], false));
+        let req = seen.lock().unwrap()[0].clone();
+        assert!(first_line(&req).contains("q=is%3Apr+review-requested%3A%40me+archived%3Afalse+is%3Aopen&per_page=100"), "{}", first_line(&req));
     }
 
     #[tokio::test]

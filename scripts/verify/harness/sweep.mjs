@@ -26,7 +26,7 @@ const status = {
   has_submodules: true,
   stash_count: 2,
 };
-const PAGES = ["Profiles", "SSH Keys", "GitHub Auth", "Repositories", "Pull requests", "Clone", "Repository", "Ports", "Auto Assign", "Doctor", "Commit Audit", "Settings"];
+const PAGES = ["Profiles", "SSH Keys", "GitHub Auth", "Repositories", "Pull requests", "Clone", "Repository", "Ports", "Auto Assign", "Doctor", "Commit Audit", "Uninstall", "Settings"];
 
 // The app's own content-security policy, served with the page: anything the
 // built app does that the policy forbids shows up here as a violation.
@@ -79,6 +79,7 @@ try {
       // page loop's Refresh-parity readings stay what they were.
       const auto = {
         scan_repos: [{ path: "/repos/argos-platform-infrastructure", remote_url: "git@github.com:acme/argos.git", owner: "acme", name: "argos" }],
+        scan_repos_tracked: { root: "/repos", folders: 12, cancelled: false, repos: [{ path: "/repos/argos-platform-infrastructure", remote_url: "git@github.com:acme/argos.git", owner: "acme", name: "argos" }] },
         resolve_key_account: "me", gh_list_accounts: ["me"], gh_get_token: "tok",
         verify_github_token: { id: 1, login: "me", name: null, email: null, avatar_url: "" },
         check_repo_access: { admin: false, push: true, pull: true },
@@ -98,8 +99,20 @@ try {
           if (window.__AUTO__ && cmd in auto) return Promise.resolve(auto[cmd]);
           switch (cmd) {
             case "audit_commits": return Promise.resolve(audit);
+            // The Uninstall tab: a very long app name, its own row, one that can't be removed.
+            case "apps_list": return Promise.resolve({ platform: "macos", notes: ["A note about apps that could not be listed, long enough to wrap at half screen width without pushing anything sideways."], apps: [
+          { id: "mac:/Applications/Release Engineering Automation And Platform Infrastructure Notifications.app", name: "Release Engineering Automation And Platform Infrastructure Notifications", version: "2026.10.11-nightly+build.1234567890", publisher: null, location: "/Applications/Vendors/Release Engineering Automation And Platform Infrastructure Notifications.app", source: "homebrew", size: 1234567890, date: 1760000000, notes: ["Installed with Homebrew — `brew uninstall --cask release-engineering-automation-and-platform-infrastructure-notifications` also removes Homebrew's record of it."], blocked: null, is_self: false },
+          { id: "mac:/Applications/GitSwitch.app", name: "GitSwitch", version: "0.1.0", publisher: null, location: "/Applications/GitSwitch.app", source: "app", size: null, date: null, notes: [], blocked: null, is_self: true },
+          { id: "mac:/Applications/Xcode.app", name: "Xcode", version: "26.0", publisher: null, location: "/Applications/Xcode.app", source: "app-store", size: null, date: null, notes: [], blocked: "GitSwitch's git comes from it (xcode-select points into it).", is_self: false },
+        ] });
+            case "apps_sessions": return Promise.resolve([]);
+            case "apps_size": return Promise.resolve([987654321, false]);
             // GitHub: long names, so the sweep measures the worst rows.
             case "repo_accounts": return Promise.resolve([{ key: "gh:releaseengineeringautomation", label: "releaseengineeringautomation", source: "GitHub CLI" }]);
+            case "github_pull_repos": return Promise.resolve({ login: "releaseengineeringautomation", truncated: true, notes: ["Some organizations' repositories are hidden: they use single sign-on and @releaseengineeringautomation's token is not authorized for them (GitHub › Settings › Applications, or `gh auth refresh -h github.com`)."], repos: [
+              { repo: "releaseengineeringautomation/platforminfrastructureteamnotifications", private: true, archived: true, fork: false, pushed_at: "2026-01-01T00:00:00Z", permission: "maintain", open: 12345, to_review: 678, mine: 90, affiliated: true },
+              { repo: "someoneelse/averyveryverylongrepositorynamewithoutanybreaks", private: false, archived: false, fork: false, pushed_at: null, permission: null, open: null, to_review: 0, mine: 1, affiliated: false },
+            ] });
             case "github_repo_context": return Promise.resolve({ owner: "releaseengineeringautomation", name: "platforminfrastructureteamnotifications", not_github: null, profile_login: null, suggested: "gh:releaseengineeringautomation", accounts: [{ account: "gh:releaseengineeringautomation", login: "releaseengineeringautomation", source: "GitHub CLI", permission: "admin", private: true, why: null }] });
             case "github_pulls":
             case "github_pulls_search": return Promise.resolve({ items: [{ repo: "releaseengineeringautomation/platforminfrastructureteamnotifications", number: 12345, title: "Releaseengineeringautomationandplatforminfrastructureteamnotifications rework of everything", author: "releaseengineeringautomation", draft: false, state: "open", created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", merged_at: null, closed_at: null, head_ref: "feature/releaseengineeringautomationandplatforminfrastructureteam", base_ref: "main", comments: 3, labels: ["enhancement", "needs-review"], html_url: "" }], next_page: null, total: 1 });

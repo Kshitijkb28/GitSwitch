@@ -13,6 +13,7 @@ import { RefreshButton } from "../components/RefreshButton";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { useAnyJobRunning } from "../lib/gitJobs";
+import { UninstallDialog } from "../components/UninstallDialog";
 
 export function Settings() {
   const toast = useToast();
@@ -30,6 +31,7 @@ export function Settings() {
   const [lockBusy, setLockBusy] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [lockMessage, setLockMessage] = useState<string | null>(null);
+  const [uninstalling, setUninstalling] = useState(false);
 
   useEffect(() => {
     loadConfig();
@@ -438,6 +440,22 @@ export function Settings() {
           </div>
         </div>
       </Card>
+
+      <Card>
+        <div className="flex items-center gap-2 mb-2">
+          <Trash2 size={16} className="text-zinc-300" />
+          <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">Uninstall</h2>
+        </div>
+        <p className="text-xs text-zinc-500 mb-3 leading-relaxed">
+          Removes GitSwitch from this computer: first what it set up in git, your repositories and the push
+          locks, then — once it has quit — its data and the app itself. Your SSH keys and repositories stay.
+        </p>
+        <Button variant="danger" size="sm" onClick={() => setUninstalling(true)} data-uninstall-open>
+          <Trash2 size={14} />
+          Uninstall GitSwitch…
+        </Button>
+      </Card>
+      <UninstallDialog open={uninstalling} onClose={() => setUninstalling(false)} />
     </div>
   );
 }

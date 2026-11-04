@@ -3,7 +3,7 @@ import { Routes, Route, NavLink, Navigate, useLocation, useNavigate } from "reac
 import { listen } from "@tauri-apps/api/event";
 import { readPersisted, writePersisted } from "./lib/persist";
 import { deepLinkTake } from "./lib/api";
-import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequest, GitPullRequestArrow, SquareTerminal, Network } from "lucide-react";
+import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequest, GitPullRequestArrow, SquareTerminal, Network, Trash2 } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
 import { ProfileForm } from "./pages/ProfileForm";
@@ -18,6 +18,7 @@ import { CommitAudit } from "./pages/CommitAudit";
 import { Repo } from "./pages/Repo";
 import { Ports } from "./pages/Ports";
 import { Pulls } from "./pages/Pulls";
+import { Uninstall } from "./pages/Uninstall";
 import { ConsoleDrawer } from "./components/console/ConsoleDrawer";
 import { toggleConsole, useConsole } from "./lib/console";
 
@@ -127,6 +128,9 @@ function App() {
           <SidebarLink to="/commits" icon={<HistoryIcon size={18} />}>
             Commit Audit
           </SidebarLink>
+          <SidebarLink to="/uninstall" icon={<Trash2 size={18} />}>
+            Uninstall
+          </SidebarLink>
           <SidebarLink to="/settings" icon={<SettingsIcon size={18} />}>
             Settings
           </SidebarLink>
@@ -170,6 +174,7 @@ function App() {
           <Route path="/doctor" element={<Doctor />} />
           <Route path="/history" element={<Navigate to="/repo/history" replace />} />
           <Route path="/commits" element={<CommitAudit />} />
+          <Route path="/uninstall" element={<Uninstall />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>

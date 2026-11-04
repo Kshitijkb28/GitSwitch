@@ -129,11 +129,24 @@ pub(crate) fn noise_folder(name: &str) -> bool {
 /// still being written left out. Nothing is asked of git — the Repository
 /// page's list and Find repositories' "already listed" are this same walk.
 pub(crate) fn walk_repo_dirs(root: &std::path::Path) -> Vec<PathBuf> {
+    walk_repo_dirs_observed(root, &mut |_, _, _| true)
+}
+
+/// `walk_repo_dirs`, telling `observe` about each folder it takes up — the
+/// folder, how many it has taken up so far and how many repositories it has
+/// found — and stopping, with what it found until then, once `observe`
+/// answers false. The walk itself is the same, folder for folder.
+pub(crate) fn walk_repo_dirs_observed(root: &std::path::Path, observe: &mut dyn FnMut(&std::path::Path, usize, usize) -> bool) -> Vec<PathBuf> {
     const MAX_DEPTH: u32 = 5;
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0u32)];
+    let mut folders = 0usize;
 
     while let Some((dir, depth)) = stack.pop() {
+        folders += 1;
+        if !observe(&dir, folders, out.len()) {
+            break;
+        }
         if dir.join(".git").exists() {
             // A clone still writing this folder: not a repository yet.
             if crate::sparse::clone_running_at(&dir.to_string_lossy()) {
@@ -198,6 +211,81 @@ fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
 /// Runs on a blocking thread — filesystem walks can be large.
 pub async fn scan_repos(root: String) -> Result<Vec<ScannedRepo>, AppError> {
     tokio::task::spawn_blocking(move || scan_sync(&root))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// A folder scan the page can watch and stop: what `scan_repos` finds, the
+/// folder it searched, and how many folders it took up.
+#[derive(Debug, Serialize, Default)]
+pub struct TrackedScan {
+    pub root: String,
+    pub repos: Vec<ScannedRepo>,
+    pub folders: usize,
+    /// Stopped before it ended: `repos` is then empty — half a list would
+    /// read as the whole folder.
+    pub cancelled: bool,
+}
+
+/// Progress is published every this many folders (and on each repository found).
+const PROGRESS_EVERY: usize = 256;
+
+pub(crate) fn scan_tracked_sync(root: &str, state: &crate::find_clones::ScanState) -> Result<TrackedScan, AppError> {
+    let root_path = PathBuf::from(root);
+    if !root_path.is_dir() {
+        return Err(AppError::Config(format!("Folder not found: {}", root)));
+    }
+    let mut out = TrackedScan { root: root.to_string(), ..Default::default() };
+    let mut last_found = 0usize;
+    let dirs = walk_repo_dirs_observed(&root_path, &mut |dir, folders, found| {
+        if state.cancelled() {
+            return false;
+        }
+        if folders == 1 || folders.is_multiple_of(PROGRESS_EVERY) || found != last_found {
+            last_found = found;
+            state.set(|p| {
+                p.phase = "looking".into();
+                p.folders = folders;
+                p.found = found;
+                p.place = dir.to_string_lossy().to_string();
+            });
+        }
+        out.folders = folders;
+        true
+    });
+    if state.cancelled() {
+        out.cancelled = true;
+        return Ok(out);
+    }
+    let total = dirs.len();
+    state.set(|p| {
+        p.phase = "reading".into();
+        p.found = total;
+        p.checked = 0;
+        p.total = total;
+    });
+    for (i, d) in dirs.iter().enumerate() {
+        if state.cancelled() {
+            out.cancelled = true;
+            out.repos.clear();
+            return Ok(out);
+        }
+        state.set(|p| {
+            p.checked = i;
+            p.place = d.to_string_lossy().to_string();
+        });
+        out.repos.push(scanned_repo(d));
+    }
+    out.repos.sort_by(|a, b| a.path.cmp(&b.path));
+    state.set(|p| p.checked = total);
+    Ok(out)
+}
+
+/// `scan_repos`, with progress and Stop through the scan id (polled like
+/// Find repositories' search).
+pub async fn scan_tracked(scan_id: String, root: String) -> Result<TrackedScan, AppError> {
+    let state = crate::find_clones::scan(&scan_id);
+    tokio::task::spawn_blocking(move || scan_tracked_sync(&root, &state))
         .await
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
 }
@@ -284,6 +372,53 @@ mod tests {
         assert!(has("repo_b"));
         assert!(!has("inner"), "must not descend into a repo");
         assert!(!has("dep"), "must skip node_modules");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_observed_walk_is_the_same_walk_and_can_stop() {
+        let base = std::env::temp_dir().join(format!("gitswitch_scan_observed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["a/.git", "a/vendor/inner/.git", "g/s/b/.git", "g/s/c/.git", "node_modules/dep/.git", "deep/1/2/3/4/5/six/.git", "x/y/z"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let plain = walk_repo_dirs(&base);
+        let mut seen = Vec::new();
+        let observed = walk_repo_dirs_observed(&base, &mut |d, n, found| {
+            seen.push((d.to_path_buf(), n, found));
+            true
+        });
+        assert_eq!(plain, observed, "same folders, same order");
+        assert_eq!(seen.first().map(|s| (s.0.clone(), s.1, s.2)), Some((base.clone(), 1, 0)));
+        assert!(seen.windows(2).all(|w| w[1].1 == w[0].1 + 1), "folders counted one by one");
+        assert_eq!(seen.last().unwrap().2 + usize::from(seen.last().unwrap().0.join(".git").exists()), plain.len());
+        // Stopped after three folders: what was found until then, no more.
+        let stopped = walk_repo_dirs_observed(&base, &mut |_, n, _| n <= 3);
+        assert!(stopped.len() <= plain.len() && plain.starts_with(&stopped), "{stopped:?} is a prefix of {plain:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_tracked_scan_reports_where_it_is_and_stops_with_nothing() {
+        let base = std::env::temp_dir().join(format!("gitswitch_scan_tracked_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["one/.git", "two/.git", "deeper/three/.git"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let root = base.to_string_lossy().to_string();
+        let state = crate::find_clones::ScanState::new();
+        let out = scan_tracked_sync(&root, &state).unwrap();
+        let names: Vec<String> = out.repos.iter().map(|r| crate::paths::base_name(&r.path)).collect();
+        assert_eq!(names, vec!["three", "one", "two"], "sorted by path");
+        assert!(!out.cancelled && out.root == root && out.folders >= 5, "{} folders", out.folders);
+        let p = state.snapshot();
+        assert_eq!((p.phase.as_str(), p.found, p.checked, p.total), ("reading", 3, 3, 3));
+
+        let stopped = crate::find_clones::ScanState::new();
+        stopped.stop();
+        let out = scan_tracked_sync(&root, &stopped).unwrap();
+        assert!(out.cancelled && out.repos.is_empty());
+        assert!(scan_tracked_sync(&base.join("missing").to_string_lossy(), &crate::find_clones::ScanState::new()).is_err());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -87,10 +87,30 @@ class H(http.server.BaseHTTPRequestHandler):
             link = {"Link": f'<{base}/repos/acme/app/pulls?page={page + 1}>; rel="next"'} if page * per < len(src) else {}
             return self.answer(200, chunk, link)
         if method == "GET" and p == "/search/issues":
+            if "author:@me" in q.get("q", "") and "repo:" not in q.get("q", ""):
+                # The account's own open pull requests, across repositories.
+                mine = [{"number": 2, "title": "PR 2", "user": {"login": me}, "state": "open", "repository_url": "https://api.github.com/repos/acme/app", "pull_request": {"merged_at": None}, "html_url": "h"}]
+                return self.answer(200, {"total_count": 1, "items": mine})
             items = [{"number": 9, "title": "Elsewhere", "user": {"login": "pal"}, "state": "open", "comments": 2, "labels": [{"name": "review"}],
                       "repository_url": "https://api.github.com/repos/other/lib", "pull_request": {"merged_at": None}, "html_url": "h",
                       "created_at": "2026-10-01T00:00:00Z", "updated_at": "2026-10-03T00:00:00Z"}]
             return self.answer(200, {"total_count": 1, "items": items})
+        if method == "POST" and p == "/graphql":
+            if token == "t-me-home":
+                # GitHub could not finish the query in time (asked again smaller: the same).
+                return self.answer(502, {"message": "Server Error"})
+            v = json.loads(body).get("variables", {})
+            node = lambda n, o, perm, pushed, archived=False: {"nameWithOwner": n, "isPrivate": True, "isArchived": archived, "isFork": False, "pushedAt": pushed, "viewerPermission": perm, "pullRequests": {"totalCount": o}}
+            if v.get("cursor") is None:
+                page = {"pageInfo": {"hasNextPage": True, "endCursor": "c2"}, "nodes": [node("acme/app", 2, "ADMIN", "2026-10-30T00:00:00Z"), None]}
+                errors = [{"type": "FORBIDDEN", "path": ["viewer", "repositories", "nodes", 1], "extensions": {"saml_failure": True}, "message": "Resource protected by organization SAML enforcement."}]
+                return self.answer(200, {"data": {"viewer": {"login": "work-me", "repositories": page}}, "errors": errors})
+            page = {"pageInfo": {"hasNextPage": False, "endCursor": "c3"}, "nodes": [node("work-me/tools", 0, "WRITE", "2026-10-20T00:00:00Z"), node("acme/old", 0, "READ", "2026-01-01T00:00:00Z", True)]}
+            return self.answer(200, {"data": {"viewer": {"login": "work-me", "repositories": page}}})
+        if method == "GET" and p == "/user/repos":
+            listing = [{"full_name": "acme/app", "private": True, "archived": False, "fork": False, "pushed_at": "2026-10-30T00:00:00Z", "permissions": PERM[token]},
+                       {"full_name": "me-home/notes", "private": False, "archived": False, "fork": True, "pushed_at": "2026-10-10T00:00:00Z", "permissions": {"admin": True, "push": True, "pull": True}}]
+            return self.answer(200, listing, {"X-GitHub-SSO": "partial-results; organizations=21"})
         if method == "GET" and p == "/repos/acme/app/pulls/1":
             return self.answer(200, pull(1, "closed" if STATE["merged"] else "open", STATE["merged"], {"body": "Adds the thing.", "merged": STATE["merged"], "mergeable": True, "mergeable_state": "clean",
                                                     "additions": 3, "deletions": 1, "changed_files": 2, "commits": 2, "comments": 1, "review_comments": 0}))
@@ -241,6 +261,19 @@ call github_collaborator_remove "$(args '"username":"pal"')" >/dev/null
 call github_invitation_cancel "$(args '"id":77')" >/dev/null
 OUT=$(call github_collaborators "$(args)")
 ok "removing someone and cancelling an invitation: both gone" "$(printf '%s' "$OUT" | val '[c["login"] for c in v["collaborators"]], [i["login"] for i in v["invitations"]]')" "(['work-me'], ['friend'])"
+
+section "The Pull requests page: the account's repositories, each with its counts"
+OUT=$(call github_pull_repos '{"account":"gh:work-me"}')
+ok "every repository the account can reach, through GitHub's GraphQL list (both pages), with its open pull requests and the ones of its own" "$(printf '%s' "$OUT" | val '[(r["repo"], r["open"], r["to_review"], r["mine"], r["affiliated"]) for r in v["repos"]]')" "[('other/lib', None, 1, 0, False), ('acme/app', 2, 0, 1, True), ('work-me/tools', 0, 0, 0, True), ('acme/old', 0, 0, 0, True)]"
+ok "  asking for a review first, then the busiest, then the latest pushed; someone else's repository known from a review asked is there too" "$(printf '%s' "$OUT" | val 'v["repos"][0]["repo"], v["login"]')" "('other/lib', 'work-me')"
+ok "  what the account may do in each, and an archived one says so" "$(printf '%s' "$OUT" | val '[(r["repo"], r["permission"], r["archived"]) for r in v["repos"][1:]]')" "[('acme/app', 'admin', False), ('work-me/tools', 'write', False), ('acme/old', 'read', True)]"
+ok "  an organization single sign-on withholds is said, not silently missing" "$(printf '%s' "$OUT" | val '[n for n in v["notes"] if "single sign-on" in n] != [] and not v["truncated"]')" "True"
+ok "  GitHub was asked page by page, for open pull requests, as the account picked" "$(grep '"POST", "p": "/graphql"' "$SB/api.log" | grep '"t": "t-work-me"' | "$PY" -c 'import sys,json; rs=[json.loads(json.loads(l)["b"]) for l in sys.stdin]; print(([r["variables"]["cursor"] for r in rs], all("pullRequests(states: [OPEN])" in r["query"] for r in rs)))')" "([None, 'c2'], True)"
+ok "  the two counts are one search each" "$(grep '"/search/issues"' "$SB/api.log" | grep '"t": "t-work-me"' | "$PY" -c 'import sys,json; print(sorted(json.loads(l)["q"]["q"] for l in sys.stdin if "repo:" not in json.loads(l)["q"]["q"] and "is:open" in json.loads(l)["q"]["q"] and json.loads(l)["q"].get("per_page") == "100"))')" "['is:pr author:@me archived:false is:open', 'is:pr review-requested:@me archived:false is:open']"
+OUT=$(call github_pull_repos '{"account":"gh:me-home"}')
+ok "when GitHub's GraphQL list times out, the REST list is used: the same repositories, counts said to be unknown" "$(printf '%s' "$OUT" | val '[(r["repo"], r["open"], r["permission"], r["fork"]) for r in v["repos"] if r["affiliated"]], "could not be counted" in v["notes"][0]')" "([('acme/app', None, 'read', False), ('me-home/notes', None, 'admin', True)], True)"
+ok "  and the slow page was asked again, smaller, before giving up on it" "$(grep '"POST", "p": "/graphql"' "$SB/api.log" | grep '"t": "t-me-home"' | "$PY" -c 'import sys,json; print([json.loads(json.loads(l)["b"])["variables"]["first"] for l in sys.stdin])')" "[100, 50]"
+ok "  single sign-on's partial list is said there too" "$(printf '%s' "$OUT" | val 'any("single sign-on" in n for n in v["notes"])')" "True"
 
 section "Tokens"
 ok "every request carried the token of the account picked, and only known tokens were sent" "$("$PY" -c 'import sys,json; print(sorted({json.loads(l)["t"] for l in open(sys.argv[1])}))' "$SB/api.log")" "['t-me-home', 't-work-me']"

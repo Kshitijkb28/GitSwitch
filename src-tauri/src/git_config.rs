@@ -407,6 +407,25 @@ fn cleanup_orphan_gitconfigs(store: &crate::profiles::ProfileStore) {
     }
 }
 
+/// The ~/.gitconfig that holds GitSwitch's block, if one does.
+pub(crate) fn managed_gitconfig() -> Option<PathBuf> {
+    let path = get_gitconfig_path();
+    fs::read_to_string(&path).ok().filter(|c| c.contains(">>> GitSwitch managed")).map(|_| path)
+}
+
+/// Take GitSwitch's block out of ~/.gitconfig (after a backup), leaving every
+/// other line as it was. False when there was no block.
+pub fn remove_managed_block() -> Result<bool, AppError> {
+    let Some(path) = managed_gitconfig() else { return Ok(false) };
+    backup_file(&path)?;
+    let mut cleaned = remove_gitswitch_sections(&fs::read_to_string(&path)?);
+    if !cleaned.is_empty() {
+        cleaned.push('\n');
+    }
+    fs::write(&path, cleaned)?;
+    Ok(true)
+}
+
 fn remove_gitswitch_sections(content: &str) -> String {
     let mut result = String::new();
     let mut in_managed_section = false;

@@ -31,6 +31,11 @@ impl Reply {
     pub fn ok(&self) -> bool {
         (200..300).contains(&self.status)
     }
+
+    /// GitHub's `X-GitHub-SSO` header: single sign-on withheld something.
+    pub fn sso(&self) -> Option<&str> {
+        self.sso.as_deref()
+    }
 }
 
 /// The login an account key names: "gh:<login>" or "signin:<login>".

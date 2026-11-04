@@ -233,6 +233,33 @@ pub(crate) mod tests {
             "changes_repair_push_block" => forward!(c::changes_repair_push_block, args, repo_path),
             "changes_push_coverage" => forward!(c::changes_push_coverage, args, repo_path),
             "push_lock_helper_status" => forward_plain!(c::push_lock_helper_status, args),
+            "apps_list" => forward!(c::apps_list, args, kind),
+            "apps_prepare" => forward!(c::apps_prepare, args, id),
+            "apps_uninstall" => forward!(c::apps_uninstall, args, session),
+            "apps_status" => forward!(c::apps_status, args, session),
+            "apps_check_gone" => forward!(c::apps_check_gone, args, session),
+            "apps_scan" => forward!(c::apps_scan, args, session, registry),
+            "apps_delete" => forward!(c::apps_delete, args, scan, ids),
+            "apps_sessions" => reply(Ok::<_, crate::error::AppError>(c::apps_sessions())),
+            "apps_dry_scan" => forward!(crate::apps::dry_scan, args, id),
+            "apps_script" => forward!(crate::apps::script, args, steps),
+            // The real Trash (no GITSWITCH_TRASH_DIR): what macOS, Windows or the desktop's Trash does with one path.
+            "apps_trash" => match arg::<String>(&args, "path") {
+                Ok(p) => reply(Ok::<_, crate::error::AppError>(format!("{:?}", crate::apps::to_trash(std::path::Path::new(&p))))),
+                Err(e) => reply_err(e),
+            },
+            "uninstall_plan" => forward_plain!(c::uninstall_plan, args),
+            "uninstall_prepare" => forward_plain!(c::uninstall_prepare, args, keep_data),
+            // The real removal script, for a stand-in bundle and a process that has already quit.
+            "uninstall_start_remover" => {
+                let (bundle, pid, keep_data) = match (arg::<String>(&args, "bundle"), arg::<u32>(&args, "pid"), arg::<bool>(&args, "keep_data")) {
+                    (Ok(b), Ok(p), Ok(k)) => (b, p, k),
+                    _ => return reply_err("bundle, pid and keep_data are needed".to_string()),
+                };
+                let app = crate::uninstall::macos_removal(&std::path::Path::new(&bundle).join("Contents").join("MacOS").join("gitswitch"), &dirs::home_dir().unwrap_or_default());
+                let remove = if keep_data { Vec::new() } else { crate::uninstall::data_folders() };
+                reply(crate::uninstall::start_remover(pid, &remove, &app).map(|p| p.to_string_lossy().to_string()))
+            }
             "push_lock_finish_manual" => forward_plain!(c::push_lock_finish_manual, args, nonce),
             // tree: branches, undo, reset, revert, conflicts
             "changes_switch_branch" => forward!(c::changes_switch_branch, args, repo_path, name),
@@ -296,6 +323,8 @@ pub(crate) mod tests {
             "github_repo_context" => forward!(c::github_repo_context, args, repo_path, repo),
             "github_pulls" => forward!(c::github_pulls, args, account, owner, name, state, page),
             "github_pulls_search" => forward!(c::github_pulls_search, args, account, scope, state, repo, page),
+            "github_pull_repos" => forward!(c::github_pull_repos, args, account),
+            "scan_repos_tracked" => forward!(c::scan_repos_tracked, args, scan_id, root),
             "github_pull" => forward!(c::github_pull, args, account, owner, name, number),
             "github_pull_files" => forward!(c::github_pull_files, args, account, owner, name, number),
             "github_pull_commits" => forward!(c::github_pull_commits, args, account, owner, name, number),
