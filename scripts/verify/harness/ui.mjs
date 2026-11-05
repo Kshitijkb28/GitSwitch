@@ -128,6 +128,8 @@ async function openPage(browser, server, scenario, opts = {}) {
      * Merging, inviting and removing change it, as GitHub would.
      */
     gh: opts.gh ?? null,
+    /** What changes_file_diff answers for a text file; null → DIFF_TEXT. */
+    diffText: opts.diffText ?? null,
   };
   // Named, so another engine can be handed the very same bridge (webkit.sh).
   const bridge = (
@@ -281,7 +283,7 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "uninstall_commit_guard":
               return Promise.resolve("Guard removed.");
             case "changes_file_diff":
-              return Promise.resolve(args.path === "logo.png" ? diffBinary : diffText);
+              return Promise.resolve(args.path === "logo.png" ? diffBinary : cfg.diffText ?? diffText);
             case "changes_pull":
               if (cfg.hang) return new Promise(() => {}); // never settles
               if (cfg.pullResult) return Promise.resolve({ ...cfg.pullResult, status: window.__SCENARIO__ });
@@ -1995,6 +1997,95 @@ try {
     await page.waitForFunction(() => document.body.innerText.includes("Binary file"), { timeout: 4000 });
     ok("a binary file says so instead of rendering", true);
     await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Diffs: unified as before, or side by side — one choice, remembered, for every diff");
+  {
+    const SQL = {
+      ...DIFF_TEXT,
+      path: "db/q.sql",
+      lines: [
+        { kind: "meta", text: "diff --git a/db/q.sql b/db/q.sql" },
+        { kind: "meta", text: "--- a/db/q.sql" },
+        { kind: "meta", text: "+++ b/db/q.sql" },
+        { kind: "hunk", text: "@@ -10,4 +10,5 @@ select" },
+        { kind: "context", text: " select 1;" },
+        // A removed SQL comment: git writes "-" + "-- old"; read by the hunk's counts it is a removed line.
+        { kind: "meta", text: "--- old comment" },
+        { kind: "del", text: "-where a = 1" },
+        { kind: "add", text: "+-- new comment" },
+        { kind: "add", text: "+where a = 2" },
+        { kind: "add", text: "+  and b = 3" },
+        { kind: "context", text: " limit 5;" },
+        { kind: "meta", text: "\\ No newline at end of file" },
+      ],
+    };
+    const view = (page) =>
+      page.evaluate(() => ({
+        pre: !!document.querySelector("pre"),
+        table: !!document.querySelector('[data-diff-view="split"]'),
+        toggles: document.querySelectorAll("[data-diff-toggle]").length,
+        stored: localStorage.getItem("gitswitch:diff.view"),
+      }));
+    const rowsOf = (page) =>
+      page.evaluate(() =>
+        [...document.querySelectorAll('[data-diff-view="split"] tr')].map((r) =>
+          r.dataset.splitRow === "full"
+            ? r.innerText.trim()
+            : [r.dataset.old, r.querySelector('[data-side="old"]').innerText, r.dataset.new, r.querySelector('[data-side="new"]').innerText]
+        )
+      );
+    const pick = (page, label) => page.evaluate((label) => [...document.querySelectorAll("[data-diff-toggle] button")].find((b) => b.innerText.trim() === label)?.click(), label);
+
+    const page = await open(SCENARIOS.dirty, { diffText: SQL });
+    await clickInRow(page, "src/mod.ts", { index: 0 });
+    await page.waitForFunction(() => document.body.innerText.includes("@@ -10,4 +10,5 @@"), { timeout: 4000 });
+    let v = await view(page);
+    ok("a diff opens unified, as before", v.pre && !v.table && v.toggles === 1, JSON.stringify(v));
+    await pick(page, "Side by side");
+    await sleep(150);
+    v = await view(page);
+    ok("Side by side shows it as a table instead", v.table && !v.pre, JSON.stringify(v));
+    ok("  and remembers the choice", v.stored === '"split"');
+    const rows = await rowsOf(page);
+    ok("  headers and the hunk line span the table", rows[0] === "diff --git a/db/q.sql b/db/q.sql" && rows[3] === "@@ -10,4 +10,5 @@ select", JSON.stringify(rows.slice(0, 4)));
+    ok("  a context line sits on both sides with both numbers", JSON.stringify(rows[4]) === JSON.stringify(["10", "select 1;", "10", "select 1;"]), JSON.stringify(rows[4]));
+    ok("  removed lines pair with added ones, row by row — a removed \"--\" line too", JSON.stringify(rows[5]) === JSON.stringify(["11", "-- old comment", "11", "-- new comment"]) && JSON.stringify(rows[6]) === JSON.stringify(["12", "where a = 1", "12", "where a = 2"]), JSON.stringify(rows.slice(5, 8)));
+    ok("  an added line with nothing opposite leaves its left side empty", JSON.stringify(rows[7]) === JSON.stringify(["", "", "13", "  and b = 3"]), JSON.stringify(rows[7]));
+    ok("  the numbering carries on after the change", JSON.stringify(rows[8]) === JSON.stringify(["13", "limit 5;", "14", "limit 5;"]), JSON.stringify(rows[8]));
+    ok("  and git's \"no newline\" note spans the table", rows[9] === "\\ No newline at end of file", JSON.stringify(rows[9]));
+    ok("  the removed side is red and the added side green", await page.evaluate(() => { const r = document.querySelectorAll('[data-diff-view="split"] tr[data-split-row="pair"]')[1]; return r.querySelector('[data-side="old"]').className.includes("red") && r.querySelector('[data-side="new"]').className.includes("emerald"); }));
+    // UI_SHOTS=<folder>: a picture of it, for people to look at.
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/diff-side-by-side.png` });
+    await page.keyboard.press("Escape");
+    await sleep(200);
+    await clickInRow(page, "src/mod.ts", { index: 0 });
+    await page.waitForFunction(() => !!document.querySelector('[data-diff-view="split"]'), { timeout: 4000 }).catch(() => null);
+    ok("the next diff opens side by side too", (await view(page)).table);
+    await pick(page, "Unified");
+    await sleep(150);
+    v = await view(page);
+    ok("Unified brings back the view as it was", v.pre && !v.table && v.stored === '"unified"' && (await text(page)).includes("-where a = 1"));
+    await page.close();
+
+    const again = await open(SCENARIOS.dirty, { storage: { "diff.view": "split" } });
+    await clickInRow(again, "src/mod.ts", { index: 0 });
+    await again.waitForFunction(() => !!document.querySelector('[data-diff-view="split"]'), { timeout: 4000 }).catch(() => null);
+    ok("the choice holds the next time the app opens", (await view(again)).table);
+    const merge = await open(SCENARIOS.dirty, { storage: { "diff.view": "split" }, diffText: { ...DIFF_TEXT, lines: [{ kind: "hunk", text: "@@@ -1,2 -1,2 +1,3 @@@" }, { kind: "context", text: "  both" }] } });
+    await clickInRow(merge, "src/mod.ts", { index: 0 });
+    await merge.waitForFunction(() => document.body.innerText.includes("@@@ -1,2"), { timeout: 4000 }).catch(() => null);
+    ok("a combined merge diff it can't lay out is shown unified, saying so", (await view(merge)).pre && (await text(merge)).includes("This diff can only be shown unified."));
+    await again.close();
+    await merge.close();
+
+    const narrow = await open(SCENARIOS.dirty, { width: 700, storage: { "diff.view": "split" }, diffText: SQL });
+    await clickInRow(narrow, "src/mod.ts", { index: 0 });
+    await narrow.waitForFunction(() => !!document.querySelector('[data-diff-view="split"]'), { timeout: 4000 }).catch(() => null);
+    const over = await narrow.evaluate(() => { const t = document.querySelector('[data-diff-view="split"]'); return { page: document.documentElement.scrollWidth > window.innerWidth + 1, table: t ? t.scrollWidth > t.parentElement.clientWidth + 1 : true }; });
+    ok("side by side fits a 700px window: long lines wrap inside their half", !over.page && !over.table, JSON.stringify(over));
+    await narrow.close();
   }
 
   // -----------------------------------------------------------------
@@ -5628,6 +5719,27 @@ try {
       await page.evaluate(() => [...document.querySelectorAll("[role=dialog] button")].find((b) => b.innerText.trim() === "Expand all")?.click());
       await sleep(150);
       ok("  Expand all opens every file, and a file without a diff says why", (await panelText(page)).includes("GitHub shows no diff for this file (binary, or too large)."));
+      ok("  one Unified / Side by side choice above the files, none repeated per file", await page.evaluate(() => document.querySelectorAll("[role=dialog] [data-diff-toggle]").length === 1 && document.querySelectorAll("[data-pull-file] [data-diff-toggle]").length === 0));
+      await page.evaluate(() => [...document.querySelectorAll("[role=dialog] [data-diff-toggle] button")].find((b) => b.innerText.trim() === "Side by side")?.click());
+      await sleep(150);
+      ok("  Side by side shows each file's diff as a table, old left and new right", await page.evaluate(() => { const r = document.querySelector('[role=dialog] [data-diff-view="split"] tr[data-split-row="pair"]'); return !!r && r.querySelector('[data-side="old"]').innerText === "old line" && r.querySelector('[data-side="new"]').innerText === "new line" && r.dataset.old === "1" && r.dataset.new === "1"; }));
+      if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/pull-files-side-by-side.png` });
+      await page.evaluate(() => [...document.querySelectorAll("[role=dialog] [data-diff-toggle] button")].find((b) => b.innerText.trim() === "Unified")?.click());
+      await sleep(150);
+      ok("  on Files, review and merge are folded into one bar, so the diffs get the height", await page.evaluate(() => !!document.querySelector('[data-pull-actions="folded"]') && !document.querySelector('textarea[aria-label="Review comment"]')));
+      ok("  a file's diff scrolls with the page, not in a little box of its own", await page.evaluate(() => { const d = document.querySelector("[data-pull-diff]"); const cs = d && getComputedStyle(d); return !!cs && cs.maxHeight === "none" && cs.overflowY === "visible"; }));
+      await page.setViewport({ width: 900, height: 650 });
+      await sleep(200);
+      const room = await page.evaluate(() => Math.round(document.querySelector("[role=dialog] .overflow-y-auto.flex-1")?.getBoundingClientRect().height ?? 0));
+      ok("  in the app's own window size (900×650) the files get most of it", room >= 330, `${room}px`);
+      await page.evaluate(() => [...document.querySelectorAll('[data-pull-actions="folded"] button')].find((b) => b.innerText.includes("Review or merge"))?.click());
+      await sleep(150);
+      ok("  Review or merge opens them right there, on Files", await page.evaluate(() => !!document.querySelector('[data-pull-actions="open"]') && !!document.querySelector('textarea[aria-label="Review comment"]') && document.querySelector('[role=dialog] [role=tab][aria-selected="true"]')?.innerText.startsWith("Files")));
+      await page.evaluate(() => [...document.querySelectorAll('[data-pull-actions="open"] button')].find((b) => b.innerText.includes("Hide review and merge"))?.click());
+      await sleep(150);
+      ok("  and Hide folds them away again", await page.evaluate(() => !!document.querySelector('[data-pull-actions="folded"]')));
+      await page.setViewport({ width: 1280, height: 900 });
+      await sleep(150);
       await clickText(page, '[role=dialog] [role=tab]', "Commits (2)");
       await sleep(250);
       ok("Commits: each with its first line and author", (await panelText(page)).includes("first") && (await panelText(page)).includes("c2bbbbb"));

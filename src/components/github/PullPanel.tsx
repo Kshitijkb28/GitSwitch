@@ -2,7 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
   CircleDot,
   ExternalLink,
   FileText,
@@ -23,7 +25,7 @@ import { RefreshButton } from "../RefreshButton";
 import { Select } from "../Select";
 import { Textarea } from "../Textarea";
 import { useToast } from "../Toast";
-import { DiffView } from "../changes/DiffPanel";
+import { DiffView, DiffViewToggle } from "../changes/DiffPanel";
 import { usePersistedState } from "../../lib/persist";
 import { PullStateIcon, StateLabel, ago, cleanError, openOnGitHub } from "./shared";
 
@@ -99,6 +101,8 @@ export function PullPanel({
   const [reviewText, setReviewText] = useState("");
   const [sending, setSending] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  // Review and merge fold away on the Files tab: the diffs need the height.
+  const [actionsOpen, setActionsOpen] = useState(true);
   const [savedMethod, setSavedMethod] = usePersistedState<Method>("pulls.mergeMethod", "merge");
   const [method, setMethod] = useState<Method>(savedMethod);
   const [title, setTitle] = useState("");
@@ -163,6 +167,7 @@ export function PullPanel({
   }, [account, repo, number]);
 
   useEffect(() => {
+    setActionsOpen(tab !== "files");
     if (tab === "files" && !files && !filesError) void loadFiles();
     if (tab === "commits" && !commits && !commitsError) void loadCommits();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -385,7 +390,7 @@ export function PullPanel({
               )}
               {files && (
                 <div className="space-y-1">
-                  <div className="flex items-center gap-3 mb-2">
+                  <div className="flex items-center gap-3 mb-2 flex-wrap">
                     <FileText size={14} className="text-zinc-500" />
                     <span className="text-zinc-300">
                       {files.files.length} file{files.files.length === 1 ? "" : "s"} changed{files.truncated ? " (GitHub lists the first 3000)" : ""}
@@ -396,6 +401,9 @@ export function PullPanel({
                     <button type="button" className="text-xs text-zinc-400 hover:text-zinc-200 cursor-pointer" onClick={() => setOpenFiles(new Set())}>
                       Collapse all
                     </button>
+                    <span className="ml-auto">
+                      <DiffViewToggle />
+                    </span>
                   </div>
                   {files.files.map((f) => {
                     const open = openFiles.has(f.path);
@@ -423,8 +431,8 @@ export function PullPanel({
                           <span className="text-red-400 shrink-0 tabular-nums">−{f.deletions}</span>
                         </button>
                         {open && (
-                          <div className="mt-1 mb-2 rounded-lg border border-zinc-700/40 bg-zinc-900/70 max-h-[28rem] overflow-auto min-w-0">
-                            <DiffView diff={f.diff} loading={false} error={null} />
+                          <div className="mt-1 mb-2 rounded-lg border border-zinc-700/40 bg-zinc-900/70 min-w-0" data-pull-diff>
+                            <DiffView diff={f.diff} loading={false} error={null} toggle={false} />
                           </div>
                         )}
                       </div>
@@ -464,8 +472,36 @@ export function PullPanel({
           )}
         </div>
 
-        {d && d.state === "open" && (
-          <div className="border-t border-zinc-800 px-5 py-3 space-y-3 shrink-0 max-h-[45vh] overflow-y-auto">
+        {d && d.state === "open" && !(actionsOpen || actionError) && (
+          <div className="border-t border-zinc-800 px-5 py-2 shrink-0 flex items-center gap-3" data-pull-actions="folded">
+            <button
+              type="button"
+              onClick={() => setActionsOpen(true)}
+              className="inline-flex items-center gap-1.5 text-sm text-zinc-300 hover:text-zinc-100 cursor-pointer"
+              aria-expanded={false}
+            >
+              <ChevronUp size={15} />
+              Review or merge
+            </button>
+            <span className="text-xs text-zinc-500 truncate">as @{d.viewer}, into {d.base_ref}</span>
+          </div>
+        )}
+        {d && d.state === "open" && (actionsOpen || actionError) && (
+          <div className="border-t border-zinc-800 px-5 py-3 space-y-3 shrink-0 max-h-[45vh] overflow-y-auto" data-pull-actions="open">
+            {tab === "files" && (
+              <button
+                type="button"
+                onClick={() => {
+                  setActionsOpen(false);
+                  setActionError(null);
+                }}
+                className="inline-flex items-center gap-1.5 text-xs text-zinc-400 hover:text-zinc-200 cursor-pointer"
+                aria-expanded={true}
+              >
+                <ChevronDown size={14} />
+                Hide review and merge
+              </button>
+            )}
             {actionError && (
               <p role="alert" className="px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-xs whitespace-pre-line break-words">
                 {actionError}

@@ -778,6 +778,12 @@ try {
     ok("clicking one loads its diff for this commit", r?.args.hash === C2 && r?.args.path === "src/app.ts" && r?.args.repoPath === REPO, JSON.stringify(r?.args));
     let s = await text(page);
     ok("  and shows the hunk with both line kinds", s.includes("@@ -1,3 +1,4 @@") && s.includes("+added line") && s.includes("-removed line"));
+    await page.evaluate(() => [...document.querySelectorAll("[data-diff-toggle] button")].find((b) => b.innerText.trim() === "Side by side")?.click());
+    await sleep(150);
+    ok("  Side by side shows the commit's file as a table, with both versions' numbers", await page.evaluate(() => { const r = [...document.querySelectorAll('[data-diff-view="split"] tr[data-split-row="pair"]')]; return r.length >= 2 && r[1].querySelector('[data-side="old"]').innerText === "removed line" && r[1].querySelector('[data-side="new"]').innerText === "added line" && r[1].dataset.old === "2" && r[1].dataset.new === "2"; }));
+    await page.evaluate(() => [...document.querySelectorAll("[data-diff-toggle] button")].find((b) => b.innerText.trim() === "Unified")?.click());
+    await sleep(100);
+    ok("  the diff scrolls with the commit, not in a little box of its own", await page.evaluate(() => { const d = document.querySelector("[data-commit-diff]"); const cs = d && getComputedStyle(d); return !!cs && cs.maxHeight === "none" && cs.overflowY === "visible"; }));
     await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("README.md")).click());
     await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "history_commit_file_diff").length === 2, { timeout: 4000 });
     await sleep(100);
