@@ -284,7 +284,7 @@ export function CommitDetailPanel({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-3xl max-h-[85vh] overflow-y-auto rounded-xl border border-zinc-700/50 bg-zinc-900 p-6 shadow-2xl min-w-0">
+      <div className={`relative w-full ${openFile ? "max-w-5xl" : "max-w-3xl"} max-h-[85vh] overflow-y-auto rounded-xl border border-zinc-700/50 bg-zinc-900 p-6 shadow-2xl min-w-0`}>
         <div className="flex items-start justify-between gap-3 mb-4">
           <div className="min-w-0">
             <h2 className="text-lg font-semibold text-zinc-100 break-words">
@@ -539,7 +539,7 @@ export function CommitDetailPanel({
                   )}
                 </button>
                 {open && (
-                  <div className="mt-1 mb-2 rounded-lg border border-zinc-700/40 bg-zinc-900/70 max-h-96 overflow-auto min-w-0">
+                  <div className="mt-1 mb-2 rounded-lg border border-zinc-700/40 bg-zinc-900/70 min-w-0" data-commit-diff>
                     <DiffView diff={fileDiff} loading={diffLoading} error={diffError} />
                   </div>
                 )}
