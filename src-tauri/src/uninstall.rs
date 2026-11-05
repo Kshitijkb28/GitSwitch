@@ -538,7 +538,7 @@ mod tests {
         let home = Path::new("/Users/me");
         assert_eq!(
             macos_removal(Path::new("/Applications/GitSwitch.app/Contents/MacOS/gitswitch"), home),
-            AppRemoval::Trash { bundle: "/Applications/GitSwitch.app".into(), trash: "/Users/me/.Trash".into() }
+            AppRemoval::Trash { bundle: "/Applications/GitSwitch.app".into(), trash: home.join(".Trash").to_string_lossy().to_string() }
         );
         assert!(matches!(macos_removal(Path::new("/private/var/folders/x/T/AppTranslocation/ABC/d/GitSwitch.app/Contents/MacOS/gitswitch"), home), AppRemoval::Manual { .. }));
         assert!(matches!(macos_removal(Path::new("/Users/me/src/GitSwitch/src-tauri/target/debug/gitswitch"), home), AppRemoval::Manual { .. }));

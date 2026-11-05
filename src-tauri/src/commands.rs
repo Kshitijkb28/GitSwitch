@@ -205,6 +205,25 @@ pub async fn gh_auth_switch(host: String, login: String) -> Result<String, AppEr
     gh_cli::gh_auth_switch(&host, &login).await
 }
 
+/// Start `gh auth login` in the browser: the one-time code and where to enter it.
+#[tauri::command]
+pub async fn gh_auth_login_start(host: Option<String>) -> Result<gh_cli::GhDevicePrompt, AppError> {
+    gh_cli::gh_auth_login_start(host.as_deref().unwrap_or("github.com")).await
+}
+
+/// Wait for the sign-in started above: the account gh signed in.
+#[tauri::command]
+pub async fn gh_auth_login_wait() -> Result<gh_cli::GhLogin, AppError> {
+    gh_cli::gh_auth_login_wait().await
+}
+
+/// End the sign-in in progress, if any.
+#[tauri::command]
+pub async fn gh_auth_login_cancel() -> Result<(), AppError> {
+    gh_cli::gh_auth_login_cancel();
+    Ok(())
+}
+
 /// Automate "Step 2": register a local key's public half on a specific
 /// account — a gh login, or a sign-in kept here ("signin:<login>").
 /// `key_path` is the PRIVATE key path; we read `<key_path>.pub`.

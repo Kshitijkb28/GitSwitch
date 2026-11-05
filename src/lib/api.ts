@@ -256,6 +256,27 @@ export async function ghAuthSwitch(host: string, login: string): Promise<string>
   return invoke("gh_auth_switch", { host, login });
 }
 
+/** The one-time code `gh auth login --web` shows, and the page to enter it on. */
+export interface GhDevicePrompt {
+  code: string;
+  url: string;
+}
+
+/** Start gh's own browser sign-in (SSH as git's protocol, no key upload). */
+export async function ghAuthLoginStart(host?: string): Promise<GhDevicePrompt> {
+  return invoke("gh_auth_login_start", { host: host ?? null });
+}
+
+/** Wait for the sign-in started above: the account gh signed in. */
+export async function ghAuthLoginWait(): Promise<{ host: string; login: string }> {
+  return invoke("gh_auth_login_wait");
+}
+
+/** End the sign-in in progress, if any. */
+export async function ghAuthLoginCancel(): Promise<void> {
+  return invoke("gh_auth_login_cancel");
+}
+
 export async function ghRegisterSshKey(
   account: string,
   keyPath: string

@@ -56,6 +56,14 @@ export function GitHubAuth() {
   /** "<host>/<login>" while gh switches to it. */
   const [ghSwitching, setGhSwitching] = useState<string | null>(null);
   const [ghSwitchError, setGhSwitchError] = useState<string | null>(null);
+  /** `gh auth login` run by the app: asking gh for a code, then waiting with the code on screen. */
+  const [ghLogin, setGhLogin] = useState<{ phase: "starting" } | { phase: "code"; prompt: api.GhDevicePrompt } | null>(null);
+  /** What the last gh sign-in ended with, under the card. */
+  const [ghLoginNote, setGhLoginNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const [ghCodeCopied, setGhCodeCopied] = useState(false);
+  /** Bumped by Cancel and by leaving the page: an answer for an older sign-in changes nothing. */
+  const ghLoginGenRef = useRef(0);
+  const ghLoginLiveRef = useRef(false);
   const toast = useToast();
 
   /** gh's own listing — host and active flag per login — when it answers; the bare login list otherwise. */
@@ -127,8 +135,67 @@ export function GitHubAuth() {
       // that arrives late, must start nothing more.
       pollGenRef.current++;
       if (pollTimeoutRef.current) clearTimeout(pollTimeoutRef.current);
+      // A gh sign-in nobody can see the code of any more ends with the page.
+      ghLoginGenRef.current++;
+      if (ghLoginLiveRef.current) void api.ghAuthLoginCancel().catch(() => {});
     };
   }, []);
+
+  /** `gh auth login --web` through the app: show gh's code, wait for it to be entered, then re-read gh's accounts. */
+  async function startGhLogin() {
+    const gen = ++ghLoginGenRef.current;
+    const plain = (e: unknown) => String(e).replace(/^Command execution error: /, "");
+    setGhLoginNote(null);
+    setGhCodeCopied(false);
+    setGhLogin({ phase: "starting" });
+    ghLoginLiveRef.current = true;
+    let prompt: api.GhDevicePrompt;
+    try {
+      prompt = await api.ghAuthLoginStart();
+    } catch (e) {
+      if (gen !== ghLoginGenRef.current) return;
+      ghLoginLiveRef.current = false;
+      setGhLogin(null);
+      setGhLoginNote({ ok: false, text: plain(e) });
+      return;
+    }
+    if (gen !== ghLoginGenRef.current) {
+      // Cancelled while gh was still printing its code.
+      void api.ghAuthLoginCancel().catch(() => {});
+      return;
+    }
+    setGhLogin({ phase: "code", prompt });
+    try {
+      const who = await api.ghAuthLoginWait();
+      if (gen !== ghLoginGenRef.current) return;
+      setGhLoginNote({ ok: true, text: `Signed in to the GitHub CLI as ${who.login}. gh now uses it as its active account on ${who.host}.` });
+      const { logins, rows } = await readGhAccounts().catch(() => ({ logins: [] as string[], rows: [] as api.GhAccount[] }));
+      setGhAccounts(logins);
+      setGhRows(rows);
+    } catch (e) {
+      if (gen !== ghLoginGenRef.current) return;
+      setGhLoginNote({ ok: false, text: plain(e) });
+    } finally {
+      if (gen === ghLoginGenRef.current) {
+        ghLoginLiveRef.current = false;
+        setGhLogin(null);
+      }
+    }
+  }
+
+  function cancelGhLogin() {
+    ghLoginGenRef.current++;
+    ghLoginLiveRef.current = false;
+    setGhLogin(null);
+    void api.ghAuthLoginCancel().catch(() => {});
+  }
+
+  async function copyGhCode(code: string) {
+    if (await copyText(code)) {
+      setGhCodeCopied(true);
+      setTimeout(() => setGhCodeCopied(false), 2000);
+    }
+  }
 
   function openRemove(acct: string) {
     setRemoveError(null);
@@ -418,20 +485,84 @@ export function GitHubAuth() {
                   Use GitHub CLI
                 </h3>
               </div>
-              <button
-                onClick={refreshGhAccounts}
-                disabled={ghRefreshing}
-                title="Re-check gh accounts"
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer disabled:opacity-50"
-              >
-                <RefreshCw size={14} className={ghRefreshing ? "animate-spin" : ""} />
-                Refresh
-              </button>
+              <div className="flex items-center gap-1">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => void startGhLogin()}
+                  disabled={ghLogin !== null}
+                  title="gh auth login --web: gh's own sign-in in the browser, with SSH for git and no key uploaded"
+                >
+                  <GitHubIcon size={14} />
+                  Sign in to GitHub CLI
+                </Button>
+                <button
+                  onClick={refreshGhAccounts}
+                  disabled={ghRefreshing}
+                  title="Re-check gh accounts"
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  <RefreshCw size={14} className={ghRefreshing ? "animate-spin" : ""} />
+                  Refresh
+                </button>
+              </div>
             </div>
             <p className="text-sm text-zinc-500 mb-4">
               You're already signed in to these accounts via <span className="font-mono text-zinc-400">gh</span>.
               Pick one to use instantly — no code needed.
             </p>
+            {ghLogin && (
+              <div className="mb-4 px-4 py-5 rounded-lg bg-zinc-900 border border-zinc-700 text-center" aria-live="polite">
+                {ghLogin.phase === "starting" ? (
+                  <p className="flex items-center justify-center gap-2 text-sm text-zinc-400">
+                    <Loader2 size={16} className="animate-spin text-emerald-400" />
+                    Asking <span className="font-mono">gh</span> for a sign-in code…
+                  </p>
+                ) : (
+                  <>
+                    <p className="text-xs text-zinc-500 uppercase tracking-wider mb-2">GitHub CLI code</p>
+                    <div className="inline-flex items-center gap-3 bg-zinc-950 border border-zinc-700 rounded-xl px-5 py-3">
+                      <span className="text-2xl font-mono font-bold tracking-[0.3em] text-emerald-400">{ghLogin.prompt.code}</span>
+                      <button
+                        onClick={() => void copyGhCode(ghLogin.prompt.code)}
+                        title="Copy the code"
+                        className="p-2 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer"
+                      >
+                        {ghCodeCopied ? <CheckCircle2 size={18} className="text-emerald-400" /> : <Copy size={18} />}
+                      </button>
+                    </div>
+                    <div className="mt-4 flex justify-center">
+                      <Button
+                        onClick={() => {
+                          const uri = ghLogin.prompt.url;
+                          openUrl(uri).catch(() => window.open(uri, "_blank"));
+                        }}
+                      >
+                        <ExternalLink size={16} />
+                        Open GitHub
+                      </Button>
+                    </div>
+                    <p className="text-xs text-zinc-500 mt-2">
+                      Enter the code at <span className="font-mono text-zinc-300">{ghLogin.prompt.url}</span>, signed in to GitHub as the account to add.
+                    </p>
+                    <p className="mt-4 flex items-center justify-center gap-2 text-sm text-zinc-500">
+                      <Loader2 size={16} className="animate-spin" />
+                      Waiting for GitHub…
+                    </p>
+                  </>
+                )}
+                <div className="flex justify-center mt-3">
+                  <Button variant="ghost" size="sm" onClick={cancelGhLogin}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            )}
+            {ghLoginNote && (
+              <p role={ghLoginNote.ok ? "status" : "alert"} className={`text-sm mb-4 break-words ${ghLoginNote.ok ? "text-emerald-300/90" : "text-red-400"}`}>
+                {ghLoginNote.text}
+              </p>
+            )}
             {ghLoading ? (
               <div className="flex items-center justify-center gap-2 px-3 py-5 rounded-lg bg-zinc-800/40 border border-zinc-700/40 text-sm text-zinc-400">
                 <Loader2 size={16} className="animate-spin text-emerald-400" />
@@ -439,9 +570,10 @@ export function GitHubAuth() {
               </div>
             ) : ghAccounts.length === 0 ? (
               <p className="text-sm text-zinc-500 px-3 py-4 rounded-lg bg-zinc-800/40 border border-zinc-700/40 text-center">
-                No <span className="font-mono">gh</span> accounts found. Run{" "}
-                <span className="font-mono text-zinc-400">gh auth login</span> in
-                a terminal, then click <span className="text-zinc-300">Refresh</span>.
+                No <span className="font-mono">gh</span> accounts found. Click{" "}
+                <span className="text-zinc-300">Sign in to GitHub CLI</span>, or run{" "}
+                <span className="font-mono text-zinc-400">gh auth login</span> in a terminal and click{" "}
+                <span className="text-zinc-300">Refresh</span>.
               </p>
             ) : (
             <div className="space-y-1.5">

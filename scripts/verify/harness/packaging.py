@@ -8,6 +8,9 @@
 - The macOS app is sealed (ad hoc) when bundled, and CI checks the bundle.
 - The install docs say how to open a build macOS has not notarized, and name
   the installers the bundler actually writes.
+- In-app updates: a tag must be the app's version and have the signing key;
+  every OS attaches its signed installers, and latest.json is written with an
+  entry per installer once all are in.
 
 Static on purpose: node and npm do not run everywhere this gate does, and a
 release build takes many minutes. CI runs the real packaging.
@@ -128,6 +131,34 @@ ext_src = read(f"{EXT}/src/extension.ts")
 deep = read(f"{ROOT}/src-tauri/src/deep_link.rs")
 pages = re.findall(r'gitswitch://([a-z]+)', ext_src)
 ok("  the extension opens only pages the app's link allowlist names", bool(pages) and all(f'"{p}"' in deep for p in pages), f"extension opens {pages}")
+
+# --- In-app updates ---------------------------------------------------------------
+upd = conf.get("plugins", {}).get("updater", {})
+ok(
+    "installed copies look for updates on the latest published release",
+    upd.get("pubkey") and upd.get("endpoints") == ["https://github.com/Kshitijkb28/GitSwitch/releases/latest/download/latest.json"],
+    f"updater: {upd}",
+)
+ok("  local builds need no signing key (the updater files are CI's, through an overlay)", not conf.get("bundle", {}).get("createUpdaterArtifacts"))
+overlay = json.loads(read(f"{ROOT}/src-tauri/tauri.updater.conf.json"))
+build_job = re.search(r"\n  build:\n(.*?)(?=\n  [a-z][\w-]*:\n|\Z)", wf, re.S)
+bj = build_job.group(1) if build_job else ""
+ok(
+    "  a tagged build signs them with the release key, and a tag without the key fails",
+    overlay.get("bundle", {}).get("createUpdaterArtifacts") is True
+    and "--config src-tauri/tauri.updater.conf.json" in bj
+    and "TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" in bj
+    and 'elif [ "$GITHUB_REF_TYPE" = tag ]' in bj,
+)
+ok("  a tag must be the version every file carries", 'node scripts/release/version.mjs --check "$GITHUB_REF_NAME"' in bj)
+ok(
+    "  each platform attaches its installers' signatures, and latest.json is written once all are in",
+    "includeUpdaterJson: false" in bj
+    and "release/bundle/**/*.sig" in bj
+    and bool(re.search(r"\n  release-updater:\n(?:.*\n)*?    needs: \[build\]\n(?:.*\n)*?.*scripts/release/updater-manifest\.mjs(?:.*\n)*?.*--require windows-x86_64-nsis,windows-x86_64-msi,darwin-aarch64-app,darwin-x86_64-app,linux-x86_64-appimage,linux-x86_64-deb,linux-x86_64-rpm", wf)),
+)
+ok("  for every installer the bundle makes on each OS", conf.get("bundle", {}).get("targets") == "all")
+
 readme = read(f"{ROOT}/README.md")
 ok("README points to the first-open steps", "BUILD.md#first-open-on-macos" in readme)
 ok("  and to the extension's .vsix on the release", "gitswitch-<version>.vsix" in readme)

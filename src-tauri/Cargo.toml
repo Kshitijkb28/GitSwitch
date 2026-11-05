@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Switch git identities automatically per folder — multiple GitHub accounts, zero manual switching"
 authors = ["Kshitij Bhardwaj"]
 edition = "2021"
+# The workspace's default members bring the helper and the shim's binaries
+# too; `cargo run` (what `tauri dev` calls) must still know which is the app.
+default-run = "gitswitch"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

@@ -185,6 +185,9 @@ pub(crate) mod tests {
             "gh_logout" => forward!(c::gh_logout, args, account),
             "gh_auth_accounts" => forward!(c::gh_auth_accounts, args),
             "gh_auth_switch" => forward!(c::gh_auth_switch, args, host, login),
+            "gh_auth_login_start" => forward!(c::gh_auth_login_start, args, host),
+            "gh_auth_login_wait" => forward!(c::gh_auth_login_wait, args),
+            "gh_auth_login_cancel" => forward!(c::gh_auth_login_cancel, args),
             "apply_git_config" => reply(c::apply_git_config()),
             "history_list_repos" => forward!(c::history_list_repos, args),
             "path_exists" => {
@@ -571,6 +574,29 @@ pub(crate) mod tests {
                     Ok((prelude, out)) => emit(&serde_json::json!({ "prelude": prelude, "output": out })),
                     Err(e) => emit_err(e),
                 }
+            }
+            // `gh auth login` from the app, start and wait in one process as the
+            // page does: PROBE_ARGS = "" waits it out, "cancel" cancels while
+            // waiting. {"start": code or error, "done": login or error}.
+            "gh_login" => {
+                let said = |r: Result<serde_json::Value, String>| match r {
+                    Ok(v) => serde_json::json!({ "ok": true, "value": v }),
+                    Err(e) => serde_json::json!({ "ok": false, "error": e }),
+                };
+                let start = crate::gh_cli::gh_auth_login_start("github.com").await;
+                let started = start.is_ok();
+                let start = said(start.map(|p| serde_json::to_value(p).unwrap()).map_err(|e| e.to_string()));
+                let done = if !started {
+                    serde_json::Value::Null
+                } else if first == "cancel" {
+                    let waiting = tokio::spawn(crate::gh_cli::gh_auth_login_wait());
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    crate::gh_cli::gh_auth_login_cancel();
+                    said(waiting.await.unwrap().map(|l| serde_json::to_value(l).unwrap()).map_err(|e| e.to_string()))
+                } else {
+                    said(crate::gh_cli::gh_auth_login_wait().await.map(|l| serde_json::to_value(l).unwrap()).map_err(|e| e.to_string()))
+                };
+                emit(&serde_json::json!({ "start": start, "done": done }));
             }
             "lock_helper_status" => emit(&crate::push_lock::helper_status().await),
             "lock_uninstall" => emit(&crate::push_lock::uninstall_all().await),

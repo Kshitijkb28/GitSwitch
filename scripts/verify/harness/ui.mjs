@@ -729,6 +729,9 @@ async function openAuthPage(browser, server, opts = {}) {
     /** Logins whose sign-in the backend keeps; keepError: what keeping one answers. */
     kept: opts.kept ?? [],
     keepError: opts.keepError ?? null,
+    /** gh auth login through the app: what start and wait answer, scripted like the polls. */
+    loginStart: opts.loginStart ?? { resolve: { code: "C027-AF8F", url: "https://github.com/login/device" } },
+    loginWait: opts.loginWait ?? "hold",
   };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
@@ -779,6 +782,17 @@ async function openAuthPage(browser, server, opts = {}) {
           case "github_signin_keep":
             return cfg.keepError ? Promise.reject(cfg.keepError) : Promise.resolve(null);
           case "github_signin_forget":
+            return Promise.resolve(null);
+          case "gh_auth_login_start":
+            return reply(cmd, cfg.loginStart, () => Promise.reject("Command execution error: nothing scripted"));
+          case "gh_auth_login_wait":
+            // A finished sign-in is in gh's listing from then on, as its active account.
+            return reply(cmd, cfg.loginWait, () => Promise.reject("Command execution error: nothing scripted")).then((who) => {
+              if (who && who.login && !accounts.includes(who.login)) accounts.push(who.login);
+              if (who && who.login) active = who.login;
+              return who;
+            });
+          case "gh_auth_login_cancel":
             return Promise.resolve(null);
           case "get_profiles":
           case "list_ssh_keys":
@@ -837,6 +851,44 @@ async function openSshPage(browser, server, opts = {}) {
   }, cfg);
   await page.goto(`${server.url}/ssh`, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => document.body.innerText.includes("Existing SSH Keys"), { timeout: 5000 });
+  return page;
+}
+
+/**
+ * Settings against a mocked updater. `check` is what the release feed answers:
+ * an update's metadata, null for none, or { reject } for a failure. The
+ * background check's 10-second wait after launch is cut to a moment.
+ */
+async function openSettingsPage(browser, server, opts = {}) {
+  const cfg = { check: opts.check ?? null, version: opts.version ?? "0.1.0", path: opts.path ?? "/settings", install: opts.install ?? { resolve: null } };
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    const later = window.setTimeout.bind(window);
+    window.setTimeout = (f, ms, ...rest) => later(f, ms === 10_000 ? 50 : ms, ...rest);
+    window.__TAURI_INTERNALS__ = {
+      transformCallback: () => 1,
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args });
+        switch (cmd) {
+          case "plugin:app|version":
+            return Promise.resolve(cfg.version);
+          case "plugin:updater|check":
+            if (cfg.check && cfg.check.reject) return Promise.reject(cfg.check.reject);
+            return Promise.resolve(cfg.check ? { rid: 7, currentVersion: cfg.version, date: null, body: "", rawJson: {}, ...cfg.check } : null);
+          case "plugin:updater|download_and_install":
+            return cfg.install.reject ? Promise.reject(cfg.install.reject) : Promise.resolve(null);
+          case "get_current_git_config":
+            return Promise.resolve("[user]\n  name = me\n");
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}${cfg.path}`, { waitUntil: "networkidle0" });
   return page;
 }
 
@@ -3819,6 +3871,65 @@ try {
     }
   }
 
+  section("GitHub CLI accounts: signing in to gh from the app");
+  {
+    const press = (page, label) => page.evaluate((l) => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === l)?.click(), label);
+    const called = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args ?? null), cmd);
+    {
+      const page = await openAuthPage(browser, server);
+      await page.waitForFunction(() => document.body.innerText.includes("No gh accounts found"), { timeout: 4000 });
+      const s = await text(page);
+      ok("with no gh login, the card offers to sign in to gh here", s.includes("Sign in to GitHub CLI") && s.includes("Click Sign in to GitHub CLI"), s.slice(0, 300));
+      await press(page, "Sign in to GitHub CLI");
+      await page.waitForFunction(() => document.body.innerText.includes("C027-AF8F"), { timeout: 4000 }).catch(() => null);
+      const t = await text(page);
+      ok("  clicking it shows gh's one-time code", t.includes("C027-AF8F") && t.includes("Waiting for GitHub"), t.slice(0, 300));
+      ok("  with Open GitHub and where to enter it", t.includes("Open GitHub") && t.includes("https://github.com/login/device"));
+      ok("  gh was asked for the default host", JSON.stringify(await called(page, "gh_auth_login_start")) === JSON.stringify([{ host: null }]), JSON.stringify(await called(page, "gh_auth_login_start")));
+      ok("  and the page waits on it", (await called(page, "gh_auth_login_wait")).length === 1);
+      ok("  while it waits, a second sign-in cannot be started", await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in to GitHub CLI")?.disabled === true));
+      await press(page, "Cancel");
+      await sleep(200);
+      ok("Cancel ends gh's sign-in", (await called(page, "gh_auth_login_cancel")).length === 1);
+      ok("  and takes the code off the page", !(await text(page)).includes("C027-AF8F"));
+      // gh's answer arriving after Cancel changes nothing.
+      await page.evaluate(() => window.__HELD__.gh_auth_login_wait?.res({ host: "github.com", login: "late" }));
+      await sleep(200);
+      ok("  a sign-in that finishes after Cancel says nothing", !(await text(page)).includes("Signed in to the GitHub CLI"));
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { ghAccounts: ["alice"], ghActive: "alice", loginWait: { resolve: { host: "github.com", login: "newuser" } } });
+      await page.waitForFunction(() => document.body.innerText.includes("Use this account"), { timeout: 4000 });
+      await press(page, "Sign in to GitHub CLI");
+      await page.waitForFunction(() => document.body.innerText.includes("Signed in to the GitHub CLI as newuser"), { timeout: 4000 }).catch(() => null);
+      await sleep(200);
+      const s = await text(page);
+      ok("a finished sign-in names the account and that gh now uses it", s.includes("Signed in to the GitHub CLI as newuser. gh now uses it as its active account on github.com."), s.slice(0, 400));
+      ok("  the list is read again and shows it, active", s.includes("newuser") && (await called(page, "gh_auth_accounts")).length >= 2);
+      ok("  and the code is gone", !s.includes("C027-AF8F"));
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { loginWait: { reject: "The code expired before it was entered on GitHub. Start the sign-in again for a new code." } });
+      await page.waitForFunction(() => document.body.innerText.includes("No gh accounts found"), { timeout: 4000 });
+      await press(page, "Sign in to GitHub CLI");
+      await page.waitForFunction(() => document.body.innerText.includes("code expired"), { timeout: 4000 }).catch(() => null);
+      const s = await text(page);
+      ok("a code that expired says so in words, and the button is back", s.includes("The code expired before it was entered on GitHub") && !s.includes("Command execution error") && !s.includes("C027-AF8F"), s.slice(0, 300));
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { loginStart: { reject: "The GitHub CLI (gh) isn't installed on this computer. Install it from https://cli.github.com, sign in with `gh auth login`, then try again." } });
+      await page.waitForFunction(() => document.body.innerText.includes("No gh accounts found"), { timeout: 4000 });
+      await press(page, "Sign in to GitHub CLI");
+      await page.waitForFunction(() => document.body.innerText.includes("isn't installed"), { timeout: 4000 }).catch(() => null);
+      const s = await text(page);
+      ok("without gh on the computer, the click says so instead of waiting", s.includes("The GitHub CLI (gh) isn't installed") && !s.includes("Waiting for GitHub") && (await called(page, "gh_auth_login_wait")).length === 0, s.slice(0, 300));
+      await page.close();
+    }
+  }
+
   section("GitHub sign-in: a way out of every wait");
   {
     const signIn = (page) => page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
@@ -6074,6 +6185,69 @@ try {
     await refused.waitForFunction(() => document.querySelector("[data-uninstall-stopped]"), { timeout: 5000 }).catch(() => null);
     ok("the locks refused: stopped, with the command, and nothing removed", (await text(refused)).includes("nothing was uninstalled") && (await text(refused)).includes("sudo /x/helper") && (await calls(refused, "uninstall_finish")).length === 0);
     await refused.close();
+  }
+
+  {
+    const press = (page, label) => page.evaluate((l) => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === l)?.click(), label);
+    const settingsCalls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+    const sidebar = (page) => page.evaluate(() => document.querySelector("nav")?.innerText ?? "");
+    const about = (page) => page.evaluate(() => [...document.querySelectorAll("h2")].find((h) => h.innerText.trim().toLowerCase() === "about")?.parentElement?.innerText ?? "");
+
+    section("Updates: found in the background, said in the sidebar, installed from Settings");
+    {
+      const page = await openSettingsPage(browser, server, { path: "/doctor", check: { version: "0.2.0" }, version: "0.1.0" });
+      await page.waitForFunction(() => document.querySelector("nav")?.innerText.includes("Update available"), { timeout: 4000 }).catch(() => null);
+      const nav = await sidebar(page);
+      ok("the app checks for a release on its own, soon after it starts", (await settingsCalls(page, "plugin:updater|check")).length === 1);
+      ok("  and the sidebar says a newer one is out", nav.includes("Update available: v0.2.0"), nav);
+      ok("  under the version this copy was built as, read from the app (not written into the page)", nav.includes("v0.1.0"), nav);
+      await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.includes("Update available"))?.click());
+      await page.waitForFunction(() => document.body.innerText.includes("Check for Updates"), { timeout: 4000 }).catch(() => null);
+      const a = await about(page);
+      ok("the sidebar's note opens Settings, where the update is ready to install", a.includes("Install v0.2.0 and restart"), a);
+      ok("  without asking GitHub again", (await settingsCalls(page, "plugin:updater|check")).length === 1);
+      ok("  and About names the running version", a.includes("Version: 0.1.0"), a);
+      await press(page, "Install v0.2.0 and restart");
+      await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:process|restart"), { timeout: 4000 }).catch(() => null);
+      const inst = await settingsCalls(page, "plugin:updater|download_and_install");
+      ok("Install downloads and installs that update, then restarts the app", inst.length === 1 && inst[0].rid === 7 && (await settingsCalls(page, "plugin:process|restart")).length === 1, JSON.stringify(inst));
+      await page.close();
+    }
+
+    section("Updates: checking by hand, and the answers said in words");
+    {
+      const page = await openSettingsPage(browser, server, { check: null });
+      await page.waitForFunction(() => document.body.innerText.includes("Check for Updates"), { timeout: 4000 }).catch(() => null);
+      await sleep(300);
+      await press(page, "Check for Updates");
+      await page.waitForFunction(() => document.body.innerText.includes("latest version"), { timeout: 4000 }).catch(() => null);
+      ok("no newer release: says so", (await about(page)).includes("You're on the latest version."));
+      ok("  and offers nothing to install, in Settings or the sidebar", !(await text(page)).includes("Install v") && !(await sidebar(page)).includes("Update available"));
+      await page.close();
+
+      const answers = [
+        ["Could not fetch a valid release JSON from the remote", "No GitSwitch release has been published yet."],
+        ["None of the fallback platforms `[\"windows-x86_64-nsis\", \"windows-x86_64\"]` were found in the response `platforms` object", "The latest release has no update for this kind of install yet."],
+        ["error sending request for url (https://github.com/...)", "Could not reach GitHub to check for updates."],
+      ];
+      for (const [reject, said] of answers) {
+        const p = await openSettingsPage(browser, server, { check: { reject } });
+        await p.waitForFunction(() => document.body.innerText.includes("Check for Updates"), { timeout: 4000 }).catch(() => null);
+        await sleep(300);
+        await press(p, "Check for Updates");
+        await p.waitForFunction((s) => document.body.innerText.includes(s), { timeout: 4000 }, said).catch(() => null);
+        ok(`"${reject.slice(0, 40)}…" reads as: ${said}`, (await about(p)).includes(said), await about(p));
+        await p.close();
+      }
+
+      const failing = await openSettingsPage(browser, server, { check: { version: "0.2.0" }, install: { reject: "Failed to install .deb package" } });
+      await failing.waitForFunction(() => document.body.innerText.includes("Install v0.2.0 and restart"), { timeout: 4000 }).catch(() => null);
+      await press(failing, "Install v0.2.0 and restart");
+      await failing.waitForFunction(() => document.body.innerText.includes("didn't install"), { timeout: 4000 }).catch(() => null);
+      const f = await about(failing);
+      ok("an install that fails says why and does not restart", f.includes("The update didn't install: Failed to install .deb package") && (await settingsCalls(failing, "plugin:process|restart")).length === 0, f);
+      await failing.close();
+    }
   }
 } finally {
   await browser.close();

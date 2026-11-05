@@ -168,6 +168,10 @@ jobs:
         run: npm run build
       - name: IPC contract (commands.rs ↔ lib.rs ↔ api.ts)
         run: python3 scripts/verify/harness/ipc.py
+      - name: Release tooling (latest.json, the version in every file)
+        run: |
+          node scripts/release/updater-manifest.test.mjs
+          node scripts/release/version.mjs --check "v$(node scripts/release/version.mjs)"
       - name: Packaging and install docs
         run: python3 scripts/verify/harness/packaging.py
       - name: Install Rust
@@ -244,6 +248,35 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$GITHUB_REF_NAME" *.vsix --clobber --repo "$GITHUB_REPOSITORY"
 
+  # latest.json — what installed copies read (tauri.conf.json, the updater
+  # endpoint) once the release is published — written after every platform
+  # has attached its installers and their signatures. A platform missing from
+  # the release fails here instead of leaving its installs without updates.
+  release-updater:
+    if: github.ref_type == 'tag'
+    needs: [build]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Write latest.json and attach it to the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sigs"
+          gh release download "$GITHUB_REF_NAME" --pattern '*.sig' --dir "$RUNNER_TEMP/sigs" --repo "$GITHUB_REPOSITORY"
+          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' --repo "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/assets.txt"
+          node scripts/release/updater-manifest.mjs \
+            --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" \
+            --dir "$RUNNER_TEMP/sigs" --assets "$RUNNER_TEMP/assets.txt" \
+            --require windows-x86_64-nsis,windows-x86_64-msi,darwin-aarch64-app,darwin-x86_64-app,linux-x86_64-appimage,linux-x86_64-deb,linux-x86_64-rpm \
+            > "$RUNNER_TEMP/latest.json"
+          cat "$RUNNER_TEMP/latest.json"
+          gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/latest.json" --clobber --repo "$GITHUB_REPOSITORY"
+
   build:
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     strategy:
@@ -292,6 +325,32 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      # Installed copies are offered a release whose version is newer than
+      # theirs, and the version they have is the one they were built with: a
+      # tag that disagrees with the files would never be offered, or be
+      # offered again after installing.
+      - name: The tag is the version being built
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: node scripts/release/version.mjs --check "$GITHUB_REF_NAME"
+
+      # The in-app updater installs only what this key signed (the public half
+      # is the updater pubkey in tauri.conf.json). A tag without it would be a
+      # release no installed copy can update to, so a tag stops here; a manual
+      # run builds the installers without the updater's files.
+      - name: Updater signing key
+        id: updater
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "config=--config src-tauri/tauri.updater.conf.json" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "::error::The TAURI_SIGNING_PRIVATE_KEY secret is not set, so installed copies could not verify this release. See BUILD.md, Auto-updater releases."
+            exit 1
+          fi
+
       # tauri-build refuses to compile the app without the lock-helper sidecar
       # file, so build it (host triple) before the tests. `tauri build` below
       # rebuilds it for the bundle target through beforeBuildCommand.
@@ -305,6 +364,8 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: "GitSwitch ${{ github.ref_name }}"
@@ -314,7 +375,37 @@ jobs:
             **Windows:** SmartScreen says "Windows protected your PC" for an unsigned installer: More info → Run anyway.
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}
+          # latest.json is written by release-updater once every platform is
+          # in, with an entry per installer (the action's names one per OS).
+          includeUpdaterJson: false
+          args: ${{ matrix.args }} ${{ steps.updater.outputs.config }}
+
+      # Each installer the updater can install from, with the signature the
+      # bundler wrote next to it, under the names latest.json will point at.
+      # The macOS leg builds one universal app; its tarball is named for that.
+      - name: Attach the updater files to the draft release
+        if: github.ref_type == 'tag'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          shopt -s globstar nullglob
+          v="${GITHUB_REF_NAME#v}"
+          up=()
+          for sig in src-tauri/target/**/release/bundle/**/*.sig; do
+            f="${sig%.sig}"
+            case "$f" in
+              *.app.tar.gz)
+                n="GitSwitch_${v}_universal.app.tar.gz"
+                cp "$f" "$RUNNER_TEMP/$n"
+                cp "$sig" "$RUNNER_TEMP/$n.sig"
+                up+=("$RUNNER_TEMP/$n" "$RUNNER_TEMP/$n.sig") ;;
+              *) up+=("$f" "$sig") ;;
+            esac
+          done
+          [ ${#up[@]} -gt 0 ] || { echo "::error::the build wrote no updater files (.sig)"; exit 1; }
+          printf '%s\n' "${up[@]}"
+          gh release upload "$GITHUB_REF_NAME" "${up[@]}" --clobber --repo "$GITHUB_REPOSITORY"
 
       # An unsealed app on Apple Silicon is "damaged" once downloaded; a sealed
       # one only asks to be confirmed. Check the bundle that was shipped.

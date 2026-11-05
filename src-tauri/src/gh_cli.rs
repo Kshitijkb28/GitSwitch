@@ -86,7 +86,7 @@ pub(crate) fn parse_auth_status(text: &str) -> Vec<GhAccount> {
 
 /// `gh auth status`, both streams: gh writes it to stderr in some versions.
 pub async fn gh_auth_status() -> Result<Vec<GhAccount>, AppError> {
-    let output = crate::spawn::async_command("gh")
+    let output = crate::spawn::async_command(crate::spawn::program("gh"))
         .args(["auth", "status"])
         .output()
         .await
@@ -157,7 +157,7 @@ pub async fn gh_logout(account: &str) -> Result<String, AppError> {
     };
     let mut removed = false;
     for args in runs {
-        let output = crate::spawn::async_command("gh").args(&args).output().await.map_err(gh_error)?;
+        let output = crate::spawn::async_command(crate::spawn::program("gh")).args(&args).output().await.map_err(gh_error)?;
         if output.status.success() {
             removed = true;
             continue;
@@ -182,7 +182,7 @@ pub async fn gh_logout(account: &str) -> Result<String, AppError> {
 
 /// Get an OAuth token for a specific gh account without switching the active one.
 pub async fn gh_get_token(account: &str) -> Result<String, AppError> {
-    let output = crate::spawn::async_command("gh")
+    let output = crate::spawn::async_command(crate::spawn::program("gh"))
         .args(["auth", "token", "--user", account])
         .output()
         .await
@@ -229,7 +229,7 @@ pub(crate) fn switch_args(host: &str, login: &str) -> Result<Vec<String>, AppErr
 /// terminal that started it.
 pub async fn gh_auth_switch(host: &str, login: &str) -> Result<String, AppError> {
     let args = switch_args(host, login)?;
-    let output = crate::spawn::async_command("gh")
+    let output = crate::spawn::async_command(crate::spawn::program("gh"))
         .args(&args)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
@@ -256,6 +256,235 @@ pub async fn gh_auth_switch(host: &str, login: &str) -> Result<String, AppError>
                 .unwrap_or_else(|| "no account".into());
             Err(AppError::Command(format!("gh switched, but still reports {} as the active account on {}", says, host)))
         }
+    }
+}
+
+// --- `gh auth login` from the app ------------------------------------------
+//
+// gh's own browser sign-in, run through a pipe: without a terminal gh asks
+// nothing, prints the one-time code and the address, and waits (about 15
+// minutes) for the code to be entered on GitHub. The page shows the code and
+// waits on `gh_auth_login_wait`; Cancel or leaving the page ends gh.
+
+/// The scopes GitSwitch asks of a gh token beyond gh's own defaults (repo,
+/// read:org, gist): registering SSH and signing keys, and reading the
+/// account's verified addresses — what `missing_scopes` would otherwise flag.
+const LOGIN_SCOPES: &str = "admin:public_key,admin:ssh_signing_key,user:email";
+
+/// gh gives up on the code after 15 minutes; this is only the backstop.
+const LOGIN_WAIT: std::time::Duration = std::time::Duration::from_secs(16 * 60);
+
+/// How long gh may take to print the code before it is called stuck.
+const LOGIN_PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The code to enter on GitHub, and where.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GhDevicePrompt {
+    pub code: String,
+    pub url: String,
+}
+
+/// The account a finished sign-in added (or signed in again).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GhLogin {
+    pub host: String,
+    pub login: String,
+}
+
+/// The argv of the sign-in: host named, SSH as git's protocol (GitSwitch
+/// keeps keys per folder, so gh must not install itself as git's HTTPS
+/// credential helper), and no key upload — gh would generate or upload one
+/// of its own choosing.
+pub(crate) fn login_args(host: &str) -> Result<Vec<String>, AppError> {
+    plain_word("host", host)?;
+    Ok(["auth", "login", "--hostname", host, "--web", "--git-protocol", "ssh", "--skip-ssh-key", "--scopes", LOGIN_SCOPES]
+        .iter()
+        .map(|s| s.to_string())
+        .collect())
+}
+
+/// A `XXXX-XXXX` one-time code in one of gh's lines, in either spelling gh
+/// has used ("! One-time code (XXXX-XXXX) copied to clipboard", "! First copy
+/// your one-time code: XXXX-XXXX").
+pub(crate) fn device_code_in(line: &str) -> Option<String> {
+    strip_ansi(line)
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+        .find(|w| {
+            let b = w.as_bytes();
+            b.len() == 9 && b[4] == b'-' && b.iter().enumerate().all(|(i, c)| i == 4 || c.is_ascii_uppercase() || c.is_ascii_digit())
+        })
+        .map(str::to_string)
+}
+
+/// The device page's address in one of gh's lines.
+pub(crate) fn device_url_in(line: &str) -> Option<String> {
+    strip_ansi(line)
+        .split_whitespace()
+        .find(|w| w.starts_with("https://") && w.contains("/login/device"))
+        .map(|w| w.trim_end_matches(['.', ',']).to_string())
+}
+
+/// "✓ Logged in as <login>": gh's own last word on who signed in.
+pub(crate) fn logged_in_as(line: &str) -> Option<String> {
+    let line = strip_ansi(line);
+    let rest = line.split("Logged in as ").nth(1)?;
+    rest.split_whitespace().next().map(|l| l.trim_end_matches(['.', ',']).to_string()).filter(|l| !l.is_empty())
+}
+
+/// gh's last words on a failed sign-in, as the person should read them.
+pub(crate) fn login_failure(lines: &[String]) -> String {
+    let last = lines.iter().rev().map(|l| strip_ansi(l).trim().to_string()).find(|l| !l.is_empty());
+    match last {
+        Some(l) if l.contains("context deadline exceeded") || l.contains("expired") => {
+            "The code expired before it was entered on GitHub. Start the sign-in again for a new code.".into()
+        }
+        Some(l) if l.contains("access_denied") || l.contains("denied") => "The sign-in was denied on GitHub.".into(),
+        Some(l) => format!("gh could not sign in: {}", l),
+        None => "gh stopped without signing in.".into(),
+    }
+}
+
+/// A sign-in gh is running: its process, every line it printed (both streams,
+/// in order), the host, and the logins that host had before.
+struct Login {
+    id: u64,
+    child: tokio::process::Child,
+    lines: tokio::sync::mpsc::UnboundedReceiver<String>,
+    seen: Vec<String>,
+    host: String,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// The sign-in started and not yet waited on.
+static PENDING: std::sync::Mutex<Option<Login>> = std::sync::Mutex::new(None);
+/// The Cancel of the sign-in in progress, by id: a late Cancel of an earlier
+/// sign-in must not end the next one.
+static CANCEL: std::sync::Mutex<Option<(u64, tokio::sync::oneshot::Sender<()>)>> = std::sync::Mutex::new(None);
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Each line of a child's stream into `tx`, until the stream ends.
+fn forward_lines<R: tokio::io::AsyncRead + Unpin + Send + 'static>(stream: R, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(stream).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            if tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Start `gh auth login` for `host` and answer with the code it shows. A
+/// sign-in already running is ended first: there is one code on screen.
+pub async fn gh_auth_login_start(host: &str) -> Result<GhDevicePrompt, AppError> {
+    let args = login_args(host)?;
+    gh_auth_login_cancel();
+    let mut child = crate::spawn::async_command(crate::spawn::program("gh"))
+        .args(&args)
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(gh_error)?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    if let Some(out) = child.stdout.take() {
+        forward_lines(out, tx.clone());
+    }
+    if let Some(err) = child.stderr.take() {
+        forward_lines(err, tx);
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let mut code: Option<String> = None;
+    let mut url: Option<String> = None;
+    let deadline = tokio::time::Instant::now() + LOGIN_PROMPT_WAIT;
+    // The code and the address come on two lines; once the code is here the
+    // address gets a moment, and gh's usual one is assumed without it.
+    while url.is_none() {
+        let until = if code.is_some() { deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(2)) } else { deadline };
+        match tokio::time::timeout_at(until, rx.recv()).await {
+            Ok(Some(line)) => {
+                code = code.or_else(|| device_code_in(&line));
+                url = url.or_else(|| device_url_in(&line));
+                seen.push(line);
+            }
+            // Both streams closed: gh has ended without a code.
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let Some(code) = code else {
+        let _ = child.start_kill();
+        return Err(AppError::Command(if seen.is_empty() { "gh did not show a sign-in code.".into() } else { login_failure(&seen) }));
+    };
+    let url = url.unwrap_or_else(|| format!("https://{}/login/device", host));
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    *CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, cancel_tx));
+    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Login { id, child, lines: rx, seen, host: host.to_string(), cancel: cancel_rx });
+    Ok(GhDevicePrompt { code, url })
+}
+
+/// Wait for the sign-in `gh_auth_login_start` began: the account gh signed
+/// in, or why it did not.
+pub async fn gh_auth_login_wait() -> Result<GhLogin, AppError> {
+    let taken = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(mut job) = taken else {
+        return Err(AppError::Command("No GitHub CLI sign-in is running.".into()));
+    };
+    let outcome = tokio::select! {
+        r = tokio::time::timeout(LOGIN_WAIT, job.child.wait()) => Some(r),
+        _ = &mut job.cancel => None,
+    };
+    let clear = |id: u64| {
+        let mut c = CANCEL.lock().unwrap_or_else(|e| e.into_inner());
+        if c.as_ref().is_some_and(|(i, _)| *i == id) {
+            *c = None;
+        }
+    };
+    clear(job.id);
+    let status = match outcome {
+        None => {
+            let _ = job.child.kill().await;
+            return Err(AppError::Command("The sign-in was cancelled.".into()));
+        }
+        Some(Err(_)) => {
+            let _ = job.child.kill().await;
+            return Err(AppError::Command(login_failure(&["the code expired".to_string()])));
+        }
+        Some(Ok(s)) => s.map_err(|e| AppError::Command(format!("Failed to wait for gh: {}", e)))?,
+    };
+    // What gh printed after the code, up to its exit (the readers end with it).
+    while let Ok(Some(l)) = tokio::time::timeout(std::time::Duration::from_secs(1), job.lines.recv()).await {
+        job.seen.push(l);
+    }
+    if !status.success() {
+        return Err(AppError::Command(login_failure(&job.seen)));
+    }
+    if let Some(login) = job.seen.iter().rev().find_map(|l| logged_in_as(l)) {
+        return Ok(GhLogin { host: job.host, login });
+    }
+    // An older gh that does not say: its listing does — the active login on the host.
+    let now = gh_auth_status().await.unwrap_or_default();
+    now.into_iter()
+        .find(|a| a.host.eq_ignore_ascii_case(&job.host) && a.active == Some(true))
+        .map(|a| GhLogin { host: a.host, login: a.login })
+        .ok_or_else(|| AppError::Command("gh finished, but its listing names no signed-in account on this host.".into()))
+}
+
+/// End the sign-in in progress, if any: the one being waited on, or one
+/// started and not yet waited on.
+pub fn gh_auth_login_cancel() {
+    if let Some((_, tx)) = CANCEL.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = tx.send(());
+    }
+    if let Some(mut job) = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = job.child.start_kill();
     }
 }
 
@@ -295,6 +524,46 @@ mod tests {
         assert_eq!(a[2].scopes, None);
         assert_eq!(logins(&a), vec!["alice-dev", "bob-work", "carol-fg", "dave"]);
         assert!(parse_auth_status("  - Active account: true\n").is_empty());
+    }
+
+    #[test]
+    fn a_sign_in_names_its_host_keeps_git_on_ssh_and_uploads_no_key() {
+        let a = login_args("github.com").unwrap();
+        assert_eq!(&a[..4], ["auth", "login", "--hostname", "github.com"]);
+        for flag in ["--web", "--skip-ssh-key"] {
+            assert!(a.iter().any(|x| x == flag), "{flag} missing from {a:?}");
+        }
+        assert!(a.windows(2).any(|w| w == ["--git-protocol", "ssh"]), "{a:?}");
+        let scopes = a.iter().position(|x| x == "--scopes").map(|i| a[i + 1].clone()).unwrap();
+        let granted: Vec<String> = scopes.split(',').map(str::to_string).chain(["repo".to_string()]).collect();
+        assert!(missing_scopes(&granted, true).is_empty(), "a new login must not be flagged by Doctor: {scopes}");
+        for host in ["", "-h", "git hub.com"] {
+            assert!(login_args(host).is_err(), "{host:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_code_and_the_address_are_read_from_what_gh_prints() {
+        assert_eq!(device_code_in("! One-time code (C027-AF8F) copied to clipboard").as_deref(), Some("C027-AF8F"));
+        assert_eq!(device_code_in("\u{1b}[33m!\u{1b}[0m First copy your one-time code: \u{1b}[1m6E2B-91D0\u{1b}[0m").as_deref(), Some("6E2B-91D0"));
+        assert_eq!(device_code_in("Open this URL to continue in your web browser: https://github.com/login/device"), None);
+        assert_eq!(device_code_in("- gh config set -h github.com git_protocol ssh"), None);
+        assert_eq!(device_code_in("lower-case abcd-1234 is not a code"), None);
+        assert_eq!(
+            device_url_in("Open this URL to continue in your web browser: https://github.com/login/device").as_deref(),
+            Some("https://github.com/login/device")
+        );
+        assert_eq!(device_url_in("- Press Enter to open https://ghe.example.com/login/device in your browser...").as_deref(), Some("https://ghe.example.com/login/device"));
+        assert_eq!(logged_in_as("\u{1b}[32m✓\u{1b}[0m Logged in as \u{1b}[1mKshitijkb28\u{1b}[0m").as_deref(), Some("Kshitijkb28"));
+        assert_eq!(logged_in_as("✓ Configured git protocol"), None);
+    }
+
+    #[test]
+    fn a_failed_sign_in_is_said_in_words() {
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(login_failure(&l(&["! One-time code (C6C5-CFFF) copied to clipboard", "failed to authenticate via web browser: context deadline exceeded", ""])).contains("code expired"));
+        assert_eq!(login_failure(&l(&["The value of the GH_TOKEN environment variable is being used for authentication."])), "gh could not sign in: The value of the GH_TOKEN environment variable is being used for authentication.");
+        assert_eq!(login_failure(&[]), "gh stopped without signing in.");
     }
 
     #[test]
