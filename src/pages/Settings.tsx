@@ -35,17 +35,21 @@ export function Settings() {
   const [lockMessage, setLockMessage] = useState<string | null>(null);
   const [uninstalling, setUninstalling] = useState(false);
 
+  function loadVersion() {
+    return getVersion().then((v) => setVersion(typeof v === "string" ? v : null), () => {});
+  }
+
   useEffect(() => {
     loadConfig();
     loadLocks();
     setClientId(getCustomClientId() ?? "");
-    getVersion().then((v) => setVersion(typeof v === "string" ? v : null), () => {});
+    loadVersion();
   }, []);
 
   const [reloading, setReloading] = useState(false);
   async function reloadAll() {
     setReloading(true);
-    await Promise.all([loadConfig(), loadLocks()]);
+    await Promise.all([loadConfig(), loadLocks(), loadVersion()]);
     setReloading(false);
   }
 
