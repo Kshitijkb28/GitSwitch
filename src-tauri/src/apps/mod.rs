@@ -207,9 +207,17 @@ pub struct LeftoverScan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deleted {
     pub id: String,
-    /// trashed | removed | gone | changed | refused | needs-admin | protected | failed
+    /// trashed | removed | gone | changed | refused | needs-admin | protected |
+    /// in-use (Windows: running programs have its files open) | at-restart | failed
     pub outcome: String,
     pub message: String,
+}
+
+/// The app's own running processes, closed: by name, and those that would not close.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Closed {
+    pub closed: Vec<String>,
+    pub left: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -858,7 +866,7 @@ pub async fn uninstall(session: String) -> Result<Progress, AppError> {
     s.state = "uninstalling".into();
     s.message = None;
     save_session(&s);
-    log(serde_json::json!({ "event": "uninstall", "app": s.app.name, "record": s.record }));
+    log(serde_json::json!({ "event": "uninstall", "app": s.app.name, "record": s.record, "session": s }));
     let result = Box::pin(async {
         if cfg!(target_os = "macos") {
             macos::uninstall(&mut s).await
@@ -1158,7 +1166,10 @@ fn delete_one(s: &Session, others: &Others, item: &ScanItem) -> Step {
             "protected",
             format!("The system protects it ({}). Allow GitSwitch in System Settings › Privacy & Security, or move it to the Trash yourself.", m),
         ),
-        TrashOutcome::Failed(m) => Done("failed", format!("Couldn't move it to the {}: {}", trash_word(), m)),
+        TrashOutcome::Failed(m) => {
+            let (o, why) = failed_move(&item.path, &m);
+            Done(o, why)
+        }
     }
 }
 
@@ -1199,6 +1210,8 @@ pub(crate) enum JobWhat {
     UninstallEntry { view: String, key: String, name: String },
     /// A Run value, exported first.
     RunValue { view: String, name: String, data: String },
+    /// Windows: what running programs hold, deleted when Windows next starts.
+    AtRestart { path: PathBuf, root: PathBuf, ident: Option<Ident> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1253,8 +1266,88 @@ fn trash_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: bool)
         TrashOutcome::Gone => ("gone", "Already gone.".into()),
         TrashOutcome::NeedsAdmin(m) => ("needs-admin", format!("It needs the administrator: {}", m)),
         TrashOutcome::Protected(m) => ("protected", m),
-        TrashOutcome::Failed(m) => ("failed", format!("Couldn't move it to the {}: {}", trash_word(), m)),
+        TrashOutcome::Failed(m) => failed_move(path, &m),
     }
+}
+
+/// Ask a process to end (SIGTERM), or make it (SIGKILL).
+#[cfg(unix)]
+pub(crate) fn signal(pid: i32, hard: bool) {
+    // SAFETY: kill() only takes numbers.
+    unsafe {
+        libc::kill(pid, if hard { libc::SIGKILL } else { libc::SIGTERM });
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn signal(_pid: i32, _hard: bool) {}
+
+/// "A, B, C and 4 more".
+pub(crate) fn name_list(names: &[String]) -> String {
+    match names.len() {
+        0 => String::new(),
+        1 => names[0].clone(),
+        2 | 3 => format!("{} and {}", names[..names.len() - 1].join(", "), names[names.len() - 1]),
+        n => format!("{} and {} more", names[..3].join(", "), n - 3),
+    }
+}
+
+/// A move to the Trash that failed, explained. On Windows the system only
+/// says "some operations were aborted": the running programs that still
+/// have its files open or loaded are asked for, and named.
+fn failed_move(path: &Path, m: &str) -> (&'static str, String) {
+    #[cfg(windows)]
+    {
+        let users = windows::users_of(path);
+        if !users.is_empty() {
+            let them = if users.len() == 1 { "it" } else { "them" };
+            return (
+                "in-use",
+                format!("In use by {}: one of its files is open or loaded in {}. Close {} or restart, then look again — or delete it at the next restart.", name_list(&users), them, them),
+            );
+        }
+        if m.contains("Some operations were aborted") {
+            return ("failed", "Windows stopped the move: part of it is in use or protected. Restart, then look for leftovers again.".into());
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    ("failed", format!("Couldn't move it to the {}: {}", trash_word(), m))
+}
+
+/// The running programs that hold a folder's files (Windows; empty elsewhere).
+#[cfg(test)]
+pub(crate) fn users_of(path: &Path) -> Vec<String> {
+    windows::users_of(path)
+}
+
+#[cfg(test)]
+pub(crate) fn failed_move_for_test(path: &Path, m: &str) -> (&'static str, String) {
+    failed_move(path, m)
+}
+
+/// What may be deleted at the next restart: the item that was looked at, in
+/// a place programs live in (the administrator's run) — then scheduled.
+fn at_restart_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: bool) -> (&'static str, String) {
+    if std::fs::symlink_metadata(path).is_err() {
+        return ("gone", "Already gone.".into());
+    }
+    if !path.starts_with(root) || link_on_the_way(root, path) {
+        return ("refused", "A folder on the way to it is now a link, so it was kept.".into());
+    }
+    match (want, ident(path)) {
+        (Some(a), Some(b)) if a == &b => {}
+        _ => return ("changed", "It changed since it was looked at, so it was kept. Look again.".into()),
+    }
+    #[cfg(windows)]
+    if elevated {
+        if let Err(why) = windows::elevated_path_ok(path) {
+            return ("refused", format!("{} It was kept.", why));
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = elevated;
+    windows::delete_at_restart(path)
 }
 
 /// Carry out cleanup items in order, each checked again first.
@@ -1277,6 +1370,7 @@ pub(crate) fn run_items(items: &[JobItem], registry_needs_files: bool, backups: 
             }
             JobWhat::UninstallEntry { view, key, name } => windows::delete_uninstall_entry(view, key, name, backups),
             JobWhat::RunValue { view, name, data } => windows::delete_run_value(view, name, data, backups),
+            JobWhat::AtRestart { path, root, ident: want } => at_restart_checked(path, root, want.as_ref(), elevated),
         };
         out.push(Deleted { id: it.id.clone(), outcome: o.into(), message: m });
     }
@@ -1391,6 +1485,61 @@ async fn elevated_run(items: Vec<JobItem>, registry_needs_files: bool) -> Result
     r
 }
 
+/// Windows: what running programs hold (the move to the Recycle Bin was
+/// refused as "in use"), deleted when Windows next starts — for good, after
+/// one permission prompt (only the administrator may schedule that).
+pub async fn delete_at_restart(scan: String, ids: Vec<String>) -> Result<Vec<Deleted>, AppError> {
+    let (session, items) = {
+        let st = lock();
+        let sc = st.scans.get(&scan).ok_or_else(|| AppError::Config("Scan for leftovers again — this list is no longer current.".into()))?;
+        let items: Vec<JobItem> = ids
+            .iter()
+            .filter_map(|id| {
+                let i = sc.items.get(id)?;
+                (i.action == Action::Trash && i.ident.is_some()).then(|| JobItem { id: id.clone(), what: JobWhat::AtRestart { path: i.path.clone(), root: i.root.clone(), ident: i.ident.clone() } })
+            })
+            .collect();
+        (sc.session.clone(), items)
+    };
+    if items.is_empty() {
+        return Err(AppError::Config("None of these can be deleted at the next restart.".into()));
+    }
+    let s = load_session(&session)?;
+    let s2 = s.clone();
+    if let Err(why) = tokio::task::spawn_blocking(move || platform_gone(&s2)).await.map_err(|e| AppError::Command(e.to_string()))? {
+        return Err(AppError::Config(format!("{} is installed again, so nothing was deleted: {}", s.app.name, why)));
+    }
+    let ids: Vec<String> = items.iter().map(|j| j.id.clone()).collect();
+    let out = match Box::pin(elevated_run(items, false)).await {
+        Ok(done) => done,
+        Err(why) => ids.into_iter().map(|id| Deleted { id, outcome: "needs-admin".into(), message: why.clone() }).collect(),
+    };
+    for d in &out {
+        log(serde_json::json!({ "event": "leftover-at-restart", "app": s.app.name, "id": d.id, "outcome": d.outcome, "message": d.message }));
+    }
+    Ok(out)
+}
+
+/// Close the app's own running processes (windows asked to close first,
+/// the rest ended after a few seconds), so its uninstall can go ahead.
+pub async fn close(session: String) -> Result<Closed, AppError> {
+    let s = load_session(&session)?;
+    let s2 = s.clone();
+    let closed = tokio::task::spawn_blocking(move || {
+        if cfg!(target_os = "macos") {
+            macos::close(&s2)
+        } else if cfg!(windows) {
+            windows::close(&s2, Duration::from_secs(6))
+        } else {
+            linux::close(&s2)
+        }
+    })
+    .await
+    .map_err(|e| AppError::Command(e.to_string()))?;
+    log(serde_json::json!({ "event": "close", "app": s.app.name, "closed": closed.closed, "left": closed.left }));
+    Ok(closed)
+}
+
 /// Windows: delete a program's files directly instead of running its
 /// uninstaller — its folders to the Recycle Bin, then its entry and
 /// start-up values (each exported first); the administrator's part after
@@ -1402,7 +1551,7 @@ pub async fn force_remove(session: String) -> Result<Progress, AppError> {
     }
     let s2 = s.clone();
     let items = tokio::task::spawn_blocking(move || windows::force_items(&s2)).await.map_err(|e| AppError::Command(e.to_string()))?.map_err(AppError::Config)?;
-    log(serde_json::json!({ "event": "force-remove", "app": s.app.name, "record": s.record }));
+    log(serde_json::json!({ "event": "force-remove", "app": s.app.name, "record": s.record, "session": s }));
     let admin = items.iter().any(|(_, a)| *a);
     let backups = backups_dir();
     let results = if admin {
@@ -1464,6 +1613,93 @@ pub fn sessions() -> Vec<SessionSummary> {
     }
     out.sort_by_key(|s| std::cmp::Reverse(s.started));
     out
+}
+
+/// An app uninstalled with GitSwitch before, no longer installed: its
+/// leftovers can be looked for again at any time.
+#[derive(Debug, Clone, Serialize)]
+pub struct PastUninstall {
+    /// The app's id (what `rescan` takes).
+    pub key: String,
+    pub name: String,
+    /// When it was uninstalled (seconds since 1970).
+    pub at: i64,
+}
+
+/// The newest uninstall in the log, per app: (when, name, the line).
+fn logged_uninstalls() -> HashMap<String, (i64, String, serde_json::Value)> {
+    let mut out: HashMap<String, (i64, String, serde_json::Value)> = HashMap::new();
+    let Some(text) = data_dir().and_then(|d| std::fs::read_to_string(d.join("uninstall-log.jsonl")).ok()) else { return out };
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if !matches!(v["event"].as_str(), Some("uninstall") | Some("force-remove")) {
+            continue;
+        }
+        let Some(id) = logged_app_id(&v) else { continue };
+        let at = v["at"].as_i64().unwrap_or(0);
+        let name = v["app"].as_str().unwrap_or_default().to_string();
+        if out.get(&id).is_none_or(|(t, _, _)| at >= *t) {
+            out.insert(id, (at, name, v));
+        }
+    }
+    out
+}
+
+/// The app id an uninstall line is about: its session's, or (older lines)
+/// rebuilt from the Windows record.
+fn logged_app_id(v: &serde_json::Value) -> Option<String> {
+    if let Some(id) = v["session"]["app"]["id"].as_str() {
+        return Some(id.to_string());
+    }
+    match serde_json::from_value::<Record>(v["record"].clone()).ok()? {
+        Record::WinEntry { view, key, .. } => Some(format!("win:{}:{}", view, key)),
+        _ => None,
+    }
+}
+
+/// Apps uninstalled with GitSwitch that are no longer installed and not
+/// "Not finished" — newest first.
+pub fn history() -> Vec<PastUninstall> {
+    let installed: Vec<String> = lock().list.keys().cloned().collect();
+    let unfinished: Vec<String> = sessions().iter().filter_map(|u| load_session(&u.session).ok()).map(|s| s.app.id).collect();
+    let mut out: Vec<PastUninstall> = logged_uninstalls()
+        .into_iter()
+        .filter(|(id, _)| !installed.contains(id) && !unfinished.contains(id))
+        .map(|(key, (at, name, _))| PastUninstall { key, name, at })
+        .collect();
+    out.sort_by_key(|p| std::cmp::Reverse(p.at));
+    out.truncate(25);
+    out
+}
+
+/// Look for an app's leftovers again, long after it was uninstalled: a new
+/// session from what the log recorded (what identifies it is worked out
+/// again from its record when an older line didn't keep it).
+pub async fn rescan(key: String) -> Result<String, AppError> {
+    let (_, name, line) = logged_uninstalls().remove(&key).ok_or_else(|| AppError::Config("GitSwitch has no record of uninstalling that app.".into()))?;
+    if lock().list.contains_key(&key) {
+        return Err(AppError::Config(format!("{} is installed again, so its files are its own.", name)));
+    }
+    let mut s = match serde_json::from_value::<Session>(line["session"].clone()) {
+        Ok(s) => s,
+        Err(_) => {
+            let record: Record = serde_json::from_value(line["record"].clone()).map_err(|e| AppError::Config(format!("The record of that uninstall is damaged: {}", e)))?;
+            if !matches!(record, Record::WinEntry { .. }) {
+                return Err(AppError::Config("That uninstall was recorded before GitSwitch kept enough to look again.".into()));
+            }
+            let app = InstalledApp { id: key.clone(), name: name.clone(), ..Default::default() };
+            let (app2, rec2) = (app.clone(), record.clone());
+            let (p, evidence, _) = tokio::task::spawn_blocking(move || windows::prepare(&app2, &rec2)).await.map_err(|e| AppError::Command(e.to_string()))??;
+            Session { id: String::new(), app, record, evidence, facts: p.facts, started: 0, state: String::new(), message: None, packages: vec![], process: None }
+        }
+    };
+    s.id = uuid::Uuid::new_v4().to_string();
+    s.started = now();
+    s.state = "gone".into();
+    s.message = Some(format!("{} was uninstalled before; here is what is still left of it.", name));
+    s.process = None;
+    save_session(&s);
+    Ok(s.id)
 }
 
 /// Forget an unfinished uninstall.
@@ -1726,6 +1962,22 @@ mod tests {
         let mut v = vec![cand()];
         windows::promote_vendor_folders(&mut v, &ev, &Others::new(true), std::slice::from_ref(&place));
         assert_eq!(v[0].path, inner, "the publisher's folder holds something else too");
+        // The publisher not known: a folder directly in the place holding
+        // only a maybe of the app's is offered instead, still a maybe.
+        let _ = std::fs::remove_dir_all(place.join("CleverFiles").join("Other Product"));
+        let unknown = Evidence { vendor: None, ..ev.clone() };
+        let mut maybe = cand();
+        maybe.m.confidence = Confidence::Medium;
+        let mut v = vec![maybe];
+        windows::promote_vendor_folders(&mut v, &unknown, &Others::new(true), std::slice::from_ref(&place));
+        assert_eq!(v[0].path, place.join("CleverFiles"));
+        assert_eq!(v[0].m.confidence, Confidence::Medium);
+        // Known publisher: a maybe is never promoted.
+        let mut maybe = cand();
+        maybe.m.confidence = Confidence::Medium;
+        let mut v = vec![maybe];
+        windows::promote_vendor_folders(&mut v, &ev, &Others::new(true), std::slice::from_ref(&place));
+        assert_eq!(v[0].path, inner);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1829,6 +2081,65 @@ mod tests {
         assert!(place.join("D").exists(), "the second folder was not touched");
         std::env::remove_var("GITSWITCH_TRASH_DIR");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_app_uninstalled_before_can_be_looked_at_again_from_the_log() {
+        let _g = env_lock();
+        let root = plain_tmp("history");
+        std::env::set_var("GITSWITCH_DATA_DIR", root.join("data"));
+        let dir = root.join("data").join("com.gitswitch.app");
+        std::fs::create_dir_all(&dir).unwrap();
+        // An older line (no session kept), a newer one with its session, and other events.
+        let zoho = r#"{"app":"Zoho Mail - Desktop 1.7.4","at":1793901026,"event":"uninstall","record":{"icon":"C:\\Program Files\\Zoho Mail - Desktop\\Zoho Mail - Desktop.exe,0","install_dir":null,"key":"435bda16","kind":"win-entry","msi":null,"uninstall":"\"C:\\Program Files\\Zoho Mail - Desktop\\Uninstall Zoho Mail - Desktop.exe\" /allusers","view":"HKLM64"}}"#;
+        let other = r#"{"app":"X","at":1793901030,"event":"leftover","outcome":"trashed","path":"C:\\x"}"#;
+        std::fs::write(dir.join("uninstall-log.jsonl"), format!("{}\n{}\nnot json\n", zoho, other)).unwrap();
+        let h = history();
+        assert_eq!(h.len(), 1, "{h:?}");
+        assert_eq!((h[0].key.as_str(), h[0].name.as_str(), h[0].at), ("win:HKLM64:435bda16", "Zoho Mail - Desktop 1.7.4", 1793901026));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let sid = rt.block_on(rescan(h[0].key.clone())).unwrap();
+        let s = load_session(&sid).unwrap();
+        assert_eq!(s.state, "gone");
+        assert!(s.evidence.names.iter().any(|n| n == "Zoho Mail - Desktop"), "{:?}", s.evidence.names);
+        assert!(matches!(s.record, Record::WinEntry { .. }));
+        // Still not finished: not "uninstalled before" as well.
+        assert!(history().is_empty(), "it is under Not finished now");
+        assert!(rt.block_on(rescan("win:HKLM64:nothing".into())).is_err());
+        lock().sessions.remove(&sid);
+        std::env::remove_var("GITSWITCH_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_named_like_the_app_under_any_publisher_is_a_maybe() {
+        let root = tmp("anypub");
+        let pf = root.join("Program Files");
+        std::fs::create_dir_all(pf.join("CleverFiles").join("Disk Drill")).unwrap();
+        std::fs::create_dir_all(pf.join("Acme").join("Other Tool")).unwrap();
+        std::fs::create_dir_all(pf.join("Disk Drill Helper")).unwrap();
+        let ev = Evidence { ids: vec![], names: vec!["Disk Drill 6.3.1398.0".into(), "Disk Drill".into()], groups: vec![], vendor: None };
+        let mut out = Vec::new();
+        windows::under_any_publisher(std::slice::from_ref(&pf), &ev, &Others::new(true), &mut out);
+        let got: Vec<String> = out.iter().map(|c| c.path.strip_prefix(&pf).unwrap().to_string_lossy().replace('\\', "/")).collect();
+        assert_eq!(got, vec!["CleverFiles/Disk Drill"]);
+        assert_eq!(out[0].m.confidence, Confidence::Medium, "a maybe, never ticked");
+        let mut o = Others::new(true);
+        o.add_app(&[], &["Disk Drill".to_string()], None, &[]);
+        let mut out = Vec::new();
+        windows::under_any_publisher(std::slice::from_ref(&pf), &ev, &o, &mut out);
+        assert!(out.is_empty(), "another installed app has that name");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_list_of_names_reads_as_words() {
+        let n = |v: &[&str]| name_list(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        assert_eq!(n(&[]), "");
+        assert_eq!(n(&["Slack"]), "Slack");
+        assert_eq!(n(&["Slack", "Chrome"]), "Slack and Chrome");
+        assert_eq!(n(&["Slack", "Chrome", "Edge"]), "Slack, Chrome and Edge");
+        assert_eq!(n(&["Slack", "Chrome", "Edge", "Code", "Teams"]), "Slack, Chrome, Edge and 2 more");
     }
 
     #[test]

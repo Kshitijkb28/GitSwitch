@@ -2730,9 +2730,33 @@ export interface LeftoverScan {
 
 export interface LeftoverDeleted {
   id: string;
-  /** trashed | removed | gone | changed | refused | needs-admin | protected | failed */
+  /** trashed | removed | gone | changed | refused | needs-admin | protected | in-use | at-restart | failed */
   outcome: string;
   message: string;
+}
+
+/** An app uninstalled with GitSwitch before, no longer installed. */
+export interface PastUninstall {
+  /** The app's id: what appsRescan takes. */
+  key: string;
+  name: string;
+  /** When it was uninstalled, seconds since 1970. */
+  at: number;
+}
+
+export async function appsHistory(): Promise<PastUninstall[]> {
+  return invoke("apps_history");
+}
+
+/** Look for an app's leftovers again: the session to continue with. */
+export async function appsRescan(key: string): Promise<string> {
+  return invoke("apps_rescan", { key });
+}
+
+/** The app's own running processes, closed — and those that would not close. */
+export interface AppClosed {
+  closed: string[];
+  left: string[];
 }
 
 export interface UninstallSessionSummary {
@@ -2782,6 +2806,16 @@ export async function appsSessions(): Promise<UninstallSessionSummary[]> {
 
 export async function appsForget(session: string): Promise<void> {
   return invoke("apps_forget", { session });
+}
+
+/** Close the app's own running processes, so its uninstall can go ahead. */
+export async function appsClose(session: string): Promise<AppClosed> {
+  return invoke("apps_close", { session });
+}
+
+/** Windows: leftovers in use, deleted when Windows next starts (after one permission prompt). */
+export async function appsDeleteAtRestart(scan: string, ids: string[]): Promise<LeftoverDeleted[]> {
+  return invoke("apps_delete_at_restart", { scan, ids });
 }
 
 /** Windows: delete a program's files directly (folders to the Recycle Bin, its entry and start-up values removed). */

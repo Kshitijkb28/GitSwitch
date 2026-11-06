@@ -47,6 +47,9 @@ export function Uninstall() {
   const [selfOpen, setSelfOpen] = useState(false);
   const [resume, setResume] = useState<{ session: string; name: string } | null>(null);
   const [unfinished, setUnfinished] = useState<api.UninstallSessionSummary[]>([]);
+  const [past, setPast] = useState<api.PastUninstall[]>([]);
+  const [pastAll, setPastAll] = useState(false);
+  const [pastBusy, setPastBusy] = useState<string | null>(null);
   const ask = useRef(0);
   const shownKind = kind === "packages" && list?.platform !== "linux" ? "apps" : kind;
 
@@ -60,6 +63,8 @@ export function Uninstall() {
       setList(l);
       setUnfinished(s);
       setSizes({});
+      // Read after the list: what is installed again is left out.
+      api.appsHistory().then((h) => ask.current === id && setPast(h ?? []), () => {});
     } catch (e) {
       if (ask.current === id) setError(cleanError(e));
     } finally {
@@ -189,6 +194,48 @@ export function Uninstall() {
         </div>
       )}
 
+      {past.length > 0 && (
+        <Card>
+          <div className="space-y-2 text-xs" data-past>
+            <p className="text-zinc-300 font-medium">Uninstalled with GitSwitch before</p>
+            <p className="text-zinc-500">Their leftovers can be looked for again — a folder that is still there, say.</p>
+            {(pastAll ? past : past.slice(0, 4)).map((p) => (
+              <div key={p.key} className="flex items-center gap-2 flex-wrap" data-past-app={p.name}>
+                <span className="text-zinc-300">{p.name}</span>
+                <span className="text-zinc-500">{new Date(p.at * 1000).toLocaleDateString()}</span>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={pastBusy !== null}
+                  onClick={() => {
+                    setPastBusy(p.key);
+                    setError(null);
+                    api.appsRescan(p.key).then(
+                      (session) => {
+                        setPastBusy(null);
+                        setResume({ session, name: p.name });
+                      },
+                      (e) => {
+                        setPastBusy(null);
+                        setError(cleanError(e));
+                      }
+                    );
+                  }}
+                  data-past-rescan
+                >
+                  {pastBusy === p.key ? <Loader2 size={13} className="animate-spin" /> : null} Look for leftovers
+                </Button>
+              </div>
+            ))}
+            {past.length > 4 && (
+              <button type="button" className="text-emerald-400 hover:underline cursor-pointer" onClick={() => setPastAll((v) => !v)}>
+                {pastAll ? "Show fewer" : `Show all ${past.length}`}
+              </button>
+            )}
+          </div>
+        </Card>
+      )}
+
       <div className="flex items-center gap-3 flex-wrap">
         {list?.platform === "linux" && (
           <Segmented
@@ -296,6 +343,7 @@ export function Uninstall() {
           setPicked(null);
           setResume(null);
           api.appsSessions().then(setUnfinished, () => {});
+          api.appsHistory().then((h) => setPast(h ?? []), () => {});
         }}
         onChanged={() => load()}
       />

@@ -8,7 +8,7 @@ import { formatBytes } from "../changes/LfsFilesModal";
 import { cleanError } from "../github/shared";
 import * as api from "../../lib/api";
 
-type Stage = "preparing" | "confirm" | "running" | "forcing" | "gone" | "still" | "failed" | "scanning" | "leftovers" | "deleting" | "done";
+type Stage = "preparing" | "confirm" | "closing" | "running" | "forcing" | "gone" | "still" | "failed" | "scanning" | "leftovers" | "deleting" | "done";
 
 function Lines({ items, className = "text-zinc-400" }: { items: string[]; className?: string }) {
   if (items.length === 0) return null;
@@ -51,6 +51,8 @@ const OUTCOME: Record<string, [string, string]> = {
   refused: ["Kept", "text-amber-300"],
   "needs-admin": ["Needs the administrator", "text-amber-300"],
   protected: ["Protected by the system", "text-amber-300"],
+  "in-use": ["In use", "text-amber-300"],
+  "at-restart": ["Deleted at the next restart", "text-emerald-400"],
   failed: ["Failed", "text-red-400"],
 };
 
@@ -170,10 +172,37 @@ export function UninstallFlow({
     }
   }
 
+  /** Close the app's own running processes; what could not be closed is said. */
+  async function closeApp(): Promise<boolean> {
+    if (!session) return false;
+    setError(null);
+    setStage("closing");
+    try {
+      const c = await api.appsClose(session);
+      if (c.left.length > 0) setMessage(`Could not close ${c.left.join(", ")} — it may run as administrator or as a service; its uninstaller may stop it.`);
+      return true;
+    } catch (e) {
+      setError(cleanError(e));
+      setStage("confirm");
+      return false;
+    }
+  }
+
+  async function closeAndUninstall() {
+    if (await closeApp()) await uninstall();
+  }
+
+  async function closeAndForce() {
+    if (await closeApp()) {
+      setStage("confirm");
+      await forceRemove("confirm");
+    }
+  }
+
   /** Windows: its folders to the Recycle Bin, its entry and start-up values removed. */
-  async function forceRemove() {
+  async function forceRemove(from?: Stage) {
     if (!session) return;
-    const back = stage;
+    const back = from ?? stage;
     setError(null);
     setStage("forcing");
     try {
@@ -225,6 +254,20 @@ export function UninstallFlow({
     }
   }
 
+  /** Windows: what running programs hold, deleted when Windows next starts. */
+  async function atRestart(ids: string[]) {
+    if (!scan) return;
+    setError(null);
+    setStage("deleting");
+    try {
+      const done = await api.appsDeleteAtRestart(scan.scan, ids);
+      setResults((prev) => prev.map((r) => done.find((d) => d.id === r.id) ?? r));
+    } catch (e) {
+      setError(cleanError(e));
+    }
+    setStage("done");
+  }
+
   /** The ones Windows' permission prompt was declined for, again. */
   async function retryAdmin(ids: string[]) {
     if (!scan) return;
@@ -239,7 +282,7 @@ export function UninstallFlow({
     setStage("done");
   }
 
-  const busy = stage === "preparing" || stage === "scanning" || stage === "deleting" || stage === "forcing";
+  const busy = stage === "preparing" || stage === "scanning" || stage === "deleting" || stage === "forcing" || stage === "closing";
   const trashWord = platform === "windows" ? "Recycle Bin" : "Trash";
   const tickable = (i: api.Leftover) => !i.admin || !!i.elevate;
   const deletable = scan?.items.filter(tickable) ?? [];
@@ -249,6 +292,7 @@ export function UninstallFlow({
   const tickedSize = tickedItems.reduce((n, i) => n + (i.size ?? 0), 0);
   const tickedAdmin = tickedItems.filter((i) => i.admin).length;
   const retryable = results.filter((r) => r.outcome === "needs-admin" && scan?.items.find((i) => i.id === r.id)?.elevate);
+  const inUse = results.filter((r) => r.outcome === "in-use");
   const force = platform === "windows" ? prep?.force ?? null : null;
 
   const forcePanel = force && forceOpen && (
@@ -285,9 +329,15 @@ export function UninstallFlow({
         </p>
       )}
       <div className="flex items-center gap-2 pt-1">
-        <Button variant="danger" size="sm" onClick={forceRemove} disabled={!!prep?.running} data-flow-force-go>
-          <Trash2 size={14} /> Delete them
-        </Button>
+        {prep?.running ? (
+          <Button variant="danger" size="sm" onClick={closeAndForce} data-flow-force-close-go>
+            <Trash2 size={14} /> Close {name} and delete them
+          </Button>
+        ) : (
+          <Button variant="danger" size="sm" onClick={() => forceRemove()} data-flow-force-go>
+            <Trash2 size={14} /> Delete them
+          </Button>
+        )}
         <Button variant="ghost" size="sm" onClick={() => setForceOpen(false)}>
           Cancel
         </Button>
@@ -318,7 +368,9 @@ export function UninstallFlow({
                 ? "Looking for what it left behind…"
                 : stage === "forcing"
                   ? `Deleting ${name}'s files…`
-                  : `Moving them to the ${trashWord}…`}
+                  : stage === "closing"
+                    ? `Closing ${name}…`
+                    : `Moving them to the ${trashWord}…`}
           </p>
         )}
 
@@ -331,7 +383,16 @@ export function UninstallFlow({
                 <AlertTriangle size={14} className="mt-0.5 shrink-0" /> {prep.blocked}
               </p>
             )}
-            {prep.running && <p className="text-amber-300">{name} is running. Quit it first.</p>}
+            {prep.running && (
+              <div className="flex items-center gap-2 flex-wrap text-amber-300" data-flow-running-app>
+                <span>{name} is running.</span>
+                {!prep.blocked && (
+                  <Button variant="danger" size="sm" onClick={closeAndUninstall} data-flow-close-go>
+                    Close it and uninstall
+                  </Button>
+                )}
+              </div>
+            )}
             <Lines items={prep.warnings} className="text-amber-300/90" />
             {prep.also_removed.length > 0 && (
               <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 space-y-1.5" data-flow-also>
@@ -568,6 +629,16 @@ export function UninstallFlow({
                 );
               })}
             </ul>
+            {platform === "windows" && inUse.length > 0 && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 space-y-1.5" data-flow-in-use>
+                <p className="text-zinc-300">
+                  What a running program holds can't go to the Recycle Bin. Restart this PC and choose Continue under "Not finished" — or let Windows delete {inUse.length === 1 ? "it" : "them"} at the next restart, for good.
+                </p>
+                <Button variant="danger" size="sm" onClick={() => atRestart(inUse.map((r) => r.id))} data-flow-at-restart>
+                  <Shield size={14} /> Delete at the next restart
+                </Button>
+              </div>
+            )}
             <div className="flex items-center gap-2">
               {platform === "windows" && retryable.length > 0 && (
                 <Button variant="secondary" size="sm" onClick={() => retryAdmin(retryable.map((r) => r.id))} data-flow-retry>

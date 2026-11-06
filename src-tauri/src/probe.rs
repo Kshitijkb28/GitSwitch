@@ -250,6 +250,16 @@ pub(crate) mod tests {
             // program's files directly would remove.
             "apps_dry_session" => forward!(crate::apps::dry_session, args, path),
             "apps_dry_force" => forward!(crate::apps::dry_force, args, id),
+            // Read only: the "uninstalled before" list (after listing the
+            // apps, as the page does), and who holds a folder's files.
+            "apps_dry_history" => {
+                let _ = Box::pin(crate::apps::list("apps".into())).await;
+                reply(Ok::<_, crate::error::AppError>(crate::apps::history()))
+            }
+            "apps_users_of" => match arg::<String>(&args, "path") {
+                Ok(p) => reply(Ok::<_, crate::error::AppError>(crate::apps::users_of(std::path::Path::new(&p)))),
+                Err(e) => reply_err(e),
+            },
             "apps_force_remove" => forward!(c::apps_force_remove, args, session),
             "apps_script" => forward!(crate::apps::script, args, steps),
             // The real Trash (no GITSWITCH_TRASH_DIR): what macOS, Windows or the desktop's Trash does with one path.

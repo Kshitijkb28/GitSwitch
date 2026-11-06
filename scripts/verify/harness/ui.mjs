@@ -1034,6 +1034,8 @@ async function openUninstallPage(browser, server, opts = {}) {
     },
     plan: opts.plan ?? null,
     forceRemove: opts.forceRemove ?? { state: "gone", message: "Its files are in the Recycle Bin and it is no longer in Installed apps." },
+    closed: opts.closed ?? { closed: ["app.exe"], left: [] },
+    history: opts.history ?? [],
     // One map per apps_delete call: id -> { outcome, message } (default: trashed).
     deleteRounds: opts.deleteRounds ?? [],
     selfPrepare: opts.selfPrepare ?? { outcome: "done", message: "GitSwitch's changes are taken back.", command: null, done: ["Removed GitSwitch's block from ~/.gitconfig (a backup is beside it)"], problems: [] },
@@ -1072,6 +1074,14 @@ async function openUninstallPage(browser, server, opts = {}) {
           }
           case "apps_force_remove":
             return cfg.forceRemove.error ? Promise.reject(cfg.forceRemove.error) : Promise.resolve(cfg.forceRemove);
+          case "apps_close":
+            return Promise.resolve(cfg.closed);
+          case "apps_history":
+            return Promise.resolve(cfg.history);
+          case "apps_rescan":
+            return Promise.resolve("sess-again");
+          case "apps_delete_at_restart":
+            return Promise.resolve(args.ids.map((id) => ({ id, outcome: "at-restart", message: "Windows deletes it when this PC restarts — for good." })));
           case "apps_forget":
           case "apps_open_uninstaller":
             return Promise.resolve(null);
@@ -6174,7 +6184,11 @@ try {
     const run = await openUninstallPage(browser, server, { prepared: { "mac:/Applications/Foo Writer.app": { running: true } } });
     await run.evaluate(() => document.querySelector('[data-app-row="Foo Writer"] [data-app-uninstall]').click());
     await run.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
-    ok("a running app: quit it first, the button is off", (await text(run)).includes("Foo Writer is running. Quit it first.") && (await run.evaluate(() => document.querySelector("[data-flow-go]").disabled)));
+    ok("a running app: said, Uninstall is off, and Close it and uninstall is offered", (await text(run)).includes("Foo Writer is running.") && (await run.evaluate(() => document.querySelector("[data-flow-go]").disabled)) && !!(await run.$("[data-flow-close-go]")));
+    await run.evaluate(() => document.querySelector("[data-flow-close-go]").click());
+    await run.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    const runCalls = await run.evaluate(() => window.__CALLS__.map((c) => c.cmd).filter((c) => c === "apps_close" || c === "apps_uninstall"));
+    ok("  Close it and uninstall closes it, then uninstalls", JSON.stringify(runCalls) === JSON.stringify(["apps_close", "apps_uninstall"]), JSON.stringify(runCalls));
     await run.close();
 
     const still = await openUninstallPage(browser, server, { uninstall: { state: "still-installed", message: "Another copy with the same id is installed at /Users/me/Applications/Foo Writer.app — its files are its own." } });
@@ -6317,6 +6331,19 @@ try {
     ok("a Windows Installer program: no deleting its files, and why", !(await declined.$("[data-flow-force-open]")) && (await text(declined)).includes("Deleting its files directly isn't offered: Windows Installer removes it cleanly"));
     await declined.close();
 
+    // Running: close it, then delete its files.
+    const busy = await openUninstallPage(browser, server, { platform: "windows", apps, prepared: { ...prepared, "win:HKCU:uTorrent": { ...prepared["win:HKCU:uTorrent"], running: true } } });
+    await busy.evaluate(() => document.querySelector('[data-app-row="uTorrent"] [data-app-uninstall]').click());
+    await busy.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
+    await busy.evaluate(() => document.querySelector("[data-flow-force-open]").click());
+    await sleep(150);
+    ok("a running program: the panel closes it first", !!(await busy.$("[data-flow-force-close-go]")) && !(await busy.$("[data-flow-force-go]")) && (await busy.evaluate(() => document.querySelector("[data-flow-force-close-go]").innerText)).includes("Close uTorrent and delete them"));
+    await busy.evaluate(() => document.querySelector("[data-flow-force-close-go]").click());
+    await busy.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    const busyCalls = await busy.evaluate(() => window.__CALLS__.map((c) => c.cmd).filter((c) => c === "apps_close" || c === "apps_force_remove" || c === "apps_uninstall"));
+    ok("  closed, then its files deleted — its uninstaller never started", JSON.stringify(busyCalls) === JSON.stringify(["apps_close", "apps_force_remove"]), JSON.stringify(busyCalls));
+    await busy.close();
+
     // Its files already gone (deleted by hand): only its entry is left to remove.
     const orphan = await openUninstallPage(browser, server, { platform: "windows", apps, prepared: { ...prepared, "win:HKCU:uTorrent": { ...prepared["win:HKCU:uTorrent"], force: { ...force, folders: [] } } } });
     await orphan.evaluate(() => document.querySelector('[data-app-row="uTorrent"] [data-app-uninstall]').click());
@@ -6372,6 +6399,41 @@ try {
     ok("Try again sends only the two that were kept", del.length === 2 && JSON.stringify([...del[1].ids].sort()) === JSON.stringify(["l1", "l2"]), JSON.stringify(del));
     ok("  and they go", (await left.$$('[data-result="trashed"]')).length === 3 && !(await left.$("[data-flow-retry]")));
     await left.close();
+
+    // In use by running programs (a hook library still loaded): named, and deleted at the next restart if asked.
+    const inUseMsg = "In use by Microsoft Edge, Slack, Visual Studio Code and 5 more: one of its files is open or loaded in them. Close them or restart, then look again — or delete it at the next restart.";
+    const held = await openUninstallPage(browser, server, {
+      platform: "windows",
+      apps,
+      sessions: [{ session: "sess-uv", name: "UltraViewer", state: "gone", started: 1760000000 }],
+      scan: { scan: "scan-uv", notes: [], items: [{ id: "u0", path: "C:\\Program Files (x86)\\UltraViewer", place: "Install folder", kind: "folder", size: 2000000, size_complete: true, confidence: "high", reason: "the folder it was installed in", admin: true, command: null, elevate: true }] },
+      deleteRounds: [{ u0: { outcome: "in-use", message: inUseMsg } }],
+    });
+    await (await button(held, "Continue")).click();
+    await held.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    await held.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await held.waitForFunction(() => document.querySelector("[data-flow-delete]"), { timeout: 5000 }).catch(() => null);
+    await held.evaluate(() => document.querySelector("[data-flow-delete]").click());
+    await held.waitForFunction(() => document.querySelector('[data-flow-stage="done"]'), { timeout: 5000 }).catch(() => null);
+    ok("files in use: which programs hold them is said, not \"some operations were aborted\"", (await held.$$('[data-result="in-use"]')).length === 1 && (await text(held)).includes("In use by Microsoft Edge, Slack") && !(await text(held)).includes("aborted"));
+    ok("  restart, or delete at the next restart, is offered", !!(await held.$("[data-flow-in-use]")) && (await text(held)).includes("Restart this PC and choose Continue"));
+    await held.evaluate(() => document.querySelector("[data-flow-at-restart]").click());
+    await held.waitForFunction(() => document.querySelector('[data-result="at-restart"]'), { timeout: 5000 }).catch(() => null);
+    const later = await calls(held, "apps_delete_at_restart");
+    ok("  Delete at the next restart sends that one, and says so", later.length === 1 && JSON.stringify(later[0]) === JSON.stringify({ scan: "scan-uv", ids: ["u0"] }) && (await text(held)).includes("Deleted at the next restart") && !(await held.$("[data-flow-in-use]")), JSON.stringify(later));
+    await held.close();
+
+    // Uninstalled with GitSwitch before: looked at again, long after.
+    const again = await openUninstallPage(browser, server, { platform: "windows", apps, history: [{ key: "win:HKLM64:{DD}", name: "Disk Drill 6.3.1398.0", at: 1793912817 }, { key: "win:HKLM64:zoho", name: "Zoho Mail - Desktop 1.7.4", at: 1793901026 }] });
+    await again.waitForFunction(() => document.querySelector("[data-past]"), { timeout: 5000 }).catch(() => null);
+    ok("apps uninstalled with GitSwitch before are listed", JSON.stringify(await again.evaluate(() => [...document.querySelectorAll("[data-past-app]")].map((r) => r.getAttribute("data-past-app")))) === JSON.stringify(["Disk Drill 6.3.1398.0", "Zoho Mail - Desktop 1.7.4"]));
+    await again.evaluate(() => document.querySelector('[data-past-app="Disk Drill 6.3.1398.0"] [data-past-rescan]').click());
+    await again.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    ok("  Look for leftovers asks for that app by its id and goes straight to its leftovers", JSON.stringify(await calls(again, "apps_rescan")) === JSON.stringify([{ key: "win:HKLM64:{DD}" }]) && !!(await again.$("[data-flow-scan]")));
+    await again.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await sleep(300);
+    ok("  with the session it was given", JSON.stringify((await calls(again, "apps_scan"))[0]) === JSON.stringify({ session: "sess-again", registry: false }));
+    await again.close();
 
     const none = await openUninstallPage(browser, server, { platform: "windows", apps, sessions: [{ session: "sess-x", name: "Clean App", state: "gone", started: 1760000000 }], scan: { scan: "scan-0", notes: [], items: [] } });
     await (await button(none, "Continue")).click();

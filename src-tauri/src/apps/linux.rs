@@ -7,7 +7,7 @@
 #![cfg_attr(windows, allow(dead_code))]
 
 use super::matcher::{Allow, Confidence, Evidence, Match, Others};
-use super::{home, sys, unsys, Action, Candidate, InstalledApp, Place, Prepared, Record, Session, TrashOutcome};
+use super::{home, sys, unsys, Action, Candidate, Closed, InstalledApp, Place, Prepared, Record, Session, TrashOutcome};
 use crate::error::AppError;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -422,29 +422,71 @@ fn as_root() -> bool {
 
 /// Processes whose program is one of `paths`, or under `prefix`.
 fn running(paths: &[PathBuf], prefix: Option<&Path>, appimage: Option<&Path>) -> bool {
-    let Ok(rd) = std::fs::read_dir("/proc") else { return false };
+    !running_pids(paths, prefix, appimage).is_empty()
+}
+
+fn running_pids(paths: &[PathBuf], prefix: Option<&Path>, appimage: Option<&Path>) -> Vec<i32> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
     for e in rd.flatten() {
-        if !e.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
         if let Ok(exe) = std::fs::read_link(e.path().join("exe")) {
             // /bin is /usr/bin on merged-/usr systems.
             let same = |p: &Path| p.to_string_lossy().trim_end_matches(" (deleted)").replacen("/usr/bin/", "/bin/", 1);
             let exe_s = same(&exe);
             if paths.iter().any(|p| same(p) == exe_s) || prefix.is_some_and(|pre| Path::new(&exe_s).starts_with(pre)) {
-                return true;
+                out.push(pid);
+                continue;
             }
         }
         if let Some(img) = appimage {
             if let Ok(env) = std::fs::read(e.path().join("environ")) {
                 let want = format!("APPIMAGE={}", img.display());
                 if env.split(|b| *b == 0).any(|kv| kv == want.as_bytes()) {
-                    return true;
+                    out.push(pid);
                 }
             }
         }
     }
-    false
+    out
+}
+
+/// End the app's own processes: asked first (SIGTERM), then made to (SIGKILL).
+pub fn close(s: &Session) -> Closed {
+    if super::sandboxed() {
+        return Closed::default();
+    }
+    if let Record::Flatpak { id, .. } = &s.record {
+        let _ = crate::spawn::command("flatpak").args(["kill", id]).output();
+        return Closed { closed: vec![s.app.name.clone()], left: vec![] };
+    }
+    let (paths, prefix, appimage): (Vec<PathBuf>, Option<PathBuf>, Option<PathBuf>) = match &s.record {
+        Record::Deb { package, .. } => (package_files(package), None, None),
+        Record::Snap { name, .. } => (vec![], Some(Path::new("/snap").join(name)), None),
+        Record::AppImage { file, .. } => (vec![file.clone()], None, Some(file.clone())),
+        _ => return Closed::default(),
+    };
+    let pids = || running_pids(&paths, prefix.as_deref(), appimage.as_deref());
+    if pids().is_empty() {
+        return Closed::default();
+    }
+    for (hard, wait) in [(false, 5u64), (true, 2u64)] {
+        for pid in pids() {
+            super::signal(pid, hard);
+        }
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+        while !pids().is_empty() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        if pids().is_empty() {
+            break;
+        }
+    }
+    if pids().is_empty() {
+        Closed { closed: vec![s.app.name.clone()], left: vec![] }
+    } else {
+        Closed { closed: vec![], left: vec![s.app.name.clone()] }
+    }
 }
 
 pub fn prepare(app: &InstalledApp, rec: &Record) -> Result<(Prepared, Evidence, Vec<String>), AppError> {

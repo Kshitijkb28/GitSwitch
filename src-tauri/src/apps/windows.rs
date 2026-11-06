@@ -9,7 +9,7 @@
 #![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_mut))]
 
 use super::matcher::{self, Allow, Confidence, Evidence, Match, Others};
-use super::{Action, Candidate, ForceFolder, ForcePlan, InstalledApp, JobItem, JobWhat, Place, Prepared, Record, Session, Startup};
+use super::{Action, Candidate, Closed, ForceFolder, ForcePlan, InstalledApp, JobItem, JobWhat, Place, Prepared, Record, Session, Startup};
 use crate::error::AppError;
 use std::path::{Path, PathBuf};
 
@@ -1047,6 +1047,12 @@ pub fn leftovers(s: &Session, others: &Others, registry: bool) -> (Vec<Candidate
         }
     }
     let (mut out, mut notes) = super::scan_places(&places, &s.evidence, others);
+    // In the machine-wide places, a folder named exactly like the app one
+    // level down, under any publisher's folder (the publisher may not be known).
+    if let Record::WinEntry { .. } = &s.record {
+        let roots: Vec<PathBuf> = ["ProgramData", "ProgramFiles", "ProgramFiles(x86)"].iter().filter_map(|v| env_dir(v)).collect();
+        under_any_publisher(&roots, &s.evidence, others, &mut out);
+    }
     out.retain(|c| c.path.file_name().is_none_or(|n| !never_dir(&n.to_string_lossy())));
     updater_caches(s, others, &mut out);
     #[cfg(windows)]
@@ -1103,6 +1109,44 @@ pub fn leftovers(s: &Session, others: &Others, registry: bool) -> (Vec<Candidate
     (out, notes)
 }
 
+/// `<root>\<any folder>\<the app's exact name>`: a maybe, never ticked.
+pub(crate) fn under_any_publisher(roots: &[PathBuf], ev: &Evidence, others: &Others, out: &mut Vec<Candidate>) {
+    let names_only = Evidence { ids: vec![], names: ev.names.clone(), groups: vec![], vendor: None };
+    for root in roots {
+        let label = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let Ok(rd) = std::fs::read_dir(root) else { continue };
+        for v in rd.flatten() {
+            let Ok(md) = v.path().symlink_metadata() else { continue };
+            let vname = v.file_name().to_string_lossy().to_string();
+            if super::is_link(&md) || !md.is_dir() || never_dir(&vname) || matcher::vendor_matches(&vname, ev.vendor.as_deref()) {
+                continue;
+            }
+            let Ok(inner) = std::fs::read_dir(v.path()) else { continue };
+            for c in inner.flatten() {
+                let Ok(cmd) = c.path().symlink_metadata() else { continue };
+                if super::is_link(&cmd) || !cmd.is_dir() {
+                    continue;
+                }
+                let cname = c.file_name().to_string_lossy().to_string();
+                if let Some(m) = matcher::match_entry(&cname, &names_only, others, Allow::IdsAndNames) {
+                    out.push(Candidate {
+                        path: c.path(),
+                        root: root.clone(),
+                        place: label.clone(),
+                        kind: "folder",
+                        m: Match { confidence: Confidence::Medium, reason: format!("in {}: {}", vname, m.reason) },
+                        admin: false,
+                        command: None,
+                        action: Action::Trash,
+                        sized: true,
+                        entry: None,
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// An Electron app's update cache: `%LOCALAPPDATA%\<its-name>-updater`.
 fn updater_caches(s: &Session, others: &Others, out: &mut Vec<Candidate>) {
     let Record::WinEntry { .. } = &s.record else { return };
@@ -1139,7 +1183,8 @@ fn updater_caches(s: &Session, others: &Others, out: &mut Vec<Candidate>) {
 /// that publisher or name, nor a folder many programs share.
 pub(crate) fn promote_vendor_folders(out: &mut [Candidate], ev: &Evidence, others: &Others, place_roots: &[PathBuf]) {
     for c in out.iter_mut() {
-        if c.kind != "folder" || c.m.confidence != Confidence::High {
+        // Sure ones under their publisher; maybes only when the publisher isn't known.
+        if c.kind != "folder" || (c.m.confidence != Confidence::High && ev.vendor.is_some()) {
             continue;
         }
         let Some(parent) = c.path.parent().map(Path::to_path_buf) else { continue };
@@ -1147,7 +1192,11 @@ pub(crate) fn promote_vendor_folders(out: &mut [Candidate], ev: &Evidence, other
             continue;
         }
         let Some(pname) = parent.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
-        if !matcher::vendor_matches(&pname, ev.vendor.as_deref()) || !matcher::usable_name(&pname) || never_dir(&pname) || others.claims(&pname) || !safe_install_dir(&parent) {
+        // The publisher's folder; or, when the publisher isn't known, a
+        // folder directly in one of the places.
+        let publisher = matcher::vendor_matches(&pname, ev.vendor.as_deref());
+        let in_place = ev.vendor.is_none() && parent.parent().is_some_and(|g| place_roots.iter().any(|r| lower(r) == lower(g)));
+        if !(publisher || in_place) || !matcher::usable_name(&pname) || never_dir(&pname) || others.claims(&pname) || !safe_install_dir(&parent) {
             continue;
         }
         if std::fs::symlink_metadata(&parent).map(|m| super::is_link(&m)).unwrap_or(true) {
@@ -1166,7 +1215,7 @@ pub(crate) fn promote_vendor_folders(out: &mut [Candidate], ev: &Evidence, other
         if lower(&c.root) == lower(&parent) {
             c.root = grand;
         }
-        c.m.reason = format!("{}'s folder, holding nothing but this app", pname);
+        c.m.reason = if c.m.confidence == Confidence::High { format!("{}'s folder, holding nothing but this app", pname) } else { format!("{}, holding nothing but a folder named like the app", pname) };
         c.path = parent;
         c.entry = None;
     }
@@ -1235,6 +1284,64 @@ pub fn delete_run_value(view: &str, name: &str, data: &str, backups: &Path) -> (
     {
         let _ = (view, name, data, backups);
         ("failed", "Windows only.".into())
+    }
+}
+
+/// The running programs that have files of `dir` open or loaded, by name —
+/// Windows' Restart Manager, what installers use to say "files in use".
+pub fn users_of(dir: &Path) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        sys::users_of(dir)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        Vec::new()
+    }
+}
+
+/// A file or folder deleted when Windows next starts — for good (what is
+/// in use can't go to the Recycle Bin). Only the administrator may.
+pub fn delete_at_restart(path: &Path) -> (&'static str, String) {
+    #[cfg(windows)]
+    {
+        sys::delete_at_restart(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        ("failed", "Windows only.".into())
+    }
+}
+
+/// The program's own folders: not shared, not another installed program's.
+pub(crate) fn own_dirs(s: &Session) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let removed = match &s.record {
+            Record::WinEntry { view, key, .. } => format!("{}:{}", view, key),
+            _ => String::new(),
+        };
+        recorded_dirs(&s.app.name, &s.record).into_iter().filter(|d| safe_install_dir(d) && sys::install_dir_claimed(d, &removed).is_none()).collect()
+    }
+    #[cfg(not(windows))]
+    {
+        recorded_dirs(&s.app.name, &s.record).into_iter().filter(|d| safe_install_dir(d)).collect()
+    }
+}
+
+/// Close what runs from the program's own folders: its windows are asked to
+/// close; what is still running after `grace` is ended.
+pub fn close(s: &Session, grace: std::time::Duration) -> Closed {
+    #[cfg(windows)]
+    {
+        sys::close_in(&own_dirs(s), grace)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (s, grace);
+        Closed::default()
     }
 }
 
@@ -1740,6 +1847,187 @@ $j = ConvertTo-Json -InputObject $out -Compress
         }
     }
 
+    /// A folder's files (no links followed), its programs and libraries first.
+    fn files_in(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let Ok(md) = e.path().symlink_metadata() else { continue };
+            if super::super::is_link(&md) {
+                continue;
+            }
+            if md.is_dir() {
+                if depth > 0 {
+                    files_in(&e.path(), depth - 1, out);
+                }
+            } else {
+                out.push(e.path());
+            }
+        }
+    }
+
+    pub fn users_of(dir: &Path) -> Vec<String> {
+        use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
+        use windows_sys::Win32::System::RestartManager::{RmEndSession, RmGetList, RmRegisterResources, RmStartSession, CCH_RM_SESSION_KEY, RM_PROCESS_INFO};
+        let mut files = Vec::new();
+        if dir.is_dir() {
+            files_in(dir, 6, &mut files);
+        } else {
+            files.push(dir.to_path_buf());
+        }
+        let code = |p: &PathBuf| p.extension().is_some_and(|x| ["dll", "exe", "sys", "ocx"].iter().any(|c| x.eq_ignore_ascii_case(c)));
+        files.sort_by_key(|f| !code(f));
+        files.truncate(400);
+        if files.is_empty() {
+            return Vec::new();
+        }
+        let wides: Vec<Vec<u16>> = files.iter().map(|f| wide(f.as_os_str())).collect();
+        let ptrs: Vec<*const u16> = wides.iter().map(|w| w.as_ptr()).collect();
+        let mut names: Vec<String> = Vec::new();
+        // SAFETY: the session is ended below; buffers are sized as passed;
+        // the wide strings outlive the calls.
+        unsafe {
+            let mut session = 0u32;
+            let mut key = [0u16; CCH_RM_SESSION_KEY as usize + 1];
+            if RmStartSession(&mut session, 0, key.as_mut_ptr()) != 0 {
+                return names;
+            }
+            if RmRegisterResources(session, ptrs.len() as u32, ptrs.as_ptr(), 0, std::ptr::null(), 0, std::ptr::null()) == 0 {
+                let (mut needed, mut count, mut reasons) = (0u32, 0u32, 0u32);
+                let r = RmGetList(session, &mut needed, &mut count, std::ptr::null_mut(), &mut reasons);
+                if (r == ERROR_MORE_DATA || r == 0) && needed > 0 {
+                    let mut infos: Vec<RM_PROCESS_INFO> = vec![std::mem::zeroed(); needed as usize];
+                    count = needed;
+                    if RmGetList(session, &mut needed, &mut count, infos.as_mut_ptr(), &mut reasons) == 0 {
+                        for i in &infos[..(count as usize).min(infos.len())] {
+                            let len = i.strAppName.iter().position(|c| *c == 0).unwrap_or(i.strAppName.len());
+                            let n = String::from_utf16_lossy(&i.strAppName[..len]).trim().to_string();
+                            if !n.is_empty() && !names.contains(&n) {
+                                names.push(n);
+                            }
+                        }
+                    }
+                }
+            }
+            RmEndSession(session);
+        }
+        names
+    }
+
+    pub fn delete_at_restart(path: &Path) -> (&'static str, String) {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED};
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+        // Files first, then folders from the deepest up: Windows works the
+        // list in order when it starts. A link is removed as itself.
+        fn walk(p: &Path, files: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) {
+            let Ok(md) = p.symlink_metadata() else { return };
+            if md.is_dir() && !super::super::is_link(&md) {
+                dirs.push(p.to_path_buf());
+                if let Ok(rd) = std::fs::read_dir(p) {
+                    for e in rd.flatten() {
+                        walk(&e.path(), files, dirs);
+                    }
+                }
+            } else {
+                files.push(p.to_path_buf());
+            }
+        }
+        let (mut files, mut dirs) = (Vec::new(), Vec::new());
+        walk(path, &mut files, &mut dirs);
+        dirs.reverse();
+        let (mut failed, mut denied) = (0usize, false);
+        for p in files.iter().chain(dirs.iter()) {
+            let w = wide(p.as_os_str());
+            // SAFETY: a valid wide path; no new name (delete).
+            if unsafe { MoveFileExW(w.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) } == 0 {
+                failed += 1;
+                denied |= unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+            }
+        }
+        if failed == 0 {
+            ("at-restart", "Windows deletes it when this PC restarts — for good, since what is in use can't go to the Recycle Bin.".into())
+        } else if denied {
+            ("needs-admin", "Only the administrator can have Windows delete it at the next restart.".into())
+        } else {
+            ("failed", format!("{} of its {} files and folders could not be scheduled for the next restart.", failed, files.len() + dirs.len()))
+        }
+    }
+
+    /// Ask the windows of these processes to close.
+    fn post_close(pids: &[u32]) {
+        use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE};
+        unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            // SAFETY: lparam is the &Vec<u32> passed below, alive for the call.
+            let pids = &*(lparam as *const Vec<u32>);
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pids.contains(&pid) && IsWindowVisible(hwnd) != 0 {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            1
+        }
+        let list: Vec<u32> = pids.to_vec();
+        // SAFETY: the callback only reads the list, which outlives EnumWindows.
+        unsafe {
+            EnumWindows(Some(each), &list as *const Vec<u32> as LPARAM);
+        }
+    }
+
+    pub fn close_in(dirs: &[PathBuf], grace: std::time::Duration) -> Closed {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        if dirs.is_empty() {
+            return Closed::default();
+        }
+        let own = || -> Vec<(u32, u64, String)> {
+            processes()
+                .into_iter()
+                .filter_map(|p| {
+                    let path = p.path?;
+                    dirs.iter().any(|d| inside(&path, d)).then(|| (p.pid, p.created, path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()))
+                })
+                .collect()
+        };
+        let first = own();
+        if first.is_empty() {
+            return Closed::default();
+        }
+        let alive = |list: &[(u32, u64, String)]| -> Vec<(u32, u64, String)> {
+            let now = own();
+            list.iter().filter(|(pid, created, _)| now.iter().any(|(p, c, _)| p == pid && c == created)).cloned().collect()
+        };
+        post_close(&first.iter().map(|p| p.0).collect::<Vec<_>>());
+        let until = std::time::Instant::now() + grace;
+        let mut left = alive(&first);
+        while !left.is_empty() && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            left = alive(&left);
+        }
+        for (pid, _, _) in &left {
+            // SAFETY: the handle is checked and closed.
+            unsafe {
+                let h = OpenProcess(PROCESS_TERMINATE, 0, *pid);
+                if !h.is_null() {
+                    TerminateProcess(h, 1);
+                    CloseHandle(h);
+                }
+            }
+        }
+        if !left.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            left = alive(&left);
+        }
+        let names = |v: &[(u32, u64, String)]| -> Vec<String> {
+            let mut n: Vec<String> = v.iter().map(|p| p.2.clone()).collect();
+            n.sort();
+            n.dedup();
+            n
+        };
+        let still = names(&left);
+        let closed = names(&first).into_iter().filter(|n| !still.contains(n)).collect();
+        Closed { closed, left: still }
+    }
+
     fn view_of(view: &str) -> Option<(isize, u32)> {
         VIEWS.iter().find(|v| v.0 == view).map(|v| (v.1, v.2))
     }
@@ -2229,6 +2517,41 @@ mod tests {
         assert!(elevated_path_ok(Path::new(r"C:\Users\me\AppData\Roaming\uTorrent")).is_ok());
         assert_ne!(backup_name("HKLM64", "run-x"), backup_name("HKLM64", "run-x"), "never the same backup file twice");
         assert!(backup_name("HKLM32", "run-x").contains("-HKLM32-run_x-"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn files_in_use_are_named_and_a_program_running_from_its_folder_is_closed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("gitswitch-inuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hook.dll");
+        std::fs::write(&file, b"x").unwrap();
+        // Held open, unshared — as a program holds a library it loaded.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
+        let users = users_of(&dir);
+        assert!(!users.is_empty(), "this test process holds it");
+        let (outcome, why) = crate::apps::failed_move_for_test(&dir, "Unknown { description: \"Some operations were aborted\" }");
+        assert_eq!(outcome, "in-use", "{why}");
+        assert!(why.starts_with("In use by ") && why.contains("delete it at the next restart"), "{why}");
+        drop(held);
+        // Scheduling a delete at the next restart is the administrator's; as
+        // a person nothing is scheduled and nothing goes now.
+        let (o, _) = delete_at_restart(&dir);
+        assert!(o == "needs-admin" || o == "at-restart", "{o}");
+        assert!(file.exists(), "nothing deleted now");
+        // A program running from the app's folder is closed.
+        let ping = dir.join("ping.exe");
+        std::fs::copy(format!(r"{}\System32\PING.EXE", std::env::var("SystemRoot").unwrap()), &ping).unwrap();
+        let mut child = std::process::Command::new(&ping).args(["-n", "60", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let closed = sys::close_in(std::slice::from_ref(&dir), std::time::Duration::from_millis(500));
+        assert_eq!(closed.closed, vec!["ping.exe".to_string()], "{closed:?}");
+        assert!(closed.left.is_empty(), "{closed:?}");
+        assert!(child.try_wait().unwrap().is_some() || child.wait().is_ok());
+        assert!(sys::close_in(std::slice::from_ref(&dir), std::time::Duration::from_millis(100)).closed.is_empty(), "nothing left to close");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

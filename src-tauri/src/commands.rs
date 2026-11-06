@@ -1074,6 +1074,30 @@ pub async fn apps_force_remove(session: String) -> Result<crate::apps::Progress,
     Box::pin(crate::apps::force_remove(session)).await
 }
 
+/// Apps uninstalled with GitSwitch before, no longer installed.
+#[tauri::command]
+pub fn apps_history() -> Vec<crate::apps::PastUninstall> {
+    crate::apps::history()
+}
+
+/// Look for an app's leftovers again: a new session to continue with.
+#[tauri::command]
+pub async fn apps_rescan(key: String) -> Result<String, AppError> {
+    Box::pin(crate::apps::rescan(key)).await
+}
+
+/// Close the app's own running processes, so its uninstall can go ahead.
+#[tauri::command]
+pub async fn apps_close(session: String) -> Result<crate::apps::Closed, AppError> {
+    Box::pin(crate::apps::close(session)).await
+}
+
+/// Windows: leftovers in use, deleted when Windows next starts.
+#[tauri::command]
+pub async fn apps_delete_at_restart(scan: String, ids: Vec<String>) -> Result<Vec<crate::apps::Deleted>, AppError> {
+    Box::pin(crate::apps::delete_at_restart(scan, ids)).await
+}
+
 /// What uninstalling GitSwitch would take back and remove, read now.
 #[tauri::command]
 pub async fn uninstall_plan() -> crate::uninstall::UninstallPlan {
