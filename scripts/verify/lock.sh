@@ -502,7 +502,7 @@ OUT=$(probe push_mode "$SUP" "locked")
 ok "locking the superproject applies" "$(printf '%s' "$OUT" | jqf outcome):$(printf '%s' "$OUT" | jqf state.lock.locked)" "applied:True"
 for sub in lib lib/inner lib2; do ST=$(pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}"); ok "  $sub is locked too, with its mirrors in place" "$(printf '%s' "$ST" | jqf value.lock.locked):$(printf '%s' "$ST" | jqf value.lock.mirrors)" "True:ok"; done
 ok "  the coverage says so" "$(cov | jqf value.summary)" "Covers this repository and 3 submodules."
-evs() { for sub in lib lib/inner lib2; do pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}" | "$PY" -c 'import sys,json;e=json.load(sys.stdin)["value"]["lock"]["recent_events"];print(" ".join(sorted(set(x["code"] for x in e))), "|", e[0]["detail"] if e else "")'; done; }
+evs() { for sub in lib lib/inner lib2; do pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}" | "$PY" -c 'import sys,json;e=json.load(sys.stdin)["value"]["lock"]["recent_events"];print(" ".join(sorted(set(x["code"] for x in e))), "|", e[0]["detail"] if e else "")'; done | tr -d '\r'; }
 ok "  each submodule's own event log records its lock, and says who did it" "$(evs | tr '\n' ';')" "locked | locked with its superproject super-cover;locked | locked with its superproject super-cover;locked | locked with its superproject super-cover;"
 ok "  the registry lists the four of them" "$(pinvoke push_lock_helper_status "{}" | "$PY" -c 'import sys,json;print(len([l for l in json.load(sys.stdin)["value"]["locks"] if "super-cover" in l["repo"]]))')" "4"
 # A submodule the lock does not reach (unlocked from inside it, by the person):
@@ -527,7 +527,7 @@ git -C "$SUP/lib" config --local --add "$KEY" "git@github.com:"; git -C "$SUP/li
 OUT=$(pinvoke changes_repair_push_lock "{\"repoPath\":\"$SUP\"}")
 ok "  a copy and a prefix no remote needs, left by an older apply, are cleaned up" "$(git -C "$SUP/lib" config --local --get-all "$KEY" | sort | tr '\n' ' ')" "$WANT"
 OUT=$(probe push_mode "$SUP" "allowed")
-ok "unlocking the superproject unlocks them all" "$(printf '%s' "$OUT" | jqf outcome):$(for sub in lib lib/inner lib2; do pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}" | jqf value.lock.locked; done | tr '\n' ',')" "applied:False,False,False,"
+ok "unlocking the superproject unlocks them all" "$(printf '%s' "$OUT" | jqf outcome):$(for sub in lib lib/inner lib2; do pinvoke changes_push_state "{\"repoPath\":\"$SUP/$sub\"}" | jqf value.lock.locked; done | tr -d '\r' | tr '\n' ',')" "applied:False,False,False,"
 ok "  and nothing of the block is left in them" "$(git -C "$SUP/lib" config --local --get gitswitch.pushBlocked || echo unset):$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked || echo unset)" "unset:unset"
 ok "  each submodule's own event log records the unlock too" "$(evs | tr '\n' ';')" "locked unlocked | unlocked with its superproject super-cover;locked unlocked | unlocked with its superproject super-cover;locked unlocked | unlocked with its superproject super-cover;"
 
@@ -563,11 +563,27 @@ ok "(the superproject is locked)" "$(printf '%s' "$OUT" | jqf outcome)" "applied
 GD="$(git -C "$SUP/lib2" rev-parse --absolute-git-dir)"
 git -C "$SUP/lib2" config --local --unset gitswitch.pushBlocked
 chmod 555 "$GD"
+# Windows ignores a folder's read-only bit (and the CI runner is the administrator):
+# there the folder stays writable, so this case is checked on macOS and Linux.
+if ( : > "$GD/.gitswitch-ro-probe" ) 2>/dev/null; then
+  rm -f "$GD/.gitswitch-ro-probe"
+  RO_SKIP=1
+else
+  RO_SKIP=
+fi
 OUT=$(pinvoke changes_repair_push_lock "{\"repoPath\":\"$SUP\"}")
 COV=$(cov)
 chmod 755 "$GD"
+# A disclosed unprotected remote-helper directory (EXPECT_DRIFT, above: the app's
+# own rule) is drift every repository shows, this submodule too.
+DRIFT_WANT="[['mirror-flag']]"
+case "$EXPECT_DRIFT" in *remote-helper-unprotected-dir*) DRIFT_WANT="[['remote-helper-unprotected-dir', 'mirror-flag']]";; esac
+if [ -n "$RO_SKIP" ]; then
+  echo "  (skipped on $PLAT: a folder can't be made read-only here, so a Repair that can't write back is checked on macOS and Linux)"
+else
 ok "a submodule Repair cannot write back is named as not covered, and why — not called in place" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];m=v["message"];print(v["outcome"], "lib2 (" in m, "Everything is in place" in m, "Could not write: lib2" in m)')" "incomplete True False True"
-ok "  the card's Repair for it promises no administrator prompt (none is needed)" "$(printf '%s' "$COV" | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"];print(c["needs_repair"], c["needs_elevation"], [s["drift"] for s in c["submodules"] if s["path"]=="lib2"])')" "True False [['mirror-flag']]"
+ok "  the card's Repair for it promises no administrator prompt (none is needed)" "$(printf '%s' "$COV" | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"];print(c["needs_repair"], c["needs_elevation"], [s["drift"] for s in c["submodules"] if s["path"]=="lib2"])')" "True False [$DRIFT_WANT]"
+fi
 OUT=$(pinvoke changes_repair_push_lock "{\"repoPath\":\"$SUP\"}")
 ok "  and once it can be written, Repair puts it back" "$(printf '%s' "$OUT" | jqf value.outcome):$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked)" "applied:true"
 git init -q --bare "$SB/cover-lib3.git"; git clone -q "$SB/cover-lib3.git" "$SB/cover-author-lib3" 2>/dev/null
