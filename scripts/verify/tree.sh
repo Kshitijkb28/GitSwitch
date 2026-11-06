@@ -145,6 +145,28 @@ OUT=$(probe tree_branch_create "$W" "nowhere,zzzz")
 ok "an unknown start point is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "not-a-commit"
 ok "  naming what was typed" "$(printf '%s' "$OUT" | jqf refusal.message)" "\`zzzz\` isn't a commit"
 
+section "Remote branches: listed by their name on the remote, checked out as a local branch that tracks them"
+git -C "$SB/other" switch -q -c remote-only
+printf 'remote work\n' > "$SB/other/remote.txt"; git -C "$SB/other" add -A >/dev/null; git -C "$SB/other" commit -qm "remote-only work"
+git -C "$SB/other" push -q origin remote-only 2>/dev/null; git -C "$SB/other" switch -q main
+git -C "$W" fetch -q origin 2>/dev/null
+REMOTE_TIP="$(git -C "$W" rev-parse refs/remotes/origin/remote-only)"
+OUT=$(probe branches "$W")
+rows() { printf '%s' "$OUT" | "$PY" -c 'import sys,json;print([(b["full_ref"],b["remote_branch"]) for b in json.load(sys.stdin) if b["name"]==sys.argv[1]])' "$1"; }
+ok "a branch only on the remote is listed, with its full ref and its name there" "$(rows origin/remote-only)" "[('refs/remotes/origin/remote-only', 'remote-only')]"
+ok "  a local branch has its full ref and no remote name" "$(rows main)" "[('refs/heads/main', None)]"
+OUT=$(probe tree_branch_create "$W" "remote-only,refs/remotes/origin/remote-only,switch")
+ok "Check out (create from the remote ref, switch) lands on a local branch of that name" "$(on_branch "$W")" "remote-only"
+ok "  at the remote's commit" "$(head_of "$W")" "$REMOTE_TIP"
+ok "  tracking the remote branch" "$(git -C "$W" rev-parse --abbrev-ref 'remote-only@{upstream}')" "origin/remote-only"
+ok "  with its files" "$(cat "$W/remote.txt")" "remote work"
+OUT=$(probe tree_branch_switch "$W" "main")
+ok "  and the way back is a plain switch" "$(on_branch "$W")" "main"
+OUT=$(probe tree_branch_create "$W" "remote-only,refs/remotes/origin/remote-only,switch")
+ok "checking it out again while the local branch exists is explained" "$(printf '%s' "$OUT" | jqf advice.headline)" "already exists"
+ok "  and nothing moves" "$(on_branch "$W") $(git -C "$W" rev-parse remote-only)" "main $REMOTE_TIP"
+git -C "$W" branch -q -D remote-only
+
 section "Detached HEAD: commits nobody holds are never left behind"
 git -C "$W" switch -q --detach; git -C "$W" commit -q --allow-empty -m "loose commit"
 OUT=$(probe tree_branch_switch "$W" "main")

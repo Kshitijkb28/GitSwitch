@@ -326,7 +326,7 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
             if has("invalid reference") || has("did not match any file(s) known to git") {
                 return advice(
                     "That branch doesn't exist here.",
-                    "Pick one from the list. A branch that only exists on the remote has to be checked out as a local branch first.",
+                    "Pick one from the list. A branch that is only on the remote is under Remote in Branches, where Check out makes a local branch that tracks it.",
                     None,
                     s,
                 );

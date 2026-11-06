@@ -50,7 +50,7 @@ pub enum Elevated {
     Denied,
     NoAgent,
     Manual { command: String },
-    /// Built only on platforms without an elevation path yet (Windows).
+    /// Not on this operating system.
     #[allow(dead_code)]
     Unsupported(String),
     Failed(String),
@@ -85,12 +85,12 @@ fn helper_args(job: &Path, sha: &str, bootstrap: bool) -> Vec<String> {
 }
 
 #[cfg(debug_assertions)]
-fn test_mode() -> Option<String> {
+pub(crate) fn test_mode() -> Option<String> {
     std::env::var("GITSWITCH_ELEVATE").ok().filter(|s| !s.is_empty())
 }
 
 #[cfg(not(debug_assertions))]
-fn test_mode() -> Option<String> {
+pub(crate) fn test_mode() -> Option<String> {
     None
 }
 
@@ -167,6 +167,29 @@ async fn windows(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> Eleva
 
 #[cfg(windows)]
 fn windows_blocking(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> Elevated {
+    let params = format!(
+        "{}\"{}\" --sha256 {}",
+        if bootstrap { "--bootstrap " } else { "" },
+        job.to_string_lossy(),
+        sha
+    );
+    runas_blocking(helper, &params, "the lock helper")
+}
+
+/// Any program through the UAC prompt, waited for: `what` names it in errors.
+#[cfg(windows)]
+pub async fn windows_runas(program: &Path, params: String, what: &'static str) -> Elevated {
+    let program = program.to_path_buf();
+    let run = tokio::task::spawn_blocking(move || runas_blocking(&program, &params, what));
+    match tokio::time::timeout(PROMPT_TIMEOUT, run).await {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => Elevated::Failed(format!("the elevation thread failed: {}", e)),
+        Err(_) => Elevated::Failed("the administrator prompt was left open for too long".into()),
+    }
+}
+
+#[cfg(windows)]
+fn runas_blocking(program: &Path, params_s: &str, what: &str) -> Elevated {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
@@ -176,14 +199,8 @@ fn windows_blocking(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> El
 
     let wide = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
     let verb = wide(OsStr::new("runas"));
-    let file = wide(helper.as_os_str());
-    let params_s = format!(
-        "{}\"{}\" --sha256 {}",
-        if bootstrap { "--bootstrap " } else { "" },
-        job.to_string_lossy(),
-        sha
-    );
-    let params = wide(OsStr::new(&params_s));
+    let file = wide(program.as_os_str());
+    let params = wide(OsStr::new(params_s));
     // SAFETY: a zeroed SHELLEXECUTEINFOW is the documented starting point; the
     // wide strings outlive the call; handles are closed.
     unsafe {
@@ -199,11 +216,11 @@ fn windows_blocking(helper: &Path, job: &Path, sha: &str, bootstrap: bool) -> El
             return if err == ERROR_CANCELLED {
                 Elevated::Cancelled
             } else {
-                Elevated::Failed(format!("Windows could not start the lock helper (error {})", err))
+                Elevated::Failed(format!("Windows could not start {} (error {})", what, err))
             };
         }
         if info.hProcess.is_null() {
-            return Elevated::Failed("Windows started the helper but gave no process handle".into());
+            return Elevated::Failed(format!("Windows started {} but gave no process handle", what));
         }
         WaitForSingleObject(info.hProcess, INFINITE);
         let mut code: u32 = 0;

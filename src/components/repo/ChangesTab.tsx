@@ -622,6 +622,7 @@ export function ChangesTab({
       : undefined;
 
   return (
+    <>
     <div className={`space-y-5 ${visible ? "" : "hidden"}`} role="tabpanel" aria-label="Changes">
 
       {error && (
@@ -931,19 +932,22 @@ export function ChangesTab({
         </>
       )}
 
-      {branchesFor !== null && branchesStatus && (
-        <BranchesModal
-          open
-          onClose={() => setBranchesFor(null)}
-          repoPath={branchesFor}
-          status={branchesStatus}
-          busy={anyBusy}
-          run={(key, fn, opts) => apply(key, fn, branchesFor === repoPath ? undefined : branchesFor, opts)}
-        />
-      )}
-
       {/* tick keeps the elapsed timer honest without re-rendering anything else */}
       <span className="hidden">{tick}</span>
     </div>
+
+    {/* Outside the panel: the strip's Branches button is on every tab, and a
+        dialog inside a hidden panel opened unseen — the click seemed to do nothing. */}
+    {branchesFor !== null && branchesStatus && (
+      <BranchesModal
+        open
+        onClose={() => setBranchesFor(null)}
+        repoPath={branchesFor}
+        status={branchesStatus}
+        busy={anyBusy}
+        run={(key, fn, opts) => apply(key, fn, branchesFor === repoPath ? undefined : branchesFor, opts)}
+      />
+    )}
+    </>
   );
 }

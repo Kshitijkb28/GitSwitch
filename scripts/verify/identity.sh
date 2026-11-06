@@ -16,6 +16,7 @@ SB="$(realdir "$SB")"
 if command -v cygpath >/dev/null 2>&1; then
   echo "identity suite: skipped on Windows (the profile store does not follow HOME there)"
   verify_result
+  exit $?
 fi
 unset XDG_DATA_HOME XDG_CONFIG_HOME
 

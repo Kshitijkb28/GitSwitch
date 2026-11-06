@@ -26,12 +26,17 @@ const SOURCE: Record<string, string> = {
   package: "Package",
 };
 
+type Tab = "yours" | "system";
+
 /**
- * The Uninstall tab: the apps on this computer. Uninstalling one goes step
- * by step (UninstallFlow), and afterwards only its leftovers are offered.
+ * The Uninstall tab: the apps on this computer — the person's own, and the
+ * system's (what came with Windows or the PC, runs its hardware, or other
+ * apps use). Uninstalling one goes step by step (UninstallFlow), and
+ * afterwards only its leftovers are offered.
  */
 export function Uninstall() {
   const [kind, setKind] = usePersistedState<"apps" | "packages">("uninstall.kind", "apps");
+  const [tab, setTab] = usePersistedState<Tab>("uninstall.tab", "yours");
   const [list, setList] = useState<api.AppList | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -97,17 +102,26 @@ export function Uninstall() {
   }, [list]);
 
   const sizeOf = (a: api.InstalledApp) => a.size ?? sizes[a.id]?.[0] ?? null;
+  // Windows and macOS tell system apps apart; Ubuntu has its Apps / All packages switch.
+  const tabbed = list?.platform === "windows" || list?.platform === "macos";
+  const tabOf = (a: api.InstalledApp): Tab => (a.system ? "system" : "yours");
+  const matches = (a: api.InstalledApp) => {
+    const f = filter.trim().toLowerCase();
+    return !f || a.name.toLowerCase().includes(f) || (a.publisher ?? "").toLowerCase().includes(f);
+  };
+  const count = (t: Tab) => (list?.apps ?? []).filter((a) => tabOf(a) === t).length;
+  const other: Tab = tab === "yours" ? "system" : "yours";
+  const otherMatches = tabbed && filter.trim() ? (list?.apps ?? []).filter((a) => tabOf(a) === other && matches(a)).length : 0;
 
   const shown = useMemo(() => {
-    const f = filter.trim().toLowerCase();
-    const apps = (list?.apps ?? []).filter((a) => !f || a.name.toLowerCase().includes(f) || (a.publisher ?? "").toLowerCase().includes(f));
+    const apps = (list?.apps ?? []).filter((a) => matches(a) && (!tabbed || tabOf(a) === tab));
     const by = [...apps];
     if (sort === "size") by.sort((a, b) => (sizeOf(b) ?? -1) - (sizeOf(a) ?? -1));
     else if (sort === "date") by.sort((a, b) => (b.date ?? 0) - (a.date ?? 0));
     else by.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
     return by;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [list, filter, sort, sizes]);
+  }, [list, filter, sort, sizes, tab, tabbed]);
 
   function open(a: api.InstalledApp) {
     if (a.is_self) setSelfOpen(true);
@@ -148,6 +162,31 @@ export function Uninstall() {
             ))}
           </div>
         </Card>
+      )}
+
+      {tabbed && (
+        <div className="space-y-1.5">
+          <div role="tablist" aria-label="Which apps" className="flex items-center gap-1 border-b border-zinc-800">
+            {(["yours", "system"] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                role="tab"
+                aria-selected={tab === t}
+                onClick={() => setTab(t)}
+                data-apps-tab={t}
+                className={`-mb-px px-3 py-2 text-sm border-b-2 transition-colors cursor-pointer ${tab === t ? "border-emerald-500 text-zinc-100" : "border-transparent text-zinc-400 hover:text-zinc-200"}`}
+              >
+                {t === "yours" ? "Your apps" : "System apps"} <span className="text-xs text-zinc-500">{list ? count(t) : ""}</span>
+              </button>
+            ))}
+          </div>
+          {tab === "system" && (
+            <p className="text-xs text-zinc-500" data-system-note>
+              What came with {list?.platform === "windows" ? "Windows or this PC" : "macOS"}, runs its hardware, or other apps use. They can be removed, but {list?.platform === "windows" ? "Windows" : "macOS"}, your hardware or other apps may need them.
+            </p>
+          )}
+        </div>
       )}
 
       <div className="flex items-center gap-3 flex-wrap">
@@ -202,7 +241,14 @@ export function Uninstall() {
             <Loader2 size={14} className="animate-spin" /> Listing the apps…
           </p>
         ) : shown.length === 0 ? (
-          <p className="text-sm text-zinc-500">{filter ? "Nothing matches." : "No apps found."}</p>
+          <div className="text-sm text-zinc-500 flex items-center gap-2 flex-wrap" data-no-matches>
+            <span>{filter ? "Nothing matches here." : tabbed && tab === "system" ? "No system apps found." : "No apps found."}</span>
+            {otherMatches > 0 && (
+              <button type="button" className="text-emerald-400 hover:underline cursor-pointer" onClick={() => setTab(other)} data-other-tab-matches>
+                {otherMatches} in {other === "system" ? "System apps" : "Your apps"} — show {otherMatches === 1 ? "it" : "them"}
+              </button>
+            )}
+          </div>
         ) : (
           <ul className="divide-y divide-zinc-800" data-app-count={shown.length}>
             {shown.map((a) => {
@@ -215,6 +261,11 @@ export function Uninstall() {
                       {a.version && <span className="text-xs text-zinc-500 truncate max-w-[10rem]">{a.version}</span>}
                       <span className="text-[10px] px-1.5 rounded border border-zinc-700 text-zinc-400 shrink-0">{SOURCE[a.source] ?? a.source}</span>
                       {a.is_self && <span className="text-[10px] px-1.5 rounded border border-emerald-500/40 text-emerald-300 shrink-0">this app</span>}
+                      {a.system && (
+                        <span className="text-[10px] px-1.5 rounded border border-sky-500/40 text-sky-300 shrink-0" data-app-system>
+                          {a.system}
+                        </span>
+                      )}
                     </div>
                     <p className="text-xs text-zinc-500 truncate" title={a.location ?? ""}>
                       {[a.publisher, a.location].filter(Boolean).join(" · ")}

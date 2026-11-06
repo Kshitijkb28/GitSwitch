@@ -376,6 +376,7 @@ fn list_packages() -> Vec<(InstalledApp, Record)> {
                 notes: if left { vec!["Removed — only its settings are left.".into()] } else { vec![] },
                 blocked: if left { Some("Already removed; its settings are left (purge it with apt).".into()) } else { blocked_package(&r) },
                 is_self: false,
+                system: None,
             },
             Record::Deb { package: r.package.clone(), desktop: vec![] },
         ));

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 fn get_ssh_dir() -> Result<PathBuf, AppError> {
-    let home = dirs::home_dir().ok_or(AppError::Ssh("Cannot find home directory".into()))?;
+    let home = crate::paths::home_dir().ok_or(AppError::Ssh("Cannot find home directory".into()))?;
     let ssh_dir = home.join(".ssh");
     fs::create_dir_all(&ssh_dir)?;
     Ok(ssh_dir)

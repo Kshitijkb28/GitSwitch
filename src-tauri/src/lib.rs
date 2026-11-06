@@ -91,6 +91,11 @@ fn fix_path_env() {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Started elevated by the Uninstall tab to delete what needs the
+    // administrator: do only that, then exit — never the app itself.
+    if let Some(code) = apps::elevated_cleanup_from_args() {
+        std::process::exit(code);
+    }
     fix_path_env();
 
     let builder = tauri::Builder::default();
@@ -208,6 +213,7 @@ pub fn run() {
             commands::apps_sessions,
             commands::apps_forget,
             commands::apps_open_uninstaller,
+            commands::apps_force_remove,
             commands::push_lock_fix,
             commands::push_lock_finish_manual,
             commands::doctor_check_push_locks,

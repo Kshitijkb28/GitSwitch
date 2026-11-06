@@ -1068,6 +1068,12 @@ pub fn apps_open_uninstaller(session: String) -> Result<(), AppError> {
     crate::apps::open_vendor_uninstaller(session)
 }
 
+/// Windows: delete a program's files directly instead of running its uninstaller.
+#[tauri::command]
+pub async fn apps_force_remove(session: String) -> Result<crate::apps::Progress, AppError> {
+    Box::pin(crate::apps::force_remove(session)).await
+}
+
 /// What uninstalling GitSwitch would take back and remove, read now.
 #[tauri::command]
 pub async fn uninstall_plan() -> crate::uninstall::UninstallPlan {

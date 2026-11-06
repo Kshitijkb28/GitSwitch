@@ -176,6 +176,11 @@ fn developer_dir() -> Option<PathBuf> {
     out.status.success().then(|| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
 }
 
+/// One of Apple's own apps (Safari, Xcode, Keynote…): the System apps tab.
+pub(crate) fn apple_app(bundle_id: &str) -> bool {
+    bundle_id.to_lowercase().starts_with("com.apple.")
+}
+
 pub fn list() -> Result<super::Listing, AppError> {
     let casks = casks();
     let dev = developer_dir();
@@ -223,6 +228,7 @@ pub fn list() -> Result<super::Listing, AppError> {
                 notes,
                 blocked,
                 is_self: id.eq_ignore_ascii_case(SELF_ID),
+                system: apple_app(&id).then(|| "Apple's own app".to_string()),
             },
             Record::MacBundle { bundle: bundle.clone(), bundle_id: id, cask, vendor_uninstaller: uninstaller, app_store },
         ));

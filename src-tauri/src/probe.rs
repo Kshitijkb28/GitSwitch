@@ -245,6 +245,12 @@ pub(crate) mod tests {
             "apps_delete" => forward!(c::apps_delete, args, scan, ids),
             "apps_sessions" => reply(Ok::<_, crate::error::AppError>(c::apps_sessions())),
             "apps_dry_scan" => forward!(crate::apps::dry_scan, args, id),
+            // Read-only reviews against a real computer: a saved session's
+            // leftovers (no gone check), and what deleting an installed
+            // program's files directly would remove.
+            "apps_dry_session" => forward!(crate::apps::dry_session, args, path),
+            "apps_dry_force" => forward!(crate::apps::dry_force, args, id),
+            "apps_force_remove" => forward!(c::apps_force_remove, args, session),
             "apps_script" => forward!(crate::apps::script, args, steps),
             // The real Trash (no GITSWITCH_TRASH_DIR): what macOS, Windows or the desktop's Trash does with one path.
             "apps_trash" => match arg::<String>(&args, "path") {

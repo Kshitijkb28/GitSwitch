@@ -407,7 +407,7 @@ pub fn bundled_sidecar_path(name: &str) -> Option<PathBuf> {
 }
 
 fn app_dir() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("com.gitswitch.app"))
+    Some(crate::paths::data_dir()?.join("com.gitswitch.app"))
 }
 
 fn jobs_dir() -> Option<PathBuf> {

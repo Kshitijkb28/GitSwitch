@@ -161,6 +161,17 @@ impl Others {
     }
 
     /// Some other installed thing answers to this name.
+    pub fn claims(&self, name: &str) -> bool {
+        self.claims_name(&self.norm(name)).is_some()
+    }
+
+    /// Another installed app's name, written the way an Electron app names
+    /// its folders (`zoho-mail-desktop`).
+    pub fn kebab_claimed(&self, k: &str) -> bool {
+        self.names.iter().any(|n| kebab(n) == k)
+    }
+
+    /// Some other installed thing answers to this name.
     fn claims_name(&self, n: &str) -> Option<&'static str> {
         if self.names.contains(n) || self.ids.iter().any(|i| i == n) {
             return Some("another installed app has this name");
@@ -181,6 +192,46 @@ impl Others {
     fn longest_owner(&self, n: &str) -> Option<&str> {
         self.ids.iter().filter(|o| n == o.as_str() || n.starts_with(&format!("{}.", o))).max_by_key(|o| o.len()).map(|o| o.as_str())
     }
+}
+
+/// "Zoho Mail - Desktop" -> "zoho-mail-desktop".
+pub fn kebab(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.trim().to_lowercase().chars() {
+        if c.is_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+/// A company's name without its legal form: "BitTorrent Limited" ->
+/// "BitTorrent", "VS Revo Group, Ltd." -> "VS Revo Group".
+pub fn company_stem(p: &str) -> String {
+    const FORMS: &[&str] = &[
+        "inc", "incorporated", "ltd", "limited", "llc", "l.l.c", "gmbh", "corp", "corporation", "co", "company", "s.a", "sa", "ag", "ab", "b.v", "bv", "pty",
+        "plc", "srl", "s.r.l", "sas", "oy", "kk", "s.p.a", "spa", "lp", "ltda", "pvt", "private",
+    ];
+    let mut words: Vec<&str> = p.split_whitespace().collect();
+    while words.len() > 1 {
+        let last = words[words.len() - 1].trim_matches(|c: char| c == ',' || c == '.').to_lowercase();
+        if FORMS.contains(&last.as_str()) {
+            words.pop();
+        } else {
+            break;
+        }
+    }
+    words.join(" ").trim_end_matches([',', '.']).trim().to_string()
+}
+
+/// A folder named after the publisher, with or without its legal form.
+pub fn vendor_matches(folder: &str, vendor: Option<&str>) -> bool {
+    let Some(v) = vendor.map(str::trim).filter(|v| !v.is_empty()) else { return false };
+    let f = folder.trim().to_lowercase();
+    let stem = company_stem(v).to_lowercase();
+    f == v.to_lowercase() || f == stem || (!stem.is_empty() && f.replace(' ', "") == stem.replace(' ', ""))
 }
 
 pub fn norm(s: &str, fold_case: bool) -> String {
@@ -372,6 +423,28 @@ mod tests {
         for n in ["gnupg", "ssh", "password-store"] {
             assert!(match_entry(n, &keys, &Others::new(false), Allow::IdsAndNames).is_none(), "{n}: where keys live is never a leftover");
         }
+    }
+
+    #[test]
+    fn publishers_are_matched_with_or_without_their_legal_form() {
+        assert_eq!(company_stem("BitTorrent Limited"), "BitTorrent");
+        assert_eq!(company_stem("VS Revo Group, Ltd."), "VS Revo Group");
+        assert_eq!(company_stem("Docker Inc."), "Docker");
+        assert_eq!(company_stem("ASUSTeK COMPUTER INC."), "ASUSTeK COMPUTER");
+        assert_eq!(company_stem("CleverFiles"), "CleverFiles");
+        assert_eq!(company_stem("Limited"), "Limited", "never nothing");
+        assert!(vendor_matches("CleverFiles", Some("CleverFiles")));
+        assert!(vendor_matches("BitTorrent", Some("BitTorrent Limited")));
+        assert!(vendor_matches("bittorrent", Some("BitTorrent Limited")));
+        assert!(!vendor_matches("BitTorrentPersist", Some("BitTorrent Limited")));
+        assert!(!vendor_matches("CleverFiles", None));
+        assert_eq!(kebab("Zoho Mail - Desktop"), "zoho-mail-desktop");
+        assert_eq!(kebab("  Foo  Bar!! "), "foo-bar");
+        let mut o = Others::new(true);
+        o.add_app(&[], &s(&["Zoho Mail - Desktop"]), Some("Zoho Corporation"), &[]);
+        assert!(o.kebab_claimed("zoho-mail-desktop"));
+        assert!(o.claims("zoho corporation") && o.claims("Zoho"), "a publisher, and its first word");
+        assert!(!o.claims("CleverFiles"));
     }
 
     #[test]

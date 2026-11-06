@@ -9,7 +9,7 @@
 #![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_mut))]
 
 use super::matcher::{self, Allow, Confidence, Evidence, Match, Others};
-use super::{Action, Candidate, InstalledApp, Place, Prepared, Record, Session};
+use super::{Action, Candidate, ForceFolder, ForcePlan, InstalledApp, JobItem, JobWhat, Place, Prepared, Record, Session, Startup};
 use crate::error::AppError;
 use std::path::{Path, PathBuf};
 
@@ -34,6 +34,8 @@ pub(crate) struct RegEntry {
     pub parent: Option<String>,
     pub release_type: Option<String>,
     pub no_remove: bool,
+    /// Written by a WiX Burn bundle (BundleCachePath / BundleUpgradeCode).
+    pub bundle: bool,
 }
 
 pub(crate) fn is_guid(s: &str) -> bool {
@@ -221,6 +223,299 @@ pub fn safe_install_dir(dir: &Path) -> bool {
     !known_folders().iter().map(|k| lower(k)).any(|k| k == d || k.starts_with(&format!("{}\\", d)))
 }
 
+/// `a` is `dir` or inside it.
+pub(crate) fn inside(a: &Path, dir: &Path) -> bool {
+    let (a, d) = (lower(a), lower(dir));
+    a == d || a.starts_with(&format!("{}\\", d))
+}
+
+/// A folder an installer keeps its own copies in, or the person's own
+/// files: a program found there doesn't make it an install folder.
+pub(crate) fn cache_like(p: &Path) -> bool {
+    let l = lower(p);
+    let parts: Vec<&str> = l.split('\\').filter(|x| !x.is_empty()).collect();
+    if parts.get(1).is_some_and(|s| *s == "windows") {
+        return true;
+    }
+    const CACHES: &[&str] = &[
+        "package cache", "installer", "temp", "tmp", "downloads", "desktop", "documents", "onedrive", "uninstall information", "$recycle.bin",
+        "installshield installation information", "caphyon", "inetcache", "crashdumps",
+    ];
+    parts.iter().any(|s| CACHES.contains(s) || is_guid(s) || (s.starts_with('{') && s.ends_with('}')))
+}
+
+fn version_like(n: &str) -> bool {
+    let v = n.trim_start_matches('v');
+    v.contains('.') && v.chars().next().is_some_and(|c| c.is_ascii_digit()) && v.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// A subfolder a program sits in inside its install folder.
+fn generic_dir(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    const GENERIC: &[&str] = &["bin", "bin32", "bin64", "x64", "x86", "amd64", "arm64", "win32", "win64", "app", "application", "program", "current", "lib", "release", "64bit", "32bit", "64-bit", "32-bit"];
+    GENERIC.contains(&n.as_str()) || n.strip_prefix("app-").is_some_and(|v| v.starts_with(|c: char| c.is_ascii_digit())) || version_like(&n)
+}
+
+/// `"C:\x\app.exe",0` -> `C:\x\app.exe`: the file an icon setting names.
+pub(crate) fn icon_file(icon: &str) -> Option<PathBuf> {
+    let t = icon.trim();
+    let t = match t.rsplit_once(',') {
+        Some((p, idx)) if idx.trim().trim_start_matches('-').chars().all(|c| c.is_ascii_digit()) => p,
+        _ => t,
+    };
+    let p = expand(t.trim().trim_matches('"').trim());
+    (p.len() > 3 && p.as_bytes().get(1) == Some(&b':')).then(|| PathBuf::from(p))
+}
+
+/// Where programs are installed: Program Files (either, on any drive),
+/// ProgramData, or a person's AppData (Local, Programs, Roaming).
+pub(crate) fn in_install_root(p: &Path) -> bool {
+    let l = lower(p);
+    let parts: Vec<&str> = l.split('\\').filter(|x| !x.is_empty()).collect();
+    if parts.len() < 3 || !parts[0].ends_with(':') {
+        return false;
+    }
+    match parts[1] {
+        "program files" | "program files (x86)" | "programdata" => true,
+        "users" => parts.len() >= 5 && parts[3] == "appdata" && (parts[4] == "local" || parts[4] == "roaming"),
+        _ => false,
+    }
+}
+
+/// The folder a program of the app is installed in, from one of its files:
+/// the file's folder above any generic subfolder (bin, x64, app-1.2.3), when
+/// it is named like the app, inside a place programs are installed in, and
+/// neither an installer's cache nor one of Windows' own folders. (A
+/// developer's build or a portable copy elsewhere is never taken for it.)
+pub(crate) fn install_dir_of(file: &Path, names: &[String]) -> Option<PathBuf> {
+    let mut dir = file.parent()?.to_path_buf();
+    for _ in 0..2 {
+        let n = dir.file_name()?.to_string_lossy().to_string();
+        if !generic_dir(&n) {
+            break;
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    if cache_like(&dir) || !safe_install_dir(&dir) || !in_install_root(&dir) {
+        return None;
+    }
+    let n = dir.file_name()?.to_string_lossy().trim().to_lowercase();
+    let named = names.iter().filter(|x| matcher::usable_name(x)).any(|x| {
+        let x = x.trim().to_lowercase();
+        n == x || n.replace(' ', "") == x.replace(' ', "")
+    });
+    named.then_some(dir)
+}
+
+/// Add a folder unless it, or a folder holding it, is already there; drop
+/// those inside it.
+pub(crate) fn push_dir(dirs: &mut Vec<PathBuf>, d: PathBuf) {
+    if dirs.iter().any(|e| inside(&d, e)) {
+        return;
+    }
+    dirs.retain(|e| !inside(e, &d));
+    dirs.push(d);
+}
+
+/// The program a command line starts.
+pub(crate) fn command_program(cmd: &str) -> Option<PathBuf> {
+    let c = expand(cmd.trim());
+    let c = c.trim_start_matches(r"\??\");
+    let c = if c.to_lowercase().starts_with(r"\systemroot\") { format!("{}{}", std::env::var("SystemRoot").unwrap_or_default(), &c[11..]) } else { c.to_string() };
+    let (p, _) = split_command(&c, &|p| Path::new(p).is_file())?;
+    let p = if p.to_lowercase().starts_with(r"system32\") { format!(r"{}\{}", std::env::var("SystemRoot").unwrap_or_default(), p) } else { p };
+    Some(PathBuf::from(p))
+}
+
+/// The folders a program is installed in: those recorded before it went,
+/// or (an older session) what its entry itself points at.
+pub(crate) fn recorded_dirs(app_name: &str, rec: &Record) -> Vec<PathBuf> {
+    let Record::WinEntry { uninstall, install_dir, icon, dirs, exes, .. } = rec else { return vec![] };
+    if !dirs.is_empty() {
+        return dirs.clone();
+    }
+    let mut names = names_of(app_name, install_dir.as_deref(), icon.as_deref());
+    names.extend(exes.iter().cloned());
+    let mut out = Vec::new();
+    if let Some(d) = install_dir {
+        push_dir(&mut out, d.clone());
+    }
+    if let Some(f) = icon.as_deref().and_then(icon_file) {
+        if let Some(d) = install_dir_of(&f, &names) {
+            push_dir(&mut out, d);
+        }
+    }
+    if let Some((prog, _)) = split_command(uninstall, &|p| Path::new(p).is_file()) {
+        if let Some(d) = install_dir_of(Path::new(&prog), &names) {
+            push_dir(&mut out, d);
+        }
+    }
+    out
+}
+
+/// Before a program goes: every folder it is installed in, its programs'
+/// names and what starts it with Windows — from its entry, App Paths, its
+/// shortcuts and the Run keys — kept in the session for later.
+pub fn enrich(app: &InstalledApp, rec: &Record) -> Record {
+    let Record::WinEntry { view, key, install_dir, icon, .. } = rec else { return rec.clone() };
+    let removed = format!("{}:{}", view, key);
+    let names = names_of(&app.name, install_dir.as_deref(), icon.as_deref());
+    let mut found = recorded_dirs(&app.name, rec);
+    let mut exes: Vec<String> = Vec::new();
+    #[allow(unused_mut)]
+    let mut programs: Vec<PathBuf> = icon.as_deref().and_then(icon_file).into_iter().collect();
+    // App Paths and shortcuts know programs only by name: never when
+    // another installed program has this one's name.
+    #[cfg(windows)]
+    if !sys::name_shared(&app.name, &removed) {
+        programs.extend(sys::app_paths(&names));
+        programs.extend(sys::shortcut_targets(&names));
+    }
+    for f in &programs {
+        let Some(d) = install_dir_of(f, &names) else { continue };
+        let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        if f.extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) && matcher::usable_name(&stem) && !exes.iter().any(|e| e.eq_ignore_ascii_case(&stem)) {
+            exes.push(stem);
+        }
+        push_dir(&mut found, d);
+    }
+    // What starts it: Run values pointing into its own folders — never a
+    // shared one, nor one another program is installed in.
+    #[cfg(windows)]
+    let startup: Vec<Startup> = {
+        let own: Vec<&PathBuf> = found.iter().filter(|d| safe_install_dir(d) && sys::install_dir_claimed(d, &removed).is_none()).collect();
+        sys::run_values().into_iter().filter(|r| command_program(&r.data).is_some_and(|p| own.iter().any(|d| inside(&p, d)))).collect()
+    };
+    #[cfg(not(windows))]
+    let startup: Vec<Startup> = {
+        let _ = &removed;
+        Vec::new()
+    };
+    let mut out = rec.clone();
+    if let Record::WinEntry { dirs, exes: e, startup: st, .. } = &mut out {
+        *dirs = found;
+        *e = exes;
+        *st = startup;
+    }
+    out
+}
+
+/// Whether GitSwitch itself may move it (else Windows asks for permission):
+/// it can be opened for deleting.
+pub(crate) fn can_delete(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        sys::can_delete(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+/// Windows: deleting a program's files directly — what would go, or why not.
+pub(crate) fn force_plan(app: &InstalledApp, rec: &Record) -> (Option<ForcePlan>, Option<String>) {
+    let Record::WinEntry { view, key, msi, startup, bundle, .. } = rec else { return (None, None) };
+    if msi.is_some() {
+        return (None, Some("Windows Installer removes it cleanly, so its files aren't deleted directly — use Uninstall.".into()));
+    }
+    if *bundle {
+        return (None, Some("A setup bundle installed it together with other parts, so its files aren't deleted directly — use Uninstall.".into()));
+    }
+    let dirs: Vec<PathBuf> = recorded_dirs(&app.name, rec);
+    if dirs.is_empty() {
+        return (None, Some("Where its files are isn't known, so there is nothing to delete directly — use Uninstall.".into()));
+    }
+    let mut folders = Vec::new();
+    for d in &dirs {
+        if !safe_install_dir(d) {
+            return (None, Some(format!("{} is one of Windows' own folders, so it isn't deleted directly.", d.display())));
+        }
+        // Its drive not there (unplugged): nothing can be said about its files.
+        if !d.ancestors().last().is_some_and(|root| root.exists()) {
+            return (None, Some(format!("{} can't be reached right now — is its drive connected?", d.display())));
+        }
+        #[cfg(windows)]
+        if let Some(why) = sys::install_dir_claimed(d, &format!("{}:{}", view, key)) {
+            return (None, Some(format!("{} is still needed — {} — so use Uninstall.", d.display(), why)));
+        }
+        // Already gone (deleted by hand, or an earlier try): only its entry is left.
+        if !d.is_dir() {
+            continue;
+        }
+        let (size, done) = super::size_of(d, std::time::Duration::from_secs(2));
+        folders.push(ForceFolder { path: d.to_string_lossy().to_string(), size: Some(size), size_complete: done, admin: !can_delete(d) });
+    }
+    let entry_admin = view != "HKCU";
+    let admin = entry_admin || folders.iter().any(|f| f.admin) || startup.iter().any(|s| s.view != "HKCU");
+    let plan = ForcePlan {
+        folders,
+        entry: format!(r"{}\{}\{}", if view == "HKCU" { "HKCU" } else { "HKLM" }, UNINSTALL, key),
+        entry_admin,
+        startup: startup.iter().map(|s| format!("{} ({})", s.name, if s.view == "HKCU" { "starts when you sign in" } else { "starts for everyone" })).collect(),
+        admin,
+    };
+    (Some(plan), None)
+}
+
+/// What deleting a program's files directly does, in order — each with
+/// whether it needs the administrator: its folders, then its entry and its
+/// start-up values (only once every folder went).
+pub(crate) fn force_items(s: &Session) -> Result<Vec<(JobItem, bool)>, String> {
+    let Record::WinEntry { view, key, startup, .. } = &s.record else { return Err("Only a Windows program's files are deleted directly.".into()) };
+    let (plan, why) = force_plan(&s.app, &s.record);
+    let Some(plan) = plan else { return Err(why.unwrap_or_else(|| "Its files can't be deleted directly.".into())) };
+    if plan.folders.iter().any(|f| running_in(Path::new(&f.path))) {
+        return Err(format!("{} is running — close it first.", s.app.name));
+    }
+    let mut items = Vec::new();
+    // Every folder is checked before anything moves.
+    for (i, f) in plan.folders.iter().enumerate() {
+        let path = PathBuf::from(&f.path);
+        let root = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let ident = super::ident(&path).ok_or_else(|| format!("{} can't be read (or is a link), so nothing was deleted.", path.display()))?;
+        #[cfg(windows)]
+        if let Some(why) = recycle_refusal(&path) {
+            return Err(format!("{} Nothing was deleted.", why));
+        }
+        items.push((JobItem { id: format!("folder{}", i), what: JobWhat::Trash { path, root, ident: Some(ident) } }, f.admin));
+    }
+    items.push((JobItem { id: "entry".into(), what: JobWhat::UninstallEntry { view: view.clone(), key: key.clone(), name: s.app.name.clone() } }, view != "HKCU"));
+    for (i, st) in startup.iter().enumerate() {
+        items.push((JobItem { id: format!("startup{}", i), what: JobWhat::RunValue { view: st.view.clone(), name: st.name.clone(), data: st.data.clone() } }, st.view != "HKCU"));
+    }
+    Ok(items)
+}
+
+/// What the administrator's cleanup may touch: inside Program Files,
+/// ProgramData, the shared Desktop, the person's app-data folders, or a
+/// program's own folder elsewhere — never Windows itself, a folder Windows
+/// uses, or one of the folders shared by many programs.
+pub(crate) fn elevated_path_ok(path: &Path) -> Result<(), String> {
+    let p = lower(path);
+    let system_root = std::env::var("SystemRoot").map(|s| s.to_lowercase()).unwrap_or_else(|_| r"c:\windows".into());
+    if p == system_root || p.starts_with(&format!("{}\\", system_root)) {
+        return Err("It is inside Windows' own folder.".into());
+    }
+    if known_folders().iter().map(|k| lower(k)).any(|k| k == p || k.starts_with(&format!("{}\\", p))) {
+        return Err("It is a folder Windows itself uses.".into());
+    }
+    if path.file_name().is_some_and(|n| never_dir(&n.to_string_lossy())) {
+        return Err("Many programs share that folder.".into());
+    }
+    let parts: Vec<&str> = p.split('\\').filter(|x| !x.is_empty()).collect();
+    // The shared Desktop's shortcuts.
+    let public_shortcut = parts.len() == 5 && parts[1] == "users" && parts[2] == "public" && parts[3] == "desktop" && parts[4].ends_with(".lnk");
+    // A program's own folder on another drive or outside the profiles (D:\Games\X).
+    let elsewhere = parts.get(1).is_some_and(|s| *s != "users") && safe_install_dir(path);
+    if in_install_root(path) || public_shortcut || elsewhere {
+        Ok(())
+    } else {
+        Err("It is not in a place programs are installed in.".into())
+    }
+}
+
 /// Hidden from "Installed apps" too: parts, updates, entries that can't be removed.
 pub(crate) fn hidden(e: &RegEntry) -> bool {
     e.system_component || e.parent.is_some() || e.release_type.is_some() || e.no_remove || e.uninstall.as_deref().is_none_or(|u| u.trim().is_empty()) || e.name.as_deref().is_none_or(|n| n.trim().is_empty())
@@ -265,8 +560,20 @@ pub(crate) fn entry_app(e: &RegEntry) -> Option<(InstalledApp, Record)> {
             notes,
             blocked,
             is_self: name == "GitSwitch",
+            system: None,
         },
-        Record::WinEntry { view: e.view.clone(), key: e.key.clone(), uninstall: e.uninstall.clone().unwrap_or_default(), msi, install_dir, icon: e.icon.clone() },
+        Record::WinEntry {
+            view: e.view.clone(),
+            key: e.key.clone(),
+            uninstall: e.uninstall.clone().unwrap_or_default(),
+            msi,
+            install_dir,
+            icon: e.icon.clone(),
+            dirs: vec![],
+            exes: vec![],
+            startup: vec![],
+            bundle: e.bundle,
+        },
     ))
 }
 
@@ -301,41 +608,166 @@ pub(crate) fn unhex(s: &str) -> Option<Vec<u8>> {
     (0..t.len()).step_by(2).map(|i| u8::from_str_radix(&t[i..i + 2], 16).ok()).collect()
 }
 
-/// A Store app's name as its manifest gives it, unless that is a resource reference.
-pub(crate) fn manifest_name(xml: &str) -> Option<String> {
+/// A value in a Store app manifest's <Properties>, unless it is a resource reference.
+fn manifest_prop(xml: &str, tag: &str) -> Option<String> {
     let props = xml.find("<Properties>")?;
     let rest = &xml[props..];
-    let start = rest.find("<DisplayName>")? + "<DisplayName>".len();
-    let end = rest[start..].find("</DisplayName>")?;
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = rest.find(&open)? + open.len();
+    let end = rest[start..].find(&close)?;
     let n = rest[start..start + end].trim();
     (!n.is_empty() && !n.starts_with("ms-resource:")).then(|| n.replace("&amp;", "&"))
 }
 
-fn appx_app(a: &Appx) -> (InstalledApp, Record) {
+/// A Store app's name as its manifest gives it.
+pub(crate) fn manifest_name(xml: &str) -> Option<String> {
+    manifest_prop(xml, "DisplayName")
+}
+
+/// A Store app's publisher as people know it ("ASUSTeK COMPUTER INC."),
+/// where the package itself only carries a Store id.
+pub(crate) fn manifest_publisher(xml: &str) -> Option<String> {
+    manifest_prop(xml, "PublisherDisplayName")
+}
+
+fn appx_app(a: &Appx, facts: &SystemFacts) -> (InstalledApp, Record) {
     let dir = a.dir.as_deref().filter(|d| !d.is_empty()).map(PathBuf::from);
-    let shown = dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("AppxManifest.xml")).ok()).and_then(|x| manifest_name(&x)).unwrap_or_else(|| a.name.clone());
+    let manifest = dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("AppxManifest.xml")).ok());
+    let shown = manifest.as_deref().and_then(manifest_name).unwrap_or_else(|| a.name.clone());
+    let cn = a.publisher.as_deref().and_then(|p| p.split(',').next()).map(|p| p.trim_start_matches("CN=").trim_matches('"').to_string());
+    // A sparse package (a program's identity for Windows) may say only "Sparse Package".
+    let shown_publisher = manifest.as_deref().and_then(manifest_publisher).filter(|p| !p.eq_ignore_ascii_case("sparse package"));
+    let system = appx_system_reason(&a.name, &a.family, shown_publisher.as_deref(), facts).or_else(|| appx_system_reason(&a.name, &a.family, cn.as_deref(), facts));
+    let publisher = shown_publisher.or(cn);
     (
         InstalledApp {
             id: format!("appx:{}", a.full),
             name: shown,
             version: a.version.clone(),
-            publisher: a.publisher.as_deref().and_then(|p| p.split(',').next()).map(|p| p.trim_start_matches("CN=").to_string()),
+            publisher,
             location: None,
             source: "store".into(),
             notes: vec!["A Store app: removed for you only.".into()],
+            system,
             ..Default::default()
         },
         Record::WinAppx { full_name: a.full.clone(), family: a.family.clone(), name: a.name.clone(), install_dir: dir },
     )
 }
 
+// ---------------------------------------------------------------------------
+// System apps: what came with Windows or this PC, runs its hardware, or
+// other apps use. Everything else is the person's own.
+
+/// What the "System apps" tab is told apart by, read once per listing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SystemFacts {
+    /// The PC maker's first word ("asustek"), from the firmware.
+    pub maker: Option<String>,
+    /// The Store packages provisioned with Windows or by the PC maker, as
+    /// lower-case family names (`clipchamp.clipchamp_yxz26nhyzhsrt`).
+    pub provisioned: std::collections::HashSet<String>,
+}
+
+/// The first word of a company or product name, as compared: lower case,
+/// its leading letters, digits and dashes only ("Intel(R)" -> "intel").
+pub(crate) fn first_word(s: &str) -> Option<String> {
+    let w = s.split_whitespace().next()?;
+    let w: String = w.chars().take_while(|c| c.is_alphanumeric() || *c == '-').collect();
+    let w = w.trim_matches('-').to_lowercase();
+    (w.chars().count() >= 2).then_some(w)
+}
+
+/// The PC maker as the firmware names it, unless that is a placeholder
+/// (a self-built PC) or Microsoft (a Surface: Microsoft's apps are not "the maker's").
+pub(crate) fn maker_word(raw: &str) -> Option<String> {
+    let l = raw.trim().to_lowercase();
+    let placeholder = ["system manufacturer", "default string", "default", "oem", "o.e.m.", "not applicable", "none", "unknown", "to be filled by o.e.m."];
+    if l.is_empty() || placeholder.contains(&l.as_str()) || l.starts_with("to be filled") || l.starts_with("microsoft") {
+        return None;
+    }
+    first_word(&l)
+}
+
+/// `Name_Version_Arch_ResourceId_PublisherId` -> `name_publisherid`.
+pub(crate) fn provisioned_family(full: &str) -> Option<String> {
+    let parts: Vec<&str> = full.split('_').collect();
+    if parts.len() < 5 || parts[0].is_empty() || parts[parts.len() - 1].is_empty() {
+        return None;
+    }
+    Some(format!("{}_{}", parts[0], parts[parts.len() - 1]).to_lowercase())
+}
+
+/// Makers of chips and devices: their programs are drivers and their tools.
+const HARDWARE: &[&str] = &[
+    "intel", "nvidia", "amd", "realtek", "qualcomm", "mediatek", "synaptics", "elan", "elantech", "dolby", "dts", "conexant", "broadcom", "rivet",
+    "killer", "waves", "cirrus",
+];
+
+fn words(name: &str) -> Vec<String> {
+    name.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect()
+}
+
+fn is_microsoft(publisher: Option<&str>) -> bool {
+    publisher.is_some_and(|p| p.trim().to_lowercase().starts_with("microsoft"))
+}
+
+/// Why a program or Store app counts as a system app, if it does.
+pub(crate) fn system_reason(name: &str, publisher: Option<&str>, facts: &SystemFacts) -> Option<String> {
+    let pw = publisher.and_then(first_word);
+    if facts.maker.is_some() && pw == facts.maker {
+        return Some("From your PC's maker".into());
+    }
+    let pl = publisher.unwrap_or("").trim().to_lowercase();
+    if pw.as_deref().is_some_and(|w| HARDWARE.contains(&w)) || pl.starts_with("advanced micro devices") {
+        return Some("For your hardware".into());
+    }
+    let lname = name.to_lowercase();
+    if !(is_microsoft(publisher) || (pl.is_empty() && lname.starts_with("microsoft windows"))) {
+        return None;
+    }
+    let w = words(name);
+    let has = |x: &str| w.iter().any(|y| y == x);
+    let starts = |x: &str| w.iter().any(|y| y.starts_with(x));
+    if has("sdk") {
+        return None;
+    }
+    if has("redistributable") || has("runtime") || has("webview2") || lname.contains("shared framework") || lname.contains(".net") || starts("winappruntime") || starts("vclibs") {
+        return Some("Used by other apps".into());
+    }
+    if has("edge") || has("onedrive") || has("gameinput") || has("xbox") || lname.contains("update health") || lname.contains("pc health check") || lname.contains("application compatibility") {
+        return Some("Part of Windows".into());
+    }
+    if ["gamingservices", "winget", "startexperiences", "widgets", "webexperience", "crossdevice", "desktopappinstaller"].iter().any(|x| starts(x)) {
+        return Some("Part of Windows".into());
+    }
+    None
+}
+
+/// A Store app: provisioned ones came with Windows (or with the PC).
+pub(crate) fn appx_system_reason(name: &str, family: &str, publisher: Option<&str>, facts: &SystemFacts) -> Option<String> {
+    if facts.provisioned.contains(&family.to_lowercase()) {
+        return Some(if is_microsoft(publisher) { "Came with Windows" } else { "Came with this PC" }.into());
+    }
+    system_reason(name, publisher, facts)
+}
+
 pub fn list() -> Result<super::Listing, AppError> {
     #[cfg(windows)]
     {
-        let mut rows: Vec<(InstalledApp, Record)> = sys::read_entries().iter().filter_map(entry_app).collect();
+        let facts = sys::system_facts();
+        let mut rows: Vec<(InstalledApp, Record)> = sys::read_entries()
+            .iter()
+            .filter_map(entry_app)
+            .map(|(mut a, r)| {
+                a.system = system_reason(&a.name, a.publisher.as_deref(), &facts);
+                (a, r)
+            })
+            .collect();
         let mut notes = Vec::new();
         match sys::appx() {
-            Ok(l) => rows.extend(l.main.iter().map(appx_app)),
+            Ok(l) => rows.extend(l.main.iter().map(|a| appx_app(a, &facts))),
             Err(e) => notes.push(format!("Store apps could not be listed: {}", e)),
         }
         Ok((rows, notes))
@@ -362,8 +794,15 @@ pub fn prepare(app: &InstalledApp, rec: &Record) -> Result<(Prepared, Evidence, 
     let mut p = Prepared { blocked: app.blocked.clone(), ..Default::default() };
     let ev;
     match rec {
-        Record::WinEntry { view, key, uninstall, msi, install_dir, icon } => {
-            ev = Evidence { ids: vec![], names: names_of(&app.name, install_dir.as_deref(), icon.as_deref()), groups: vec![], vendor: app.publisher.clone() };
+        Record::WinEntry { view, key, uninstall, msi, install_dir, icon, exes, .. } => {
+            let mut names = names_of(&app.name, install_dir.as_deref(), icon.as_deref());
+            for x in exes {
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(x)) {
+                    names.push(x.clone());
+                }
+            }
+            ev = Evidence { ids: vec![], names, groups: vec![], vendor: app.publisher.clone() };
+            let dirs = recorded_dirs(&app.name, rec);
             let (program, args) = match msi {
                 Some(g) => (msiexec(), format!("/x {}", g)),
                 None => split_command(uninstall, &|p| Path::new(p).is_file()).ok_or_else(|| AppError::Config("Its uninstall command is empty.".into()))?,
@@ -375,7 +814,7 @@ pub fn prepare(app: &InstalledApp, rec: &Record) -> Result<(Prepared, Evidence, 
                 "Its own uninstaller opens; follow its steps. Windows asks for permission if it needs to.".into()
             };
             p.facts = vec![format!("Entry: {}\\{}\\{} ({})", if view == "HKCU" { "HKCU" } else { "HKLM" }, UNINSTALL, key, match view.as_str() { "HKLM32" => "32-bit view", "HKLM64" => "64-bit view", _ => "your own" })];
-            if let Some(d) = install_dir {
+            for d in &dirs {
                 p.facts.push(format!("Installed in: {}", d.display()));
             }
             if let Some(pb) = &app.publisher {
@@ -385,10 +824,13 @@ pub fn prepare(app: &InstalledApp, rec: &Record) -> Result<(Prepared, Evidence, 
             if let Some(signer) = sys::signer(Path::new(&program)) {
                 p.facts.push(format!("The uninstaller is signed by: {}", signer));
             }
-            p.running = install_dir.as_ref().filter(|d| safe_install_dir(d)).is_some_and(|d| running_in(d));
+            p.running = dirs.iter().filter(|d| safe_install_dir(d)).any(|d| running_in(d));
             if p.running {
                 p.warnings.push(format!("{} is running — close it first, or its uninstaller may ask you to.", app.name));
             }
+            let (force, why) = force_plan(app, rec);
+            p.force = force;
+            p.force_unavailable = why;
         }
         Record::WinAppx { full_name, family, .. } => {
             ev = Evidence { ids: vec![family.clone()], names: vec![app.name.clone()], groups: vec![], vendor: None };
@@ -558,6 +1000,10 @@ pub fn others(s: &Session) -> Others {
             let Some(name) = e.name.clone() else { continue };
             let dir = e.install_location.as_deref().and_then(clean_dir);
             o.add_app(&[], &names_of(&name, dir.as_deref(), e.icon.as_deref()), e.publisher.as_deref(), &[]);
+            // "VS Revo Group, Ltd." also answers to "VS Revo Group".
+            if let Some(p) = e.publisher.as_deref() {
+                o.add_app(&[], &[], Some(&matcher::company_stem(p)), &[]);
+            }
         }
         if let Ok(l) = sys::appx() {
             let family = match &s.record {
@@ -581,45 +1027,63 @@ fn env_dir(var: &str) -> Option<PathBuf> {
 pub fn leftovers(s: &Session, others: &Others, registry: bool) -> (Vec<Candidate>, Vec<String>) {
     let mut places = Vec::new();
     if let Some(d) = env_dir("APPDATA") {
-        places.push(Place::new(d, "%APPDATA%", Allow::IdsAndNames).vendor());
+        places.push(Place::new(d, "%APPDATA%", Allow::IdsAndNames).vendor().sure());
     }
     if let Some(d) = env_dir("LOCALAPPDATA") {
-        places.push(Place::new(d.clone(), "%LOCALAPPDATA%", Allow::IdsAndNames).vendor());
+        places.push(Place::new(d.clone(), "%LOCALAPPDATA%", Allow::IdsAndNames).vendor().sure());
         places.push(Place::new(d.join("Programs"), "%LOCALAPPDATA%\\Programs", Allow::IdsAndNames));
         if let Record::WinAppx { .. } = &s.record {
             places.push(Place::new(d.join("Packages"), "%LOCALAPPDATA%\\Packages", Allow::Ids));
         }
     }
+    // A program's other files: the machine-wide places, exact names only.
+    if let Record::WinEntry { .. } = &s.record {
+        for (var, label) in [("ProgramData", "%ProgramData%"), ("ProgramFiles", "Program Files"), ("ProgramFiles(x86)", "Program Files (x86)")] {
+            if let Some(d) = env_dir(var) {
+                if !places.iter().any(|p: &Place| lower(&p.path) == lower(&d)) {
+                    places.push(Place::new(d, label, Allow::IdsAndNames).vendor().sure());
+                }
+            }
+        }
+    }
     let (mut out, mut notes) = super::scan_places(&places, &s.evidence, others);
     out.retain(|c| c.path.file_name().is_none_or(|n| !never_dir(&n.to_string_lossy())));
+    updater_caches(s, others, &mut out);
     #[cfg(windows)]
     {
-        let install_dir = match &s.record {
-            Record::WinEntry { install_dir, .. } => install_dir.clone(),
-            _ => None,
+        let removed = match &s.record {
+            Record::WinEntry { view, key, .. } => format!("{}:{}", view, key),
+            _ => String::new(),
         };
-        if let Some(dir) = install_dir.filter(|d| d.is_dir()) {
-            match sys::install_dir_claimed(&dir, s) {
+        // Its own folders: not shared, not another installed program's.
+        let mut own: Vec<PathBuf> = Vec::new();
+        for dir in recorded_dirs(&s.app.name, &s.record) {
+            let claimed = sys::install_dir_claimed(&dir, &removed);
+            if claimed.is_none() && safe_install_dir(&dir) {
+                own.push(dir.clone());
+            }
+            if !dir.is_dir() {
+                continue;
+            }
+            match claimed {
                 Some(why) => notes.push(format!("{} is still there, but {} — so it is not offered.", dir.display(), why)),
-                None if safe_install_dir(&dir) => {
-                    let admin = !env_dir("LOCALAPPDATA").is_some_and(|l| lower(&dir).starts_with(&format!("{}\\", lower(&l))));
-                    out.push(Candidate {
-                        path: dir.clone(),
-                        root: dir.parent().map(Path::to_path_buf).unwrap_or_default(),
-                        place: "Install folder".into(),
-                        kind: "folder",
-                        m: Match { confidence: Confidence::High, reason: "the folder it was installed in".into() },
-                        admin,
-                        command: admin.then(|| format!("rd /s /q \"{}\"   (in a Command Prompt run as administrator)", dir.display())),
-                        action: if admin { Action::None } else { Action::Trash },
-                        sized: true,
-                        entry: None,
-                    });
-                }
+                None if safe_install_dir(&dir) => out.push(Candidate {
+                    path: dir.clone(),
+                    root: dir.parent().map(Path::to_path_buf).unwrap_or_default(),
+                    place: "Install folder".into(),
+                    kind: "folder",
+                    m: Match { confidence: Confidence::High, reason: "the folder it was installed in".into() },
+                    admin: false,
+                    command: None,
+                    action: Action::Trash,
+                    sized: true,
+                    entry: None,
+                }),
                 None => notes.push(format!("{} is still there, but it is one of Windows' own folders — not offered.", dir.display())),
             }
         }
-        sys::shortcuts(s, &mut out);
+        sys::shortcuts(s, &own, &mut out);
+        startup_leftovers(s, &own, &mut out);
         if registry {
             sys::registry_leftovers(s, others, &mut out);
         }
@@ -628,7 +1092,111 @@ pub fn leftovers(s: &Session, others: &Others, registry: bool) -> (Vec<Candidate
     }
     #[cfg(not(windows))]
     let _ = registry;
+    let roots: Vec<PathBuf> = places.iter().map(|p| p.path.clone()).collect();
+    promote_vendor_folders(&mut out, &s.evidence, others, &roots);
+    // Whether Windows asks for permission: measured, item by item.
+    for c in out.iter_mut().filter(|c| super::file_backed(c.kind)) {
+        c.admin = !can_delete(&c.path);
+        c.action = Action::Trash;
+        c.command = c.admin.then(|| if c.kind == "folder" { format!("rd /s /q \"{}\"   (in a Command Prompt run as administrator)", c.path.display()) } else { format!("del \"{}\"   (as administrator)", c.path.display()) });
+    }
     (out, notes)
+}
+
+/// An Electron app's update cache: `%LOCALAPPDATA%\<its-name>-updater`.
+fn updater_caches(s: &Session, others: &Others, out: &mut Vec<Candidate>) {
+    let Record::WinEntry { .. } = &s.record else { return };
+    let Some(local) = env_dir("LOCALAPPDATA") else { return };
+    let mut seen: Vec<String> = Vec::new();
+    for n in s.evidence.names.iter().filter(|n| matcher::usable_name(n)) {
+        let k = matcher::kebab(n);
+        if k.chars().count() < 4 || seen.contains(&k) || others.kebab_claimed(&k) {
+            continue;
+        }
+        seen.push(k.clone());
+        let p = local.join(format!("{}-updater", k));
+        let Ok(md) = std::fs::symlink_metadata(&p) else { continue };
+        if super::is_link(&md) || !md.is_dir() {
+            continue;
+        }
+        out.push(Candidate {
+            path: p,
+            root: local.clone(),
+            place: "%LOCALAPPDATA%".into(),
+            kind: "folder",
+            m: Match { confidence: Confidence::Medium, reason: format!("its updater's cache, named after the app ({})", n.trim()) },
+            admin: false,
+            command: None,
+            action: Action::Trash,
+            sized: true,
+            entry: None,
+        });
+    }
+}
+
+/// A publisher's folder that holds nothing but the removed app's folder is
+/// offered instead of that folder — never when another installed app has
+/// that publisher or name, nor a folder many programs share.
+pub(crate) fn promote_vendor_folders(out: &mut [Candidate], ev: &Evidence, others: &Others, place_roots: &[PathBuf]) {
+    for c in out.iter_mut() {
+        if c.kind != "folder" || c.m.confidence != Confidence::High {
+            continue;
+        }
+        let Some(parent) = c.path.parent().map(Path::to_path_buf) else { continue };
+        if place_roots.iter().any(|r| lower(r) == lower(&parent)) {
+            continue;
+        }
+        let Some(pname) = parent.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
+        if !matcher::vendor_matches(&pname, ev.vendor.as_deref()) || !matcher::usable_name(&pname) || never_dir(&pname) || others.claims(&pname) || !safe_install_dir(&parent) {
+            continue;
+        }
+        if std::fs::symlink_metadata(&parent).map(|m| super::is_link(&m)).unwrap_or(true) {
+            continue;
+        }
+        let only = std::fs::read_dir(&parent)
+            .map(|rd| {
+                let v: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+                v.len() == 1 && lower(&v[0]) == lower(&c.path)
+            })
+            .unwrap_or(false);
+        let Some(grand) = parent.parent().map(Path::to_path_buf) else { continue };
+        if !only {
+            continue;
+        }
+        if lower(&c.root) == lower(&parent) {
+            c.root = grand;
+        }
+        c.m.reason = format!("{}'s folder, holding nothing but this app", pname);
+        c.path = parent;
+        c.entry = None;
+    }
+}
+
+/// Run values that started the removed program from its own folders, while
+/// what they start is gone.
+#[cfg(windows)]
+fn startup_leftovers(s: &Session, own: &[PathBuf], out: &mut Vec<Candidate>) {
+    let Record::WinEntry { startup, .. } = &s.record else { return };
+    let now = sys::run_values();
+    let list: Vec<Startup> = if !startup.is_empty() { startup.clone() } else { now.clone() };
+    let list: Vec<Startup> = list.into_iter().filter(|r| command_program(&r.data).is_some_and(|p| own.iter().any(|d| inside(&p, d)))).collect();
+    for st in list {
+        if !now.iter().any(|r| r == &st) || command_program(&st.data).is_some_and(|p| p.exists()) {
+            continue;
+        }
+        out.push(Candidate {
+            path: PathBuf::from(format!(r"{}\{}", sys::run_key_label(&st.view), st.name)),
+            root: PathBuf::new(),
+            place: "Starts with Windows".into(),
+            kind: "startup",
+            m: Match { confidence: Confidence::High, reason: format!("started it: {}", st.data) },
+            admin: st.view != "HKCU",
+            command: None,
+            action: Action::RunValue { view: st.view.clone(), name: st.name.clone(), data: st.data.clone() },
+            sized: false,
+            entry: None,
+        });
+    }
 }
 
 /// A key under HKCU\Software: exported to a .reg file, then deleted.
@@ -642,6 +1210,39 @@ pub fn delete_registry(key: &str) -> (&'static str, String) {
         let _ = key;
         ("failed", "Windows only.".into())
     }
+}
+
+/// A program's entry in Installed apps, exported to a .reg file first.
+pub fn delete_uninstall_entry(view: &str, key: &str, name: &str, backups: &Path) -> (&'static str, String) {
+    #[cfg(windows)]
+    {
+        sys::delete_uninstall_entry(view, key, name, backups)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (view, key, name, backups);
+        ("failed", "Windows only.".into())
+    }
+}
+
+/// A Run value — only while it still holds `data` — exported first.
+pub fn delete_run_value(view: &str, name: &str, data: &str, backups: &Path) -> (&'static str, String) {
+    #[cfg(windows)]
+    {
+        sys::delete_run_value(view, name, data, backups)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (view, name, data, backups);
+        ("failed", "Windows only.".into())
+    }
+}
+
+/// A registry backup's file name: when, which registry view, what — and a
+/// part no other backup has, so none is ever written over.
+pub(crate) fn backup_name(view: &str, label: &str) -> String {
+    let unique = uuid::Uuid::new_v4().simple().to_string();
+    format!("{}-{}-{}-{}.reg", chrono::Local::now().format("%Y%m%d-%H%M%S"), view, label.replace(|c: char| !c.is_alphanumeric(), "_"), &unique[..8])
 }
 
 #[cfg(windows)]
@@ -698,6 +1299,7 @@ mod sys {
                     parent: s("ParentKeyName"),
                     release_type: s("ReleaseType"),
                     no_remove: d("NoRemove") == Some(1),
+                    bundle: s("BundleCachePath").is_some() || s("BundleUpgradeCode").is_some() || s("BundleProviderKey").is_some(),
                 });
             }
         }
@@ -919,23 +1521,15 @@ $j = ConvertTo-Json -InputObject $out -Compress
     }
 
     fn command_path(cmd: &str) -> Option<PathBuf> {
-        let c = expand(cmd.trim());
-        let c = c.trim_start_matches(r"\??\");
-        let c = if c.to_lowercase().starts_with(r"\systemroot\") { format!("{}{}", std::env::var("SystemRoot").unwrap_or_default(), &c[11..]) } else { c.to_string() };
-        let (p, _) = split_command(&c, &|p| Path::new(p).is_file())?;
-        let p = if p.to_lowercase().starts_with(r"system32\") { format!(r"{}\{}", std::env::var("SystemRoot").unwrap_or_default(), p) } else { p };
-        Some(PathBuf::from(p))
+        command_program(cmd)
     }
 
     /// Something still installed lives in that folder: another program's
-    /// entry, a service or driver, a shared DLL.
-    pub fn install_dir_claimed(dir: &Path, s: &Session) -> Option<String> {
+    /// entry, a service or driver, a shared DLL. `removed` is the
+    /// `view:key` of the program being removed.
+    pub fn install_dir_claimed(dir: &Path, removed: &str) -> Option<String> {
         let d = format!("{}\\", lower(dir));
         let inside = |p: &Path| lower(p).starts_with(&d) || lower(p) == lower(dir);
-        let removed = match &s.record {
-            Record::WinEntry { view, key, .. } => format!("{}:{}", view, key),
-            _ => String::new(),
-        };
         for e in read_entries() {
             if format!("{}:{}", e.view, e.key) == removed {
                 continue;
@@ -995,10 +1589,8 @@ $j = ConvertTo-Json -InputObject $out -Compress
         }
     }
 
-    /// Shortcuts in the Start menu and on the desktop that started the
-    /// removed program — by their target, never by their name.
-    pub fn shortcuts(s: &Session, out: &mut Vec<Candidate>) {
-        let Record::WinEntry { install_dir, icon, .. } = &s.record else { return };
+    /// Where shortcuts are: (folder, shared by everyone, label).
+    fn shortcut_places() -> Vec<(PathBuf, bool, String)> {
         let mut places: Vec<(PathBuf, bool, String)> = Vec::new();
         if let Some(a) = env_dir("APPDATA") {
             places.push((a.join(r"Microsoft\Windows\Start Menu\Programs"), false, "Start menu".into()));
@@ -1012,6 +1604,215 @@ $j = ConvertTo-Json -InputObject $out -Compress
         if let Some(p) = env_dir("PUBLIC") {
             places.push((p.join("Desktop"), true, "Desktop (everyone)".into()));
         }
+        places
+    }
+
+    /// What each shortcut starts, by its path in lower case.
+    fn resolve_targets(files: &[PathBuf]) -> HashMap<String, String> {
+        let input = std::env::temp_dir().join(format!("gitswitch-lnk-{}-{}.json", std::process::id(), uuid::Uuid::new_v4()));
+        let list: Vec<String> = files.iter().map(|f| f.to_string_lossy().to_string()).collect();
+        if std::fs::write(&input, serde_json::to_vec(&list).unwrap_or_default()).is_err() {
+            return HashMap::new();
+        }
+        let answer = run_ps(SHORTCUTS, &[("GS_IN", &input.to_string_lossy())]);
+        let _ = std::fs::remove_file(&input);
+        let Some(targets) = answer.ok().and_then(|h| unhex(&h)).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { return HashMap::new() };
+        // ConvertTo-Json writes one object, not a list, for a single shortcut.
+        let targets = match targets {
+            serde_json::Value::Array(v) => v,
+            other => vec![other],
+        };
+        targets.iter().filter_map(|t| Some((t["p"].as_str()?.to_lowercase(), t["t"].as_str().unwrap_or("").to_string()))).collect()
+    }
+
+    /// The programs that shortcuts named like the app start.
+    pub fn shortcut_targets(names: &[String]) -> Vec<PathBuf> {
+        let keys: Vec<String> = names.iter().filter(|n| matcher::usable_name(n)).map(|n| n.trim().to_lowercase().replace(' ', "")).collect();
+        if keys.is_empty() {
+            return vec![];
+        }
+        let mut files = Vec::new();
+        for (dir, _, _) in shortcut_places() {
+            lnk_files(&dir, if dir.ends_with("Desktop") { 0 } else { 2 }, &mut files);
+        }
+        // Named exactly like the app ("Disk Drill.lnk", "Disk Drill (x64).lnk").
+        files.retain(|f| {
+            f.file_stem().map(|s| s.to_string_lossy().to_string()).is_some_and(|s| {
+                let whole = s.to_lowercase().replace(' ', "");
+                let plain = strip_version(&s).to_lowercase().replace(' ', "");
+                keys.contains(&whole) || keys.contains(&plain)
+            })
+        });
+        if files.is_empty() {
+            return vec![];
+        }
+        resolve_targets(&files).into_values().filter(|t| !t.is_empty()).map(PathBuf::from).filter(|p| p.is_absolute()).collect()
+    }
+
+    /// Another installed program (not `removed`, "view:key") has this name.
+    pub fn name_shared(name: &str, removed: &str) -> bool {
+        let n = strip_version(name).to_lowercase();
+        read_entries().iter().any(|e| format!("{}:{}", e.view, e.key) != removed && e.name.as_deref().is_some_and(|x| strip_version(x).to_lowercase() == n))
+    }
+
+    const APP_PATHS: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
+
+    /// Programs App Paths registers under one of the app's names.
+    pub fn app_paths(names: &[String]) -> Vec<PathBuf> {
+        let keys: Vec<String> = names.iter().filter(|n| matcher::usable_name(n)).map(|n| n.trim().to_lowercase().replace(' ', "")).collect();
+        let mut out = Vec::new();
+        for (_, h, flag) in VIEWS {
+            let Ok(ap) = hive(h).open_subkey_with_flags(APP_PATHS, KEY_READ | flag) else { continue };
+            for k in ap.enum_keys().flatten() {
+                let l = k.to_lowercase();
+                let stem = l.strip_suffix(".exe").unwrap_or(&l).replace(' ', "");
+                if !keys.contains(&stem) {
+                    continue;
+                }
+                let Ok(sub) = ap.open_subkey_with_flags(&k, KEY_READ | flag) else { continue };
+                if let Ok(v) = sub.get_value::<String, _>("") {
+                    let p = PathBuf::from(expand(v.trim().trim_matches('"')));
+                    if p.is_absolute() {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub const RUN: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+
+    /// The Run key's full name for a view, as shown.
+    pub fn run_key_label(view: &str) -> String {
+        match view {
+            "HKCU" => format!(r"HKCU\{}", RUN),
+            "HKLM32" => r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run".to_string(),
+            _ => format!(r"HKLM\{}", RUN),
+        }
+    }
+
+    /// Every Run value: yours, and everyone's in both registry views.
+    pub fn run_values() -> Vec<Startup> {
+        let mut out = Vec::new();
+        for (view, h, flag) in VIEWS {
+            let Ok(k) = hive(h).open_subkey_with_flags(RUN, KEY_READ | flag) else { continue };
+            for (name, _) in k.enum_values().flatten() {
+                if name.is_empty() {
+                    continue;
+                }
+                if let Ok(data) = k.get_value::<String, _>(&name) {
+                    out.push(Startup { view: view.into(), name, data });
+                }
+            }
+        }
+        out
+    }
+
+    /// The PC maker, and the Store apps provisioned with Windows or by the maker.
+    pub fn system_facts() -> SystemFacts {
+        let lm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let maker = lm
+            .open_subkey_with_flags(r"HARDWARE\DESCRIPTION\System\BIOS", KEY_READ)
+            .ok()
+            .and_then(|k| k.get_value::<String, _>("SystemManufacturer").ok())
+            .and_then(|m| maker_word(&m));
+        let provisioned = lm
+            .open_subkey_with_flags(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Applications", KEY_READ | KEY_WOW64_64KEY)
+            .map(|k| k.enum_keys().flatten().filter_map(|n| provisioned_family(&n)).collect())
+            .unwrap_or_default();
+        SystemFacts { maker, provisioned }
+    }
+
+    /// Opening it for deleting works (else it needs the administrator).
+    pub fn can_delete(path: &Path) -> bool {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{CreateFileW, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+        let w = wide(path.as_os_str());
+        // SAFETY: a valid wide path; the handle is closed below.
+        unsafe {
+            let h = CreateFileW(w.as_ptr(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut());
+            if h == INVALID_HANDLE_VALUE {
+                return GetLastError() != ERROR_ACCESS_DENIED;
+            }
+            CloseHandle(h);
+            true
+        }
+    }
+
+    fn view_of(view: &str) -> Option<(isize, u32)> {
+        VIEWS.iter().find(|v| v.0 == view).map(|v| (v.1, v.2))
+    }
+
+    /// `reg export` of a key, into the backups folder.
+    fn export(view: &str, sub: &str, backups: &Path, label: &str) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(backups).map_err(|e| format!("The backup folder could not be made ({}), so it was kept.", e))?;
+        let file = backups.join(backup_name(view, label));
+        if std::fs::symlink_metadata(&file).is_ok() {
+            return Err("The backup could not be written, so it was kept.".into());
+        }
+        let reg = format!(r"{}\System32\reg.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
+        let full = format!(r"{}\{}", if view == "HKCU" { "HKCU" } else { "HKLM" }, sub);
+        let out = crate::spawn::command(&reg).args(["export", &full]).arg(&file).args(["/y", if view == "HKLM32" { "/reg:32" } else { "/reg:64" }]).output();
+        if out.as_ref().is_ok_and(|o| o.status.success()) {
+            Ok(file)
+        } else {
+            Err("The backup could not be written, so it was kept.".into())
+        }
+    }
+
+    pub fn delete_uninstall_entry(view: &str, key: &str, name: &str, backups: &Path) -> (&'static str, String) {
+        let Some((h, flag)) = view_of(view) else { return ("refused", "Not an entry GitSwitch removes.".into()) };
+        if key.trim().is_empty() || key.contains(['\\', '/']) {
+            return ("refused", "Not an entry GitSwitch removes.".into());
+        }
+        let sub = format!(r"{}\{}", UNINSTALL, key);
+        let Ok(k) = hive(h).open_subkey_with_flags(&sub, KEY_READ | flag) else { return ("gone", "Already gone from Installed apps.".into()) };
+        let shown = k.get_value::<String, _>("DisplayName").map(|x| x.trim().to_string()).unwrap_or_default();
+        drop(k);
+        // The same program after an update ("Disk Drill 6.3" -> "Disk Drill 6.4") still is.
+        if !name.trim().is_empty() && shown != name.trim() && strip_version(&shown).to_lowercase() != strip_version(name).to_lowercase() {
+            return ("changed", "That entry now names another program, so it was kept.".into());
+        }
+        let backup = match export(view, &sub, backups, key) {
+            Ok(b) => b,
+            Err(e) => return ("failed", e),
+        };
+        match hive(h).open_subkey_with_flags(UNINSTALL, KEY_ALL_ACCESS | flag).and_then(|u| u.delete_subkey_all(key)) {
+            Ok(()) => ("removed", format!("Removed from Installed apps; the backup is {}", backup.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => ("needs-admin", format!("It needs the administrator (the backup is {}).", backup.display())),
+            Err(e) => ("failed", format!("{} (the backup is {})", e, backup.display())),
+        }
+    }
+
+    pub fn delete_run_value(view: &str, name: &str, data: &str, backups: &Path) -> (&'static str, String) {
+        let Some((h, flag)) = view_of(view) else { return ("refused", "Not a start-up entry GitSwitch removes.".into()) };
+        if name.is_empty() {
+            return ("refused", "Not a start-up entry GitSwitch removes.".into());
+        }
+        let Ok(k) = hive(h).open_subkey_with_flags(RUN, KEY_READ | flag) else { return ("gone", "Already gone.".into()) };
+        match k.get_value::<String, _>(name) {
+            Err(_) => return ("gone", "Already gone.".into()),
+            Ok(v) if v != data => return ("changed", "It now starts something else, so it was kept.".into()),
+            Ok(_) => {}
+        }
+        drop(k);
+        let backup = match export(view, RUN, backups, &format!("run-{}", name)) {
+            Ok(b) => b,
+            Err(e) => return ("failed", e),
+        };
+        match hive(h).open_subkey_with_flags(RUN, KEY_SET_VALUE | flag).and_then(|k| k.delete_value(name)) {
+            Ok(()) => ("removed", format!("Windows no longer starts it; the backup is {}", backup.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => ("needs-admin", format!("It needs the administrator (the backup is {}).", backup.display())),
+            Err(e) => ("failed", format!("{} (the backup is {})", e, backup.display())),
+        }
+    }
+
+    /// Shortcuts in the Start menu and on the desktop that started the
+    /// removed program — by their target, never by their name.
+    pub fn shortcuts(s: &Session, own: &[PathBuf], out: &mut Vec<Candidate>) {
+        let Record::WinEntry { icon, .. } = &s.record else { return };
+        let places = shortcut_places();
         let mut files: Vec<(PathBuf, usize)> = Vec::new();
         for (i, (dir, _, _)) in places.iter().enumerate() {
             let mut v = Vec::new();
@@ -1021,24 +1822,20 @@ $j = ConvertTo-Json -InputObject $out -Compress
         if files.is_empty() {
             return;
         }
-        let input = std::env::temp_dir().join(format!("gitswitch-lnk-{}.json", std::process::id()));
-        let list: Vec<String> = files.iter().map(|f| f.0.to_string_lossy().to_string()).collect();
-        if std::fs::write(&input, serde_json::to_vec(&list).unwrap_or_default()).is_err() {
+        let paths: Vec<PathBuf> = files.iter().map(|f| f.0.clone()).collect();
+        let target_of = resolve_targets(&paths);
+        if target_of.is_empty() {
             return;
         }
-        let answer = run_ps(SHORTCUTS, &[("GS_IN", &input.to_string_lossy())]);
-        let _ = std::fs::remove_file(&input);
-        let Some(targets) = answer.ok().and_then(|h| unhex(&h)).and_then(|b| serde_json::from_slice::<Vec<serde_json::Value>>(&b).ok()) else { return };
-        let target_of: HashMap<String, String> = targets.iter().filter_map(|t| Some((t["p"].as_str()?.to_lowercase(), t["t"].as_str().unwrap_or("").to_string()))).collect();
         let stem = icon.as_deref().and_then(exe_stem).map(|s| s.to_lowercase());
-        let dir_l = install_dir.as_ref().map(|d| format!("{}\\", lower(d)));
+        let dirs_l: Vec<String> = own.iter().map(|d| format!("{}\\", lower(d))).collect();
         let qualifies = |f: &Path| -> Option<Confidence> {
             let t = target_of.get(&f.to_string_lossy().to_lowercase())?;
             if t.is_empty() {
                 return None;
             }
             let tl = t.to_lowercase();
-            if dir_l.as_ref().is_some_and(|d| tl.starts_with(d)) {
+            if dirs_l.iter().any(|d| tl.starts_with(d)) {
                 return Some(Confidence::High);
             }
             let tstem = exe_stem(t).map(|x| x.to_lowercase());
@@ -1137,7 +1934,7 @@ $j = ConvertTo-Json -InputObject $out -Compress
         if parts.is_empty() || parts.len() > 2 || parts.iter().any(|p| p.is_empty()) || REG_NEVER.contains(&parts[0].to_lowercase().as_str()) {
             return ("refused", "Not a key GitSwitch deletes.".into());
         }
-        let Some(dir) = dirs::data_dir().map(|d| d.join("com.gitswitch.app").join("registry-backups")) else { return ("failed", "No data folder for the backup.".into()) };
+        let Some(dir) = crate::paths::data_dir().map(|d| d.join("com.gitswitch.app").join("registry-backups")) else { return ("failed", "No data folder for the backup.".into()) };
         let _ = std::fs::create_dir_all(&dir);
         let backup = dir.join(format!("{}-{}.reg", chrono::Local::now().format("%Y%m%d-%H%M%S"), parts.last().unwrap_or(&"key").replace(|c: char| !c.is_alphanumeric(), "_")));
         let reg = format!(r"{}\System32\reg.exe", std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()));
@@ -1273,13 +2070,195 @@ mod tests {
         let l: AppxListing = serde_json::from_slice(&unhex(&hex).unwrap()).unwrap();
         assert_eq!(l.main[0].family, "SpotifyAB.SpotifyMusic_zpdnekdrzrea0");
         assert_eq!(l.all.len(), 1);
-        let (app, _) = appx_app(&l.main[0]);
+        let (app, _) = appx_app(&l.main[0], &SystemFacts::default());
         assert_eq!(app.publisher.as_deref(), Some("5C0B8F5D"));
+        assert_eq!(app.system, None, "a Store app the person installed is theirs");
         assert_eq!(manifest_name("<Package><Properties><DisplayName>Spotify Music</DisplayName></Properties></Package>").as_deref(), Some("Spotify Music"));
+        let xml = "<Package><Properties><DisplayName>ARMOURY CRATE</DisplayName><PublisherDisplayName>ASUSTeK COMPUTER INC.</PublisherDisplayName></Properties></Package>";
+        assert_eq!(manifest_name(xml).as_deref(), Some("ARMOURY CRATE"), "PublisherDisplayName is not the DisplayName");
+        assert_eq!(manifest_publisher(xml).as_deref(), Some("ASUSTeK COMPUTER INC."));
+        assert_eq!(manifest_publisher("<Properties><PublisherDisplayName>ms-resource:Pub</PublisherDisplayName></Properties>"), None);
         assert_eq!(manifest_name("<Properties><DisplayName>ms-resource:AppName</DisplayName></Properties>"), None);
         assert_eq!(unhex("4G"), None);
         assert_eq!(msi_result(0), None);
         assert_eq!(msi_result(1602).unwrap().0, "failed");
         assert_eq!(msi_result(3010).unwrap().0, "restart");
+    }
+
+    fn asus() -> SystemFacts {
+        let mut provisioned = std::collections::HashSet::new();
+        provisioned.insert(provisioned_family("Clipchamp.Clipchamp_4.7.10220.0_neutral_~_yxz26nhyzhsrt").unwrap());
+        provisioned.insert(provisioned_family("Microsoft.WindowsCalculator_11.2502.2.0_x64__8wekyb3d8bbwe").unwrap());
+        SystemFacts { maker: maker_word("ASUSTeK COMPUTER INC."), provisioned }
+    }
+
+    #[test]
+    fn system_apps_are_what_came_with_windows_or_the_pc_runs_its_hardware_or_others_use() {
+        let f = asus();
+        let r = |name: &str, publisher: Option<&str>| system_reason(name, publisher, &f);
+        assert_eq!(r("Armoury Crate Service", Some("ASUSTek COMPUTER INC.")).as_deref(), Some("From your PC's maker"), "ASUSTeK and ASUSTek are one maker");
+        assert_eq!(r("NVIDIA Graphics Driver 555.97", Some("NVIDIA Corporation")).as_deref(), Some("For your hardware"));
+        assert_eq!(r("Intel(R) Wireless Bluetooth(R)", Some("Intel Corporation")).as_deref(), Some("For your hardware"));
+        assert_eq!(r("AMD Software", Some("Advanced Micro Devices, Inc.")).as_deref(), Some("For your hardware"));
+        assert_eq!(r("Microsoft Visual C++ v14 Redistributable (x64) - 14.50.35719", Some("Microsoft Corporation")).as_deref(), Some("Used by other apps"));
+        assert_eq!(r("Microsoft .NET Runtime - 8.0.21 (x64)", Some("Microsoft Corporation")).as_deref(), Some("Used by other apps"));
+        assert_eq!(r("Microsoft ASP.NET Core 8.0.14 - Shared Framework (x86)", Some("Microsoft Corporation")).as_deref(), Some("Used by other apps"));
+        assert_eq!(r("Microsoft OneDrive", Some("Microsoft Corporation")).as_deref(), Some("Part of Windows"));
+        assert_eq!(r("Xbox Service", Some("Microsoft Corporation")).as_deref(), Some("Part of Windows"));
+        assert_eq!(r("Microsoft Windows Application Compatibility Fix Database", None).as_deref(), Some("Part of Windows"));
+        for (name, publisher) in [
+            ("Microsoft Visual Studio Code (User)", Some("Microsoft Corporation")),
+            ("Microsoft Office Professional Plus 2024 - en-us", Some("Microsoft Corporation")),
+            ("Microsoft Build of OpenJDK  17.0.17+10 (x64)", Some("Microsoft")),
+            ("Windows Software Development Kit - Windows 10.0.26100.7705", Some("Microsoft Corporation")),
+            ("Windows SDK AddOn", Some("Microsoft Corporation")),
+            ("Microsoft .NET SDK 8.0.100 (x64)", Some("Microsoft Corporation")),
+            ("µTorrent", Some("BitTorrent Limited")),
+            ("Brave", Some("Brave Software Inc")),
+            ("Google Chrome", Some("Google LLC")),
+            ("Microsoft Knowledge Base Reader", Some("Microsoft Corporation")),
+            ("Docker Desktop", Some("Docker Inc.")),
+            ("Ninja", None),
+        ] {
+            assert_eq!(r(name, publisher), None, "{name}: the person's own");
+        }
+        // Store apps: provisioned ones came with Windows or with the PC.
+        assert_eq!(appx_system_reason("Microsoft.WindowsCalculator", "Microsoft.WindowsCalculator_8wekyb3d8bbwe", Some("Microsoft Corporation"), &f).as_deref(), Some("Came with Windows"));
+        assert_eq!(appx_system_reason("Clipchamp.Clipchamp", "Clipchamp.Clipchamp_yxz26nhyzhsrt", Some("Clipchamp"), &f).as_deref(), Some("Came with this PC"));
+        assert_eq!(appx_system_reason("B9ECED6F.ArmouryCrate", "B9ECED6F.ArmouryCrate_qmba6cd70vzyy", Some("ASUSTeK COMPUTER INC."), &f).as_deref(), Some("From your PC's maker"));
+        assert_eq!(appx_system_reason("MicrosoftCorporationII.WinAppRuntime.Singleton", "x_8wekyb3d8bbwe", Some("Microsoft Corporation"), &f).as_deref(), Some("Used by other apps"));
+        assert_eq!(appx_system_reason("Microsoft.WidgetsPlatformRuntime", "x_8wekyb3d8bbwe", Some("Microsoft Corporation"), &f).as_deref(), Some("Part of Windows"));
+        assert_eq!(appx_system_reason("Microsoft.Winget.Source", "x_8wekyb3d8bbwe", Some("Microsoft Corporation"), &f).as_deref(), Some("Part of Windows"));
+        assert_eq!(appx_system_reason("com.tinyspeck.slackdesktop", "com.tinyspeck.slackdesktop_8yrtsj140pw4g", Some("Slack Technologies Inc."), &f), None);
+        // ASUS's sparse package: its manifest says "Sparse Package", its signer says ASUS.
+        let sparse = Appx { name: "ASUSAmbientHAL64".into(), full: "ASUSAmbientHAL64_1.0.0.3_neutral__ecvjzhf6c4w7r".into(), family: "ASUSAmbientHAL64_ecvjzhf6c4w7r".into(), publisher: Some("CN=ASUSTeK COMPUTER INC., O=ASUSTeK COMPUTER INC., L=Taipei, C=TW".into()), version: None, dir: None };
+        let (app, _) = appx_app(&sparse, &f);
+        assert_eq!(app.system.as_deref(), Some("From your PC's maker"));
+        assert_eq!(app.publisher.as_deref(), Some("ASUSTeK COMPUTER INC."));
+        assert_eq!(appx_system_reason("Microsoft.PowerToys", "Microsoft.PowerToys_8wekyb3d8bbwe", Some("Microsoft Corporation"), &f), None, "a Store app the person installed");
+        // A self-built PC or a Surface has no "maker's apps".
+        for m in ["System manufacturer", "To Be Filled By O.E.M.", "Default string", "Microsoft Corporation", ""] {
+            assert_eq!(maker_word(m), None, "{m}");
+        }
+        assert_eq!(maker_word("Dell Inc.").as_deref(), Some("dell"));
+        assert_eq!(first_word("Intel(R) Corporation").as_deref(), Some("intel"));
+        assert_eq!(first_word("Micro-Star International Co., Ltd.").as_deref(), Some("micro-star"));
+        assert_eq!(provisioned_family("Microsoft.X_1.0.0.0_x64__8wekyb3d8bbwe").as_deref(), Some("microsoft.x_8wekyb3d8bbwe"));
+        assert_eq!(provisioned_family("nounderscores"), None);
+    }
+
+    #[test]
+    fn an_install_folder_comes_from_its_program_named_like_the_app_never_from_a_cache() {
+        let names = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let zoho = names(&["Zoho Mail - Desktop 1.7.4", "Zoho Mail - Desktop"]);
+        assert_eq!(install_dir_of(Path::new(r"C:\Program Files\Zoho Mail - Desktop\Zoho Mail - Desktop.exe"), &zoho), Some(PathBuf::from(r"C:\Program Files\Zoho Mail - Desktop")));
+        let dd = names(&["Disk Drill 6.3.1398.0", "Disk Drill", "DiskDrill"]);
+        assert_eq!(install_dir_of(Path::new(r"C:\Program Files\CleverFiles\Disk Drill\DiskDrill.exe"), &dd), Some(PathBuf::from(r"C:\Program Files\CleverFiles\Disk Drill")));
+        assert_eq!(install_dir_of(Path::new(r"C:\ProgramData\Package Cache\{E6E5DD13-939D-4CB1-8E74-ACBF3501726B}\DiskDrillSetup.6.3.1398.0.exe"), &dd), None, "an installer's cache");
+        assert_eq!(install_dir_of(Path::new(r"C:\Windows\Installer\{E6E5DD13-939D-4CB1-8E74-ACBF3501726B}\icon.exe"), &dd), None, "Windows' own folder");
+        let idm = names(&["Internet Download Manager", "IDMan"]);
+        assert_eq!(install_dir_of(Path::new(r"C:\Users\me\Downloads\Internet Download Manager\IDMan.exe"), &idm), None, "a download is not an install");
+        assert_eq!(install_dir_of(Path::new(r"C:\Program Files\Foo Tool\bin\x64\foo.exe"), &names(&["Foo Tool"])), Some(PathBuf::from(r"C:\Program Files\Foo Tool")), "bin and x64 walked up");
+        assert_eq!(install_dir_of(Path::new(r"C:\Users\me\AppData\Local\Discordia\app-1.0.9\Discordia.exe"), &names(&["Discordia"])), Some(PathBuf::from(r"C:\Users\me\AppData\Local\Discordia")), "a Squirrel version folder");
+        assert_eq!(install_dir_of(Path::new(r"C:\Program Files\Common Files\Foo\foo.exe"), &names(&["Bar"])), None, "named like another app");
+        assert_eq!(install_dir_of(Path::new(r"C:\Tools\foo.exe"), &names(&["Tools"])), None, "too near the drive");
+        assert_eq!(install_dir_of(Path::new(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"), &names(&["Microsoft Edge", "msedge"])), None);
+        // A developer's build or a portable copy named like the app is not where it is installed.
+        assert_eq!(install_dir_of(Path::new(r"C:\Users\me\source\repos\AcmeStudio\x64\Release\AcmeStudio.exe"), &names(&["Acme Studio"])), None);
+        assert_eq!(install_dir_of(Path::new(r"D:\Apps\AcmeStudio\AcmeStudio.exe"), &names(&["Acme Studio"])), None);
+        assert_eq!(install_dir_of(Path::new(r"D:\Program Files\Acme Studio\acme.exe"), &names(&["Acme Studio"])), Some(PathBuf::from(r"D:\Program Files\Acme Studio")), "Program Files on another drive");
+        assert_eq!(install_dir_of(Path::new(r"C:\Users\me\Documents\Acme Studio\acme.exe"), &names(&["Acme Studio"])), None, "a person's documents");
+        assert!(in_install_root(Path::new(r"C:\ProgramData\CleverFiles\Disk Drill")) && in_install_root(Path::new(r"C:\Users\me\AppData\Roaming\uTorrent")) && !in_install_root(Path::new(r"C:\Users\me\Desktop\x")));
+        assert_eq!(icon_file(r#""C:\Users\me\AppData\Roaming\uTorrent\uTorrent.exe",0"#), Some(PathBuf::from(r"C:\Users\me\AppData\Roaming\uTorrent\uTorrent.exe")));
+        assert_eq!(icon_file(r"C:\Program Files\X\x.ico"), Some(PathBuf::from(r"C:\Program Files\X\x.ico")));
+        assert_eq!(icon_file("x.exe,0"), None, "not a full path");
+        let mut v = vec![PathBuf::from(r"C:\Program Files\Foo\sub")];
+        push_dir(&mut v, PathBuf::from(r"C:\Program Files\Foo"));
+        push_dir(&mut v, PathBuf::from(r"c:\program files\foo\other"));
+        assert_eq!(v, vec![PathBuf::from(r"C:\Program Files\Foo")], "the outer folder only, once");
+    }
+
+    #[test]
+    fn an_older_session_still_finds_its_folder_from_what_its_entry_points_at() {
+        // Zoho Mail's real entry: no InstallLocation, its icon in its folder.
+        let rec = Record::WinEntry {
+            view: "HKLM64".into(),
+            key: "435bda16-99fd-51d0-938d-c156968a2aa4".into(),
+            uninstall: r#""C:\Program Files\Zoho Mail - Desktop\Uninstall Zoho Mail - Desktop.exe" /allusers"#.into(),
+            msi: None,
+            install_dir: None,
+            icon: Some(r"C:\Program Files\Zoho Mail - Desktop\Zoho Mail - Desktop.exe,0".into()),
+            dirs: vec![],
+            exes: vec![],
+            startup: vec![],
+            bundle: false,
+        };
+        assert_eq!(recorded_dirs("Zoho Mail - Desktop 1.7.4", &rec), vec![PathBuf::from(r"C:\Program Files\Zoho Mail - Desktop")]);
+        // Disk Drill's: everything in an installer's cache — nothing derived.
+        let dd = |msi: Option<&str>, bundle: bool| Record::WinEntry {
+            view: "HKLM64".into(),
+            key: "{E6E5DD13-939D-4CB1-8E74-ACBF3501726B}".into(),
+            uninstall: r#""C:\ProgramData\Package Cache\{E6E5DD13-939D-4CB1-8E74-ACBF3501726B}\DiskDrillSetup.6.3.1398.0.exe"  /uninstall"#.into(),
+            msi: msi.map(str::to_string),
+            install_dir: None,
+            icon: Some(r"C:\ProgramData\Package Cache\{E6E5DD13-939D-4CB1-8E74-ACBF3501726B}\DiskDrillSetup.6.3.1398.0.exe,0".into()),
+            dirs: vec![],
+            exes: vec![],
+            startup: vec![],
+            bundle,
+        };
+        assert!(recorded_dirs("Disk Drill 6.3.1398.0", &dd(None, true)).is_empty());
+        let app = InstalledApp { name: "Disk Drill 6.3.1398.0".into(), ..Default::default() };
+        let (plan, why) = force_plan(&app, &dd(None, true));
+        assert!(plan.is_none() && why.unwrap().contains("setup bundle"), "a bundle is removed by its own uninstaller");
+        assert!(force_plan(&app, &dd(Some("{23170F69-40C1-2702-2301-000001000000}"), false)).1.unwrap().contains("Windows Installer"));
+        assert!(force_plan(&app, &dd(None, false)).1.unwrap().contains("isn't known"));
+    }
+
+    #[test]
+    fn the_administrators_cleanup_never_touches_windows_or_shared_folders() {
+        // Shallow or shared folders are refused wherever this runs.
+        for bad in [r"C:\", r"C:\Program Files", r"C:\Windows\System32\drivers", r"C:\Program Files\Common Files", r"C:\Program Files\Microsoft Office", r"C:\Program Files\WindowsApps"] {
+            assert!(elevated_path_ok(Path::new(bad)).is_err(), "{bad}");
+        }
+        assert!(elevated_path_ok(Path::new(r"D:\Games\Some Game")).is_ok(), "a program's own folder on another drive");
+        for bad in [r"C:\Users\me\Documents\Taxes", r"C:\Users\other\AppData", r"C:\Users\Public\Desktop\Notes.txt", r"C:\Users\me\Desktop\Projects"] {
+            assert!(elevated_path_ok(Path::new(bad)).is_err(), "{bad}: a person's own files");
+        }
+        assert!(elevated_path_ok(Path::new(r"C:\Users\Public\Desktop\Disk Drill.lnk")).is_ok(), "the shared Desktop's shortcut");
+        assert!(elevated_path_ok(Path::new(r"C:\Users\me\AppData\Roaming\uTorrent")).is_ok());
+        assert_ne!(backup_name("HKLM64", "run-x"), backup_name("HKLM64", "run-x"), "never the same backup file twice");
+        assert!(backup_name("HKLM32", "run-x").contains("-HKLM32-run_x-"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_program_whose_files_are_already_gone_can_still_be_removed_from_the_list() {
+        let gone = PathBuf::from(r"C:\Program Files\GitSwitch Test Program That Is Not There");
+        let rec = Record::WinEntry { view: "HKCU".into(), key: "GitSwitchTestNothing".into(), uninstall: String::new(), msi: None, install_dir: Some(gone.clone()), icon: None, dirs: vec![gone], exes: vec![], startup: vec![], bundle: false };
+        let app = InstalledApp { name: "GitSwitch Test Program".into(), ..Default::default() };
+        let (plan, why) = force_plan(&app, &rec);
+        let plan = plan.unwrap_or_else(|| panic!("{why:?}"));
+        assert!(plan.folders.is_empty() && plan.entry.ends_with(r"\GitSwitchTestNothing"), "only its entry is left to remove");
+        let unplugged = PathBuf::from(r"Q:\Games\Gone");
+        if !Path::new(r"Q:\").exists() {
+            let rec = Record::WinEntry { view: "HKCU".into(), key: "k".into(), uninstall: String::new(), msi: None, install_dir: Some(unplugged.clone()), icon: None, dirs: vec![unplugged], exes: vec![], startup: vec![], bundle: false };
+            assert!(force_plan(&app, &rec).1.unwrap().contains("can't be reached"), "a drive that isn't there");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn what_needs_the_administrator_is_measured() {
+        let f = std::env::temp_dir().join(format!("gitswitch-can-delete-{}", std::process::id()));
+        std::fs::write(&f, b"x").unwrap();
+        assert!(can_delete(&f), "your own file");
+        let _ = std::fs::remove_file(&f);
+        let pf = std::env::var("ProgramFiles").unwrap();
+        assert!(!can_delete(Path::new(&pf)), "Program Files needs the administrator");
+        assert!(elevated_path_ok(Path::new(&pf).join("CleverFiles").as_path()).is_ok());
+        assert!(elevated_path_ok(Path::new(&std::env::var("ProgramData").unwrap()).join("CleverFiles").as_path()).is_ok());
+        assert!(elevated_path_ok(Path::new(&std::env::var("SystemRoot").unwrap()).join("Temp").as_path()).is_err());
+        assert!(elevated_path_ok(Path::new(&std::env::var("APPDATA").unwrap())).is_err(), "a folder Windows uses");
     }
 }

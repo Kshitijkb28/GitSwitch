@@ -166,6 +166,30 @@ pub fn shell_quote(v: &str) -> String {
     }
 }
 
+/// The platform's data folder, which holds `com.gitswitch.app` (the profile
+/// store, the per-profile include files, backups). On Windows `dirs` asks the
+/// system for it and ignores HOME, so the verify suites — whose HOME is a
+/// sandbox — would write their profiles into the person's real store; a
+/// debug build honours `GITSWITCH_DATA_DIR` for them. A release build ignores it.
+pub fn data_dir() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("GITSWITCH_DATA_DIR").filter(|d| !d.is_empty()) {
+        return Some(dir.into());
+    }
+    dirs::data_dir()
+}
+
+/// The home folder `~/.ssh` is under, as `dirs` gives it (on Windows the
+/// user profile folder, whatever HOME says). A debug build honours
+/// `GITSWITCH_HOME`, for the same reason as `data_dir`.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("GITSWITCH_HOME").filter(|d| !d.is_empty()) {
+        return Some(dir.into());
+    }
+    dirs::home_dir()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

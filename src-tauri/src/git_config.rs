@@ -209,7 +209,7 @@ pub(crate) fn ssh_command_for(key: &str) -> String {
 /// `C:\Users\me\...` produces `fatal: bad config line` and makes the entire
 /// ~/.gitconfig unreadable — not just for GitSwitch, for every git command.
 fn get_profile_gitconfig_path(profile: &Profile) -> String {
-    let data_dir = dirs::data_dir().unwrap_or_default();
+    let data_dir = crate::paths::data_dir().unwrap_or_default();
     let app_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
     crate::paths::norm(&format!("{}/{}.gitconfig", app_dir.display(), profile.id))
 }
@@ -307,7 +307,7 @@ fn profile_gitconfig_content(profile: &Profile, default_signs: bool) -> String {
 }
 
 fn write_profile_gitconfig(profile: &Profile, default_signs: bool) -> Result<(), AppError> {
-    let data_dir = dirs::data_dir().ok_or(AppError::Config("Cannot find data dir".into()))?;
+    let data_dir = crate::paths::data_dir().ok_or(AppError::Config("Cannot find data dir".into()))?;
     let config_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
     fs::create_dir_all(&config_dir)?;
 
@@ -385,7 +385,7 @@ pub fn apply_git_config() -> Result<(), AppError> {
 }
 
 fn cleanup_orphan_gitconfigs(store: &crate::profiles::ProfileStore) {
-    let Some(data_dir) = dirs::data_dir() else { return };
+    let Some(data_dir) = crate::paths::data_dir() else { return };
     let config_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
     let Ok(entries) = fs::read_dir(&config_dir) else { return };
 

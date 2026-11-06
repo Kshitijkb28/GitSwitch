@@ -33,6 +33,28 @@ pub struct BranchInfo {
     /// One of GitSwitch's own backup branches (see `is_safety_branch`).
     #[serde(default)]
     pub is_backup: bool,
+    /// `refs/heads/x` or `refs/remotes/origin/x` — unambiguous where the
+    /// short name is not (a remote ref shortens to `remotes/origin/x` when a
+    /// local branch is called `origin/x`).
+    #[serde(default)]
+    pub full_ref: String,
+    /// A remote-tracking branch's name on its remote: `x` for `origin/x`,
+    /// `team/x` for `origin/team/x`. None for a local branch, or a remote ref
+    /// no configured remote owns.
+    #[serde(default)]
+    pub remote_branch: Option<String>,
+}
+
+/// The branch name on the remote for `refs/remotes/<remote>/<branch>`. A
+/// remote's name may hold a `/` itself, so the longest configured remote that
+/// prefixes the ref wins.
+fn split_remote(full_ref: &str, remotes: &[String]) -> Option<String> {
+    let rest = full_ref.strip_prefix("refs/remotes/")?;
+    remotes
+        .iter()
+        .filter(|r| rest.len() > r.len() + 1 && rest.starts_with(r.as_str()) && rest.as_bytes()[r.len()] == b'/')
+        .max_by_key(|r| r.len())
+        .map(|r| rest[r.len() + 1..].to_string())
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -453,6 +475,14 @@ pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
         &["for-each-ref", "--sort=-committerdate", "--format", &fmt, "refs/heads", "refs/remotes"],
     )?;
 
+    // Only needed to name a remote branch on its remote; read once, and only
+    // when there is a remote-tracking ref to name.
+    let remotes: Vec<String> = if raw.lines().any(|l| l.starts_with("refs/remotes/")) {
+        git(&repo, &["remote"]).map(|r| r.lines().map(str::to_string).collect()).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     let mut branches = Vec::new();
     for line in raw.lines() {
         // subject is last so any separator inside it can't shift the other fields
@@ -488,6 +518,8 @@ pub fn list_branches(repo_path: &str) -> Result<Vec<BranchInfo>, AppError> {
             last_author: f[5].to_string(),
             last_date: f[6].to_string(),
             last_subject: f[9].to_string(),
+            remote_branch: if is_remote { split_remote(full_ref, &remotes) } else { None },
+            full_ref: full_ref.to_string(),
         });
     }
     Ok(branches)
@@ -1321,6 +1353,21 @@ mod tests {
         assert_eq!(list[1].email, "bob@x");
         assert_eq!(list[2], AuthorCount { name: "No Email".into(), email: String::new(), commits: 1 });
         assert!(parse_shortlog("").is_empty());
+    }
+
+    #[test]
+    fn a_remote_branch_is_named_as_it_is_on_its_remote() {
+        let remotes = vec!["origin".to_string(), "a/b".to_string(), "a".to_string()];
+        assert_eq!(split_remote("refs/remotes/origin/feature", &remotes).as_deref(), Some("feature"));
+        assert_eq!(split_remote("refs/remotes/origin/team/feature", &remotes).as_deref(), Some("team/feature"));
+        // A remote whose name holds a slash: the longest remote that prefixes the ref owns it.
+        assert_eq!(split_remote("refs/remotes/a/b/x", &remotes).as_deref(), Some("x"));
+        assert_eq!(split_remote("refs/remotes/a/c", &remotes).as_deref(), Some("c"));
+        // No configured remote owns it, a remote name alone, or a local branch.
+        assert_eq!(split_remote("refs/remotes/upstream/x", &remotes), None);
+        assert_eq!(split_remote("refs/remotes/origin", &remotes), None);
+        assert_eq!(split_remote("refs/remotes/origin/", &remotes), None);
+        assert_eq!(split_remote("refs/heads/origin/x", &remotes), None);
     }
 
     #[test]

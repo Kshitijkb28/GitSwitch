@@ -3482,7 +3482,7 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         }
     }
     if opts.bundles {
-        if let Some(dir) = dirs::data_dir().map(|d| d.join("com.gitswitch.app").join("update-backups").join(format!("{}-{}", crate::paths::base_name(repo_path), id))) {
+        if let Some(dir) = crate::paths::data_dir().map(|d| d.join("com.gitswitch.app").join("update-backups").join(format!("{}-{}", crate::paths::base_name(repo_path), id))) {
             if let Ok(p) = write_bundle(&repo, &dir, "superproject").await {
                 st.bundles.push(p);
             }

@@ -169,7 +169,7 @@ export function StatusStrip({
             size="sm"
             variant="ghost"
             disabled={busy || !status || !!status.operation || !actions}
-            title={opTitle ?? (busy ? "Wait for the running operation" : "Switch, create, rename or delete local branches")}
+            title={opTitle ?? (busy ? "Wait for the running operation" : "Switch to a local or remote branch; create, rename or delete local ones")}
             onClick={() => actions?.branches()}
             className="px-2"
           >

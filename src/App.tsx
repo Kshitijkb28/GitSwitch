@@ -88,15 +88,18 @@ function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Only the page scrolls, and the sidebar's list in a window too short for it —
+  // never the window as a whole, which put a second scrollbar beside the
+  // page's on Windows. The sidebar fits the default window (650 high).
   return (
-    <div className="flex h-screen bg-zinc-900 text-zinc-100">
+    <div className="flex h-screen overflow-hidden bg-zinc-900 text-zinc-100">
       <nav className="w-56 shrink-0 border-r border-zinc-800 flex flex-col">
         <div className="p-4 border-b border-zinc-800">
           <h1 className="text-lg font-bold tracking-tight">
             <span className="text-emerald-400">Git</span>Switch
           </h1>
         </div>
-        <div className="flex-1 p-3 space-y-1">
+        <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-0.5 [scrollbar-width:thin]">
           <SidebarLink
             to="/"
             icon={<LayoutDashboard size={18} />}
@@ -148,7 +151,7 @@ function App() {
             type="button"
             onClick={toggleConsole}
             title="A shell in the selected repository (Ctrl/Cmd + `)"
-            className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors cursor-pointer ${
+            className={`w-full flex items-center gap-3 px-3 py-1.5 rounded-lg text-sm transition-colors cursor-pointer ${
               consoleOpen
                 ? "bg-emerald-500/10 text-emerald-400"
                 : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
@@ -220,7 +223,7 @@ function SidebarLink({
       end
       className={({ isActive }) => {
         const highlighted = active !== undefined ? active : isActive;
-        return `flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${
+        return `flex items-center gap-3 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
           highlighted
             ? "bg-zinc-800 text-emerald-400"
             : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50"

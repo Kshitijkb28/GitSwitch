@@ -61,7 +61,7 @@ pub(crate) fn shell_pids() -> Vec<u32> {
 }
 
 fn app_dir() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("com.gitswitch.app"))
+    Some(crate::paths::data_dir()?.join("com.gitswitch.app"))
 }
 
 fn shim_dir() -> Option<PathBuf> {

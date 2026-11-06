@@ -49,6 +49,10 @@ pub struct InstalledApp {
     pub blocked: Option<String>,
     /// GitSwitch itself: it has its own uninstall.
     pub is_self: bool,
+    /// A system app, and why: it came with Windows or the PC, runs its
+    /// hardware, or other apps use it ("Your apps" holds the rest).
+    #[serde(default)]
+    pub system: Option<String>,
 }
 
 /// What the backend needs to remove it — never sent by the page.
@@ -56,12 +60,41 @@ pub struct InstalledApp {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Record {
     MacBundle { bundle: PathBuf, bundle_id: String, cask: Option<String>, vendor_uninstaller: Option<PathBuf>, app_store: bool },
-    WinEntry { view: String, key: String, uninstall: String, msi: Option<String>, install_dir: Option<PathBuf>, icon: Option<String> },
+    WinEntry {
+        view: String,
+        key: String,
+        uninstall: String,
+        msi: Option<String>,
+        install_dir: Option<PathBuf>,
+        icon: Option<String>,
+        /// Every folder it is installed in, recorded before it goes (its
+        /// InstallLocation, or where its program, uninstaller and shortcuts point).
+        #[serde(default)]
+        dirs: Vec<PathBuf>,
+        /// Its programs' names (`DiskDrill` for DiskDrill.exe).
+        #[serde(default)]
+        exes: Vec<String>,
+        /// What starts it when Windows starts: Run values pointing into its folders.
+        #[serde(default)]
+        startup: Vec<Startup>,
+        /// Installed by a setup bundle (WiX Burn): the bundle registered more than this entry.
+        #[serde(default)]
+        bundle: bool,
+    },
     WinAppx { full_name: String, family: String, name: String, install_dir: Option<PathBuf> },
     Deb { package: String, desktop: Vec<PathBuf> },
     Snap { name: String, classic: bool },
     Flatpak { id: String, installation: String, branch: Option<String> },
     AppImage { file: PathBuf, desktop: Vec<PathBuf> },
+}
+
+/// A Run value that starts a program when Windows starts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Startup {
+    /// HKCU | HKLM64 | HKLM32
+    pub view: String,
+    pub name: String,
+    pub data: String,
 }
 
 /// A platform's listing: the apps with what removing each needs, and notes.
@@ -109,6 +142,31 @@ pub struct Prepared {
     pub warnings: Vec<String>,
     /// macOS: the app's own uninstaller, to use instead.
     pub vendor_uninstaller: Option<String>,
+    /// Windows: deleting its files directly instead of running its uninstaller.
+    pub force: Option<ForcePlan>,
+    /// Windows: why its files can't be deleted directly.
+    pub force_unavailable: Option<String>,
+}
+
+/// Windows: what deleting a program's files directly would remove.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ForcePlan {
+    pub folders: Vec<ForceFolder>,
+    /// Its entry in Installed apps.
+    pub entry: String,
+    pub entry_admin: bool,
+    /// Its start-up entries, as "name (where)".
+    pub startup: Vec<String>,
+    /// Windows asks for permission for some of it.
+    pub admin: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ForceFolder {
+    pub path: String,
+    pub size: Option<u64>,
+    pub size_complete: bool,
+    pub admin: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -130,9 +188,13 @@ pub struct Leftover {
     pub size_complete: bool,
     pub confidence: Confidence,
     pub reason: String,
-    /// Needs the administrator: listed with `command`, not deleted here.
+    /// Needs the administrator.
     pub admin: bool,
+    /// What the administrator would run, where GitSwitch can't do it itself.
     pub command: Option<String>,
+    /// GitSwitch deletes it after Windows' permission prompt (Windows).
+    #[serde(default)]
+    pub elevate: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,7 +204,7 @@ pub struct LeftoverScan {
     pub notes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deleted {
     pub id: String,
     /// trashed | removed | gone | changed | refused | needs-admin | protected | failed
@@ -172,6 +234,9 @@ pub(crate) enum Action {
     Purge { package: String },
     /// A command link that pointed into the removed app: still that link, to the Trash.
     Link { target: PathBuf },
+    /// Windows: a Run value that started it, exported first.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    RunValue { view: String, name: String, data: String },
     /// Listed only.
     None,
 }
@@ -206,11 +271,18 @@ pub(crate) struct Place {
     pub vendor_depth: bool,
     /// The home folder: only `.name` entries, matched without their dot.
     pub dot_names: bool,
+    /// Windows: a publisher's folder is also its name without the legal
+    /// form, and the app's exact name inside it is sure (two things agree).
+    pub vendor_sure: bool,
 }
 
 impl Place {
     pub fn new(path: PathBuf, label: &str, allow: Allow) -> Place {
-        Place { path, label: label.to_string(), allow, admin: false, sized: true, vendor_depth: false, dot_names: false }
+        Place { path, label: label.to_string(), allow, admin: false, sized: true, vendor_depth: false, dot_names: false, vendor_sure: false }
+    }
+    pub fn sure(mut self) -> Place {
+        self.vendor_sure = true;
+        self
     }
     pub fn admin(mut self) -> Place {
         self.admin = true;
@@ -269,7 +341,7 @@ pub(crate) fn home() -> PathBuf {
 }
 
 fn data_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("com.gitswitch.app"))
+    crate::paths::data_dir().map(|d| d.join("com.gitswitch.app"))
 }
 
 pub(crate) fn now() -> i64 {
@@ -297,6 +369,8 @@ struct ScanItem {
     ident: Option<Ident>,
     action: Action,
     admin: bool,
+    /// Done after Windows' permission prompt.
+    elevate: bool,
     entry: Option<(String, Allow)>,
 }
 
@@ -356,7 +430,7 @@ pub(crate) fn log(event: serde_json::Value) {
 // ---------------------------------------------------------------------------
 // The file or folder the scan saw, and nothing else.
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Ident {
     dev: u64,
     ino: u64,
@@ -365,7 +439,25 @@ pub(crate) struct Ident {
     /// For a file: size and modification time. A folder's time changes with
     /// what is inside, so it is not compared.
     len: Option<u64>,
+    #[serde(with = "i128_text")]
     mtime: Option<i128>,
+}
+
+/// An i128 travels as text: JSON numbers stop at 64 bits.
+mod i128_text {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<i128>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(n) => s.serialize_some(&n.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i128>, D::Error> {
+        let t: Option<String> = Option::deserialize(d)?;
+        t.map(|x| x.parse().map_err(serde::de::Error::custom)).transpose()
+    }
 }
 
 /// None for a link (or junction), or what can't be read.
@@ -540,7 +632,7 @@ pub(crate) fn to_trash(path: &Path) -> TrashOutcome {
             let lower = text.to_lowercase();
             if lower.contains("not permitted") || lower.contains("code=513") {
                 TrashOutcome::Protected(text)
-            } else if lower.contains("permission denied") || lower.contains("access is denied") || lower.contains("code: 13") || lower.contains("code: 5,") {
+            } else if lower.contains("permission denied") || lower.contains("access is denied") || lower.contains("code: 13") || lower.contains("code: 5,") || lower.contains("-2147024891") || lower.contains("0x80070005") {
                 TrashOutcome::NeedsAdmin(text)
             } else {
                 TrashOutcome::Failed(text)
@@ -612,7 +704,10 @@ pub(crate) fn scan_places(places: &[Place], ev: &Evidence, others: &Others) -> (
             // `<vendor>/<name>`: the vendor folder is never the app's, a
             // folder named exactly like the app inside it may be.
             let vendor = ev.vendor.as_deref().map(|v| matcher::norm(v, others.fold_case()));
-            if place.vendor_depth && ft.is_dir() && vendor.is_some_and(|v| v == matcher::norm(&key, others.fold_case())) {
+            let vendor_folder = if place.vendor_sure { matcher::vendor_matches(&key, ev.vendor.as_deref()) } else { vendor.is_some_and(|v| v == matcher::norm(&key, others.fold_case())) };
+            // Sure only under a publisher's own name: "Microsoft" or "Google" hold many apps' folders.
+            let sure = place.vendor_sure && matcher::usable_name(&key);
+            if place.vendor_depth && ft.is_dir() && vendor_folder {
                 let names_only = Evidence { ids: vec![], names: ev.names.clone(), groups: vec![], vendor: None };
                 let Ok(inner) = std::fs::read_dir(e.path()) else { continue };
                 for c in inner.flatten() {
@@ -630,7 +725,7 @@ pub(crate) fn scan_places(places: &[Place], ev: &Evidence, others: &Others) -> (
                             root: place.path.clone(),
                             place: place.label.clone(),
                             kind: "folder",
-                            m: Match { confidence: m.confidence, reason: format!("in {}: {}", name, m.reason) },
+                            m: Match { confidence: if sure { Confidence::High } else { m.confidence }, reason: format!("in {}: {}", name, m.reason) },
                             admin: false,
                             command: None,
                             action: Action::Trash,
@@ -698,6 +793,10 @@ pub async fn size(id: String) -> Result<(u64, bool), AppError> {
     tokio::task::spawn_blocking(move || size_of(&path, Duration::from_secs(4))).await.map_err(|e| AppError::Command(e.to_string()))
 }
 
+/// A platform's confirm step: what to show, what identifies the app, the
+/// packages approved (Ubuntu).
+type Prepped = (Prepared, Evidence, Vec<String>);
+
 /// The confirm step: record what identifies the app, say how it will go.
 pub async fn prepare(id: String) -> Result<Prepared, AppError> {
     if !lock().list.contains_key(&id) {
@@ -710,19 +809,26 @@ pub async fn prepare(id: String) -> Result<Prepared, AppError> {
     }
     let session_id = uuid::Uuid::new_v4().to_string();
     let (rec2, app2) = (rec.clone(), app.clone());
-    let mut p = tokio::task::spawn_blocking(move || -> Result<(Prepared, Evidence, Vec<String>), AppError> {
+    let (mut p, rec) = tokio::task::spawn_blocking(move || -> Result<(Prepped, Record), AppError> {
         if cfg!(target_os = "macos") {
-            macos::prepare(&app2, &rec2)
+            macos::prepare(&app2, &rec2).map(|p| (p, rec2))
         } else if cfg!(windows) {
-            windows::prepare(&app2, &rec2)
+            // What only the installed program can tell: its folders, programs, start-up entries.
+            let rec2 = windows::enrich(&app2, &rec2);
+            windows::prepare(&app2, &rec2).map(|p| (p, rec2))
         } else {
-            linux::prepare(&app2, &rec2)
+            linux::prepare(&app2, &rec2).map(|p| (p, rec2))
         }
     })
     .await
     .map_err(|e| AppError::Command(e.to_string()))??;
     if p.0.blocked.is_none() {
         p.0.blocked = app.blocked.clone();
+    }
+    // A system app can go, but something may need it.
+    if let Some(why) = &app.system {
+        let os = if cfg!(target_os = "macos") { "macOS" } else { "Windows" };
+        p.0.warnings.push(format!("{}: {}, your hardware or other apps may need it.", why, os));
     }
     let session = Session {
         id: session_id.clone(),
@@ -862,14 +968,14 @@ fn scan_blocking(mut s: Session, registry: bool) -> Result<LeftoverScan, AppErro
     cands.sort_by(|a, b| a.path.cmp(&b.path).then(b.m.confidence.cmp(&a.m.confidence)));
     cands.dedup_by(|a, b| a.path == b.path);
     // Nothing inside something else that is offered.
-    let paths: Vec<PathBuf> = cands.iter().filter(|c| c.kind != "registry").map(|c| c.path.clone()).collect();
-    cands.retain(|c| c.kind == "registry" || !paths.iter().any(|p| p != &c.path && c.path.starts_with(p)));
+    let paths: Vec<PathBuf> = cands.iter().filter(|c| file_backed(c.kind)).map(|c| c.path.clone()).collect();
+    cands.retain(|c| !file_backed(c.kind) || !paths.iter().any(|p| p != &c.path && c.path.starts_with(p)));
     let scan_id = uuid::Uuid::new_v4().to_string();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut items = Vec::new();
     let mut held = HashMap::new();
     for (i, c) in cands.into_iter().enumerate() {
-        let file_backed = c.kind != "registry" && c.kind != "package-settings";
+        let file_backed = file_backed(c.kind);
         if file_backed && link_on_the_way(&c.root, &c.path) {
             notes.push(format!("{} was skipped: a folder on the way to it is a link.", c.path.display()));
             continue;
@@ -882,9 +988,11 @@ fn scan_blocking(mut s: Session, registry: bool) -> Result<LeftoverScan, AppErro
         } else {
             (None, false)
         };
+        // Windows: GitSwitch does what needs the administrator after its prompt.
+        let elevate = c.admin && cfg!(windows) && c.action != Action::None;
         held.insert(
             id.clone(),
-            ScanItem { path: c.path.clone(), root: c.root.clone(), ident: if file_backed { ident(&c.path) } else { None }, action: c.action.clone(), admin: c.admin, entry: c.entry.clone() },
+            ScanItem { path: c.path.clone(), root: c.root.clone(), ident: if file_backed { ident(&c.path) } else { None }, action: c.action.clone(), admin: c.admin, elevate, entry: c.entry.clone() },
         );
         items.push(Leftover {
             id,
@@ -897,6 +1005,7 @@ fn scan_blocking(mut s: Session, registry: bool) -> Result<LeftoverScan, AppErro
             reason: c.m.reason,
             admin: c.admin,
             command: c.command,
+            elevate,
         });
     }
     let mut st = lock();
@@ -905,12 +1014,45 @@ fn scan_blocking(mut s: Session, registry: bool) -> Result<LeftoverScan, AppErro
     Ok(LeftoverScan { scan: scan_id, items, notes })
 }
 
-/// Move the leftovers the person ticked to the Trash — each one checked again first.
+/// Move the leftovers the person ticked to the Trash — each one checked
+/// again first; on Windows, what needs the administrator after one prompt.
 pub async fn delete(scan: String, ids: Vec<String>) -> Result<Vec<Deleted>, AppError> {
-    tokio::task::spawn_blocking(move || delete_blocking(scan, ids)).await.map_err(|e| AppError::Command(e.to_string()))?
+    let (session, mut out, batch) = tokio::task::spawn_blocking(move || delete_blocking(scan, ids)).await.map_err(|e| AppError::Command(e.to_string()))??;
+    if !batch.is_empty() {
+        let app = load_session(&session).map(|s| s.app.name).unwrap_or_default();
+        match Box::pin(elevated_run(batch.clone(), false)).await {
+            Ok(done) => {
+                for d in done {
+                    log(serde_json::json!({ "event": "leftover", "app": app, "id": d.id, "outcome": d.outcome, "message": d.message, "elevated": true }));
+                    out.push(d);
+                }
+            }
+            Err(why) => {
+                for b in batch {
+                    out.push(Deleted { id: b.id, outcome: "needs-admin".into(), message: why.clone() });
+                }
+            }
+        }
+    }
+    if out.iter().all(|d| d.outcome == "trashed" || d.outcome == "removed" || d.outcome == "gone") {
+        if let Ok(mut s) = load_session(&session) {
+            s.state = "cleaned".into();
+            save_session(&s);
+        }
+    }
+    Ok(out)
 }
 
-fn delete_blocking(scan: String, ids: Vec<String>) -> Result<Vec<Deleted>, AppError> {
+/// What a leftover came to: done here, or to do after the permission prompt.
+enum Step {
+    Done(&'static str, String),
+    Elevate(JobWhat),
+}
+
+/// (session, what was done here, what needs the administrator)
+type Phase = (String, Vec<Deleted>, Vec<JobItem>);
+
+fn delete_blocking(scan: String, ids: Vec<String>) -> Result<Phase, AppError> {
     let (session, items) = {
         let st = lock();
         let sc = st.scans.get(&scan).ok_or_else(|| AppError::Config("Scan for leftovers again — this list is no longer current.".into()))?;
@@ -920,83 +1062,390 @@ fn delete_blocking(scan: String, ids: Vec<String>) -> Result<Vec<Deleted>, AppEr
         }
         (sc.session.clone(), picked)
     };
-    let mut s = load_session(&session)?;
+    let s = load_session(&session)?;
     // Reinstalled since the scan? Then nothing of it is a leftover.
     if let Err(why) = platform_gone(&s) {
         return Err(AppError::Config(format!("{} is installed again, so nothing was deleted: {}", s.app.name, why)));
     }
     let others = platform_others(&s);
     let mut out = Vec::new();
+    let mut batch = Vec::new();
     for (id, item) in items {
         let Some(item) = item else {
             out.push(Deleted { id, outcome: "refused".into(), message: "Not part of this scan.".into() });
             continue;
         };
-        let d = delete_one(&s, &others, &item);
-        log(serde_json::json!({ "event": "leftover", "app": s.app.name, "path": item.path, "outcome": d.0, "message": d.1 }));
-        out.push(Deleted { id, outcome: d.0.into(), message: d.1 });
+        match delete_one(&s, &others, &item) {
+            Step::Done(o, m) => {
+                log(serde_json::json!({ "event": "leftover", "app": s.app.name, "path": item.path, "outcome": o, "message": m }));
+                out.push(Deleted { id, outcome: o.into(), message: m });
+            }
+            Step::Elevate(what) => batch.push(JobItem { id, what }),
+        }
     }
-    if out.iter().all(|d| d.outcome == "trashed" || d.outcome == "removed" || d.outcome == "gone") {
-        s.state = "cleaned".into();
-        save_session(&s);
-    }
-    Ok(out)
+    Ok((session, out, batch))
 }
 
-fn delete_one(s: &Session, others: &Others, item: &ScanItem) -> (&'static str, String) {
-    if item.admin || item.action == Action::None {
-        return ("needs-admin", "This one needs the administrator; GitSwitch doesn't delete it.".into());
+fn delete_one(s: &Session, others: &Others, item: &ScanItem) -> Step {
+    use Step::Done;
+    if item.action == Action::None || (item.admin && !item.elevate) {
+        return Done("needs-admin", "This one needs the administrator; GitSwitch doesn't delete it.".into());
     }
     if let Some((entry, allow)) = &item.entry {
         if matcher::match_entry(entry, &s.evidence, others, *allow).is_none() {
-            return ("refused", "Something installed now claims this name, so it was kept.".into());
+            return Done("refused", "Something installed now claims this name, so it was kept.".into());
         }
     }
     match &item.action {
-        Action::Registry { key } => return windows::delete_registry(key),
-        Action::Purge { package } => return linux::purge(package),
+        Action::Registry { key } => {
+            let (o, m) = windows::delete_registry(key);
+            return Done(o, m);
+        }
+        Action::Purge { package } => {
+            let (o, m) = linux::purge(package);
+            return Done(o, m);
+        }
+        Action::RunValue { view, name, data } => {
+            if item.elevate {
+                return Step::Elevate(JobWhat::RunValue { view: view.clone(), name: name.clone(), data: data.clone() });
+            }
+            let (o, m) = windows::delete_run_value(view, name, data, &backups_dir());
+            return Done(o, m);
+        }
         _ => {}
     }
     if let Action::Link { target } = &item.action {
         let still = std::fs::symlink_metadata(&item.path).is_ok_and(|m| m.file_type().is_symlink())
             && std::fs::read_link(&item.path).ok().map(|t| if t.is_absolute() { t } else { item.root.join(t) }).as_ref() == Some(target);
         if !still {
-            return ("changed", "It is no longer the same link, so it was kept.".into());
+            return Done("changed", "It is no longer the same link, so it was kept.".into());
         }
         return match to_trash(&item.path) {
-            TrashOutcome::Trashed | TrashOutcome::Gone => ("trashed", "Moved to the Trash.".into()),
-            TrashOutcome::NeedsAdmin(m) => ("needs-admin", m),
-            TrashOutcome::Protected(m) | TrashOutcome::Failed(m) => ("failed", m),
+            TrashOutcome::Trashed | TrashOutcome::Gone => Done("trashed", "Moved to the Trash.".into()),
+            TrashOutcome::NeedsAdmin(m) => Done("needs-admin", m),
+            TrashOutcome::Protected(m) | TrashOutcome::Failed(m) => Done("failed", m),
         };
     }
     if std::fs::symlink_metadata(&item.path).is_err() {
-        return ("gone", "Already gone.".into());
+        return Done("gone", "Already gone.".into());
     }
     if !item.path.starts_with(&item.root) || link_on_the_way(&item.root, &item.path) {
-        return ("refused", "A folder on the way to it is now a link, so it was kept.".into());
+        return Done("refused", "A folder on the way to it is now a link, so it was kept.".into());
     }
     match (&item.ident, ident(&item.path)) {
         (Some(a), Some(b)) if a == &b => {}
-        _ => return ("changed", "It changed since the scan (replaced, or now a link), so it was kept. Scan again.".into()),
+        _ => return Done("changed", "It changed since the scan (replaced, or now a link), so it was kept. Scan again.".into()),
     }
     // Windows would delete for good what the Recycle Bin can't take.
     #[cfg(windows)]
     if let Some(why) = windows::recycle_refusal(&item.path) {
-        return ("refused", why);
+        return Done("refused", why);
+    }
+    let elevated = || Step::Elevate(JobWhat::Trash { path: item.path.clone(), root: item.root.clone(), ident: item.ident.clone() });
+    if item.elevate {
+        return elevated();
     }
     if let Action::LaunchAgent { label } = &item.action {
         macos::bootout(label);
     }
     match to_trash(&item.path) {
-        TrashOutcome::Trashed => ("trashed", "Moved to the Trash.".into()),
-        TrashOutcome::Gone => ("gone", "Already gone.".into()),
-        TrashOutcome::NeedsAdmin(m) => ("needs-admin", format!("It needs the administrator: {}", m)),
-        TrashOutcome::Protected(m) => (
+        TrashOutcome::Trashed => Done("trashed", format!("Moved to the {}.", trash_word())),
+        TrashOutcome::Gone => Done("gone", "Already gone.".into()),
+        // Windows: refused here after all — the administrator's step tries it.
+        TrashOutcome::NeedsAdmin(_) if cfg!(windows) => elevated(),
+        TrashOutcome::NeedsAdmin(m) => Done("needs-admin", format!("It needs the administrator: {}", m)),
+        TrashOutcome::Protected(m) => Done(
             "protected",
             format!("The system protects it ({}). Allow GitSwitch in System Settings › Privacy & Security, or move it to the Trash yourself.", m),
         ),
-        TrashOutcome::Failed(m) => ("failed", format!("Couldn't move it to the Trash: {}", m)),
+        TrashOutcome::Failed(m) => Done("failed", format!("Couldn't move it to the {}: {}", trash_word(), m)),
     }
+}
+
+fn trash_word() -> &'static str {
+    if cfg!(windows) {
+        "Recycle Bin"
+    } else {
+        "Trash"
+    }
+}
+
+/// Leftover kinds that are files or folders (not registry keys, package
+/// settings or start-up values).
+pub(crate) fn file_backed(kind: &str) -> bool {
+    !matches!(kind, "registry" | "package-settings" | "startup")
+}
+
+// ---------------------------------------------------------------------------
+// Windows: what needs the administrator, done after one permission prompt —
+// GitSwitch itself, started elevated, carries out a job file whose SHA-256
+// it was given, checking every item again.
+
+/// The argument GitSwitch is started with, elevated, to carry out a job.
+pub const ELEVATED_FLAG: &str = "--gitswitch-elevated-cleanup";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct JobItem {
+    pub id: String,
+    pub what: JobWhat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum JobWhat {
+    /// A file or folder to the Recycle Bin: the very one that was looked at.
+    Trash { path: PathBuf, root: PathBuf, ident: Option<Ident> },
+    /// A program's entry in Installed apps, exported first.
+    UninstallEntry { view: String, key: String, name: String },
+    /// A Run value, exported first.
+    RunValue { view: String, name: String, data: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Job {
+    version: u32,
+    items: Vec<JobItem>,
+    /// Deleting files directly: the entry and start-up values go only once
+    /// every folder went.
+    registry_needs_files: bool,
+    backups: PathBuf,
+}
+
+fn backups_dir() -> PathBuf {
+    data_dir().unwrap_or_else(std::env::temp_dir).join("registry-backups")
+}
+
+fn result_path_of(job: &Path) -> PathBuf {
+    let mut p = job.as_os_str().to_owned();
+    p.push(".result.json");
+    PathBuf::from(p)
+}
+
+/// One file or folder to the Recycle Bin, checked again first. `elevated`:
+/// the administrator's run, which refuses anything outside the places
+/// programs live in.
+fn trash_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: bool) -> (&'static str, String) {
+    if std::fs::symlink_metadata(path).is_err() {
+        return ("gone", "Already gone.".into());
+    }
+    if !path.starts_with(root) || link_on_the_way(root, path) {
+        return ("refused", "A folder on the way to it is now a link, so it was kept.".into());
+    }
+    match (want, ident(path)) {
+        (Some(a), Some(b)) if a == &b => {}
+        _ => return ("changed", "It changed since it was looked at (replaced, or now a link), so it was kept. Look again.".into()),
+    }
+    #[cfg(windows)]
+    {
+        if elevated {
+            if let Err(why) = windows::elevated_path_ok(path) {
+                return ("refused", format!("{} It was kept.", why));
+            }
+        }
+        if let Some(why) = windows::recycle_refusal(path) {
+            return ("refused", why);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = elevated;
+    match to_trash(path) {
+        TrashOutcome::Trashed => ("trashed", format!("Moved to the {}.", trash_word())),
+        TrashOutcome::Gone => ("gone", "Already gone.".into()),
+        TrashOutcome::NeedsAdmin(m) => ("needs-admin", format!("It needs the administrator: {}", m)),
+        TrashOutcome::Protected(m) => ("protected", m),
+        TrashOutcome::Failed(m) => ("failed", format!("Couldn't move it to the {}: {}", trash_word(), m)),
+    }
+}
+
+/// Carry out cleanup items in order, each checked again first.
+pub(crate) fn run_items(items: &[JobItem], registry_needs_files: bool, backups: &Path, elevated: bool) -> Vec<Deleted> {
+    let mut out = Vec::new();
+    let mut files_ok = true;
+    for it in items {
+        let (o, m) = match &it.what {
+            // Deleting files directly stops at the first folder that can't go.
+            JobWhat::Trash { .. } if registry_needs_files && !files_ok => ("refused", "Kept: an earlier folder could not be moved, so this one was left as it was.".into()),
+            JobWhat::Trash { path, root, ident: want } => {
+                let r = trash_checked(path, root, want.as_ref(), elevated);
+                if r.0 != "trashed" && r.0 != "gone" {
+                    files_ok = false;
+                }
+                r
+            }
+            JobWhat::UninstallEntry { .. } | JobWhat::RunValue { .. } if registry_needs_files && !files_ok => {
+                ("refused", "Kept: its folder could not be moved, so the rest was left as it was.".into())
+            }
+            JobWhat::UninstallEntry { view, key, name } => windows::delete_uninstall_entry(view, key, name, backups),
+            JobWhat::RunValue { view, name, data } => windows::delete_run_value(view, name, data, backups),
+        };
+        out.push(Deleted { id: it.id.clone(), outcome: o.into(), message: m });
+    }
+    out
+}
+
+/// No folder from the drive down to `p` is a link (or junction): what the
+/// administrator writes lands where it says.
+fn no_link_on_the_path(p: &Path) -> bool {
+    p.ancestors().all(|a| std::fs::symlink_metadata(a).map(|m| !is_link(&m)).unwrap_or(true))
+}
+
+/// The elevated side: check the job against the hash it was approved with,
+/// carry it out, write what happened next to it — never through a link.
+pub(crate) fn run_job_file(job: &Path, sha: &str) -> i32 {
+    let result = (|| -> Result<Vec<Deleted>, String> {
+        if !no_link_on_the_path(job.parent().unwrap_or(job)) {
+            return Err("GitSwitch's data folder is reached through a link, so the administrator's step did nothing.".into());
+        }
+        let bytes = std::fs::read(job).map_err(|e| format!("The job could not be read: {}", e))?;
+        if !gitswitch_lock_core::sha256_hex(&bytes).eq_ignore_ascii_case(sha.trim()) {
+            return Err("The job does not match what was approved, so nothing was done.".into());
+        }
+        let j: Job = serde_json::from_slice(&bytes).map_err(|e| format!("The job is damaged: {}", e))?;
+        if j.version != 1 {
+            return Err("The job was written by another version of GitSwitch, so nothing was done.".into());
+        }
+        if !no_link_on_the_path(&j.backups) {
+            return Err("The backup folder is reached through a link, so the administrator's step did nothing.".into());
+        }
+        Ok(run_items(&j.items, j.registry_needs_files, &j.backups, true))
+    })();
+    let (code, body) = match result {
+        Ok(d) => (0, serde_json::json!({ "ok": true, "results": d })),
+        Err(e) => (2, serde_json::json!({ "ok": false, "error": e })),
+    };
+    // A new file only: never one (or a link) that is already there.
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).create_new(true).open(result_path_of(job)) {
+        use std::io::Write;
+        let _ = f.write_all(&serde_json::to_vec(&body).unwrap_or_default());
+    }
+    code
+}
+
+/// GitSwitch started elevated for a job: carry it out. None when this is
+/// an ordinary start; with the flag, always Some — never the app itself.
+pub fn elevated_cleanup_from_args() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == ELEVATED_FLAG)?;
+    let job = args.get(i + 1);
+    let sha = args.iter().position(|a| a == "--sha256").and_then(|j| args.get(j + 1));
+    Some(match (job, sha) {
+        (Some(job), Some(sha)) => run_job_file(Path::new(job), sha),
+        _ => 2,
+    })
+}
+
+async fn launch_elevated(job: &Path, sha: &str) -> crate::elevate::Elevated {
+    use crate::elevate::Elevated;
+    if let Some(mode) = crate::elevate::test_mode() {
+        return match mode.as_str() {
+            "direct" => Elevated::Ran { code: run_job_file(job, sha), stdout: String::new(), stderr: String::new() },
+            "cancelled" => Elevated::Cancelled,
+            "failed" => Elevated::Failed("simulated failure".into()),
+            other => Elevated::Failed(format!("unknown GITSWITCH_ELEVATE mode {}", other)),
+        };
+    }
+    #[cfg(windows)]
+    {
+        match std::env::current_exe() {
+            Ok(exe) => crate::elevate::windows_runas(&exe, format!("{} \"{}\" --sha256 {}", ELEVATED_FLAG, job.display(), sha), "GitSwitch's cleanup").await,
+            Err(e) => Elevated::Failed(format!("GitSwitch could not find itself: {}", e)),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (job, sha);
+        Elevated::Unsupported("Only on Windows.".into())
+    }
+}
+
+/// Write the job, ask Windows for permission once, read what happened.
+/// Err: nothing was done (the prompt was declined, or it could not run).
+async fn elevated_run(items: Vec<JobItem>, registry_needs_files: bool) -> Result<Vec<Deleted>, String> {
+    use crate::elevate::Elevated;
+    let dir = data_dir().ok_or("GitSwitch has no data folder to write the job in.")?.join("uninstall-jobs");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("The job could not be written: {}", e))?;
+    let job_path = dir.join(format!("{}.json", uuid::Uuid::new_v4()));
+    let job = Job { version: 1, items, registry_needs_files, backups: backups_dir() };
+    let bytes = serde_json::to_vec_pretty(&job).map_err(|e| e.to_string())?;
+    std::fs::write(&job_path, &bytes).map_err(|e| format!("The job could not be written: {}", e))?;
+    let sha = gitswitch_lock_core::sha256_hex(&bytes);
+    let result_path = result_path_of(&job_path);
+    // One prompt at a time — a test run (no prompt at all) doesn't hold the guard.
+    let testing = crate::elevate::test_mode().is_some();
+    let guard = if testing { None } else { crate::elevate::begin() };
+    let outcome = if testing || guard.is_some() { Some(launch_elevated(&job_path, &sha).await) } else { None };
+    drop(guard);
+    let r = match outcome {
+        None => Err("Another administrator prompt is open — finish it, then try again.".to_string()),
+        Some(Elevated::Ran { .. }) => match std::fs::read(&result_path).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) {
+            Some(v) if v["ok"].as_bool() == Some(true) => serde_json::from_value::<Vec<Deleted>>(v["results"].clone()).map_err(|e| e.to_string()),
+            Some(v) => Err(v["error"].as_str().unwrap_or("The administrator's step failed.").to_string()),
+            None => Err("The administrator's step ended without saying what it did.".into()),
+        },
+        Some(Elevated::Cancelled) | Some(Elevated::Denied) => Err("Windows' permission prompt was declined, so these were kept.".into()),
+        Some(Elevated::Failed(m)) | Some(Elevated::Unsupported(m)) => Err(m),
+        Some(_) => Err("The administrator's step could not run.".into()),
+    };
+    let _ = std::fs::remove_file(&job_path);
+    let _ = std::fs::remove_file(&result_path);
+    r
+}
+
+/// Windows: delete a program's files directly instead of running its
+/// uninstaller — its folders to the Recycle Bin, then its entry and
+/// start-up values (each exported first); the administrator's part after
+/// one prompt. Nothing is half done: the entry goes only once the folders did.
+pub async fn force_remove(session: String) -> Result<Progress, AppError> {
+    let mut s = load_session(&session)?;
+    if !matches!(s.state.as_str(), "prepared" | "still-installed" | "failed") {
+        return Err(AppError::Config(format!("This uninstall is already {}.", s.state)));
+    }
+    let s2 = s.clone();
+    let items = tokio::task::spawn_blocking(move || windows::force_items(&s2)).await.map_err(|e| AppError::Command(e.to_string()))?.map_err(AppError::Config)?;
+    log(serde_json::json!({ "event": "force-remove", "app": s.app.name, "record": s.record }));
+    let admin = items.iter().any(|(_, a)| *a);
+    let backups = backups_dir();
+    let results = if admin {
+        // One prompt: every folder and what only the administrator may
+        // remove. Your own entries are removed here, afterwards, in your
+        // own registry — whoever approved the prompt.
+        let (elevated, later): (Vec<_>, Vec<_>) = items.into_iter().partition(|(j, a)| *a || matches!(j.what, JobWhat::Trash { .. }));
+        let first = Box::pin(elevated_run(elevated.into_iter().map(|(j, _)| j).collect(), true)).await.map_err(AppError::Config)?;
+        let files_ok = first.iter().filter(|d| d.id.starts_with("folder")).all(|d| d.outcome == "trashed" || d.outcome == "gone");
+        let later: Vec<JobItem> = later.into_iter().map(|(j, _)| j).collect();
+        let rest = if files_ok {
+            tokio::task::spawn_blocking(move || run_items(&later, true, &backups, false)).await.map_err(|e| AppError::Command(e.to_string()))?
+        } else {
+            later.into_iter().map(|j| Deleted { id: j.id, outcome: "refused".into(), message: "Kept: its folder could not be moved, so the rest was left as it was.".into() }).collect()
+        };
+        first.into_iter().chain(rest).collect()
+    } else {
+        let jobs: Vec<JobItem> = items.into_iter().map(|(j, _)| j).collect();
+        tokio::task::spawn_blocking(move || run_items(&jobs, true, &backups, false)).await.map_err(|e| AppError::Command(e.to_string()))?
+    };
+    for r in &results {
+        log(serde_json::json!({ "event": "force-remove-item", "app": s.app.name, "id": r.id, "outcome": r.outcome, "message": r.message }));
+    }
+    let problems: Vec<String> = results.iter().filter(|r| !matches!(r.outcome.as_str(), "trashed" | "removed" | "gone")).map(|r| r.message.clone()).collect();
+    let s3 = s.clone();
+    let gone = tokio::task::spawn_blocking(move || platform_gone(&s3)).await.map_err(|e| AppError::Command(e.to_string()))?;
+    s.process = None;
+    match gone {
+        Ok(()) => {
+            s.state = "gone".into();
+            s.message = Some(if problems.is_empty() {
+                format!("{}'s files are in the Recycle Bin and it is no longer in Installed apps.", s.app.name)
+            } else {
+                format!("{} is no longer in Installed apps, but: {}", s.app.name, problems.join(" "))
+            });
+        }
+        Err(why) => {
+            s.state = "still-installed".into();
+            s.message = Some(if problems.is_empty() { why } else { problems.join(" ") });
+        }
+    }
+    save_session(&s);
+    Ok(Progress { state: s.state.clone(), message: s.message.clone() })
 }
 
 /// Uninstalls that were started and not cleaned up — after a restart, say.
@@ -1098,6 +1547,7 @@ pub(crate) async fn dry_scan(id: String) -> Result<Vec<(String, String, String, 
         list("apps".into()).await?;
     }
     let (app, rec) = lock().list.get(&id).cloned().ok_or_else(|| AppError::Config("No such app.".into()))?;
+    let rec = if cfg!(windows) { windows::enrich(&app, &rec) } else { rec };
     let (_, ev, _) = if cfg!(target_os = "macos") {
         macos::prepare(&app, &rec)?
     } else if cfg!(windows) {
@@ -1115,6 +1565,50 @@ pub(crate) async fn dry_scan(id: String) -> Result<Vec<(String, String, String, 
         linux::leftovers(&s, &others)
     };
     Ok(c.into_iter().map(|c| (c.path.to_string_lossy().to_string(), format!("{:?}", c.m.confidence), c.m.reason, c.admin)).collect())
+}
+
+/// The probe's look at what a scan of a saved session (a session file,
+/// read and never written) WOULD offer — nothing deleted, the gone check
+/// skipped. For reviewing the rules against what an uninstall really left.
+#[cfg(test)]
+pub(crate) async fn dry_session(path: String) -> Result<Vec<serde_json::Value>, AppError> {
+    let text = std::fs::read_to_string(&path).map_err(|e| AppError::Config(e.to_string()))?;
+    let s: Session = serde_json::from_str(&text).map_err(|e| AppError::Config(e.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let others = platform_others(&s);
+        let (c, notes) = if cfg!(target_os = "macos") {
+            macos::leftovers(&s, &others)
+        } else if cfg!(windows) {
+            windows::leftovers(&s, &others, true)
+        } else {
+            linux::leftovers(&s, &others)
+        };
+        let mut out: Vec<serde_json::Value> = c
+            .into_iter()
+            .map(|c| serde_json::json!({ "path": c.path, "kind": c.kind, "place": c.place, "confidence": c.m.confidence, "reason": c.m.reason, "admin": c.admin }))
+            .collect();
+        out.push(serde_json::json!({ "notes": notes }));
+        Ok(out)
+    })
+    .await
+    .map_err(|e| AppError::Command(e.to_string()))?
+}
+
+/// The probe's look at what deleting an installed program's files directly
+/// would remove — read only: the record GitSwitch would keep, and the plan.
+#[cfg(test)]
+pub(crate) async fn dry_force(id: String) -> Result<serde_json::Value, AppError> {
+    if !lock().list.contains_key(&id) {
+        list("apps".into()).await?;
+    }
+    let (app, rec) = lock().list.get(&id).cloned().ok_or_else(|| AppError::Config("No such app.".into()))?;
+    tokio::task::spawn_blocking(move || {
+        let rec = windows::enrich(&app, &rec);
+        let (plan, why) = windows::force_plan(&app, &rec);
+        Ok(serde_json::json!({ "app": app, "record": rec, "plan": plan, "unavailable": why }))
+    })
+    .await
+    .map_err(|e| AppError::Command(e.to_string()))?
 }
 
 #[cfg(test)]
@@ -1175,6 +1669,175 @@ mod tests {
         std::os::unix::fs::symlink(root.join("moved"), place.join("a").join("b")).unwrap();
         assert!(link_on_the_way(&place, &place.join("a").join("b").join("c")), "a link between the place and the item");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_publishers_folder_and_the_apps_name_inside_it_are_sure_on_windows_places_only() {
+        let root = tmp("vendor-sure");
+        let place = root.join("ProgramData");
+        std::fs::create_dir_all(place.join("CleverFiles").join("Disk Drill")).unwrap();
+        std::fs::create_dir_all(place.join("BitTorrent").join("uTorrent")).unwrap();
+        let ev = Evidence { ids: vec![], names: vec!["Disk Drill".into(), "uTorrent".into()], groups: vec![], vendor: Some("CleverFiles".into()) };
+        let o = Others::new(true);
+        let (plain, _) = scan_places(&[Place::new(place.clone(), "P", Allow::IdsAndNames).vendor()], &ev, &o);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].m.confidence, Confidence::Medium, "elsewhere (macOS) a name alone stays a maybe");
+        let (sure, _) = scan_places(&[Place::new(place.clone(), "P", Allow::IdsAndNames).vendor().sure()], &ev, &o);
+        assert_eq!(sure.len(), 1);
+        assert_eq!(sure[0].m.confidence, Confidence::High, "publisher folder + exact name");
+        let bt = Evidence { vendor: Some("BitTorrent Limited".into()), ..ev.clone() };
+        let (found, _) = scan_places(&[Place::new(place.clone(), "P", Allow::IdsAndNames).vendor().sure()], &bt, &o);
+        assert_eq!(found.iter().map(|c| c.path.file_name().unwrap().to_string_lossy().to_string()).collect::<Vec<_>>(), vec!["uTorrent"], "the publisher without its legal form");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_publishers_folder_holding_only_the_app_is_offered_instead_unless_another_app_has_that_publisher() {
+        // As Windows names folders (canonicalize would add \\?\).
+        let root = PathBuf::from(tmp("promote").to_string_lossy().trim_start_matches(r"\\?\"));
+        let place = root.join("Program Files");
+        let inner = place.join("CleverFiles").join("Disk Drill");
+        std::fs::create_dir_all(&inner).unwrap();
+        let ev = Evidence { ids: vec![], names: vec!["Disk Drill".into()], groups: vec![], vendor: Some("CleverFiles".into()) };
+        let cand = || Candidate {
+            path: inner.clone(),
+            root: place.clone(),
+            place: "P".into(),
+            kind: "folder",
+            m: Match { confidence: Confidence::High, reason: "x".into() },
+            admin: false,
+            command: None,
+            action: Action::Trash,
+            sized: true,
+            entry: None,
+        };
+        // The temp folder is a few levels deep, like C:\Program Files\X.
+        let mut v = vec![cand()];
+        windows::promote_vendor_folders(&mut v, &ev, &Others::new(true), std::slice::from_ref(&place));
+        assert_eq!(v[0].path, place.join("CleverFiles"), "{:?}", v[0].m.reason);
+        assert!(v[0].path.starts_with(&v[0].root));
+        let mut o = Others::new(true);
+        o.add_app(&[], &["Another Tool".to_string()], Some("CleverFiles"), &[]);
+        let mut v = vec![cand()];
+        windows::promote_vendor_folders(&mut v, &ev, &o, std::slice::from_ref(&place));
+        assert_eq!(v[0].path, inner, "another installed app has that publisher");
+        std::fs::create_dir_all(place.join("CleverFiles").join("Other Product")).unwrap();
+        let mut v = vec![cand()];
+        windows::promote_vendor_folders(&mut v, &ev, &Others::new(true), std::slice::from_ref(&place));
+        assert_eq!(v[0].path, inner, "the publisher's folder holds something else too");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_administrators_job_is_refused_unless_it_is_exactly_what_was_approved() {
+        let root = tmp("job");
+        let job = root.join("job.json");
+        let j = Job { version: 1, items: vec![], registry_needs_files: false, backups: root.join("b") };
+        let bytes = serde_json::to_vec(&j).unwrap();
+        std::fs::write(&job, &bytes).unwrap();
+        assert_eq!(run_job_file(&job, "00"), 2, "another hash");
+        let r: serde_json::Value = serde_json::from_slice(&std::fs::read(result_path_of(&job)).unwrap()).unwrap();
+        assert!(r["error"].as_str().unwrap().contains("does not match"));
+        assert_eq!(run_job_file(&job, &gitswitch_lock_core::sha256_hex(&bytes)), 0);
+        let r: serde_json::Value = serde_json::from_slice(&std::fs::read(result_path_of(&job)).unwrap()).unwrap();
+        assert!(r["error"].as_str().unwrap().contains("does not match"), "a result already there is never written over");
+        let _ = std::fs::remove_file(result_path_of(&job));
+        assert_eq!(run_job_file(&job, &gitswitch_lock_core::sha256_hex(&bytes)), 0);
+        let r: serde_json::Value = serde_json::from_slice(&std::fs::read(result_path_of(&job)).unwrap()).unwrap();
+        assert_eq!(r["ok"], serde_json::json!(true));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Tests that point GitSwitch's folders somewhere else take turns.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A temp folder as Windows names it (canonicalize adds \\?\ there).
+    fn plain_tmp(name: &str) -> PathBuf {
+        PathBuf::from(tmp(name).to_string_lossy().trim_start_matches(r"\\?\"))
+    }
+
+    #[test]
+    fn the_administrators_part_runs_after_the_prompt_and_nothing_when_it_is_declined() {
+        let _g = env_lock();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let root = plain_tmp("elevated");
+        std::env::set_var("GITSWITCH_DATA_DIR", root.join("data"));
+        std::env::set_var("GITSWITCH_TRASH_DIR", root.join("trash"));
+        let place = root.join("place");
+        std::fs::create_dir_all(place.join("Kept")).unwrap();
+        std::fs::create_dir_all(place.join("Moved")).unwrap();
+        let item = |n: &str| JobItem { id: n.into(), what: JobWhat::Trash { path: place.join(n), root: place.clone(), ident: ident(&place.join(n)) } };
+        std::env::set_var("GITSWITCH_ELEVATE", "cancelled");
+        let declined = rt.block_on(elevated_run(vec![item("Kept")], false));
+        assert!(declined.as_ref().unwrap_err().contains("declined"), "{declined:?}");
+        assert!(place.join("Kept").exists(), "declined: nothing moved");
+        std::env::set_var("GITSWITCH_ELEVATE", "direct");
+        let done = rt.block_on(elevated_run(vec![item("Moved")], false)).unwrap();
+        assert_eq!(done[0].outcome, "trashed", "{done:?}");
+        assert!(!place.join("Moved").exists() && root.join("trash").join("Moved").exists());
+        let jobs = root.join("data").join("com.gitswitch.app").join("uninstall-jobs");
+        assert_eq!(std::fs::read_dir(&jobs).unwrap().count(), 0, "the job and its result are cleaned up");
+        for v in ["GITSWITCH_ELEVATE", "GITSWITCH_DATA_DIR", "GITSWITCH_TRASH_DIR"] {
+            std::env::remove_var(v);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cleanup_item_is_moved_only_while_it_is_the_one_that_was_looked_at() {
+        let _g = env_lock();
+        let root = tmp("items");
+        let trash = root.join("trash");
+        std::env::set_var("GITSWITCH_TRASH_DIR", &trash);
+        let place = root.join("place");
+        std::fs::create_dir_all(place.join("A")).unwrap();
+        std::fs::create_dir_all(place.join("B")).unwrap();
+        let seen_a = ident(&place.join("A"));
+        let seen_b = ident(&place.join("B"));
+        // B is swapped for another folder of the same name.
+        std::fs::rename(place.join("B"), root.join("B-moved")).unwrap();
+        std::fs::create_dir_all(place.join("B")).unwrap();
+        let items = vec![
+            JobItem { id: "a".into(), what: JobWhat::Trash { path: place.join("A"), root: place.clone(), ident: seen_a } },
+            JobItem { id: "b".into(), what: JobWhat::Trash { path: place.join("B"), root: place.clone(), ident: seen_b } },
+            JobItem { id: "c".into(), what: JobWhat::Trash { path: place.join("C"), root: place.clone(), ident: None } },
+        ];
+        let out = run_items(&items, false, &root.join("b"), false);
+        let o: Vec<&str> = out.iter().map(|d| d.outcome.as_str()).collect();
+        assert_eq!(o, vec!["trashed", "changed", "gone"]);
+        assert!(trash.join("A").exists() && place.join("B").exists());
+        // Deleting files directly: the rest waits for every folder.
+        let items = vec![
+            JobItem { id: "f".into(), what: JobWhat::Trash { path: place.join("B"), root: place.clone(), ident: None } },
+            JobItem { id: "e".into(), what: JobWhat::UninstallEntry { view: "HKCU".into(), key: "Nothing".into(), name: "Nothing".into() } },
+        ];
+        let out = run_items(&items, true, &root.join("b"), false);
+        assert_eq!(out[0].outcome, "changed");
+        assert_eq!(out[1].outcome, "refused", "its entry stays when its folder could not be moved");
+        // Deleting files directly stops at the first folder that can't go.
+        std::fs::create_dir_all(place.join("D")).unwrap();
+        let items = vec![
+            JobItem { id: "f0".into(), what: JobWhat::Trash { path: place.join("B"), root: place.clone(), ident: None } },
+            JobItem { id: "f1".into(), what: JobWhat::Trash { path: place.join("D"), root: place.clone(), ident: ident(&place.join("D")) } },
+        ];
+        let out = run_items(&items, true, &root.join("b"), false);
+        assert_eq!(out.iter().map(|d| d.outcome.as_str()).collect::<Vec<_>>(), vec!["changed", "refused"]);
+        assert!(place.join("D").exists(), "the second folder was not touched");
+        std::env::remove_var("GITSWITCH_TRASH_DIR");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn jobs_and_results_survive_the_trip_to_the_administrators_run() {
+        let item = JobItem { id: "x".into(), what: JobWhat::Trash { path: PathBuf::from("p"), root: PathBuf::from("r"), ident: Some(Ident { dev: 1, ino: 2, owner: 0, dir: true, len: None, mtime: Some(1_700_000_000_123_456_789) }) } };
+        let back: JobItem = serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap();
+        assert_eq!(back, item);
+        let d: Vec<Deleted> = serde_json::from_value(serde_json::json!([{ "id": "x", "outcome": "trashed", "message": "m" }])).unwrap();
+        assert_eq!(d[0].outcome, "trashed");
     }
 
     #[test]

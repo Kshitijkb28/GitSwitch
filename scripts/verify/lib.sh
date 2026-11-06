@@ -30,6 +30,12 @@ verify_init() {
   # Tokens (a kept "Sign in with GitHub") go to files here, never the real
   # keychain: the debug build honours this, a release build ignores it.
   export GITSWITCH_TOKEN_DIR="$SB/tokens"
+  # Windows: the app finds its data folder and ~/.ssh through the system, not
+  # HOME, so without these a suite's profiles land in the real store (they
+  # once showed up as "Ports" and "Workspaces" in the installed app).
+  if command -v cygpath >/dev/null 2>&1; then
+    export GITSWITCH_DATA_DIR="$HOME/AppData/Roaming" GITSWITCH_HOME="$HOME"
+  fi
   cat > "$HOME/.gitconfig" <<EOF
 [user]
 	name = ${2:-Verify User}

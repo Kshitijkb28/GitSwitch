@@ -90,7 +90,7 @@ fn platform() -> &'static str {
 /// ever deleted.
 pub(crate) fn data_folders() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for base in [dirs::data_dir(), dirs::data_local_dir(), dirs::cache_dir(), dirs::config_dir()].into_iter().flatten() {
+    for base in [crate::paths::data_dir(), dirs::data_local_dir(), dirs::cache_dir(), dirs::config_dir()].into_iter().flatten() {
         out.push(base.join(ID));
     }
     if cfg!(target_os = "macos") {

@@ -7,7 +7,7 @@ const BEGIN: &str = "# >>> GitSwitch managed signers (DO NOT EDIT) >>>";
 const END: &str = "# <<< GitSwitch managed signers (DO NOT EDIT) <<<";
 
 pub fn allowed_signers_path() -> PathBuf {
-    dirs::home_dir()
+    crate::paths::home_dir()
         .unwrap_or_default()
         .join(".ssh")
         .join("allowed_signers")

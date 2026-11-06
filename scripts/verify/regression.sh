@@ -340,7 +340,7 @@ JSONPY
   probe profile_apply "$SB" "$SB/pcasedclones.json" >/dev/null
   # Stored exactly as typed (an older build, or a hand edit): the app itself
   # now saves the disk's spelling.
-  STORE_R="$("$PY" -c 'import os;h=os.environ["HOME"];c=[os.path.join(h,"Library/Application Support/com.gitswitch.app/profiles.json"),os.path.join(h,".local/share/com.gitswitch.app/profiles.json")];print(next((p for p in c if os.path.exists(p)),"MISSING"))')"
+  STORE_R="$("$PY" -c 'import os;h=os.environ["HOME"];c=[os.path.join(h,"Library/Application Support/com.gitswitch.app/profiles.json"),os.path.join(h,".local/share/com.gitswitch.app/profiles.json"),os.path.join(h,"AppData/Roaming/com.gitswitch.app/profiles.json")];print(next((p for p in c if os.path.exists(p)),"MISSING"))')"
   "$PY" - "$STORE_R" "$SB/casedclones" <<'STOREPY'
 import json, sys
 f, folder = sys.argv[1:]

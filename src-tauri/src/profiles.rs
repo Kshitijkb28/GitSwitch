@@ -227,7 +227,7 @@ fn dedupe_directories(store: &mut ProfileStore, keep_id: &str, dirs: &[String]) 
 }
 
 fn get_store_path() -> Result<PathBuf, AppError> {
-    let data_dir = dirs::data_dir().ok_or(AppError::Config("Cannot find app data directory".into()))?;
+    let data_dir = crate::paths::data_dir().ok_or(AppError::Config("Cannot find app data directory".into()))?;
     let app_dir = data_dir.join("com.gitswitch.app");
     fs::create_dir_all(&app_dir)?;
     Ok(app_dir.join("profiles.json"))
