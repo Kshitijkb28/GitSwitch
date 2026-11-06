@@ -1283,6 +1283,7 @@ pub(crate) fn signal(pid: i32, hard: bool) {
 pub(crate) fn signal(_pid: i32, _hard: bool) {}
 
 /// "A, B, C and 4 more".
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn name_list(names: &[String]) -> String {
     match names.len() {
         0 => String::new(),
@@ -1321,7 +1322,7 @@ pub(crate) fn users_of(path: &Path) -> Vec<String> {
     windows::users_of(path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn failed_move_for_test(path: &Path, m: &str) -> (&'static str, String) {
     failed_move(path, m)
 }
