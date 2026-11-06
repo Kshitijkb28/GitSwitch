@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "speedbar",
+  "description": "The net speed bar: its numbers, and dragging it",
+  "windows": ["speedbar"],
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
+}

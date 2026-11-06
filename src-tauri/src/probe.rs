@@ -256,6 +256,16 @@ pub(crate) mod tests {
                 let _ = Box::pin(crate::apps::list("apps".into())).await;
                 reply(Ok::<_, crate::error::AppError>(crate::apps::history()))
             }
+            // Read only: this computer's adapters, twice a second apart, and its Wi-Fi.
+            "netspeed_probe" => {
+                let a = crate::netspeed::read();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let b = crate::netspeed::read();
+                let prev: std::collections::HashMap<String, [u64; 2]> = a.iter().map(|i| (i.id.clone(), [i.rx, i.tx])).collect();
+                let (rates, _) = crate::netspeed::rates_between(&prev, &b, 1.0);
+                let wifi = crate::netspeed::wifi_for_probe();
+                reply(Ok::<_, crate::error::AppError>(serde_json::json!({ "interfaces": b, "rates": rates, "wifi": wifi })))
+            }
             "apps_users_of" => match arg::<String>(&args, "path") {
                 Ok(p) => reply(Ok::<_, crate::error::AppError>(crate::apps::users_of(std::path::Path::new(&p)))),
                 Err(e) => reply_err(e),

@@ -2735,6 +2735,118 @@ export interface LeftoverDeleted {
   message: string;
 }
 
+// ---- Net speed
+
+export type NetKind = "wifi" | "ethernet" | "cellular" | "other" | "virtual";
+
+/** An adapter, with its speed now (bytes per second). */
+export interface NetIface {
+  id: string;
+  name: string;
+  detail: string | null;
+  kind: NetKind;
+  up: boolean;
+  in_use: boolean;
+  /** Bits per second. */
+  link_bps: number | null;
+  down: number;
+  upload: number;
+}
+
+export interface NetWifi {
+  ssid: string | null;
+  signal: number | null;
+  rssi_dbm: number | null;
+  rx_mbps: number | null;
+  tx_mbps: number | null;
+  /** Why something isn't shown. */
+  note: string | null;
+  /** The setting that would show it: "location". */
+  fix: string | null;
+}
+
+export interface NetSettings {
+  /** Show the speed in the taskbar / menu bar / top bar. */
+  tray: boolean;
+  /** Windows: numbers in the tray icon, the speed bar, or both. */
+  style: "icon" | "bar" | "both";
+  /** macOS / Linux: also the floating speed bar. */
+  bar: boolean;
+  bar_pos: [number, number] | null;
+  show: "both" | "down" | "up";
+  unit: "bytes" | "bits";
+  interval_ms: number;
+  /** "auto", "all" or an adapter's id. */
+  source: string;
+}
+
+export interface NetSnapshot {
+  platform: "windows" | "macos" | "linux";
+  down: number;
+  up: number;
+  source_name: string;
+  connection: NetIface | null;
+  wifi: NetWifi | null;
+  /** [ms since 1970, down, up], oldest first. */
+  history: [number, number, number][];
+  interfaces: NetIface[];
+  usage: { today: [number, number]; month: [number, number]; session: [number, number]; since: number };
+  settings: NetSettings;
+}
+
+export interface NetBar {
+  down: string;
+  up: string;
+  show: string;
+  light: boolean;
+}
+
+export interface SpeedTest {
+  /** idle | latency | download | upload | done | cancelled | failed */
+  phase: string;
+  progress: number;
+  latency_ms: number | null;
+  /** Bytes per second. */
+  down_bps: number | null;
+  up_bps: number | null;
+  used_bytes: number;
+  error: string | null;
+  at: number | null;
+}
+
+export async function netspeedSnapshot(): Promise<NetSnapshot> {
+  return invoke("netspeed_snapshot");
+}
+
+export async function netspeedSetSettings(settings: NetSettings): Promise<NetSettings> {
+  return invoke("netspeed_set_settings", { settings });
+}
+
+export async function netspeedBar(): Promise<NetBar> {
+  return invoke("netspeed_bar");
+}
+
+/** The system's settings page: the taskbar's icons (Windows) or location access. */
+export async function netspeedOpenSettings(which: "taskbar" | "location"): Promise<void> {
+  return invoke("netspeed_open_settings", { which });
+}
+
+export async function netspeedShowTab(): Promise<void> {
+  return invoke("netspeed_show_tab");
+}
+
+export async function speedtestStart(): Promise<void> {
+  return invoke("netspeed_speedtest_start");
+}
+
+export async function speedtestStatus(): Promise<SpeedTest> {
+  return invoke("netspeed_speedtest_status");
+}
+
+export async function speedtestCancel(): Promise<void> {
+  return invoke("netspeed_speedtest_cancel");
+}
+
 /** An app uninstalled with GitSwitch before, no longer installed. */
 export interface PastUninstall {
   /** The app's id: what appsRescan takes. */
