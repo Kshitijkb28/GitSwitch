@@ -327,6 +327,31 @@ export function NetSpeed() {
               />
             </div>
           )}
+          {snap.platform === "windows" && s.style !== "icon" && (
+            <div className="flex items-center gap-3 flex-wrap pl-6">
+              <span className="text-zinc-400">Where</span>
+              <Segmented
+                label="Where the speed bar goes"
+                value={s.bar_place ?? "taskbar"}
+                disabled={!s.tray}
+                onChange={(v) => save({ bar_place: v })}
+                options={[
+                  { value: "taskbar", label: "On the taskbar" },
+                  { value: "anywhere", label: "Anywhere on the screen" },
+                ]}
+              />
+            </div>
+          )}
+          {snap.platform === "windows" && s.tray && s.style !== "icon" && (
+            <p className="text-zinc-500 pl-6" data-bar-tip={s.bar_place ?? "taskbar"}>
+              {(s.bar_place ?? "taskbar") === "taskbar"
+                ? "The speed bar sits on the taskbar and keeps clear of the app icons and the clock: when they need its place, it moves to the nearest free spot. Drag it along the taskbar to choose where it goes; double-click it to come back here."
+                : "The speed bar floats over other windows: drag it anywhere on the screen and it stays where you leave it. Double-click it to come back here."}{" "}
+              <button type="button" data-bar-reset className="text-emerald-400 hover:underline cursor-pointer" onClick={() => api.netspeedBarReset().catch((e) => setError(cleanError(e)))}>
+                Put it back beside the clock
+              </button>
+            </p>
+          )}
           {snap.platform !== "windows" && (
             <label className="flex items-center gap-2 cursor-pointer text-zinc-300">
               <Checkbox checked={s.bar} onChange={(v) => save({ bar: v })} aria-label="Also show a floating speed bar" />

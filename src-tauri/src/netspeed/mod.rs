@@ -7,12 +7,17 @@
 //! as set) while anything shows the speed, every ten seconds otherwise (for
 //! the usage counts). Nothing is sent anywhere, except by the speed test.
 
+/// The floating speed bar, anywhere on the screen: a small webview window.
 pub mod bar;
+pub mod dock;
 mod format;
 mod icon;
 mod linux;
 mod macos;
 pub mod speedtest;
+/// The speed bar docked on the Windows taskbar: a native window of its own.
+#[cfg(windows)]
+mod taskbar;
 mod usage;
 mod windows;
 
@@ -77,8 +82,13 @@ pub struct Settings {
     pub style: String,
     /// macOS / Linux: also the floating speed bar.
     pub bar: bool,
-    /// Where the speed bar was put.
+    /// Windows: the speed bar "taskbar" (docked on it, clear of the icons,
+    /// moved along it) or "anywhere" (floating, dragged anywhere on the screen).
+    pub bar_place: String,
+    /// Where the floating speed bar was put.
     pub bar_pos: Option<[i32; 2]>,
+    /// Where on the taskbar the speed bar was put (Windows); none: beside the clock.
+    pub bar_dock: Option<dock::Dock>,
     /// "both", "down" or "up".
     pub show: String,
     /// "bytes" (MB/s) or "bits" (Mbps).
@@ -92,7 +102,18 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Settings {
-        Settings { tray: false, style: "icon".into(), bar: false, bar_pos: None, show: "both".into(), unit: "bytes".into(), interval_ms: 1000, source: "auto".into() }
+        Settings {
+            tray: false,
+            style: "icon".into(),
+            bar: false,
+            bar_place: "taskbar".into(),
+            bar_pos: None,
+            bar_dock: None,
+            show: "both".into(),
+            unit: "bytes".into(),
+            interval_ms: 1000,
+            source: "auto".into(),
+        }
     }
 }
 
@@ -102,6 +123,9 @@ impl Settings {
         let d = Settings::default();
         if !["icon", "bar", "both"].contains(&self.style.as_str()) {
             self.style = d.style;
+        }
+        if !["taskbar", "anywhere"].contains(&self.bar_place.as_str()) {
+            self.bar_place = d.bar_place;
         }
         if !["both", "down", "up"].contains(&self.show.as_str()) {
             self.show = d.show;
@@ -133,6 +157,11 @@ impl Settings {
         } else {
             self.bar
         }
+    }
+
+    /// The speed bar is the one docked on the Windows taskbar (not the floating one).
+    pub fn bar_on_taskbar(&self) -> bool {
+        cfg!(windows) && self.bar_place != "anywhere"
     }
 }
 
@@ -488,7 +517,15 @@ fn show(app: &AppHandle) {
         }
     }
     lock().showing_text = want;
-    bar::sync(app, s.wants_bar(), s.bar_pos);
+    // One speed bar at a time: docked on the taskbar, or floating anywhere.
+    let bar = s.wants_bar();
+    #[cfg(windows)]
+    taskbar::sync(
+        bar && s.bar_on_taskbar(),
+        taskbar::View { up: format::full(up, s.bits()), down: format::full(down, s.bits()), show: s.show.clone(), light: light_taskbar(), bits: s.bits() },
+        s.bar_dock,
+    );
+    bar::sync(app, bar && !s.bar_on_taskbar(), s.bar_pos);
 }
 
 #[cfg(windows)]
@@ -522,9 +559,10 @@ pub fn set_settings(app: &AppHandle, new: Settings) -> Settings {
     let new = new.checked();
     {
         let mut st = lock();
-        // Where the bar was dragged to stays unless said otherwise.
-        let keep_pos = st.settings.bar_pos;
-        st.settings = Settings { bar_pos: new.bar_pos.or(keep_pos), ..new };
+        // Where the bar was dragged to stays unless said otherwise; the taskbar
+        // spot is the bar's own (a page's copy may be older than the last drag).
+        let (keep_pos, keep_dock) = (st.settings.bar_pos, st.settings.bar_dock);
+        st.settings = Settings { bar_pos: new.bar_pos.or(keep_pos), bar_dock: keep_dock, ..new };
         st.dirty = true;
         write_json("netspeed.json", &st.settings);
     }
@@ -543,6 +581,50 @@ pub(crate) fn bar_moved(_app: &AppHandle, x: i32, y: i32) {
     let mut st = lock();
     st.settings.bar_pos = Some([x, y]);
     write_json("netspeed.json", &st.settings);
+}
+
+/// The speed bar was dragged along the taskbar: remembered (off the bar's thread).
+#[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn bar_docked(dock: dock::Dock) {
+    let mut st = lock();
+    st.settings.bar_dock = Some(dock);
+    write_json("netspeed.json", &st.settings);
+}
+
+/// The speed bar back where it starts: beside the clock (docked on the
+/// taskbar), or just above it (floating; moved there at once).
+pub fn bar_reset(app: &AppHandle) {
+    {
+        let mut st = lock();
+        st.settings.bar_dock = None;
+        st.settings.bar_pos = None;
+        st.dirty = true;
+        write_json("netspeed.json", &st.settings);
+    }
+    bar::reset(app);
+}
+
+/// A double-click on the taskbar's speed bar (off the bar's thread).
+#[cfg(windows)]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn open_tab() {
+    let app = lock().app.clone();
+    if let Some(app) = app {
+        show_tab(&app);
+    }
+}
+
+/// Read only: this computer's taskbar, its buttons, and where the bar would go.
+#[cfg(all(test, windows))]
+pub(crate) fn taskbar_probe() -> serde_json::Value {
+    taskbar::probe()
+}
+
+/// The real taskbar bar, shown for a few seconds with this text.
+#[cfg(all(test, windows))]
+pub(crate) fn taskbar_show_for(secs: u64, up: &str, down: &str, light: bool) -> serde_json::Value {
+    taskbar::show_for(secs, taskbar::View { up: up.into(), down: down.into(), show: "both".into(), light, bits: false })
 }
 
 /// Everything the tab shows. Asking keeps the numbers fresh for a few seconds.
@@ -647,8 +729,10 @@ mod tests {
 
     #[test]
     fn settings_keep_to_what_they_can_be() {
-        let s = Settings { style: "neon".into(), show: "x".into(), unit: "furlongs".into(), interval_ms: 7, source: " ".into(), ..Settings::default() }.checked();
+        let s = Settings { style: "neon".into(), bar_place: "sideways".into(), show: "x".into(), unit: "furlongs".into(), interval_ms: 7, source: " ".into(), ..Settings::default() }.checked();
         assert_eq!(s, Settings::default());
+        assert_eq!(Settings::default().bar_on_taskbar(), cfg!(windows), "Windows: docked on the taskbar unless chosen otherwise");
+        assert!(!Settings { bar_place: "anywhere".into(), ..Settings::default() }.bar_on_taskbar(), "anywhere: the floating one");
         let parsed: Settings = serde_json::from_str(r#"{"tray":true}"#).unwrap();
         assert!(parsed.tray && parsed.interval_ms == 1000 && parsed.show == "both", "missing fields take their defaults");
         let on = Settings { tray: true, ..Settings::default() };

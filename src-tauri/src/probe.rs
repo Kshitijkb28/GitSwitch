@@ -266,6 +266,17 @@ pub(crate) mod tests {
                 let wifi = crate::netspeed::wifi_for_probe();
                 reply(Ok::<_, crate::error::AppError>(serde_json::json!({ "interfaces": b, "rates": rates, "wifi": wifi })))
             }
+            // Read only: this computer's taskbar, its buttons (UI Automation),
+            // the free stretches, and where the speed bar would go.
+            #[cfg(windows)]
+            "netspeed_taskbar" => reply(Ok::<_, crate::error::AppError>(crate::netspeed::taskbar_probe())),
+            // The real taskbar speed bar for a few seconds (to look at it), then gone.
+            #[cfg(windows)]
+            "netspeed_taskbar_show" => {
+                let secs = arg::<u64>(&args, "seconds").unwrap_or(4).min(30);
+                let light = arg::<bool>(&args, "light").unwrap_or(false);
+                reply(Ok::<_, crate::error::AppError>(crate::netspeed::taskbar_show_for(secs, "300 KB/s", "12.4 MB/s", light)))
+            }
             "apps_users_of" => match arg::<String>(&args, "path") {
                 Ok(p) => reply(Ok::<_, crate::error::AppError>(crate::apps::users_of(std::path::Path::new(&p)))),
                 Err(e) => reply_err(e),

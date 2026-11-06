@@ -1128,7 +1128,7 @@ async function openNetSpeedPage(browser, server, opts = {}) {
         iface("veth", "vEthernet (WSL)", "virtual", { link_bps: 10_000_000_000, upload: 74 }),
       ],
       usage: { today: [1_240_000_000, 45_600_000], month: [38_500_000_000, 2_100_000_000], session: [340_000_000, 12_000_000], since: 1793950000 },
-      settings: { tray: false, style: "icon", bar: false, bar_pos: null, show: "both", unit: "bytes", interval_ms: 1000, source: "auto", ...(opts.settings ?? {}) },
+      settings: { tray: false, style: "icon", bar: false, bar_place: "taskbar", bar_pos: null, show: "both", unit: "bytes", interval_ms: 1000, source: "auto", ...(opts.settings ?? {}) },
     },
     tests: opts.tests ?? [
       { phase: "latency", progress: 0.05, latency_ms: null, down_bps: null, up_bps: null, used_bytes: 0, error: null, at: null },
@@ -6532,11 +6532,20 @@ try {
     await sleep(200);
     let set = await calls(win, "netspeed_set_settings");
     ok("  turned on, the setting is sent", set.length === 1 && set[0].settings.tray === true && set[0].settings.style === "icon", JSON.stringify(set));
-    ok("  the tray-icon tip and 'keeps running' are said", !!(await win.$("[data-taskbar-tip]")) && !!(await win.$("[data-keeps-running]")));
+    ok("  the tray-icon tip and 'keeps running' are said", !!(await win.$("[data-taskbar-tip]")) && !!(await win.$("[data-keeps-running]")) && !(await win.$("[data-bar-tip]")));
     await win.evaluate(() => [...document.querySelectorAll('[aria-label="How the speed is shown"] button')].find((b) => b.innerText === "Speed bar on the taskbar").click());
     await sleep(200);
     set = await calls(win, "netspeed_set_settings");
     ok("  the speed bar can be chosen instead", set.length === 2 && set[1].settings.style === "bar" && !(await win.$("[data-taskbar-tip]")));
+    ok("  the speed bar: it keeps clear of the icons and the clock, and can be dragged", (await win.evaluate(() => document.querySelector("[data-bar-tip]")?.innerText ?? "")).includes("keeps clear of the app icons"));
+    await win.evaluate(() => document.querySelector("[data-bar-reset]").click());
+    await sleep(150);
+    ok("  'Put it back beside the clock' asks for exactly that", (await calls(win, "netspeed_bar_reset")).length === 1 && (await calls(win, "netspeed_set_settings")).length === 2);
+    const where = () => win.evaluate(() => [...document.querySelectorAll('[aria-label="Where the speed bar goes"] button')].map((b) => b.innerText).join("|"));
+    ok("  where it goes: on the taskbar, or anywhere on the screen", (await where()) === "On the taskbar|Anywhere on the screen" && (await win.evaluate(() => document.querySelector("[data-bar-tip]")?.getAttribute("data-bar-tip"))) === "taskbar");
+    await win.evaluate(() => [...document.querySelectorAll('[aria-label="Where the speed bar goes"] button')].find((b) => b.innerText === "Anywhere on the screen").click());
+    await sleep(200);
+    ok("  'Anywhere on the screen' is sent, and the tip says it floats", (await calls(win, "netspeed_set_settings")).pop().settings.bar_place === "anywhere" && (await win.evaluate(() => document.querySelector('[data-bar-tip="anywhere"]')?.innerText ?? "")).includes("anywhere on the screen"));
     await win.evaluate(() => [...document.querySelectorAll('[aria-label="Units"] button')].find((b) => b.innerText === "Mbps").click());
     await sleep(1300);
     ok("units: Mbps", (await win.evaluate(() => document.querySelector('[data-speed="down"]')?.innerText ?? "")).includes("99.2 Mbps") && (await calls(win, "netspeed_set_settings")).pop().settings.unit === "bits");
@@ -6556,7 +6565,7 @@ try {
 
     const mac = await openNetSpeedPage(browser, server, { platform: "macos", settings: { tray: true } });
     const mt = await text(mac);
-    ok("macOS: the menu bar, and a floating speed bar to choose", mt.includes("Show the speed in the menu bar") && mt.includes("Also show a floating speed bar") && !(await mac.$('[aria-label="How the speed is shown"]')) && !(await mac.$("[data-taskbar-tip]")));
+    ok("macOS: the menu bar, and a floating speed bar to choose", mt.includes("Show the speed in the menu bar") && mt.includes("Also show a floating speed bar") && !(await mac.$('[aria-label="How the speed is shown"]')) && !(await mac.$('[aria-label="Where the speed bar goes"]')) && !(await mac.$("[data-taskbar-tip]")));
     await mac.close();
     const lin = await openNetSpeedPage(browser, server, { platform: "linux", settings: { tray: true } });
     ok("Ubuntu: the top bar, with what it needs", (await text(lin)).includes("Show the speed in the top bar") && (await text(lin)).includes("AppIndicator"));

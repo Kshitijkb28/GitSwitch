@@ -218,6 +218,7 @@ pub fn run() {
             commands::netspeed_snapshot,
             commands::netspeed_set_settings,
             commands::netspeed_bar,
+            commands::netspeed_bar_reset,
             commands::netspeed_open_settings,
             commands::netspeed_show_tab,
             commands::netspeed_speedtest_start,

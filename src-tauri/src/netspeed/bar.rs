@@ -1,8 +1,10 @@
-//! The speed bar: a small window that shows the speed in readable text — on
-//! Windows on the taskbar, just left of the notification area; on macOS and
-//! Linux under the menu bar, top right. It can be dragged anywhere, and is
-//! remembered there. On Windows it is put back on top each tick (the taskbar
-//! is a topmost window too) and hidden while a full-screen app is in front.
+//! The floating speed bar: a small window that shows the speed in readable
+//! text, anywhere on the screen. On macOS and Linux it starts under the menu
+//! bar at the top right; on Windows (when "Anywhere on the screen" is chosen —
+//! the bar docked on the taskbar is `taskbar.rs`) just above the clock, with a
+//! clear background. It can be dragged anywhere and is remembered there. On
+//! Windows it is put back on top each tick (the taskbar is a topmost window
+//! too) and hidden while a full-screen app is in front.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -36,6 +38,20 @@ pub fn sync(app: &AppHandle, want: bool, saved: Option<[i32; 2]>) {
     }
 }
 
+/// Back where it starts (the person asked): moved there now, if it is open.
+pub fn reset(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window(LABEL) {
+        if let Some([x, y]) = default_position(app, &w) {
+            place(&w, x, y);
+        }
+    }
+}
+
+fn place(win: &tauri::WebviewWindow, x: i32, y: i32) {
+    *PLACED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    let _ = win.set_position(PhysicalPosition::new(x, y));
+}
+
 fn create(app: &AppHandle, saved: Option<[i32; 2]>) -> tauri::Result<()> {
     let builder = WebviewWindowBuilder::new(app, LABEL, WebviewUrl::App("index.html".into()))
         .title("GitSwitch — net speed")
@@ -49,7 +65,7 @@ fn create(app: &AppHandle, saved: Option<[i32; 2]>) -> tauri::Result<()> {
         .focusable(false)
         .shadow(false)
         .visible(false);
-    // Clear on the Windows taskbar; a solid strip elsewhere (macOS would need its private API).
+    // Clear on Windows; a solid strip elsewhere (macOS would need its private API).
     #[cfg(windows)]
     let builder = builder.transparent(true);
     #[cfg(target_os = "macos")]
@@ -57,8 +73,7 @@ fn create(app: &AppHandle, saved: Option<[i32; 2]>) -> tauri::Result<()> {
     let win = builder.build()?;
     let pos = saved.filter(|p| on_a_screen(app, *p)).or_else(|| default_position(app, &win));
     if let Some([x, y]) = pos {
-        *PLACED_AT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-        let _ = win.set_position(PhysicalPosition::new(x, y));
+        place(&win, x, y);
     }
     let _ = win.show();
     let app2 = app.clone();
@@ -75,23 +90,23 @@ fn create(app: &AppHandle, saved: Option<[i32; 2]>) -> tauri::Result<()> {
 
 /// Whether a saved position is on one of the screens there are now.
 fn on_a_screen(app: &AppHandle, [x, y]: [i32; 2]) -> bool {
-    app.available_monitors().map(|ms| ms.iter().any(|m| {
-        let (p, s) = (m.position(), m.size());
-        x >= p.x && y >= p.y && x < p.x + s.width as i32 && y < p.y + s.height as i32
-    })).unwrap_or(false)
+    app.available_monitors()
+        .map(|ms| {
+            ms.iter().any(|m| {
+                let (p, s) = (m.position(), m.size());
+                x >= p.x && y >= p.y && x < p.x + s.width as i32 && y < p.y + s.height as i32
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn default_position(app: &AppHandle, win: &tauri::WebviewWindow) -> Option<[i32; 2]> {
     let size = win.outer_size().ok()?;
-    #[cfg(windows)]
-    if let Some(p) = sys::beside_the_clock(size.width as i32, size.height as i32) {
-        return Some(p);
-    }
     let m = app.primary_monitor().ok()??;
     let area = m.work_area();
     let (w, h) = (size.width as i32, size.height as i32);
     if cfg!(windows) {
-        // Bottom right, just above the taskbar.
+        // Just above the clock: the free area's bottom right (not on the taskbar's icons).
         Some([area.position.x + area.size.width as i32 - w - 12, area.position.y + area.size.height as i32 - h - 8])
     } else {
         // Top right, under the menu bar.
@@ -125,39 +140,13 @@ fn keep(win: &tauri::WebviewWindow) {
 mod sys {
     use windows_sys::Win32::Foundation::{HWND, RECT};
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowExW, FindWindowW, GetClassNameW, GetForegroundWindow, GetWindowRect, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    };
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetForegroundWindow, GetWindowRect, SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE};
 
     fn rect(h: HWND) -> Option<RECT> {
         // SAFETY: a valid out-pointer.
         unsafe {
             let mut r: RECT = std::mem::zeroed();
             (GetWindowRect(h, &mut r) != 0).then_some(r)
-        }
-    }
-
-    /// On the taskbar, just left of the notification area, when the taskbar
-    /// is at the bottom of the screen.
-    pub fn beside_the_clock(w: i32, h: i32) -> Option<[i32; 2]> {
-        // SAFETY: class names are valid wide strings; handles are only read.
-        unsafe {
-            let bar = FindWindowW(wide("Shell_TrayWnd").as_ptr(), std::ptr::null());
-            if bar.is_null() {
-                return None;
-            }
-            let b = rect(bar)?;
-            // A taskbar at the bottom is wider than tall.
-            if b.right - b.left < (b.bottom - b.top) * 2 {
-                return None;
-            }
-            let tray = FindWindowExW(bar, std::ptr::null_mut(), wide("TrayNotifyWnd").as_ptr(), std::ptr::null());
-            let right = if tray.is_null() { b.right - 220 } else { rect(tray)?.left };
-            Some([right - w - 6, b.top + ((b.bottom - b.top) - h) / 2])
         }
     }
 

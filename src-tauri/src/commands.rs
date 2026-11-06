@@ -1092,6 +1092,12 @@ pub async fn netspeed_bar() -> crate::netspeed::BarText {
     crate::netspeed::bar_text()
 }
 
+/// The speed bar back beside the clock (wherever it was dragged).
+#[tauri::command]
+pub async fn netspeed_bar_reset(app: tauri::AppHandle) {
+    crate::netspeed::bar_reset(&app)
+}
+
 /// The system's settings page for the taskbar's icons or location access.
 #[tauri::command]
 pub async fn netspeed_open_settings(which: String) -> Result<(), AppError> {

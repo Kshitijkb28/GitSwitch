@@ -2772,7 +2772,11 @@ export interface NetSettings {
   style: "icon" | "bar" | "both";
   /** macOS / Linux: also the floating speed bar. */
   bar: boolean;
+  /** Windows: the speed bar docked on the taskbar, or floating anywhere on the screen. */
+  bar_place: "taskbar" | "anywhere";
   bar_pos: [number, number] | null;
+  /** Windows: where on the taskbar the speed bar was dragged (kept by the bar itself). */
+  bar_dock?: { anchor: "left" | "tray"; px: number } | null;
   show: "both" | "down" | "up";
   unit: "bytes" | "bits";
   interval_ms: number;
@@ -2824,6 +2828,11 @@ export async function netspeedSetSettings(settings: NetSettings): Promise<NetSet
 
 export async function netspeedBar(): Promise<NetBar> {
   return invoke("netspeed_bar");
+}
+
+/** Windows: the taskbar's speed bar back beside the clock. */
+export async function netspeedBarReset(): Promise<void> {
+  return invoke("netspeed_bar_reset");
 }
 
 /** The system's settings page: the taskbar's icons (Windows) or location access. */
