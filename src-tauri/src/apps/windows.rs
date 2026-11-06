@@ -2435,6 +2435,8 @@ mod tests {
         assert_eq!(provisioned_family("nounderscores"), None);
     }
 
+    // Backslash paths only split into folders on Windows, where this code runs.
+    #[cfg(windows)]
     #[test]
     fn an_install_folder_comes_from_its_program_named_like_the_app_never_from_a_cache() {
         let names = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
@@ -2466,6 +2468,8 @@ mod tests {
         assert_eq!(v, vec![PathBuf::from(r"C:\Program Files\Foo")], "the outer folder only, once");
     }
 
+    // Backslash paths only split into folders on Windows, where this code runs.
+    #[cfg(windows)]
     #[test]
     fn an_older_session_still_finds_its_folder_from_what_its_entry_points_at() {
         // Zoho Mail's real entry: no InstallLocation, its icon in its folder.
@@ -2503,6 +2507,8 @@ mod tests {
         assert!(force_plan(&app, &dd(None, false)).1.unwrap().contains("isn't known"));
     }
 
+    // Backslash paths only split into folders on Windows, where this code runs.
+    #[cfg(windows)]
     #[test]
     fn the_administrators_cleanup_never_touches_windows_or_shared_folders() {
         // Shallow or shared folders are refused wherever this runs.
@@ -2578,7 +2584,10 @@ mod tests {
         assert!(can_delete(&f), "your own file");
         let _ = std::fs::remove_file(&f);
         let pf = std::env::var("ProgramFiles").unwrap();
-        assert!(!can_delete(Path::new(&pf)), "Program Files needs the administrator");
+        // SAFETY: no arguments. (CI's Windows runner runs elevated, UAC off.)
+        if unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } == 0 {
+            assert!(!can_delete(Path::new(&pf)), "Program Files needs the administrator");
+        }
         assert!(elevated_path_ok(Path::new(&pf).join("CleverFiles").as_path()).is_ok());
         assert!(elevated_path_ok(Path::new(&std::env::var("ProgramData").unwrap()).join("CleverFiles").as_path()).is_ok());
         assert!(elevated_path_ok(Path::new(&std::env::var("SystemRoot").unwrap()).join("Temp").as_path()).is_err());
