@@ -52,6 +52,7 @@ mod workspace;
 mod tray;
 mod uninstall;
 mod apps;
+mod netspeed;
 
 /// macOS/Linux GUI apps launched from Finder/the dock inherit a minimal PATH that
 /// omits Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`). Tools like `gh` live
@@ -214,6 +215,14 @@ pub fn run() {
             commands::apps_forget,
             commands::apps_open_uninstaller,
             commands::apps_force_remove,
+            commands::netspeed_snapshot,
+            commands::netspeed_set_settings,
+            commands::netspeed_bar,
+            commands::netspeed_open_settings,
+            commands::netspeed_show_tab,
+            commands::netspeed_speedtest_start,
+            commands::netspeed_speedtest_status,
+            commands::netspeed_speedtest_cancel,
             commands::apps_close,
             commands::apps_history,
             commands::apps_rescan,
@@ -297,8 +306,19 @@ pub fn run() {
             commands::workspace_info,
             commands::workspace_set_offset,
         ])
+        // While the net speed is shown outside the window, closing the
+        // window keeps GitSwitch running in the tray (Quit is in its menu).
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" && netspeed::keeps_running() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             tray::setup_tray(app.handle())?;
+            netspeed::start(app.handle());
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 let handle = app.handle().clone();
@@ -331,6 +351,12 @@ pub fn run() {
             // window that opened it.
             if let tauri::RunEvent::Exit = event {
                 terminal::close_all();
+                netspeed::save();
+            }
+            // macOS: the Dock icon brings back a window that was closed to the menu bar.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                tray::show_main(_app);
             }
         });
 }

@@ -1106,6 +1106,71 @@ async function openUninstallPage(browser, server, opts = {}) {
   return page;
 }
 
+/** The Net speed tab (or the speed bar's window) against a mocked backend. */
+async function openNetSpeedPage(browser, server, opts = {}) {
+  const page = await browser.newPage();
+  await page.setViewport({ width: opts.width ?? 1200, height: 1000 });
+  const now = 1793952000000;
+  const history = Array.from({ length: 30 }, (_, i) => [now - (29 - i) * 1000, 1_000_000 + i * 400_000, 50_000 + i * 10_000]);
+  const iface = (id, name, kind, extra = {}) => ({ id, name, detail: null, kind, up: true, in_use: false, link_bps: null, down: 0, upload: 0, ...extra });
+  const cfg = {
+    snapshot: {
+      platform: opts.platform ?? "windows",
+      down: 12_400_000,
+      up: 300_000,
+      source_name: "Wi-Fi",
+      connection: iface("wifi", "Wi-Fi", "wifi", { in_use: true, link_bps: 390_000_000, detail: "Intel(R) Wi-Fi 6 AX201", down: 12_400_000, upload: 300_000 }),
+      wifi: opts.wifi === undefined ? { ssid: "Home Network", signal: 54, rssi_dbm: -73, rx_mbps: 390, tx_mbps: 130, note: null, fix: null } : opts.wifi,
+      history,
+      interfaces: [
+        iface("eth", "Ethernet", "ethernet", { up: false, detail: "Realtek PCIe GbE" }),
+        iface("wifi", "Wi-Fi", "wifi", { in_use: true, link_bps: 390_000_000, down: 12_400_000, upload: 300_000 }),
+        iface("veth", "vEthernet (WSL)", "virtual", { link_bps: 10_000_000_000, upload: 74 }),
+      ],
+      usage: { today: [1_240_000_000, 45_600_000], month: [38_500_000_000, 2_100_000_000], session: [340_000_000, 12_000_000], since: 1793950000 },
+      settings: { tray: false, style: "icon", bar: false, bar_pos: null, show: "both", unit: "bytes", interval_ms: 1000, source: "auto", ...(opts.settings ?? {}) },
+    },
+    tests: opts.tests ?? [
+      { phase: "latency", progress: 0.05, latency_ms: null, down_bps: null, up_bps: null, used_bytes: 0, error: null, at: null },
+      { phase: "download", progress: 0.4, latency_ms: 18, down_bps: null, up_bps: null, used_bytes: 0, error: null, at: null },
+      { phase: "done", progress: 1, latency_ms: 18.4, down_bps: 12_500_000, up_bps: 2_500_000, used_bytes: 95_000_000, error: null, at: 1793952100 },
+    ],
+    bar: opts.bar ?? { down: "12.4 MB/s", up: "300 KB/s", show: "both", light: false },
+  };
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    let test = { phase: "idle", progress: 0, latency_ms: null, down_bps: null, up_bps: null, used_bytes: 0, error: null, at: null };
+    let started = false;
+    window.__TAURI_INTERNALS__ = {
+      transformCallback: () => 1,
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args });
+        switch (cmd) {
+          case "netspeed_snapshot":
+            return Promise.resolve(JSON.parse(JSON.stringify(cfg.snapshot)));
+          case "netspeed_set_settings":
+            cfg.snapshot.settings = { ...args.settings };
+            return Promise.resolve(cfg.snapshot.settings);
+          case "netspeed_speedtest_start":
+            started = true;
+            return Promise.resolve(null);
+          case "netspeed_speedtest_status":
+            if (started && cfg.tests.length) test = cfg.tests.shift();
+            return Promise.resolve(test);
+          case "netspeed_bar":
+            return Promise.resolve(cfg.bar);
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}${opts.path ?? "/netspeed"}`, { waitUntil: "networkidle0" });
+  if (!(opts.path ?? "").includes("speedbar")) await page.waitForFunction(() => document.querySelector("[data-netspeed]"), { timeout: 5000 }).catch(() => null);
+  return page;
+}
+
 /** The profile form against a mocked backend: its profiles, gh logins and GitHub's answers. */
 async function openProfilePage(browser, server, opts = {}) {
   const cfg = {
@@ -6442,6 +6507,69 @@ try {
     await none.waitForFunction(() => document.querySelector('[data-flow-stage="leftovers"]'), { timeout: 5000 }).catch(() => null);
     ok("nothing left behind: said, and only Done", (await text(none)).includes("Nothing of Clean App's was left behind") && !!(await none.$("[data-flow-close]")) && !(await none.$("[data-flow-delete]")) && !(await text(none)).includes("Keep them"));
     await none.close();
+  }
+
+  section("Net speed tab: the speed now, the connection, the last two minutes, data used, a speed test, and the speed in the taskbar / menu bar / top bar");
+  {
+    const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+    const win = await openNetSpeedPage(browser, server);
+    const t = await text(win);
+    ok("the speed now, in MB/s, with its connection", (await win.evaluate(() => document.querySelector('[data-speed="down"]')?.innerText ?? "")).includes("12.4 MB/s") && (await win.evaluate(() => document.querySelector('[data-speed="up"]')?.innerText ?? "")).includes("300 KB/s"));
+    ok("  the connection in use: Wi-Fi, its link, the network, the signal", (await win.evaluate(() => document.querySelector("[data-connection]")?.innerText ?? "")).includes("Wi-Fi") && t.includes("390 Mbps link") && t.includes("Home Network") && t.includes("54%"));
+    ok("the last two minutes as a graph, with a legend", (await win.$$("[data-speed-graph] svg path")).length >= 4 && (await win.evaluate(() => document.querySelector("[data-graph-legend]")?.innerText ?? "")).includes("Download"));
+    const box = await (await win.$("[data-speed-graph] svg")).boundingBox();
+    await win.mouse.move(box.x + box.width - 20, box.y + box.height / 2);
+    await sleep(150);
+    ok("  hovering shows both speeds at that moment", (await win.evaluate(() => document.querySelector("[data-graph-tooltip]")?.innerText ?? "")).includes("Download") && (await win.evaluate(() => document.querySelector("[data-graph-tooltip]")?.innerText ?? "")).includes("Upload"));
+    ok("  and the numbers are in a table too", !!(await win.$("[data-graph-table]")));
+    ok("data used today, this month, since GitSwitch started", t.includes("1.24 GB") && t.includes("38.5 GB") && t.includes("340 MB") && t.includes("not VPNs"));
+    ok("adapters: yours, the one in use marked; virtual ones on request", JSON.stringify(await win.evaluate(() => [...document.querySelectorAll("[data-adapter]")].map((r) => r.getAttribute("data-adapter")))) === JSON.stringify(["Ethernet", "Wi-Fi"]) && (await win.evaluate(() => document.querySelector('[data-adapter="Wi-Fi"]').innerText)).includes("in use"));
+    await win.evaluate(() => document.querySelector("[data-show-virtual]").click());
+    await sleep(100);
+    ok("  Show virtual adapters adds them", !!(await win.$('[data-adapter="vEthernet (WSL)"]')));
+    ok("Windows: 'Show the speed in the taskbar', off", (await text(win)).includes("Show the speed in the taskbar") && !(await win.evaluate(() => document.querySelector('[aria-label="Show the speed in the taskbar"]').checked)));
+    await win.evaluate(() => document.querySelector('[aria-label="Show the speed in the taskbar"]').click());
+    await sleep(200);
+    let set = await calls(win, "netspeed_set_settings");
+    ok("  turned on, the setting is sent", set.length === 1 && set[0].settings.tray === true && set[0].settings.style === "icon", JSON.stringify(set));
+    ok("  the tray-icon tip and 'keeps running' are said", !!(await win.$("[data-taskbar-tip]")) && !!(await win.$("[data-keeps-running]")));
+    await win.evaluate(() => [...document.querySelectorAll('[aria-label="How the speed is shown"] button')].find((b) => b.innerText === "Speed bar on the taskbar").click());
+    await sleep(200);
+    set = await calls(win, "netspeed_set_settings");
+    ok("  the speed bar can be chosen instead", set.length === 2 && set[1].settings.style === "bar" && !(await win.$("[data-taskbar-tip]")));
+    await win.evaluate(() => [...document.querySelectorAll('[aria-label="Units"] button')].find((b) => b.innerText === "Mbps").click());
+    await sleep(1300);
+    ok("units: Mbps", (await win.evaluate(() => document.querySelector('[data-speed="down"]')?.innerText ?? "")).includes("99.2 Mbps") && (await calls(win, "netspeed_set_settings")).pop().settings.unit === "bits");
+    await win.evaluate(() => document.querySelector("[data-speedtest-start]").click());
+    await win.waitForFunction(() => document.querySelector("[data-speedtest-result]") && document.body.innerText.includes("Test again"), { timeout: 8000 }).catch(() => null);
+    const res = await win.evaluate(() => document.querySelector("[data-speedtest-result]")?.innerText ?? "");
+    ok("the speed test: download, upload and delay", res.includes("100 Mbps") && res.includes("20.0 Mbps") && res.includes("18 ms") && (await calls(win, "netspeed_speedtest_start")).length === 1, res);
+    ok("  and what it used", (await text(win)).includes("It used 95.0 MB"));
+    await win.close();
+
+    const hidden = await openNetSpeedPage(browser, server, { wifi: { ssid: null, signal: 54, rssi_dbm: -73, rx_mbps: 390, tx_mbps: 130, note: "Windows shows the Wi-Fi's name to apps only when \"Let desktop apps access your location\" is on.", fix: "location" } });
+    ok("a Wi-Fi name Windows hides: why, and the setting", (await hidden.evaluate(() => document.querySelector("[data-wifi-note]")?.innerText ?? "")).includes("Let desktop apps access your location"));
+    await hidden.evaluate(() => [...document.querySelectorAll("[data-wifi-note] button")][0].click());
+    await sleep(150);
+    ok("  Open the location settings asks for exactly that", JSON.stringify(await calls(hidden, "netspeed_open_settings")) === JSON.stringify([{ which: "location" }]));
+    await hidden.close();
+
+    const mac = await openNetSpeedPage(browser, server, { platform: "macos", settings: { tray: true } });
+    const mt = await text(mac);
+    ok("macOS: the menu bar, and a floating speed bar to choose", mt.includes("Show the speed in the menu bar") && mt.includes("Also show a floating speed bar") && !(await mac.$('[aria-label="How the speed is shown"]')) && !(await mac.$("[data-taskbar-tip]")));
+    await mac.close();
+    const lin = await openNetSpeedPage(browser, server, { platform: "linux", settings: { tray: true } });
+    ok("Ubuntu: the top bar, with what it needs", (await text(lin)).includes("Show the speed in the top bar") && (await text(lin)).includes("AppIndicator"));
+    await lin.close();
+
+    const bar = await openNetSpeedPage(browser, server, { path: "/?speedbar" });
+    await bar.waitForFunction(() => document.querySelector("[data-speed-bar]")?.innerText.includes("MB/s"), { timeout: 5000 }).catch(() => null);
+    const bt = await bar.evaluate(() => document.querySelector("[data-speed-bar]")?.innerText ?? "");
+    ok("the speed bar's window: only the speed, upload above download", bt.includes("↑") && bt.includes("300 KB/s") && bt.includes("↓") && bt.includes("12.4 MB/s") && bt.indexOf("↑") < bt.indexOf("↓") && !(await bar.$("nav")), bt);
+    await bar.evaluate(() => document.querySelector("[data-speed-bar]").dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+    await sleep(150);
+    ok("  double-click opens the Net speed tab", (await calls(bar, "netspeed_show_tab")).length === 1);
+    await bar.close();
   }
 
   section("Settings › Uninstall GitSwitch: what is taken back and what is kept, the locks refused stops everything");

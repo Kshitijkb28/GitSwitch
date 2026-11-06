@@ -1074,6 +1074,51 @@ pub async fn apps_force_remove(session: String) -> Result<crate::apps::Progress,
     Box::pin(crate::apps::force_remove(session)).await
 }
 
+/// Net speed: the speeds, the connection, usage and settings for the tab.
+#[tauri::command]
+pub async fn netspeed_snapshot() -> crate::netspeed::Snapshot {
+    crate::netspeed::snapshot()
+}
+
+/// Net speed: new settings (shown at once in the taskbar / menu bar).
+#[tauri::command]
+pub async fn netspeed_set_settings(app: tauri::AppHandle, settings: crate::netspeed::Settings) -> crate::netspeed::Settings {
+    crate::netspeed::set_settings(&app, settings)
+}
+
+/// What the speed bar shows.
+#[tauri::command]
+pub async fn netspeed_bar() -> crate::netspeed::BarText {
+    crate::netspeed::bar_text()
+}
+
+/// The system's settings page for the taskbar's icons or location access.
+#[tauri::command]
+pub async fn netspeed_open_settings(which: String) -> Result<(), AppError> {
+    crate::netspeed::open_os_settings(&which)
+}
+
+/// The speed bar was double-clicked: the window, on the Net speed tab.
+#[tauri::command]
+pub async fn netspeed_show_tab(app: tauri::AppHandle) {
+    crate::netspeed::show_tab(&app)
+}
+
+#[tauri::command]
+pub async fn netspeed_speedtest_start() -> Result<(), AppError> {
+    crate::netspeed::speedtest::start().map_err(AppError::Config)
+}
+
+#[tauri::command]
+pub async fn netspeed_speedtest_status() -> crate::netspeed::speedtest::TestState {
+    crate::netspeed::speedtest::status()
+}
+
+#[tauri::command]
+pub async fn netspeed_speedtest_cancel() {
+    crate::netspeed::speedtest::cancel()
+}
+
 /// Apps uninstalled with GitSwitch before, no longer installed.
 #[tauri::command]
 pub fn apps_history() -> Vec<crate::apps::PastUninstall> {

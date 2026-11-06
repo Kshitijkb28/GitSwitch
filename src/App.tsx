@@ -5,7 +5,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { readPersisted, writePersisted } from "./lib/persist";
 import { deepLinkTake } from "./lib/api";
 import { startUpdateChecks, useUpdates } from "./lib/updates";
-import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequest, GitPullRequestArrow, SquareTerminal, Network, Trash2, CircleArrowUp } from "lucide-react";
+import { LayoutDashboard, Key, Settings as SettingsIcon, GitBranch, ScanSearch, Stethoscope, History as HistoryIcon, BookMarked, GitPullRequest, GitPullRequestArrow, SquareTerminal, Network, Trash2, CircleArrowUp, Gauge } from "lucide-react";
 import { GitHubIcon } from "./components/GitHubIcon";
 import { Dashboard } from "./pages/Dashboard";
 import { ProfileForm } from "./pages/ProfileForm";
@@ -21,6 +21,7 @@ import { Repo } from "./pages/Repo";
 import { Ports } from "./pages/Ports";
 import { Pulls } from "./pages/Pulls";
 import { Uninstall } from "./pages/Uninstall";
+import { NetSpeed } from "./pages/NetSpeed";
 import { ConsoleDrawer } from "./components/console/ConsoleDrawer";
 import { toggleConsole, useConsole } from "./lib/console";
 
@@ -97,6 +98,8 @@ function App() {
         <div className="p-4 border-b border-zinc-800">
           <h1 className="text-lg font-bold tracking-tight">
             <span className="text-emerald-400">Git</span>Switch
+            {/* The version beside the name: the sidebar's foot is only there for an update. */}
+            {version && <span className="ml-2 text-xs font-normal tracking-normal text-zinc-600">v{version}</span>}
           </h1>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-0.5 [scrollbar-width:thin]">
@@ -132,6 +135,9 @@ function App() {
           <SidebarLink to="/ports" icon={<Network size={18} />}>
             Ports
           </SidebarLink>
+          <SidebarLink to="/netspeed" icon={<Gauge size={18} />}>
+            Net speed
+          </SidebarLink>
           <SidebarLink to="/auto-assign" icon={<ScanSearch size={18} />}>
             Auto Assign
           </SidebarLink>
@@ -161,7 +167,7 @@ function App() {
             Terminal
           </button>
         </div>
-        <div className="p-3 border-t border-zinc-800 space-y-2">
+        <div className={update ? "p-3 border-t border-zinc-800" : ""}>
           {update && (
             <NavLink
               to="/settings"
@@ -172,7 +178,6 @@ function App() {
               Update available: v{update.version}
             </NavLink>
           )}
-          {version && <p className="text-xs text-zinc-600">v{version}</p>}
         </div>
       </nav>
 
@@ -198,6 +203,7 @@ function App() {
           <Route path="/history" element={<Navigate to="/repo/history" replace />} />
           <Route path="/commits" element={<CommitAudit />} />
           <Route path="/uninstall" element={<Uninstall />} />
+          <Route path="/netspeed" element={<NetSpeed />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </main>
