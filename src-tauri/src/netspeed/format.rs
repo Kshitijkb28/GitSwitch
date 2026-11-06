@@ -21,7 +21,8 @@ pub fn full(bytes_per_s: f64, bits: bool) -> String {
 }
 
 /// At most four characters: "0K", "3.4K", "340K", "1.2M", "12M", "120M",
-/// "1.2G". Bytes use K/M/G, bits k/m/g.
+/// "1.2G". Bytes use K/M/G, bits k/m/g. (The Windows tray icon's.)
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn compact(bytes_per_s: f64, bits: bool) -> String {
     let letters: [char; 3] = if bits { ['k', 'm', 'g'] } else { ['K', 'M', 'G'] };
     let mut v = if bits { bytes_per_s * 8.0 } else { bytes_per_s };

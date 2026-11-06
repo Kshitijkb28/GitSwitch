@@ -16,7 +16,8 @@ const HEIGHT: f64 = 36.0;
 
 /// GitSwitch moving it (not the person): not remembered as their choice.
 static PLACED_AT: Mutex<Option<Instant>> = Mutex::new(None);
-/// Hidden by GitSwitch while a full-screen app is in front.
+/// Hidden by GitSwitch while a full-screen app is in front (Windows).
+#[cfg(windows)]
 static HIDDEN_FOR_FULL_SCREEN: Mutex<bool> = Mutex::new(false);
 
 /// Show or close the bar; while shown, keep it where it belongs.

@@ -1,6 +1,8 @@
 //! The Windows tray icon with the speed drawn in it: two lines of at most
 //! four characters (download above, upload below), in a pixel font made for
 //! the icon's size, so they stay sharp at 16, 20, 24 or 32 pixels.
+//! (macOS and Linux show text beside the icon instead.)
+#![cfg_attr(not(windows), allow(dead_code))]
 
 /// A glyph: its width and its rows, the leftmost pixel in the highest bit.
 struct Glyph {
