@@ -275,7 +275,11 @@ fn pids_in(bundle: &Path) -> Vec<i32> {
                 .lines()
                 .filter_map(|l| {
                     let (pid, comm) = l.trim().split_once(' ')?;
-                    comm.trim().starts_with(&prefix).then(|| pid.trim().parse().ok()).flatten()
+                    if comm.trim().starts_with(&prefix) {
+                        pid.trim().parse().ok()
+                    } else {
+                        None
+                    }
                 })
                 .collect()
         })
