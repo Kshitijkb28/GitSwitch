@@ -16,6 +16,7 @@ SB="$(realdir "$SB")"
 if command -v cygpath >/dev/null 2>&1; then
   echo "identity suite: skipped on Windows (the profile store does not follow HOME there)"
   verify_result
+  exit $?
 fi
 unset XDG_DATA_HOME XDG_CONFIG_HOME
 
@@ -403,6 +404,20 @@ case "$1 $2" in
       /Logged in to / { cur = $5; print; if (cur == host) print "  - Active account: " (($7 == user) ? "true" : "false"); next }
       { print }' "$status" > "$status.new"
     mv "$status.new" "$status"; exit 0 ;;
+  "auth login")
+    # gh through a pipe: the code and the address, then a wait for the browser.
+    echo "$*" >> "$GH_FAKE_DIR/gh-calls.txt"
+    if [ -n "${GH_TOKEN:-}" ]; then echo "The value of the GH_TOKEN environment variable is being used for authentication." >&2; exit 1; fi
+    echo "! One-time code (C027-AF8F) copied to clipboard" >&2
+    echo "Open this URL to continue in your web browser: https://github.com/login/device" >&2
+    case "${GH_FAKE_LOGIN:-}" in
+      expire) sleep 1; echo "failed to authenticate via web browser: context deadline exceeded" >&2; exit 1 ;;
+      hang) echo $$ > "$GH_FAKE_DIR/gh-login.pid"; sleep 30; exit 0 ;;
+    esac
+    sleep 1
+    printf '  ✓ Logged in to github.com account newuser (keyring)\n' >> "$status"
+    echo "- gh config set -h github.com git_protocol ssh" >&2
+    echo "✓ Logged in as newuser" >&2; exit 0 ;;
 esac
 exit 1
 FAKEGH
@@ -433,6 +448,25 @@ ok "a login gh does not have is refused in gh's words" "$(ghx gh_auth_switch '{"
 ok "  and so is something that is not a login at all" "$(ghx gh_auth_switch '{"host":"github.com","login":"-u"}' | jqf error)" "Not a login"
 OUT=$( PATH="$GHB:$PATH" GH_FAKE_DIR="$SB" GH_TOKEN=x pinvoke gh_auth_switch '{"host":"github.com","login":"alice"}' )
 ok "a GH_TOKEN in the app's own environment does not reach gh (it would refuse)" "$(printf '%s' "$OUT" | jqf value)" "alice is now the GitHub CLI's active account"
+
+section "Signing in to the GitHub CLI from GitSwitch"
+: > "$SB/gh-calls.txt"
+ghlogin() { ( unset GITHUB_TOKEN; PATH="$GHB:$PATH" GH_FAKE_DIR="$SB" probe gh_login "$SB" "$@" ); }
+# A GH_TOKEN in the app's environment would make gh refuse; it must not reach gh.
+OUT=$(GH_TOKEN=x ghlogin)
+ok "the page is given gh's one-time code" "$(printf '%s' "$OUT" | jqf start.value.code)" "C027-AF8F"
+ok "  and the address to enter it at" "$(printf '%s' "$OUT" | jqf start.value.url)" "https://github.com/login/device"
+ok "  then the account gh signed in" "$(printf '%s' "$OUT" | jqf done.value.login)@$(printf '%s' "$OUT" | jqf done.value.host)" "newuser@github.com"
+ok "  gh was asked for the host, the browser, SSH for git and no key upload" "$(cat "$SB/gh-calls.txt")" "auth login --hostname github.com --web --git-protocol ssh --skip-ssh-key"
+ok "  with the scopes Doctor checks for" "$(cat "$SB/gh-calls.txt")" "--scopes admin:public_key,admin:ssh_signing_key,user:email"
+ok "  and the listing has the new login" "$(ghx gh_list_accounts '{}' | jqf value)" "newuser"
+OUT=$(GH_FAKE_LOGIN=expire ghlogin)
+ok "a code nobody entered in time is said in words" "$(printf '%s' "$OUT" | jqf done.error)" "The code expired before it was entered on GitHub"
+BEFORE=$(grep -c "account newuser " "$SB/gh-status.txt")
+OUT=$(GH_FAKE_LOGIN=hang ghlogin cancel)
+ok "Cancel ends a sign-in that is waiting" "$(printf '%s' "$OUT" | jqf done.error)" "The sign-in was cancelled."
+ok "  gh is no longer running" "$(kill -0 "$(cat "$SB/gh-login.pid")" 2>/dev/null && echo running || echo gone)" "gone"
+ok "  and no account was added" "$(grep -c "account newuser " "$SB/gh-status.txt")" "$BEFORE"
 
 section "An account's own addresses come back with it, when the token may read them"
 "$PY" - "$SB/emails-api.log" > "$SB/emails-api-port" <<'PYAPI' &

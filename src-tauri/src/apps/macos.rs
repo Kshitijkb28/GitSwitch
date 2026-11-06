@@ -4,7 +4,7 @@
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use super::matcher::{Allow, Confidence, Evidence, Match, Others};
-use super::{home, sandboxed, sys, Action, Candidate, InstalledApp, Place, Prepared, Record, Session, TrashOutcome};
+use super::{home, sandboxed, sys, Action, Candidate, Closed, InstalledApp, Place, Prepared, Record, Session, TrashOutcome};
 use crate::error::AppError;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -176,6 +176,11 @@ fn developer_dir() -> Option<PathBuf> {
     out.status.success().then(|| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
 }
 
+/// One of Apple's own apps (Safari, Xcode, Keynote…): the System apps tab.
+pub(crate) fn apple_app(bundle_id: &str) -> bool {
+    bundle_id.to_lowercase().starts_with("com.apple.")
+}
+
 pub fn list() -> Result<super::Listing, AppError> {
     let casks = casks();
     let dev = developer_dir();
@@ -223,6 +228,7 @@ pub fn list() -> Result<super::Listing, AppError> {
                 notes,
                 blocked,
                 is_self: id.eq_ignore_ascii_case(SELF_ID),
+                system: apple_app(&id).then(|| "Apple's own app".to_string()),
             },
             Record::MacBundle { bundle: bundle.clone(), bundle_id: id, cask, vendor_uninstaller: uninstaller, app_store },
         ));
@@ -256,6 +262,62 @@ fn is_running(bundle: &Path, id: &str) -> bool {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim().starts_with(&prefix)))
         .unwrap_or(false)
+}
+
+/// The processes running from inside the bundle.
+fn pids_in(bundle: &Path) -> Vec<i32> {
+    let prefix = format!("{}/", bundle.display());
+    crate::spawn::command("ps")
+        .args(["-axo", "pid=,comm="])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| {
+                    let (pid, comm) = l.trim().split_once(' ')?;
+                    if comm.trim().starts_with(&prefix) {
+                        pid.trim().parse().ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Quit the app as the person would (it may ask to save), then end what is
+/// still running from its bundle.
+pub fn close(s: &Session) -> Closed {
+    let Record::MacBundle { bundle, bundle_id, .. } = &s.record else { return Closed::default() };
+    if sandboxed() || !is_running(bundle, bundle_id) {
+        return Closed::default();
+    }
+    if !bundle_id.is_empty() && !bundle_id.contains('"') {
+        let _ = crate::spawn::command("osascript").args(["-e", &format!("tell application id \"{}\" to quit", bundle_id)]).output();
+    }
+    let wait = |secs: u64| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while is_running(bundle, bundle_id) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    };
+    wait(6);
+    for hard in [false, true] {
+        let pids = pids_in(bundle);
+        if pids.is_empty() {
+            break;
+        }
+        for pid in pids {
+            super::signal(pid, hard);
+        }
+        wait(2);
+    }
+    if is_running(bundle, bundle_id) {
+        Closed { closed: vec![], left: vec![s.app.name.clone()] }
+    } else {
+        Closed { closed: vec![s.app.name.clone()], left: vec![] }
+    }
 }
 
 /// `codesign -dv`'s TeamIdentifier ("not set" for Apple's and ad-hoc apps).

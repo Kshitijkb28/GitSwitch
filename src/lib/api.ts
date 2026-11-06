@@ -256,6 +256,27 @@ export async function ghAuthSwitch(host: string, login: string): Promise<string>
   return invoke("gh_auth_switch", { host, login });
 }
 
+/** The one-time code `gh auth login --web` shows, and the page to enter it on. */
+export interface GhDevicePrompt {
+  code: string;
+  url: string;
+}
+
+/** Start gh's own browser sign-in (SSH as git's protocol, no key upload). */
+export async function ghAuthLoginStart(host?: string): Promise<GhDevicePrompt> {
+  return invoke("gh_auth_login_start", { host: host ?? null });
+}
+
+/** Wait for the sign-in started above: the account gh signed in. */
+export async function ghAuthLoginWait(): Promise<{ host: string; login: string }> {
+  return invoke("gh_auth_login_wait");
+}
+
+/** End the sign-in in progress, if any. */
+export async function ghAuthLoginCancel(): Promise<void> {
+  return invoke("gh_auth_login_cancel");
+}
+
 export async function ghRegisterSshKey(
   account: string,
   keyPath: string
@@ -323,6 +344,10 @@ export interface BranchInfo {
   last_subject: string;
   /** One of GitSwitch's own backup branches (before an update, a reset, a rewrite). */
   is_backup?: boolean;
+  /** The full ref: `refs/heads/x`, `refs/remotes/origin/x`. */
+  full_ref?: string;
+  /** A remote-tracking branch's name on its remote (`x` for `origin/x`); null for a local branch or an unknown remote. */
+  remote_branch?: string | null;
 }
 
 export interface HistoryCommit {
@@ -2637,6 +2662,8 @@ export interface InstalledApp {
   notes: string[];
   blocked: string | null;
   is_self: boolean;
+  /** A system app, and why (came with Windows or the PC, runs its hardware, others use it). */
+  system?: string | null;
 }
 
 export interface AppList {
@@ -2656,6 +2683,21 @@ export interface AppPrepared {
   running: boolean;
   warnings: string[];
   vendor_uninstaller: string | null;
+  /** Windows: deleting its files directly instead of running its uninstaller. */
+  force?: ForcePlan | null;
+  /** Windows: why its files can't be deleted directly. */
+  force_unavailable?: string | null;
+}
+
+export interface ForcePlan {
+  folders: { path: string; size: number | null; size_complete: boolean; admin: boolean }[];
+  /** Its entry in Installed apps. */
+  entry: string;
+  entry_admin: boolean;
+  /** Its start-up entries, as "name (where)". */
+  startup: string[];
+  /** Windows asks for permission for some of it. */
+  admin: boolean;
 }
 
 export interface AppProgress {
@@ -2676,6 +2718,8 @@ export interface Leftover {
   reason: string;
   admin: boolean;
   command: string | null;
+  /** GitSwitch deletes it after Windows' permission prompt (Windows). */
+  elevate?: boolean;
 }
 
 export interface LeftoverScan {
@@ -2686,9 +2730,33 @@ export interface LeftoverScan {
 
 export interface LeftoverDeleted {
   id: string;
-  /** trashed | removed | gone | changed | refused | needs-admin | protected | failed */
+  /** trashed | removed | gone | changed | refused | needs-admin | protected | in-use | at-restart | failed */
   outcome: string;
   message: string;
+}
+
+/** An app uninstalled with GitSwitch before, no longer installed. */
+export interface PastUninstall {
+  /** The app's id: what appsRescan takes. */
+  key: string;
+  name: string;
+  /** When it was uninstalled, seconds since 1970. */
+  at: number;
+}
+
+export async function appsHistory(): Promise<PastUninstall[]> {
+  return invoke("apps_history");
+}
+
+/** Look for an app's leftovers again: the session to continue with. */
+export async function appsRescan(key: string): Promise<string> {
+  return invoke("apps_rescan", { key });
+}
+
+/** The app's own running processes, closed — and those that would not close. */
+export interface AppClosed {
+  closed: string[];
+  left: string[];
 }
 
 export interface UninstallSessionSummary {
@@ -2738,6 +2806,21 @@ export async function appsSessions(): Promise<UninstallSessionSummary[]> {
 
 export async function appsForget(session: string): Promise<void> {
   return invoke("apps_forget", { session });
+}
+
+/** Close the app's own running processes, so its uninstall can go ahead. */
+export async function appsClose(session: string): Promise<AppClosed> {
+  return invoke("apps_close", { session });
+}
+
+/** Windows: leftovers in use, deleted when Windows next starts (after one permission prompt). */
+export async function appsDeleteAtRestart(scan: string, ids: string[]): Promise<LeftoverDeleted[]> {
+  return invoke("apps_delete_at_restart", { scan, ids });
+}
+
+/** Windows: delete a program's files directly (folders to the Recycle Bin, its entry and start-up values removed). */
+export async function appsForceRemove(session: string): Promise<AppProgress> {
+  return invoke("apps_force_remove", { session });
 }
 
 export async function appsOpenUninstaller(session: string): Promise<void> {

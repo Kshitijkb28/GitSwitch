@@ -10,10 +10,11 @@ import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
 import { notePushChanged } from "../lib/console";
 import { RefreshButton } from "../components/RefreshButton";
-import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { getVersion } from "@tauri-apps/api/app";
 import { useAnyJobRunning } from "../lib/gitJobs";
 import { UninstallDialog } from "../components/UninstallDialog";
+import { checkForUpdate, useUpdates } from "../lib/updates";
 
 export function Settings() {
   const toast = useToast();
@@ -21,9 +22,10 @@ export function Settings() {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
-  const [checking, setChecking] = useState(false);
-  const [pendingUpdate, setPendingUpdate] = useState<Update | null>(null);
+  // Shared with the sidebar: an update the background check found is ready here.
+  const { update: pendingUpdate, checking } = useUpdates();
   const [installing, setInstalling] = useState(false);
+  const [version, setVersion] = useState<string | null>(null);
   // Installing restarts the app, which would kill a pull or sync mid-way.
   const jobRunning = useAnyJobRunning();
   const [clientId, setClientId] = useState("");
@@ -33,16 +35,21 @@ export function Settings() {
   const [lockMessage, setLockMessage] = useState<string | null>(null);
   const [uninstalling, setUninstalling] = useState(false);
 
+  function loadVersion() {
+    return getVersion().then((v) => setVersion(typeof v === "string" ? v : null), () => {});
+  }
+
   useEffect(() => {
     loadConfig();
     loadLocks();
     setClientId(getCustomClientId() ?? "");
+    loadVersion();
   }, []);
 
   const [reloading, setReloading] = useState(false);
   async function reloadAll() {
     setReloading(true);
-    await Promise.all([loadConfig(), loadLocks()]);
+    await Promise.all([loadConfig(), loadLocks(), loadVersion()]);
     setReloading(false);
   }
 
@@ -127,28 +134,14 @@ export function Settings() {
   }
 
   async function handleCheckUpdate() {
-    setChecking(true);
     setUpdateStatus(null);
-    setPendingUpdate(null);
     try {
-      const update = await check();
-      if (update) {
-        // Found, not installed: installing restarts the app, so that is a
-        // separate, deliberate click below.
-        setPendingUpdate(update);
-        setUpdateStatus(`Version ${update.version} is available.`);
-      } else {
-        setUpdateStatus("You're on the latest version.");
-      }
+      // Found, not installed: installing restarts the app, so that is a
+      // separate, deliberate click below.
+      const update = await checkForUpdate();
+      setUpdateStatus(update ? `Version ${update.version} is available.` : "You're on the latest version.");
     } catch (e) {
-      const msg = String(e);
-      if (/endpoint|pubkey|not configured|Tauri runtime/i.test(msg)) {
-        setUpdateStatus("Update checks aren't configured for this build (see BUILD.md, \"Auto-updater releases\").");
-      } else {
-        setUpdateStatus(`Could not check: ${msg}`);
-      }
-    } finally {
-      setChecking(false);
+      setUpdateStatus(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -403,7 +396,7 @@ export function Settings() {
           <div className="space-y-1 text-sm text-zinc-400">
             <p>
               <span className="text-zinc-500">Version:</span>{" "}
-              <span className="text-zinc-300">0.1.0</span>
+              <span className="text-zinc-300">{version ?? "—"}</span>
             </p>
             <p>
               <span className="text-zinc-500">Built with:</span>{" "}

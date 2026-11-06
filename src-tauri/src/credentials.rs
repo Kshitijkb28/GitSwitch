@@ -105,7 +105,7 @@ pub struct KeptSignIn {
 fn index_path() -> Option<PathBuf> {
     match store() {
         Store::Files(dir) => Some(dir.join("github-signins.json")),
-        Store::System => dirs::data_dir().map(|d| d.join("com.gitswitch.app").join("github-signins.json")),
+        Store::System => crate::paths::data_dir().map(|d| d.join("com.gitswitch.app").join("github-signins.json")),
     }
 }
 

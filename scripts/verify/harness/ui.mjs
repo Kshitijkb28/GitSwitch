@@ -729,6 +729,9 @@ async function openAuthPage(browser, server, opts = {}) {
     /** Logins whose sign-in the backend keeps; keepError: what keeping one answers. */
     kept: opts.kept ?? [],
     keepError: opts.keepError ?? null,
+    /** gh auth login through the app: what start and wait answer, scripted like the polls. */
+    loginStart: opts.loginStart ?? { resolve: { code: "C027-AF8F", url: "https://github.com/login/device" } },
+    loginWait: opts.loginWait ?? "hold",
   };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
@@ -779,6 +782,17 @@ async function openAuthPage(browser, server, opts = {}) {
           case "github_signin_keep":
             return cfg.keepError ? Promise.reject(cfg.keepError) : Promise.resolve(null);
           case "github_signin_forget":
+            return Promise.resolve(null);
+          case "gh_auth_login_start":
+            return reply(cmd, cfg.loginStart, () => Promise.reject("Command execution error: nothing scripted"));
+          case "gh_auth_login_wait":
+            // A finished sign-in is in gh's listing from then on, as its active account.
+            return reply(cmd, cfg.loginWait, () => Promise.reject("Command execution error: nothing scripted")).then((who) => {
+              if (who && who.login && !accounts.includes(who.login)) accounts.push(who.login);
+              if (who && who.login) active = who.login;
+              return who;
+            });
+          case "gh_auth_login_cancel":
             return Promise.resolve(null);
           case "get_profiles":
           case "list_ssh_keys":
@@ -837,6 +851,44 @@ async function openSshPage(browser, server, opts = {}) {
   }, cfg);
   await page.goto(`${server.url}/ssh`, { waitUntil: "networkidle0" });
   await page.waitForFunction(() => document.body.innerText.includes("Existing SSH Keys"), { timeout: 5000 });
+  return page;
+}
+
+/**
+ * Settings against a mocked updater. `check` is what the release feed answers:
+ * an update's metadata, null for none, or { reject } for a failure. The
+ * background check's 10-second wait after launch is cut to a moment.
+ */
+async function openSettingsPage(browser, server, opts = {}) {
+  const cfg = { check: opts.check ?? null, version: opts.version ?? "0.1.0", path: opts.path ?? "/settings", install: opts.install ?? { resolve: null } };
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+  await page.evaluateOnNewDocument((cfg) => {
+    window.__CALLS__ = [];
+    localStorage.clear();
+    const later = window.setTimeout.bind(window);
+    window.setTimeout = (f, ms, ...rest) => later(f, ms === 10_000 ? 50 : ms, ...rest);
+    window.__TAURI_INTERNALS__ = {
+      transformCallback: () => 1,
+      invoke: (cmd, args) => {
+        window.__CALLS__.push({ cmd, args });
+        switch (cmd) {
+          case "plugin:app|version":
+            return Promise.resolve(cfg.version);
+          case "plugin:updater|check":
+            if (cfg.check && cfg.check.reject) return Promise.reject(cfg.check.reject);
+            return Promise.resolve(cfg.check ? { rid: 7, currentVersion: cfg.version, date: null, body: "", rawJson: {}, ...cfg.check } : null);
+          case "plugin:updater|download_and_install":
+            return cfg.install.reject ? Promise.reject(cfg.install.reject) : Promise.resolve(null);
+          case "get_current_git_config":
+            return Promise.resolve("[user]\n  name = me\n");
+          default:
+            return Promise.resolve(null);
+        }
+      },
+    };
+  }, cfg);
+  await page.goto(`${server.url}${cfg.path}`, { waitUntil: "networkidle0" });
   return page;
 }
 
@@ -981,6 +1033,11 @@ async function openUninstallPage(browser, server, opts = {}) {
       ],
     },
     plan: opts.plan ?? null,
+    forceRemove: opts.forceRemove ?? { state: "gone", message: "Its files are in the Recycle Bin and it is no longer in Installed apps." },
+    closed: opts.closed ?? { closed: ["app.exe"], left: [] },
+    history: opts.history ?? [],
+    // One map per apps_delete call: id -> { outcome, message } (default: trashed).
+    deleteRounds: opts.deleteRounds ?? [],
     selfPrepare: opts.selfPrepare ?? { outcome: "done", message: "GitSwitch's changes are taken back.", command: null, done: ["Removed GitSwitch's block from ~/.gitconfig (a backup is beside it)"], problems: [] },
   };
   await page.evaluateOnNewDocument((cfg) => {
@@ -1011,8 +1068,20 @@ async function openUninstallPage(browser, server, opts = {}) {
             return Promise.resolve(cfg.checkGone);
           case "apps_scan":
             return Promise.resolve(cfg.scan);
-          case "apps_delete":
-            return Promise.resolve(args.ids.map((id) => ({ id, outcome: "trashed", message: "Moved to the Trash." })));
+          case "apps_delete": {
+            const round = cfg.deleteRounds.length ? cfg.deleteRounds.shift() : {};
+            return Promise.resolve(args.ids.map((id) => ({ id, outcome: "trashed", message: "Moved to the Trash.", ...(round[id] ?? {}) })));
+          }
+          case "apps_force_remove":
+            return cfg.forceRemove.error ? Promise.reject(cfg.forceRemove.error) : Promise.resolve(cfg.forceRemove);
+          case "apps_close":
+            return Promise.resolve(cfg.closed);
+          case "apps_history":
+            return Promise.resolve(cfg.history);
+          case "apps_rescan":
+            return Promise.resolve("sess-again");
+          case "apps_delete_at_restart":
+            return Promise.resolve(args.ids.map((id) => ({ id, outcome: "at-restart", message: "Windows deletes it when this PC restarts — for good." })));
           case "apps_forget":
           case "apps_open_uninstaller":
             return Promise.resolve(null);
@@ -3819,6 +3888,65 @@ try {
     }
   }
 
+  section("GitHub CLI accounts: signing in to gh from the app");
+  {
+    const press = (page, label) => page.evaluate((l) => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === l)?.click(), label);
+    const called = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args ?? null), cmd);
+    {
+      const page = await openAuthPage(browser, server);
+      await page.waitForFunction(() => document.body.innerText.includes("No gh accounts found"), { timeout: 4000 });
+      const s = await text(page);
+      ok("with no gh login, the card offers to sign in to gh here", s.includes("Sign in to GitHub CLI") && s.includes("Click Sign in to GitHub CLI"), s.slice(0, 300));
+      await press(page, "Sign in to GitHub CLI");
+      await page.waitForFunction(() => document.body.innerText.includes("C027-AF8F"), { timeout: 4000 }).catch(() => null);
+      const t = await text(page);
+      ok("  clicking it shows gh's one-time code", t.includes("C027-AF8F") && t.includes("Waiting for GitHub"), t.slice(0, 300));
+      ok("  with Open GitHub and where to enter it", t.includes("Open GitHub") && t.includes("https://github.com/login/device"));
+      ok("  gh was asked for the default host", JSON.stringify(await called(page, "gh_auth_login_start")) === JSON.stringify([{ host: null }]), JSON.stringify(await called(page, "gh_auth_login_start")));
+      ok("  and the page waits on it", (await called(page, "gh_auth_login_wait")).length === 1);
+      ok("  while it waits, a second sign-in cannot be started", await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in to GitHub CLI")?.disabled === true));
+      await press(page, "Cancel");
+      await sleep(200);
+      ok("Cancel ends gh's sign-in", (await called(page, "gh_auth_login_cancel")).length === 1);
+      ok("  and takes the code off the page", !(await text(page)).includes("C027-AF8F"));
+      // gh's answer arriving after Cancel changes nothing.
+      await page.evaluate(() => window.__HELD__.gh_auth_login_wait?.res({ host: "github.com", login: "late" }));
+      await sleep(200);
+      ok("  a sign-in that finishes after Cancel says nothing", !(await text(page)).includes("Signed in to the GitHub CLI"));
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { ghAccounts: ["alice"], ghActive: "alice", loginWait: { resolve: { host: "github.com", login: "newuser" } } });
+      await page.waitForFunction(() => document.body.innerText.includes("Use this account"), { timeout: 4000 });
+      await press(page, "Sign in to GitHub CLI");
+      await page.waitForFunction(() => document.body.innerText.includes("Signed in to the GitHub CLI as newuser"), { timeout: 4000 }).catch(() => null);
+      await sleep(200);
+      const s = await text(page);
+      ok("a finished sign-in names the account and that gh now uses it", s.includes("Signed in to the GitHub CLI as newuser. gh now uses it as its active account on github.com."), s.slice(0, 400));
+      ok("  the list is read again and shows it, active", s.includes("newuser") && (await called(page, "gh_auth_accounts")).length >= 2);
+      ok("  and the code is gone", !s.includes("C027-AF8F"));
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { loginWait: { reject: "The code expired before it was entered on GitHub. Start the sign-in again for a new code." } });
+      await page.waitForFunction(() => document.body.innerText.includes("No gh accounts found"), { timeout: 4000 });
+      await press(page, "Sign in to GitHub CLI");
+      await page.waitForFunction(() => document.body.innerText.includes("code expired"), { timeout: 4000 }).catch(() => null);
+      const s = await text(page);
+      ok("a code that expired says so in words, and the button is back", s.includes("The code expired before it was entered on GitHub") && !s.includes("Command execution error") && !s.includes("C027-AF8F"), s.slice(0, 300));
+      await page.close();
+    }
+    {
+      const page = await openAuthPage(browser, server, { loginStart: { reject: "The GitHub CLI (gh) isn't installed on this computer. Install it from https://cli.github.com, sign in with `gh auth login`, then try again." } });
+      await page.waitForFunction(() => document.body.innerText.includes("No gh accounts found"), { timeout: 4000 });
+      await press(page, "Sign in to GitHub CLI");
+      await page.waitForFunction(() => document.body.innerText.includes("isn't installed"), { timeout: 4000 }).catch(() => null);
+      const s = await text(page);
+      ok("without gh on the computer, the click says so instead of waiting", s.includes("The GitHub CLI (gh) isn't installed") && !s.includes("Waiting for GitHub") && (await called(page, "gh_auth_login_wait")).length === 0, s.slice(0, 300));
+      await page.close();
+    }
+  }
+
   section("GitHub sign-in: a way out of every wait");
   {
     const signIn = (page) => page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Sign in with GitHub")?.click());
@@ -4602,6 +4730,86 @@ try {
     const sw = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_switch_branch"));
     ok("  and sends the branch name", sw?.args?.repoPath === "/repos/gitswitch" && sw?.args?.name === "feature/login");
     ok("  success closes the dialog", !(await text(page)).includes("Create branch"));
+    await page.close();
+  }
+  {
+    // Remote branches: one the current branch tracks, one another local branch tracks, one with no
+    // local copy, and one whose name a local branch that tracks nothing already has.
+    const remote = (name) => ({ ...BRANCHES[4], name, full_ref: `refs/remotes/${name}`, remote_branch: name.slice("origin/".length), last_subject: `tip of ${name}` });
+    const withRemotes = [
+      ...BRANCHES.slice(0, 2),
+      { ...BRANCHES[2], upstream: "origin/hotfix/typo" },
+      BRANCHES[3],
+      remote("origin/main"),
+      remote("origin/hotfix/typo"),
+      remote("origin/release/2.0"),
+      remote("origin/feature/login"),
+    ];
+    const remoteTab = (page) => page.evaluate(() => [...document.querySelectorAll('[aria-label="Which branches"] button')].find((b) => b.innerText.startsWith("Remote")).click());
+    const remoteRow = (page, n) =>
+      page.evaluate((n) => {
+        const row = document.querySelector(`[data-remote-branch="${n}"]`);
+        return row ? { text: row.innerText, buttons: [...row.querySelectorAll("button")].map((b) => b.innerText.trim()) } : null;
+      }, n);
+    const clickRemote = (page, n, label) =>
+      page.evaluate((n, label) => [...document.querySelector(`[data-remote-branch="${n}"]`).querySelectorAll("button")].find((b) => b.innerText.trim() === label).click(), n, label);
+    const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+
+    const page = await open(SCENARIOS.clean, { branches: withRemotes });
+    await openBranches(page);
+    ok("remote branches: the dialog opens on Local, with no remote rows", (await page.$$("[data-remote-branch]")).length === 0 && (await text(page)).includes("Remote (4)"));
+    await remoteTab(page);
+    await sleep(150);
+    const names = await page.evaluate(() => [...document.querySelectorAll("[data-remote-branch]")].map((r) => r.getAttribute("data-remote-branch")));
+    ok("  Remote lists them, as of the last fetch", JSON.stringify(names) === JSON.stringify(["origin/main", "origin/hotfix/typo", "origin/release/2.0", "origin/feature/login"]) && (await text(page)).includes("As of the last Fetch"), JSON.stringify(names));
+    const om = await remoteRow(page, "origin/main");
+    ok("  the one the current branch tracks: named as it, HEAD, nothing to click", om?.text.includes("as main") && om.text.includes("HEAD") && om.buttons.length === 0, JSON.stringify(om));
+    const fl = await remoteRow(page, "origin/feature/login");
+    ok("  one whose name a local branch already has: said, and no button — nothing is overwritten", fl?.text.includes("A local branch feature/login already exists") && fl.buttons.length === 0, JSON.stringify(fl));
+    const ht = await remoteRow(page, "origin/hotfix/typo");
+    ok("  one a local branch tracks offers Switch", ht?.text.includes("as hotfix/typo") && JSON.stringify(ht.buttons) === '["Switch"]', JSON.stringify(ht));
+    await clickRemote(page, "origin/hotfix/typo", "Switch");
+    await sleep(300);
+    ok("  which switches to that local branch, and closes", JSON.stringify((await calls(page, "changes_switch_branch")).map((a) => a.name)) === '["hotfix/typo"]' && !(await text(page)).includes("Create branch"));
+    await page.close();
+
+    const co = await open(SCENARIOS.clean, { branches: withRemotes });
+    await openBranches(co);
+    await remoteTab(co);
+    await sleep(150);
+    ok("one with no local copy offers Check out", JSON.stringify((await remoteRow(co, "origin/release/2.0"))?.buttons) === '["Check out"]');
+    await clickRemote(co, "origin/release/2.0", "Check out");
+    await sleep(300);
+    const made = await calls(co, "changes_create_branch");
+    ok("  which makes a local branch of the same name tracking it, and switches", made.length === 1 && made[0].name === "release/2.0" && made[0].from === "refs/remotes/origin/release/2.0" && made[0].switchTo === true, JSON.stringify(made));
+    ok("  and closes", !(await text(co)).includes("Create branch"));
+    await co.close();
+
+    const no = await open(SCENARIOS.clean, {
+      branches: withRemotes,
+      refuse: { changes_create_branch: { code: "detached-commits", message: "HEAD holds 2 commit(s) no branch has." } },
+    });
+    await openBranches(no);
+    await remoteTab(no);
+    await sleep(150);
+    await clickRemote(no, "origin/release/2.0", "Check out");
+    await sleep(300);
+    ok("a refused check out keeps the dialog open, on Remote, with the reason", (await text(no)).includes("HEAD holds 2 commit(s) no branch has.") && !!(await no.$('[data-remote-branch="origin/release/2.0"]')));
+    await no.close();
+  }
+  {
+    // The strip's Branches is on every tab; the dialog used to open inside the hidden Changes panel, unseen.
+    const page = await open(SCENARIOS.clean);
+    await page.evaluate(() => [...document.querySelectorAll('a[role="tab"]')].find((a) => a.innerText.trim().startsWith("History")).click());
+    await sleep(300);
+    const onHistory = await page.evaluate(() => document.querySelector('[role="tabpanel"][aria-label="Changes"]')?.offsetParent === null);
+    await (await button(page, "Branches")).click();
+    await sleep(300);
+    const seen = await page.evaluate(() => {
+      const b = [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Create branch");
+      return !!b && b.getBoundingClientRect().width > 0;
+    });
+    ok("on the History tab, Branches opens a dialog you can see", onHistory && seen, JSON.stringify({ onHistory, seen }));
     await page.close();
   }
   {
@@ -5976,7 +6184,11 @@ try {
     const run = await openUninstallPage(browser, server, { prepared: { "mac:/Applications/Foo Writer.app": { running: true } } });
     await run.evaluate(() => document.querySelector('[data-app-row="Foo Writer"] [data-app-uninstall]').click());
     await run.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
-    ok("a running app: quit it first, the button is off", (await text(run)).includes("Foo Writer is running. Quit it first.") && (await run.evaluate(() => document.querySelector("[data-flow-go]").disabled)));
+    ok("a running app: said, Uninstall is off, and Close it and uninstall is offered", (await text(run)).includes("Foo Writer is running.") && (await run.evaluate(() => document.querySelector("[data-flow-go]").disabled)) && !!(await run.$("[data-flow-close-go]")));
+    await run.evaluate(() => document.querySelector("[data-flow-close-go]").click());
+    await run.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    const runCalls = await run.evaluate(() => window.__CALLS__.map((c) => c.cmd).filter((c) => c === "apps_close" || c === "apps_uninstall"));
+    ok("  Close it and uninstall closes it, then uninstalls", JSON.stringify(runCalls) === JSON.stringify(["apps_close", "apps_uninstall"]), JSON.stringify(runCalls));
     await run.close();
 
     const still = await openUninstallPage(browser, server, { uninstall: { state: "still-installed", message: "Another copy with the same id is installed at /Users/me/Applications/Foo Writer.app — its files are its own." } });
@@ -6031,6 +6243,7 @@ try {
       prepared: { "deb:xterm": { method: "The package xterm and the 1 other package(s) listed are removed; the system asks for your password.", command: "pkexec env DEBIAN_FRONTEND=noninteractive dpkg -r xterm xterm-extra", also_removed: ["xterm-extra"] } },
     });
     ok("Ubuntu shows Apps and All packages", (await text(lin)).includes("All packages"));
+    ok("  and no Your apps / System apps tabs there", !(await lin.$('[role="tablist"][aria-label="Which apps"]')));
     await lin.evaluate(() => document.querySelector("[data-app-uninstall]").click());
     await lin.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
     ok("what apt would also remove is shown, and Uninstall waits for a yes", (await text(lin)).includes("xterm-extra") && (await lin.evaluate(() => document.querySelector("[data-flow-go]").disabled)));
@@ -6044,6 +6257,191 @@ try {
     ok("All packages asks for every package", (await calls(lin, "apps_list")).some((a) => a.kind === "packages") && (await text(lin)).includes("libfoo1"));
     ok("  with a warning about what packages are", (await text(lin)).includes("the system's own packages can't be removed here"));
     await lin.close();
+  }
+
+  section("Uninstall tab on Windows: Your apps and System apps, deleting a program's files directly, the administrator's part after one prompt, the leftover buttons");
+  {
+    const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+    const rows = (page) => page.evaluate(() => [...document.querySelectorAll("[data-app-row]")].map((r) => r.getAttribute("data-app-row")).sort());
+    const tabSelected = (page) => page.evaluate(() => document.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute("data-apps-tab"));
+    const winApp = (id, name, extra = {}) => ({ id, name, version: "1.0", publisher: null, location: null, source: "exe", size: 1000, date: null, notes: [], blocked: null, is_self: false, system: null, ...extra });
+    const apps = [
+      winApp("win:HKCU:uTorrent", "uTorrent", { publisher: "BitTorrent Limited", location: "C:\\Users\\me\\AppData\\Roaming\\uTorrent" }),
+      winApp("win:HKLM32:Brave", "Brave", { publisher: "Brave Software Inc" }),
+      winApp("win:HKLM64:{7-ZIP}", "7-Zip MSI", { source: "msi" }),
+      winApp("win:HKLM64:NVIDIA", "NVIDIA Graphics Driver 555.97", { publisher: "NVIDIA Corporation", system: "For your hardware" }),
+      winApp("win:HKLM32:VC", "Microsoft Visual C++ v14 Redistributable (x64)", { publisher: "Microsoft Corporation", system: "Used by other apps" }),
+      winApp("appx:Microsoft.WindowsCalculator", "Windows Calculator", { source: "store", publisher: "Microsoft Corporation", system: "Came with Windows" }),
+    ];
+    const force = { folders: [{ path: "C:\\Users\\me\\AppData\\Roaming\\uTorrent", size: 67590546, size_complete: true, admin: false }], entry: "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\uTorrent", entry_admin: false, startup: ["ut (starts when you sign in)"], admin: false };
+    const prepared = {
+      "win:HKCU:uTorrent": { method: "Its own uninstaller opens; follow its steps. Windows asks for permission if it needs to.", command: '"C:\\Users\\me\\AppData\\Roaming\\uTorrent\\uTorrent.exe" /UNINSTALL', force, force_unavailable: null },
+      "win:HKLM64:{7-ZIP}": { method: "Windows Installer removes it (msiexec).", force: null, force_unavailable: "Windows Installer removes it cleanly, so its files aren't deleted directly — use Uninstall." },
+      "win:HKLM32:Brave": { method: "Its own uninstaller opens; follow its steps.", force: { ...force, folders: [{ path: "C:\\Program Files\\BraveSoftware\\Brave-Browser", size: 500000000, size_complete: false, admin: true }], entry_admin: true, startup: [], admin: true }, force_unavailable: null },
+    };
+    const page = await openUninstallPage(browser, server, { platform: "windows", apps, prepared });
+    await page.waitForFunction(() => document.querySelectorAll("[data-app-row]").length > 0, { timeout: 5000 }).catch(() => null);
+    ok("two tabs, Your apps first", (await tabSelected(page)) === "yours" && (await page.$$('[role="tablist"][aria-label="Which apps"] [role="tab"]')).length === 2);
+    ok("  Your apps holds the person's own", JSON.stringify(await rows(page)) === JSON.stringify(["7-Zip MSI", "Brave", "uTorrent"]), JSON.stringify(await rows(page)));
+    ok("  each tab says how many", await page.evaluate(() => { const t = [...document.querySelectorAll('[role="tab"]')].map((b) => b.innerText.replace(/\s+/g, " ").trim()); return t[0] === "Your apps 3" && t[1] === "System apps 3"; }));
+    await page.type('input[aria-label="Find an app"]', "nvidia");
+    await sleep(200);
+    ok("a search that only matches a system app says where it is", (await text(page)).includes("Nothing matches here.") && !!(await page.$("[data-other-tab-matches]")) && (await text(page)).includes("1 in System apps — show it"));
+    await page.evaluate(() => document.querySelector("[data-other-tab-matches]").click());
+    await sleep(200);
+    ok("  and shows it", (await tabSelected(page)) === "system" && JSON.stringify(await rows(page)) === JSON.stringify(["NVIDIA Graphics Driver 555.97"]));
+    await page.evaluate(() => { const i = document.querySelector('input[aria-label="Find an app"]'); const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set; set.call(i, ""); i.dispatchEvent(new Event("input", { bubbles: true })); });
+    await sleep(200);
+    ok("System apps: what came with Windows, the hardware's, what others use — each saying why", JSON.stringify(await rows(page)) === JSON.stringify(["Microsoft Visual C++ v14 Redistributable (x64)", "NVIDIA Graphics Driver 555.97", "Windows Calculator"]) && (await page.evaluate(() => [...document.querySelectorAll("[data-app-system]")].map((b) => b.innerText).sort().join("|"))) === "Came with Windows|For your hardware|Used by other apps");
+    ok("  with a line saying they may be needed", (await text(page)).includes("Windows, your hardware or other apps may need them"));
+    ok("  the tab is remembered", await page.evaluate(() => Object.keys(localStorage).some((k) => k.endsWith("uninstall.tab") && localStorage.getItem(k) === '"system"')));
+    await page.evaluate(() => document.querySelector('[data-apps-tab="yours"]').click());
+    await sleep(150);
+
+    // Deleting µTorrent's files directly.
+    await page.evaluate(() => document.querySelector('[data-app-row="uTorrent"] [data-app-uninstall]').click());
+    await page.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
+    ok("a program offers its uninstaller and, beside it, deleting its files", !!(await page.$("[data-flow-go]")) && !!(await page.$("[data-flow-force-open]")) && !(await page.$("[data-flow-force]")));
+    await page.evaluate(() => document.querySelector("[data-flow-force-open]").click());
+    await sleep(150);
+    const panel = await page.evaluate(() => document.querySelector("[data-flow-force]")?.innerText ?? "");
+    ok("  the panel says exactly what goes", panel.includes("C:\\Users\\me\\AppData\\Roaming\\uTorrent") && panel.includes("to the Recycle Bin") && panel.includes("removes it from Installed apps") && panel.includes("removes its start-up entry ut (starts when you sign in)"), panel);
+    ok("  that files saved in that folder go too, and its uninstaller is not run", panel.includes("including anything you saved there") && panel.includes("Its uninstaller is not run"));
+    ok("  no permission prompt for a folder of your own", !panel.includes("Windows asks for permission"));
+    await page.evaluate(() => document.querySelector("[data-flow-force-go]").click());
+    await page.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    const forced = await calls(page, "apps_force_remove");
+    ok("Delete them deletes its files with the session — its uninstaller never started", forced.length === 1 && typeof forced[0].session === "string" && forced[0].session.startsWith("sess-") && (await calls(page, "apps_uninstall")).length === 0, JSON.stringify(forced));
+    ok("  then its leftovers can be looked for", !!(await page.$("[data-flow-scan]")) && (await text(page)).includes("no longer in Installed apps"));
+    await page.close();
+
+    const declined = await openUninstallPage(browser, server, { platform: "windows", apps, prepared, forceRemove: { error: "Windows' permission prompt was declined, so these were kept." } });
+    await declined.evaluate(() => document.querySelector('[data-app-row="Brave"] [data-app-uninstall]').click());
+    await declined.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
+    await declined.evaluate(() => document.querySelector("[data-flow-force-open]").click());
+    await sleep(150);
+    ok("a folder under Program Files: Windows will ask for permission", !!(await declined.$("[data-force-admin]")));
+    await declined.evaluate(() => document.querySelector("[data-flow-force-go]").click());
+    await sleep(300);
+    ok("  the prompt declined: said, nothing moved on", (await text(declined)).includes("permission prompt was declined") && !!(await declined.$('[data-flow-stage="confirm"]')));
+    await declined.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Cancel" && !b.closest("[data-flow-force]"))?.click());
+    await sleep(200);
+    await declined.evaluate(() => document.querySelector('[data-app-row="7-Zip MSI"] [data-app-uninstall]').click());
+    await declined.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]') && document.body.innerText.includes("Windows Installer removes it ("), { timeout: 5000 }).catch(() => null);
+    ok("a Windows Installer program: no deleting its files, and why", !(await declined.$("[data-flow-force-open]")) && (await text(declined)).includes("Deleting its files directly isn't offered: Windows Installer removes it cleanly"));
+    await declined.close();
+
+    // Running: close it, then delete its files.
+    const busy = await openUninstallPage(browser, server, { platform: "windows", apps, prepared: { ...prepared, "win:HKCU:uTorrent": { ...prepared["win:HKCU:uTorrent"], running: true } } });
+    await busy.evaluate(() => document.querySelector('[data-app-row="uTorrent"] [data-app-uninstall]').click());
+    await busy.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
+    await busy.evaluate(() => document.querySelector("[data-flow-force-open]").click());
+    await sleep(150);
+    ok("a running program: the panel closes it first", !!(await busy.$("[data-flow-force-close-go]")) && !(await busy.$("[data-flow-force-go]")) && (await busy.evaluate(() => document.querySelector("[data-flow-force-close-go]").innerText)).includes("Close uTorrent and delete them"));
+    await busy.evaluate(() => document.querySelector("[data-flow-force-close-go]").click());
+    await busy.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    const busyCalls = await busy.evaluate(() => window.__CALLS__.map((c) => c.cmd).filter((c) => c === "apps_close" || c === "apps_force_remove" || c === "apps_uninstall"));
+    ok("  closed, then its files deleted — its uninstaller never started", JSON.stringify(busyCalls) === JSON.stringify(["apps_close", "apps_force_remove"]), JSON.stringify(busyCalls));
+    await busy.close();
+
+    // Its files already gone (deleted by hand): only its entry is left to remove.
+    const orphan = await openUninstallPage(browser, server, { platform: "windows", apps, prepared: { ...prepared, "win:HKCU:uTorrent": { ...prepared["win:HKCU:uTorrent"], force: { ...force, folders: [] } } } });
+    await orphan.evaluate(() => document.querySelector('[data-app-row="uTorrent"] [data-app-uninstall]').click());
+    await orphan.waitForFunction(() => document.querySelector('[data-flow-stage="confirm"]'), { timeout: 5000 }).catch(() => null);
+    await orphan.evaluate(() => document.querySelector("[data-flow-force-open]").click());
+    await sleep(150);
+    const opanel = await orphan.evaluate(() => document.querySelector("[data-flow-force]")?.innerText ?? "");
+    ok("files already gone: it says so, and only its entry goes", !!(await orphan.$("[data-force-no-files]")) && opanel.includes("removes it from Installed apps") && !opanel.includes("including anything you saved there"), opanel);
+    await orphan.close();
+
+    // The leftovers: the buttons, the administrator's ones, a declined prompt and Try again.
+    const scan = {
+      scan: "scan-w",
+      notes: [],
+      items: [
+        { id: "l0", path: "C:\\Users\\me\\AppData\\Local\\DiskDrill", place: "%LOCALAPPDATA%", kind: "folder", size: 3000, size_complete: true, confidence: "medium", reason: "named like the app (Disk Drill)", admin: false, command: null, elevate: false },
+        { id: "l1", path: "C:\\Program Files\\CleverFiles", place: "Program Files", kind: "folder", size: 9000, size_complete: true, confidence: "high", reason: "CleverFiles's folder, holding nothing but this app", admin: true, command: 'rd /s /q "C:\\Program Files\\CleverFiles"', elevate: true },
+        { id: "l2", path: "C:\\ProgramData\\CleverFiles", place: "%ProgramData%", kind: "folder", size: 100, size_complete: true, confidence: "high", reason: "CleverFiles's folder, holding nothing but this app", admin: true, command: null, elevate: true },
+        { id: "l3", path: "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\\dd", place: "Starts with Windows", kind: "startup", size: null, size_complete: false, confidence: "high", reason: "started it: C:\\x\\dd.exe", admin: false, command: null, elevate: false },
+      ],
+    };
+    const declinedMsg = "Windows' permission prompt was declined, so these were kept.";
+    const left = await openUninstallPage(browser, server, {
+      platform: "windows",
+      apps,
+      sessions: [{ session: "sess-dd", name: "Disk Drill", state: "gone", started: 1760000000 }],
+      scan,
+      deleteRounds: [{ l1: { outcome: "needs-admin", message: declinedMsg }, l2: { outcome: "needs-admin", message: declinedMsg } }],
+    });
+    await (await button(left, "Continue")).click();
+    await left.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    await left.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await left.waitForFunction(() => document.querySelector('[data-flow-stage="leftovers"]'), { timeout: 5000 }).catch(() => null);
+    const ticks = await left.evaluate(() => Object.fromEntries([...document.querySelectorAll("[data-leftover]")].map((l) => [l.getAttribute("data-leftover"), l.querySelector('input[type="checkbox"]').checked])));
+    ok("the administrator's ones can be ticked here, the sure ones are", JSON.stringify(ticks) === JSON.stringify({ l0: false, l1: true, l2: true, l3: true }) || (ticks.l0 === false && ticks.l1 && ticks.l2 && ticks.l3), JSON.stringify(ticks));
+    ok("  marked as asking for permission, and no separate list of commands", (await left.$$("[data-leftover-elevate]")).length === 2 && !(await left.$("[data-flow-admin]")));
+    ok("  the button counts them and says Windows will ask", (await text(left)).includes("Move 3 to the Recycle Bin") && (await left.evaluate(() => document.querySelector("[data-flow-admin-note]")?.innerText ?? "")).includes("Windows asks for permission for 2 of them"));
+    await left.evaluate(() => document.querySelector("[data-flow-tick-all]").click());
+    await sleep(150);
+    ok("Tick all ticks every one", (await text(left)).includes("Move 4 to the Recycle Bin") && (await left.evaluate(() => document.querySelector("[data-flow-tick-all]").innerText)) === "Untick all");
+    await left.evaluate(() => document.querySelector("[data-flow-tick-all]").click());
+    await sleep(150);
+    ok("nothing ticked: no red Move 0 button, just Close", !(await left.$("[data-flow-delete]")) && (await text(left)).includes("Nothing is ticked.") && !!(await left.$("[data-flow-close]")) && !(await text(left)).includes("Move 0") && !(await text(left)).includes("Keep them"));
+    await left.evaluate(() => { for (const id of ["l1", "l2", "l3"]) document.querySelector(`[data-leftover="${id}"] input[type="checkbox"]`).click(); });
+    await sleep(150);
+    await left.evaluate(() => document.querySelector("[data-flow-delete]").click());
+    await left.waitForFunction(() => document.querySelector('[data-flow-stage="done"]'), { timeout: 5000 }).catch(() => null);
+    ok("the prompt declined: those kept, said so, and Try again offered", (await left.$$('[data-result="needs-admin"]')).length === 2 && (await text(left)).includes(declinedMsg) && !!(await left.$("[data-flow-retry]")));
+    ok("  the rest went, in Windows' words", (await left.$$('[data-result="trashed"]')).length === 1 && (await text(left)).includes("Moved to the Recycle Bin"));
+    await left.evaluate(() => document.querySelector("[data-flow-retry]").click());
+    await left.waitForFunction(() => document.querySelectorAll('[data-result="trashed"]').length === 3, { timeout: 5000 }).catch(() => null);
+    const del = await calls(left, "apps_delete");
+    ok("Try again sends only the two that were kept", del.length === 2 && JSON.stringify([...del[1].ids].sort()) === JSON.stringify(["l1", "l2"]), JSON.stringify(del));
+    ok("  and they go", (await left.$$('[data-result="trashed"]')).length === 3 && !(await left.$("[data-flow-retry]")));
+    await left.close();
+
+    // In use by running programs (a hook library still loaded): named, and deleted at the next restart if asked.
+    const inUseMsg = "In use by Microsoft Edge, Slack, Visual Studio Code and 5 more: one of its files is open or loaded in them. Close them or restart, then look again — or delete it at the next restart.";
+    const held = await openUninstallPage(browser, server, {
+      platform: "windows",
+      apps,
+      sessions: [{ session: "sess-uv", name: "UltraViewer", state: "gone", started: 1760000000 }],
+      scan: { scan: "scan-uv", notes: [], items: [{ id: "u0", path: "C:\\Program Files (x86)\\UltraViewer", place: "Install folder", kind: "folder", size: 2000000, size_complete: true, confidence: "high", reason: "the folder it was installed in", admin: true, command: null, elevate: true }] },
+      deleteRounds: [{ u0: { outcome: "in-use", message: inUseMsg } }],
+    });
+    await (await button(held, "Continue")).click();
+    await held.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    await held.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await held.waitForFunction(() => document.querySelector("[data-flow-delete]"), { timeout: 5000 }).catch(() => null);
+    await held.evaluate(() => document.querySelector("[data-flow-delete]").click());
+    await held.waitForFunction(() => document.querySelector('[data-flow-stage="done"]'), { timeout: 5000 }).catch(() => null);
+    ok("files in use: which programs hold them is said, not \"some operations were aborted\"", (await held.$$('[data-result="in-use"]')).length === 1 && (await text(held)).includes("In use by Microsoft Edge, Slack") && !(await text(held)).includes("aborted"));
+    ok("  restart, or delete at the next restart, is offered", !!(await held.$("[data-flow-in-use]")) && (await text(held)).includes("Restart this PC and choose Continue"));
+    await held.evaluate(() => document.querySelector("[data-flow-at-restart]").click());
+    await held.waitForFunction(() => document.querySelector('[data-result="at-restart"]'), { timeout: 5000 }).catch(() => null);
+    const later = await calls(held, "apps_delete_at_restart");
+    ok("  Delete at the next restart sends that one, and says so", later.length === 1 && JSON.stringify(later[0]) === JSON.stringify({ scan: "scan-uv", ids: ["u0"] }) && (await text(held)).includes("Deleted at the next restart") && !(await held.$("[data-flow-in-use]")), JSON.stringify(later));
+    await held.close();
+
+    // Uninstalled with GitSwitch before: looked at again, long after.
+    const again = await openUninstallPage(browser, server, { platform: "windows", apps, history: [{ key: "win:HKLM64:{DD}", name: "Disk Drill 6.3.1398.0", at: 1793912817 }, { key: "win:HKLM64:zoho", name: "Zoho Mail - Desktop 1.7.4", at: 1793901026 }] });
+    await again.waitForFunction(() => document.querySelector("[data-past]"), { timeout: 5000 }).catch(() => null);
+    ok("apps uninstalled with GitSwitch before are listed", JSON.stringify(await again.evaluate(() => [...document.querySelectorAll("[data-past-app]")].map((r) => r.getAttribute("data-past-app")))) === JSON.stringify(["Disk Drill 6.3.1398.0", "Zoho Mail - Desktop 1.7.4"]));
+    await again.evaluate(() => document.querySelector('[data-past-app="Disk Drill 6.3.1398.0"] [data-past-rescan]').click());
+    await again.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    ok("  Look for leftovers asks for that app by its id and goes straight to its leftovers", JSON.stringify(await calls(again, "apps_rescan")) === JSON.stringify([{ key: "win:HKLM64:{DD}" }]) && !!(await again.$("[data-flow-scan]")));
+    await again.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await sleep(300);
+    ok("  with the session it was given", JSON.stringify((await calls(again, "apps_scan"))[0]) === JSON.stringify({ session: "sess-again", registry: false }));
+    await again.close();
+
+    const none = await openUninstallPage(browser, server, { platform: "windows", apps, sessions: [{ session: "sess-x", name: "Clean App", state: "gone", started: 1760000000 }], scan: { scan: "scan-0", notes: [], items: [] } });
+    await (await button(none, "Continue")).click();
+    await none.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    await none.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await none.waitForFunction(() => document.querySelector('[data-flow-stage="leftovers"]'), { timeout: 5000 }).catch(() => null);
+    ok("nothing left behind: said, and only Done", (await text(none)).includes("Nothing of Clean App's was left behind") && !!(await none.$("[data-flow-close]")) && !(await none.$("[data-flow-delete]")) && !(await text(none)).includes("Keep them"));
+    await none.close();
   }
 
   section("Settings › Uninstall GitSwitch: what is taken back and what is kept, the locks refused stops everything");
@@ -6074,6 +6472,106 @@ try {
     await refused.waitForFunction(() => document.querySelector("[data-uninstall-stopped]"), { timeout: 5000 }).catch(() => null);
     ok("the locks refused: stopped, with the command, and nothing removed", (await text(refused)).includes("nothing was uninstalled") && (await text(refused)).includes("sudo /x/helper") && (await calls(refused, "uninstall_finish")).length === 0);
     await refused.close();
+  }
+
+  {
+    const press = (page, label) => page.evaluate((l) => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === l)?.click(), label);
+    const settingsCalls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+    const sidebar = (page) => page.evaluate(() => document.querySelector("nav")?.innerText ?? "");
+    const about = (page) => page.evaluate(() => [...document.querySelectorAll("h2")].find((h) => h.innerText.trim().toLowerCase() === "about")?.parentElement?.innerText ?? "");
+
+    section("Updates: found in the background, said in the sidebar, installed from Settings");
+    {
+      const page = await openSettingsPage(browser, server, { path: "/doctor", check: { version: "0.2.0" }, version: "0.1.0" });
+      await page.waitForFunction(() => document.querySelector("nav")?.innerText.includes("Update available"), { timeout: 4000 }).catch(() => null);
+      const nav = await sidebar(page);
+      ok("the app checks for a release on its own, soon after it starts", (await settingsCalls(page, "plugin:updater|check")).length === 1);
+      ok("  and the sidebar says a newer one is out", nav.includes("Update available: v0.2.0"), nav);
+      ok("  under the version this copy was built as, read from the app (not written into the page)", nav.includes("v0.1.0"), nav);
+      await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.innerText.includes("Update available"))?.click());
+      await page.waitForFunction(() => document.body.innerText.includes("Check for Updates"), { timeout: 4000 }).catch(() => null);
+      const a = await about(page);
+      ok("the sidebar's note opens Settings, where the update is ready to install", a.includes("Install v0.2.0 and restart"), a);
+      ok("  without asking GitHub again", (await settingsCalls(page, "plugin:updater|check")).length === 1);
+      ok("  and About names the running version", a.includes("Version: 0.1.0"), a);
+      await press(page, "Install v0.2.0 and restart");
+      await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:process|restart"), { timeout: 4000 }).catch(() => null);
+      const inst = await settingsCalls(page, "plugin:updater|download_and_install");
+      ok("Install downloads and installs that update, then restarts the app", inst.length === 1 && inst[0].rid === 7 && (await settingsCalls(page, "plugin:process|restart")).length === 1, JSON.stringify(inst));
+      await page.close();
+    }
+
+    section("Updates: checking by hand, and the answers said in words");
+    {
+      const page = await openSettingsPage(browser, server, { check: null });
+      await page.waitForFunction(() => document.body.innerText.includes("Check for Updates"), { timeout: 4000 }).catch(() => null);
+      await sleep(300);
+      await press(page, "Check for Updates");
+      await page.waitForFunction(() => document.body.innerText.includes("latest version"), { timeout: 4000 }).catch(() => null);
+      ok("no newer release: says so", (await about(page)).includes("You're on the latest version."));
+      ok("  and offers nothing to install, in Settings or the sidebar", !(await text(page)).includes("Install v") && !(await sidebar(page)).includes("Update available"));
+      await page.close();
+
+      const answers = [
+        ["Could not fetch a valid release JSON from the remote", "No GitSwitch release has been published yet."],
+        ["None of the fallback platforms `[\"windows-x86_64-nsis\", \"windows-x86_64\"]` were found in the response `platforms` object", "The latest release has no update for this kind of install yet."],
+        ["error sending request for url (https://github.com/...)", "Could not reach GitHub to check for updates."],
+      ];
+      for (const [reject, said] of answers) {
+        const p = await openSettingsPage(browser, server, { check: { reject } });
+        await p.waitForFunction(() => document.body.innerText.includes("Check for Updates"), { timeout: 4000 }).catch(() => null);
+        await sleep(300);
+        await press(p, "Check for Updates");
+        await p.waitForFunction((s) => document.body.innerText.includes(s), { timeout: 4000 }, said).catch(() => null);
+        ok(`"${reject.slice(0, 40)}…" reads as: ${said}`, (await about(p)).includes(said), await about(p));
+        await p.close();
+      }
+
+      const failing = await openSettingsPage(browser, server, { check: { version: "0.2.0" }, install: { reject: "Failed to install .deb package" } });
+      await failing.waitForFunction(() => document.body.innerText.includes("Install v0.2.0 and restart"), { timeout: 4000 }).catch(() => null);
+      await press(failing, "Install v0.2.0 and restart");
+      await failing.waitForFunction(() => document.body.innerText.includes("didn't install"), { timeout: 4000 }).catch(() => null);
+      const f = await about(failing);
+      ok("an install that fails says why and does not restart", f.includes("The update didn't install: Failed to install .deb package") && (await settingsCalls(failing, "plugin:process|restart")).length === 0, f);
+      await failing.close();
+    }
+  }
+
+  section("The window never scrolls as a whole: the sidebar fits the default window, and scrolls inside itself in a shorter one");
+  {
+    // window: the document scrolls (a second scrollbar beside the page's on Windows); list: the sidebar's entries scroll; footer: its bottom is in view.
+    const shell = (page) => page.evaluate(() => {
+      const d = document.documentElement;
+      const nav = document.querySelector("nav");
+      const list = nav.children[1];
+      return { window: d.scrollHeight > d.clientHeight, list: list.scrollHeight > list.clientHeight, footer: nav.children[2].getBoundingClientRect().bottom <= window.innerHeight };
+    });
+    const sized = async (opts, width, height) => {
+      const page = await openSettingsPage(browser, server, opts);
+      await page.setViewport({ width, height });
+      await sleep(200);
+      return page;
+    };
+    const fits = JSON.stringify({ window: false, list: false, footer: true });
+    const plain = await sized({}, 900, 650);
+    const p = JSON.stringify(await shell(plain));
+    ok("the default window (900×650): it does not scroll, and the whole sidebar shows", p === fits, p);
+    await plain.close();
+    const noted = await sized({ check: { version: "0.2.0" } }, 900, 650);
+    await noted.waitForFunction(() => document.querySelector("nav")?.innerText.includes("Update available"), { timeout: 4000 }).catch(() => null);
+    const n = JSON.stringify(await shell(noted));
+    ok("  and with \"Update available\" in the sidebar too", n === fits && (await noted.evaluate(() => document.querySelector("nav").innerText.includes("Update available"))), n);
+    await noted.close();
+    const short = await sized({}, 700, 500);
+    const s = JSON.stringify(await shell(short));
+    ok("the smallest window (700×500): it still does not scroll; the sidebar's entries do, its footer stays in view", s === JSON.stringify({ window: false, list: true, footer: true }), s);
+    const reach = await short.evaluate(() => {
+      const last = [...document.querySelector("nav").children[1].querySelectorAll("a,button")].pop();
+      last.scrollIntoView();
+      return `${last.innerText.trim()}:${last.getBoundingClientRect().bottom <= window.innerHeight}`;
+    });
+    ok("  and its last entry can be scrolled to", reach === "Terminal:true", reach);
+    await short.close();
   }
 } finally {
   await browser.close();

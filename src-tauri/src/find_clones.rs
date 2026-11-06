@@ -1132,7 +1132,9 @@ mod tests {
 
     #[test]
     fn the_folders_holding_profile_folders_outside_home_are_searched_but_never_a_disk_root() {
-        let t = tmp("beside");
+        // Deeper than the Repository page's walk reaches from "/" (5 levels):
+        // Linux's /tmp is shallow enough that a profile at "/" would list it.
+        let t = tmp("beside").join("a").join("b").join("c").join("d");
         let home = t.join("home");
         std::fs::create_dir_all(&home).unwrap();
         let work = t.join("work");

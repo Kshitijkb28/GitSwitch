@@ -90,7 +90,7 @@ fn platform() -> &'static str {
 /// ever deleted.
 pub(crate) fn data_folders() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for base in [dirs::data_dir(), dirs::data_local_dir(), dirs::cache_dir(), dirs::config_dir()].into_iter().flatten() {
+    for base in [crate::paths::data_dir(), dirs::data_local_dir(), dirs::cache_dir(), dirs::config_dir()].into_iter().flatten() {
         out.push(base.join(ID));
     }
     if cfg!(target_os = "macos") {
@@ -538,7 +538,7 @@ mod tests {
         let home = Path::new("/Users/me");
         assert_eq!(
             macos_removal(Path::new("/Applications/GitSwitch.app/Contents/MacOS/gitswitch"), home),
-            AppRemoval::Trash { bundle: "/Applications/GitSwitch.app".into(), trash: "/Users/me/.Trash".into() }
+            AppRemoval::Trash { bundle: "/Applications/GitSwitch.app".into(), trash: home.join(".Trash").to_string_lossy().to_string() }
         );
         assert!(matches!(macos_removal(Path::new("/private/var/folders/x/T/AppTranslocation/ABC/d/GitSwitch.app/Contents/MacOS/gitswitch"), home), AppRemoval::Manual { .. }));
         assert!(matches!(macos_removal(Path::new("/Users/me/src/GitSwitch/src-tauri/target/debug/gitswitch"), home), AppRemoval::Manual { .. }));

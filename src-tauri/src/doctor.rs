@@ -118,7 +118,7 @@ pub fn manual_includeif_rules(gitconfig: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 async fn command_exists(bin: &str) -> bool {
-    crate::spawn::async_command(bin)
+    crate::spawn::async_command(crate::spawn::program(bin))
         .arg("--version")
         .output()
         .await
@@ -211,9 +211,9 @@ pub async fn check_environment() -> Result<Vec<Finding>, AppError> {
                     "gh-not-authenticated",
                     "info",
                     "GitHub CLI has no signed-in accounts",
-                    "Run `gh auth login` in a terminal so GitSwitch can verify repo access and register keys.",
+                    "Sign in to the GitHub CLI on the GitHub page (or run `gh auth login` in a terminal) so GitSwitch can verify repo access and register keys.",
                 )
-                .with_fix("copy:gh auth login", "Copy the command"),
+                .with_fix("nav:/github", "Sign in on the GitHub page"),
             ),
         }
     }
@@ -444,9 +444,9 @@ pub async fn check_repo_access() -> Result<Vec<Finding>, AppError> {
                 "access-unchecked",
                 "info",
                 "Repository access wasn't checked",
-                "The GitHub CLI has no signed-in account to ask GitHub with. Run `gh auth login`, then check again.",
+                "The GitHub CLI has no signed-in account to ask GitHub with. Sign in to it on the GitHub page (or run `gh auth login`), then check again.",
             )
-            .with_fix("copy:gh auth login", "Copy the command"),
+            .with_fix("nav:/github", "Sign in on the GitHub page"),
         );
         return Ok(out);
     }

@@ -205,6 +205,25 @@ pub async fn gh_auth_switch(host: String, login: String) -> Result<String, AppEr
     gh_cli::gh_auth_switch(&host, &login).await
 }
 
+/// Start `gh auth login` in the browser: the one-time code and where to enter it.
+#[tauri::command]
+pub async fn gh_auth_login_start(host: Option<String>) -> Result<gh_cli::GhDevicePrompt, AppError> {
+    gh_cli::gh_auth_login_start(host.as_deref().unwrap_or("github.com")).await
+}
+
+/// Wait for the sign-in started above: the account gh signed in.
+#[tauri::command]
+pub async fn gh_auth_login_wait() -> Result<gh_cli::GhLogin, AppError> {
+    gh_cli::gh_auth_login_wait().await
+}
+
+/// End the sign-in in progress, if any.
+#[tauri::command]
+pub async fn gh_auth_login_cancel() -> Result<(), AppError> {
+    gh_cli::gh_auth_login_cancel();
+    Ok(())
+}
+
 /// Automate "Step 2": register a local key's public half on a specific
 /// account — a gh login, or a sign-in kept here ("signin:<login>").
 /// `key_path` is the PRIVATE key path; we read `<key_path>.pub`.
@@ -1047,6 +1066,36 @@ pub fn apps_forget(session: String) -> Result<(), AppError> {
 #[tauri::command]
 pub fn apps_open_uninstaller(session: String) -> Result<(), AppError> {
     crate::apps::open_vendor_uninstaller(session)
+}
+
+/// Windows: delete a program's files directly instead of running its uninstaller.
+#[tauri::command]
+pub async fn apps_force_remove(session: String) -> Result<crate::apps::Progress, AppError> {
+    Box::pin(crate::apps::force_remove(session)).await
+}
+
+/// Apps uninstalled with GitSwitch before, no longer installed.
+#[tauri::command]
+pub fn apps_history() -> Vec<crate::apps::PastUninstall> {
+    crate::apps::history()
+}
+
+/// Look for an app's leftovers again: a new session to continue with.
+#[tauri::command]
+pub async fn apps_rescan(key: String) -> Result<String, AppError> {
+    Box::pin(crate::apps::rescan(key)).await
+}
+
+/// Close the app's own running processes, so its uninstall can go ahead.
+#[tauri::command]
+pub async fn apps_close(session: String) -> Result<crate::apps::Closed, AppError> {
+    Box::pin(crate::apps::close(session)).await
+}
+
+/// Windows: leftovers in use, deleted when Windows next starts.
+#[tauri::command]
+pub async fn apps_delete_at_restart(scan: String, ids: Vec<String>) -> Result<Vec<crate::apps::Deleted>, AppError> {
+    Box::pin(crate::apps::delete_at_restart(scan, ids)).await
 }
 
 /// What uninstalling GitSwitch would take back and remove, read now.

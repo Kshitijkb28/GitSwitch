@@ -36,14 +36,30 @@ function errorText(r: OpResult): { line: string; guidance: string | null } {
   };
 }
 
+/** What a remote branch's row offers: the local branch already tracking it, a local copy to make, or a name already taken. */
+type RemoteAction = { kind: "switch"; local: BranchInfo } | { kind: "checkout"; name: string } | { kind: "taken"; name: string } | null;
+
+function remoteAction(remote: BranchInfo, locals: BranchInfo[]): RemoteAction {
+  const tracking = locals.find((l) => l.upstream === remote.name);
+  if (tracking) return { kind: "switch", local: tracking };
+  const name = remote.remote_branch;
+  if (!name) return null;
+  if (locals.some((l) => l.name === name)) return { kind: "taken", name };
+  return { kind: "checkout", name };
+}
+
 /**
- * Local branches: switch, create, rename, delete. Nothing here touches the
- * remote. A refusal keeps the dialog open with git's reason in it — the
- * blocking files for a switch, the commit count for a delete — so the fix is
- * one look away instead of one toast that already faded.
+ * Local branches: switch, create, rename, delete. Remote branches (as of the
+ * last fetch): switch to the local branch that tracks one, or check one out as
+ * a new local branch tracking it — never over a local branch of that name.
+ * Nothing here changes the remote. A refusal keeps the dialog open with git's
+ * reason in it — the blocking files for a switch, the commit count for a
+ * delete — so the fix is one look away instead of one toast that already faded.
  */
 export function BranchesModal({ open, onClose, repoPath, status, busy, onResult, run }: Props) {
   const [branches, setBranches] = useState<BranchInfo[]>([]);
+  const [remotes, setRemotes] = useState<BranchInfo[]>([]);
+  const [showRemote, setShowRemote] = useState(false);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [error, setError] = useState<{ line: string; guidance: string | null } | null>(null);
@@ -63,6 +79,7 @@ export function BranchesModal({ open, onClose, repoPath, status, busy, onResult,
       .historyBranches(repoPath)
       .then((list) => {
         setBranches(list.filter((b) => !b.is_remote));
+        setRemotes(list.filter((b) => b.is_remote));
         setLoadError(null);
       })
       .catch((e) => setLoadError(String(e)))
@@ -78,6 +95,7 @@ export function BranchesModal({ open, onClose, repoPath, status, busy, onResult,
     setRenaming(null);
     setConfirmDelete(null);
     setError(null);
+    setShowRemote(false);
     load();
   }, [open, current, load]);
 
@@ -203,92 +221,179 @@ export function BranchesModal({ open, onClose, repoPath, status, busy, onResult,
 
         {loadError && <p className="text-xs text-red-400 break-words">{loadError}</p>}
 
-        <ul className="max-h-80 overflow-y-auto divide-y divide-zinc-800/70 rounded-lg border border-zinc-700/50">
-          {loading && branches.length === 0 && (
-            <li className="flex items-center gap-2 px-3 py-3 text-xs text-zinc-500">
-              <Loader2 size={12} className="animate-spin" />
-              Reading branches…
-            </li>
-          )}
-          {!loading && branches.length === 0 && !loadError && (
-            <li className="px-3 py-3 text-xs text-zinc-500">No local branches yet.</li>
-          )}
-          {branches.map((b) => (
-            <li key={b.name} className="flex items-start gap-2 px-3 py-2">
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="font-mono text-xs text-zinc-100">{b.name}</span>
-                  {b.is_current && <Badge variant="success">HEAD</Badge>}
-                  <span className="text-[11px] text-zinc-500">
-                    {b.upstream ? `→ ${b.upstream}` : "not published"}
-                    {b.ahead > 0 && <span className="text-emerald-400"> ↑{b.ahead}</span>}
-                    {b.behind > 0 && <span className="text-sky-400"> ↓{b.behind}</span>}
-                  </span>
-                </div>
-                <p className="text-xs text-zinc-500 truncate" title={b.last_subject}>
-                  {b.last_subject}
-                </p>
-                {renaming === b.name && (
-                  <div className="flex flex-wrap items-center gap-2 mt-1.5">
-                    <Input
-                      aria-label="Rename to"
-                      value={renameTo}
-                      onChange={(e) => setRenameTo(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") saveRename(b.name);
-                        if (e.key === "Escape") setRenaming(null);
-                      }}
-                      containerClassName="flex-1 min-w-[10rem]"
-                      className="py-1 text-xs font-mono"
-                      autoFocus
-                    />
-                    <Button size="sm" disabled={busy || !renameTo.trim()} onClick={() => saveRename(b.name)}>
-                      Save
-                    </Button>
-                    <Button size="sm" variant="ghost" disabled={busy} onClick={() => setRenaming(null)}>
-                      Cancel
-                    </Button>
+        <div className="flex items-center gap-1" role="tablist" aria-label="Which branches">
+          {(["local", "remote"] as const).map((k) => {
+            const active = (k === "remote") === showRemote;
+            return (
+              <button
+                key={k}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => setShowRemote(k === "remote")}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                  active ? "bg-zinc-800 text-emerald-400" : "text-zinc-500 hover:text-zinc-300"
+                }`}
+              >
+                {k === "local" ? "Local" : `Remote${remotes.length ? ` (${remotes.length})` : ""}`}
+              </button>
+            );
+          })}
+          {showRemote && <span className="ml-auto text-[11px] text-zinc-500">As of the last Fetch</span>}
+        </div>
+
+        {showRemote && (
+          <ul data-remote-branches className="max-h-80 overflow-y-auto divide-y divide-zinc-800/70 rounded-lg border border-zinc-700/50">
+            {loading && remotes.length === 0 && (
+              <li className="flex items-center gap-2 px-3 py-3 text-xs text-zinc-500">
+                <Loader2 size={12} className="animate-spin" />
+                Reading branches…
+              </li>
+            )}
+            {!loading && remotes.length === 0 && !loadError && (
+              <li className="px-3 py-3 text-xs text-zinc-500">No remote branches. Fetch to see the ones on the remote.</li>
+            )}
+            {remotes.map((r) => {
+              const a = remoteAction(r, branches);
+              return (
+                <li key={r.full_ref || r.name} data-remote-branch={r.name} className="flex items-start gap-2 px-3 py-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-mono text-xs text-zinc-100">{r.name}</span>
+                      {a?.kind === "switch" && (
+                        <span className="text-[11px] text-zinc-500">
+                          as <span className="font-mono">{a.local.name}</span>
+                        </span>
+                      )}
+                      {a?.kind === "switch" && a.local.is_current && <Badge variant="success">HEAD</Badge>}
+                    </div>
+                    <p className="text-xs text-zinc-500 truncate" title={r.last_subject}>
+                      {r.last_subject}
+                    </p>
+                    {a?.kind === "taken" && (
+                      <p className="text-[11px] text-amber-300/90">
+                        A local branch <span className="font-mono">{a.name}</span> already exists and doesn't track this one.
+                      </p>
+                    )}
                   </div>
-                )}
-              </div>
-              <div className="flex items-center gap-1 shrink-0">
-                {!b.is_current && (
+                  <div className="flex items-center gap-1 shrink-0">
+                    {a?.kind === "switch" && !a.local.is_current && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy}
+                        title={`Switch to ${a.local.name}, which tracks ${r.name}`}
+                        onClick={() => act("branch", () => api.changesSwitchBranch(repoPath, a.local.name))}
+                      >
+                        Switch
+                      </Button>
+                    )}
+                    {a?.kind === "checkout" && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy}
+                        title={`Make a local branch ${a.name} that tracks ${r.name}, and switch to it`}
+                        onClick={() => act("branch", () => api.changesCreateBranch(repoPath, a.name, r.full_ref || r.name, true))}
+                      >
+                        Check out
+                      </Button>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        {!showRemote && (
+          <ul className="max-h-80 overflow-y-auto divide-y divide-zinc-800/70 rounded-lg border border-zinc-700/50">
+            {loading && branches.length === 0 && (
+              <li className="flex items-center gap-2 px-3 py-3 text-xs text-zinc-500">
+                <Loader2 size={12} className="animate-spin" />
+                Reading branches…
+              </li>
+            )}
+            {!loading && branches.length === 0 && !loadError && (
+              <li className="px-3 py-3 text-xs text-zinc-500">No local branches yet.</li>
+            )}
+            {branches.map((b) => (
+              <li key={b.name} className="flex items-start gap-2 px-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-mono text-xs text-zinc-100">{b.name}</span>
+                    {b.is_current && <Badge variant="success">HEAD</Badge>}
+                    <span className="text-[11px] text-zinc-500">
+                      {b.upstream ? `→ ${b.upstream}` : "not published"}
+                      {b.ahead > 0 && <span className="text-emerald-400"> ↑{b.ahead}</span>}
+                      {b.behind > 0 && <span className="text-sky-400"> ↓{b.behind}</span>}
+                    </span>
+                  </div>
+                  <p className="text-xs text-zinc-500 truncate" title={b.last_subject}>
+                    {b.last_subject}
+                  </p>
+                  {renaming === b.name && (
+                    <div className="flex flex-wrap items-center gap-2 mt-1.5">
+                      <Input
+                        aria-label="Rename to"
+                        value={renameTo}
+                        onChange={(e) => setRenameTo(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") saveRename(b.name);
+                          if (e.key === "Escape") setRenaming(null);
+                        }}
+                        containerClassName="flex-1 min-w-[10rem]"
+                        className="py-1 text-xs font-mono"
+                        autoFocus
+                      />
+                      <Button size="sm" disabled={busy || !renameTo.trim()} onClick={() => saveRename(b.name)}>
+                        Save
+                      </Button>
+                      <Button size="sm" variant="ghost" disabled={busy} onClick={() => setRenaming(null)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  {!b.is_current && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={busy}
+                      title="Switch to this branch"
+                      onClick={() => act("branch", () => api.changesSwitchBranch(repoPath, b.name))}
+                    >
+                      Switch
+                    </Button>
+                  )}
                   <Button
                     size="sm"
                     variant="ghost"
                     disabled={busy}
-                    title="Switch to this branch"
-                    onClick={() => act("branch", () => api.changesSwitchBranch(repoPath, b.name))}
+                    title="Rename this branch"
+                    onClick={() => {
+                      setRenaming(b.name);
+                      setRenameTo(b.name);
+                    }}
                   >
-                    Switch
+                    Rename…
                   </Button>
-                )}
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={busy}
-                  title="Rename this branch"
-                  onClick={() => {
-                    setRenaming(b.name);
-                    setRenameTo(b.name);
-                  }}
-                >
-                  Rename…
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={busy || b.is_current}
-                  title={b.is_current ? "You can't delete the branch you're on" : "Delete this branch"}
-                  className="hover:text-red-400"
-                  onClick={() => del(b.name, false)}
-                >
-                  Delete…
-                </Button>
-              </div>
-            </li>
-          ))}
-        </ul>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy || b.is_current}
+                    title={b.is_current ? "You can't delete the branch you're on" : "Delete this branch"}
+                    className="hover:text-red-400"
+                    onClick={() => del(b.name, false)}
+                  >
+                    Delete…
+                  </Button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </Modal>
   );

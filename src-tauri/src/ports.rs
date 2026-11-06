@@ -34,6 +34,7 @@ const DOCKER_TIMEOUT: Duration = Duration::from_secs(3);
 const DOCKER_BACKOFF: Duration = Duration::from_secs(60);
 const DOCKER_STOP_TIMEOUT: Duration = Duration::from_secs(25);
 const KILL_GRACE: Duration = Duration::from_secs(3);
+#[cfg_attr(windows, allow(dead_code))]
 const KILL_HARD_GRACE: Duration = Duration::from_secs(1);
 
 /// Docker Desktop's own processes: they hold every published port on macOS
@@ -691,13 +692,13 @@ pub(crate) fn clone_of(dir: &str, profs: &[crate::profiles::Profile]) -> Option<
     }
 }
 
-fn os_name() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "macOS"
-    } else if cfg!(windows) {
-        "Windows"
-    } else {
-        "Linux"
+/// The OS of a listing as the page names it — from what was gathered, not
+/// the machine the code runs on, so a listing reads the same in a test.
+fn os_name(os: &str) -> &'static str {
+    match os {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        _ => "Linux",
     }
 }
 
@@ -741,7 +742,7 @@ pub(crate) fn why_not_killable(row: &Listener, g: &Gathered) -> Option<String> {
         return Some("Docker Desktop's own process — stop the container instead (Docker did not answer, so the container is unknown).".into());
     }
     if row.exe.as_deref().is_some_and(|e| is_system_exe(e, &g.os)) {
-        return Some(format!("Part of {} — not stoppable from here.", os_name()));
+        return Some(format!("Part of {} — not stoppable from here.", os_name(&g.os)));
     }
     if g.os == "windows" {
         if row.name.as_deref().is_some_and(|n| WINDOWS_SYSTEM_NAMES.contains(&n)) {
@@ -946,6 +947,7 @@ fn own_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn pid_list(pids: &[u32]) -> String {
     pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
 }

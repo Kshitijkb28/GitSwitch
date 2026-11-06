@@ -12,6 +12,7 @@ codebase builds installers for **Windows, macOS, and Linux**.
 # Run the app in Docker (any machine), in a browser ... docker compose up app   -> localhost:6080
 # Run `tauri dev` in Docker on this checkout .......... docker compose up dev   -> localhost:6080
 # Build ALL three OSes' installers .................... git tag vX.Y.Z && git push --tags  (CI)
+#   (a release the apps update to: version.mjs X.Y.Z first, see "Auto-updater releases")
 ```
 
 > To **run** GitSwitch from the codebase, use `npm run tauri dev` — or, with
@@ -55,6 +56,17 @@ so the first time it is opened macOS asks for confirmation:
   open it again.
 
 After that it opens like any other app.
+
+### Updating
+
+GitSwitch checks for a newer release shortly after it starts and every six
+hours after; when one is out, the sidebar says **Update available**. Install
+it from **Settings → About** (or check by hand there). Each copy updates from
+the same kind of installer it came from — the Windows setup or `.msi`, the
+macOS app, the `.deb`, `.rpm` or AppImage — and only from a release signed
+with the project's key. Windows (installed for all users), and the `.deb` and
+`.rpm`, ask for administrator rights while installing; GitSwitch restarts
+when it is done.
 
 ### Runtime requirements (must exist on the user's machine)
 
@@ -155,18 +167,39 @@ cross-built with Docker — see [Testing on Windows](#6-testing-on-windows).)
 This also removes the build-folder `.app`, ejects stray DMG mounts, and fixes
 Launch Services registrations so you never end up with "two GitSwitch apps."
 
-## 5. Auto-updater releases (optional)
+## 5. Auto-updater releases
 
-The updater's public key lives in `tauri.conf.json`; the matching **private
-key** is at `~/.tauri/gitswitch_updater.key` (never commit it — losing it means
-you can't sign future updates).
+Installed copies read `latest.json` from the **latest published** release
+(`plugins.updater.endpoints` in `tauri.conf.json`) and install only files
+signed with the key whose public half is `plugins.updater.pubkey` there. The
+matching **private key** is at `~/.tauri/gitswitch_updater.key` on the
+maintainer's Mac — never commit it, and never replace it: every copy already
+installed trusts that one key (and the push-lock helper's signed upgrades use
+it too), so a new key would strand them all.
 
-To ship signed updates from CI:
-1. Add repo secrets: `TAURI_SIGNING_PRIVATE_KEY` (file contents) and
-   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (empty if none).
-2. Set `"createUpdaterArtifacts": true` under `bundle` in `tauri.conf.json`.
-3. Tag a release — the workflow uploads the updater artifacts + `latest.json`
-   that the in-app "Check for Updates" consumes.
+Once, in the repository's **Settings → Secrets and variables → Actions**:
+`TAURI_SIGNING_PRIVATE_KEY` (the key file's contents) and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (its password; empty if none).
+
+Each release:
+
+```bash
+node scripts/release/version.mjs 0.2.0   # tauri.conf.json, package.json, package-lock.json, Cargo.toml, Cargo.lock
+git commit -am "chore: 0.2.0" && git tag v0.2.0 && git push && git push --tags
+```
+
+1. CI refuses a tag that is not the version in those files (an update the
+   apps would never see, or would be offered again after installing), and a
+   tag without the signing key.
+2. Each OS builds its installers with the updater's signatures
+   (`--config src-tauri/tauri.updater.conf.json`; local builds skip them and
+   need no key) and attaches them to the draft release.
+3. `release-updater` then writes `latest.json` — an entry per installer
+   (`windows-x86_64-nsis`, `-msi`, `darwin-aarch64-app`, `darwin-x86_64-app`,
+   `linux-x86_64-appimage`, `-deb`, `-rpm`, plus a plain `<os>-<arch>` each),
+   built by `scripts/release/updater-manifest.mjs` — and fails if any platform
+   is missing.
+4. **Publish** the draft. Until then installed copies see nothing new.
 
 ## 6. Testing on Windows
 
