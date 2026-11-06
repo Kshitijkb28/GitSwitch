@@ -26,7 +26,7 @@ git init -q --bare "$T\remote.git"; git clone -q "$T\remote.git" "$T\work"; cd "
 | 4 | `git push origin main`, then `git push --no-verify origin main` (Git Bash **and** PowerShell) | Both refused with "GitSwitch: push refused." … "Do not work around this …". | |
 | 5 | **Allowed** → **Unlock** → **Yes** | "Unlocked 1 repository."; push works; the marker block is gone. | |
 | 6 | Standard account: **Locked** | UAC asks for an **administrator's password** this time. | |
-| 7 | Settings → Push locks → Remove → **Yes** | `dir C:\ProgramData\GitSwitch` → not found; the remote helper `.exe` is gone from `<InstallPath>\mingw64\libexec\git-core`; the helper itself disappears at the next reboot (a running exe cannot delete itself). | |
+| 7 | Settings → Push locks → Remove → **Yes** | `dir C:\ProgramData\GitSwitch` → not found; the remote helper `.exe` is gone from git's exec path (`git --exec-path`: `<InstallPath>\ucrt64\libexec\git-core` on current Git for Windows, `mingw64` on older ones); the helper itself disappears at the next reboot (a running exe cannot delete itself). | |
 | 8 | With UAC set to "Never notify" (then set it back!): Doctor | `push-lock-uac-off` warning. | |
 
 ## Runs
