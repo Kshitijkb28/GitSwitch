@@ -582,7 +582,7 @@ if [ -n "$RO_SKIP" ]; then
   echo "  (skipped on $PLAT: a folder can't be made read-only here, so a Repair that can't write back is checked on macOS and Linux)"
 else
 ok "a submodule Repair cannot write back is named as not covered, and why — not called in place" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];m=v["message"];print(v["outcome"], "lib2 (" in m, "Everything is in place" in m, "Could not write: lib2" in m)')" "incomplete True False True"
-ok "  the card's Repair for it promises no administrator prompt (none is needed)" "$(printf '%s' "$COV" | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"];print(c["needs_repair"], c["needs_elevation"], [s["drift"] for s in c["submodules"] if s["path"]=="lib2"])')" "True False [$DRIFT_WANT]"
+ok "  the card's Repair for it promises no administrator prompt (none is needed)" "$(printf '%s' "$COV" | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"];print(c["needs_repair"], c["needs_elevation"], [s["drift"] for s in c["submodules"] if s["path"]=="lib2"])')" "True False $DRIFT_WANT"
 fi
 OUT=$(pinvoke changes_repair_push_lock "{\"repoPath\":\"$SUP\"}")
 ok "  and once it can be written, Repair puts it back" "$(printf '%s' "$OUT" | jqf value.outcome):$(git -C "$SUP/lib2" config --local --get gitswitch.pushBlocked)" "applied:true"
