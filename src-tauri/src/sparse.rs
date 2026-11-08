@@ -1191,6 +1191,16 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
             }
         }
         if let Err(e) = res {
+            // A download the app stopped leaves what git's inner clone had
+            // made so far. On unix git removes that itself (SIGTERM, then the
+            // group's grace); Windows ends the whole job object at once, so
+            // the empty module directory and the folder's `.git` stay — the
+            // row then reads "interrupted", and the `git submodule update
+            // --init` the error suggests fails with "Unable to find current
+            // revision". Cleared as git would have; anything holding a commit
+            // is kept (clear_incomplete's rule). Not reported as `cleared`:
+            // that names leftovers found before a download.
+            let _ = clear_incomplete(repo, name, path).await;
             failed.push(path.clone());
             if first_error.is_none() {
                 first_error = Some(match e {
