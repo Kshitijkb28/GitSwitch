@@ -692,8 +692,12 @@ pub struct OpResult {
     pub tree: Option<crate::tree::TreeOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stash: Option<crate::stash::StashOutcome>,
+    /// Boxed: a debug build gives every OpResult temporary in every
+    /// operation's frames a stack slot of its own, and inline, this dozen
+    /// strings pushed `changes_sync_run` past a 2 MiB thread stack (see
+    /// every_heavy_command_future_stays_far_below_a_threads_stack).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<crate::states::StateOutcome>,
+    pub state: Option<Box<crate::states::StateOutcome>>,
     /// Submodules a push would leave a clone unable to check out (their
     /// recorded commit is on no remote of theirs), or could not check.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]

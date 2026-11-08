@@ -1148,7 +1148,7 @@ fn short(oid: &str) -> &str {
 
 fn failed(status: RepoStatus, said: &str, detail: String, state: StateOutcome) -> OpResult {
     let a = git_advice::explain(GitOp::Reset, said, &advice_ctx(&status));
-    OpResult { detail, state: Some(state), ..OpResult::failed(a, status) }
+    OpResult { detail, state: Some(Box::new(state)), ..OpResult::failed(a, status) }
 }
 
 fn oid_matches(have: &str, want: &str) -> bool {
@@ -1225,7 +1225,7 @@ pub async fn save(repo_path: &str, slot: &str, name: Option<&str>, replace: Opti
     let mut o = outcome("save", &slot, &name);
     o.oid = Some(c.oid.clone());
     o.recovery = current.map(|c| format!("the state it replaced was {}", c));
-    Ok(OpResult { state: Some(o), ..OpResult::done(format!("Saved {}.", slot.label()), detail, after) })
+    Ok(OpResult { state: Some(Box::new(o)), ..OpResult::done(format!("Saved {}.", slot.label()), detail, after) })
 }
 
 /// Go back to the state in `slot` (the page names it by `oid`): what is there
@@ -1428,7 +1428,7 @@ pub async fn restore(repo_path: &str, slot: &str, oid: &str, new_branch: Option<
         detail.push_str(n);
     }
     detail.push_str(" What you had before is saved as “Before going back”.");
-    Ok(OpResult { state: Some(o), ..OpResult::done(format!("Back to {}.", slot.label()), detail, after) })
+    Ok(OpResult { state: Some(Box::new(o)), ..OpResult::done(format!("Back to {}.", slot.label()), detail, after) })
 }
 
 /// Remove the state in `slot` (the page names it by `oid`), and its parts in
@@ -1456,7 +1456,7 @@ pub async fn delete(repo_path: &str, slot: &str, oid: &str) -> Result<OpResult, 
     o.oid = Some(c.clone());
     o.recovery = Some(format!("its commit was {}", c));
     let after = snapshot(repo_path).await?;
-    Ok(OpResult { state: Some(o), ..OpResult::done(format!("Deleted {}.", slot.label()), format!("“{}” is gone from the list.", name), after) })
+    Ok(OpResult { state: Some(Box::new(o)), ..OpResult::done(format!("Deleted {}.", slot.label()), format!("“{}” is gone from the list.", name), after) })
 }
 
 /// The slot's parts in the repositories inside, removed (only where they are

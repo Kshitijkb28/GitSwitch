@@ -317,11 +317,9 @@ pub(crate) mod tests {
             "changes_stash_list" => forward!(c::changes_stash_list, args, repo_path),
             "changes_stash_show" => forward!(c::changes_stash_show, args, repo_path, index),
             "changes_stash_file_diff" => forward!(c::changes_stash_file_diff, args, repo_path, index, path),
-            "states_list" => forward!(c::states_list, args, repo_path),
-            "states_save" => forward!(c::states_save, args, repo_path, slot, name, replace),
-            "states_restore" => forward!(c::states_restore, args, repo_path, slot, oid, new_branch, allow_pushed),
-            "states_delete" => forward!(c::states_delete, args, repo_path, slot, oid),
-            "states_set_max" => forward!(c::states_set_max, args, repo_path, max),
+            // In a function of their own: each arm written here adds its debug
+            // slots to this frame, which lies under every live call.
+            s if s.starts_with("states_") => Box::pin(invoke_states(s.to_string(), args)).await,
             "changes_stash_push" => forward!(c::changes_stash_push, args, repo_path, message, include_untracked),
             "changes_stash_apply" => forward!(c::changes_stash_apply, args, repo_path, index, pop, restore_index, oid),
             "changes_stash_drop" => forward!(c::changes_stash_drop, args, repo_path, index, oid),
@@ -389,6 +387,19 @@ pub(crate) mod tests {
                 "`{}` needs a Tauri AppHandle, which the probe cannot supply",
                 cmd
             )),
+            other => reply_err(format!("unknown command `{}`", other)),
+        }
+    }
+
+    /// The States commands, reached through `invoke` (see the arm there).
+    async fn invoke_states(cmd: String, args: serde_json::Value) {
+        use crate::commands as c;
+        match cmd.as_str() {
+            "states_list" => forward!(c::states_list, args, repo_path),
+            "states_save" => forward!(c::states_save, args, repo_path, slot, name, replace),
+            "states_restore" => forward!(c::states_restore, args, repo_path, slot, oid, new_branch, allow_pushed),
+            "states_delete" => forward!(c::states_delete, args, repo_path, slot, oid),
+            "states_set_max" => forward!(c::states_set_max, args, repo_path, max),
             other => reply_err(format!("unknown command `{}`", other)),
         }
     }
