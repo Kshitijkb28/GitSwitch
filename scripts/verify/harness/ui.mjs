@@ -113,6 +113,8 @@ async function openPage(browser, server, scenario, opts = {}) {
     cloneSize: opts.cloneSize ?? null,
     /** How long the shell takes to start: the pty answers after this many ms. */
     terminalOpenDelayMs: opts.terminalOpenDelayMs ?? 0,
+    /** The shell's first output is Windows' cursor question (ESC[6n), sent before the session id arrives. */
+    terminalAsksCursor: opts.terminalAsksCursor ?? false,
     /** More remembered settings (gitswitch:* keys, without the prefix). */
     storage: opts.storage ?? null,
     /** What workspace_info answers: by default a repository cloned once. */
@@ -295,6 +297,10 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "terminal_open":
               if (cfg.gonePaths.includes(args?.repoPath)) return Promise.reject(`Command execution error: Not found: ${args.repoPath} no longer exists on disk`);
               if (cfg.terminalFails.includes(args?.repoPath)) return Promise.reject("Command execution error: Could not open a terminal: no pty");
+              // Windows' console asks where the cursor is before it prints a
+              // thing, and says nothing more until it is answered; the question
+              // can come through the output channel before the session id does.
+              if (cfg.terminalAsksCursor && args?.onOutput) window.__CHANNELS__?.[args.onOutput.id]?.({ index: 0, message: "\x1b[6n" });
               // The session id arrives when the shell has started — at once, or late.
               return cfg.terminalOpenDelayMs
                 ? new Promise((res) => setTimeout(() => res("test-session"), cfg.terminalOpenDelayMs))
@@ -2844,6 +2850,26 @@ try {
   }
 
   // -----------------------------------------------------------------
+  section("The terminal drawer answers the console's first question");
+  {
+    // Windows' console (ConPTY) opens with "where is the cursor?" (ESC[6n) and
+    // prints nothing — no banner, no prompt — until the terminal answers, which
+    // xterm does through onData. When that question came before the session id,
+    // the answer had nowhere to go and the drawer stayed blank.
+    const page = await open(SCENARIOS.clean, { terminalAsksCursor: true, terminalOpenDelayMs: 400 });
+    await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 4000 });
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Terminal")?.click());
+    await page.waitForFunction(() => !!document.querySelector('[aria-label="Terminal"]'), { timeout: 4000 });
+    await sleep(1000);
+    const writes = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "terminal_write").map((c) => c.args));
+    ok(
+      "a question that comes before the shell's id is still answered, to that shell",
+      writes.some((w) => w.id === "test-session" && /^\x1b\[\d+;\d+R$/.test(w.data)),
+      JSON.stringify(writes)
+    );
+    await page.close();
+  }
+
   section("The terminal drawer never outgrows the window");
   {
     // A remembered 900 px drawer (dragged tall on a big screen) in a 600 px

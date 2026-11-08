@@ -110,6 +110,20 @@ export function TerminalView({ repoPath, sizeKey, visible }: Props) {
     // The size the shell is started with; it may be stale by the time the
     // shell exists.
     const opened = { cols: t.cols, rows: t.rows };
+    // Listening before the shell exists: on Windows the console's first words
+    // are a question (where is the cursor?) that xterm answers through onData,
+    // and the console prints nothing until it hears the answer. An answer
+    // given before the session id is known waits here instead of being lost.
+    let shellId: string | null = null;
+    const early: string[] = [];
+    const send = (id: string, data: string) =>
+      void api.terminalWrite(id, data).catch(() => {
+        /* the shell exited; its farewell is already on screen */
+      });
+    t.onData((data) => {
+      if (shellId) send(shellId, data);
+      else early.push(data);
+    });
     api
       .terminalOpen(repoPath, opened.cols, opened.rows, (chunk) => {
         if (!dead) t.write(chunk);
@@ -121,11 +135,8 @@ export function TerminalView({ repoPath, sizeKey, visible }: Props) {
         }
         session.current = id;
         told.current = opened;
-        t.onData((data) => {
-          void api.terminalWrite(id, data).catch(() => {
-            /* the shell exited; its farewell is already on screen */
-          });
-        });
+        shellId = id;
+        for (const data of early.splice(0)) send(id, data);
         // Fit once more now that there is a shell to tell, and pass on
         // whatever the size became while it was starting.
         refit();
