@@ -692,6 +692,8 @@ pub struct OpResult {
     pub tree: Option<crate::tree::TreeOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stash: Option<crate::stash::StashOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<crate::states::StateOutcome>,
     /// Submodules a push would leave a clone unable to check out (their
     /// recorded commit is on no remote of theirs), or could not check.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
@@ -715,6 +717,7 @@ impl OpResult {
             sync: None,
             tree: None,
             stash: None,
+            state: None,
             unpushed_submodules: Vec::new(),
         }
     }

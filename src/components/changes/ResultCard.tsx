@@ -119,6 +119,9 @@ export function ResultCard({ result, busy, onDismiss, onRecordPointers, onAlignS
           {stash?.recovery && (
             <p className="text-xs text-zinc-500 font-mono break-all">undo: {stash.recovery}</p>
           )}
+          {result.state?.action === "delete" && result.state.recovery && (
+            <p className="text-xs text-zinc-500 font-mono break-all">{result.state.recovery}</p>
+          )}
           {result.submodules && result.submodules.listed > 0 && (
             <p className="text-xs text-zinc-400">
               Submodules: {result.submodules.downloaded} of {result.submodules.listed} up to date

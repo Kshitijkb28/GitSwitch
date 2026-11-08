@@ -74,7 +74,7 @@ jobs:
       - name: Setup Bun
         if: matrix.os != 'windows-latest'
         uses: oven-sh/setup-bun@v2
-      - name: Git suites (Changes sandbox, regression, submodules, LFS, sync, tree, stashes)
+      - name: Git suites (Changes sandbox, regression, submodules, LFS, sync, tree, stashes, states)
         if: matrix.os != 'windows-latest'
         shell: bash
         run: |
@@ -90,6 +90,7 @@ jobs:
           bash scripts/verify/sync.sh
           bash scripts/verify/tree.sh
           bash scripts/verify/stash.sh
+          bash scripts/verify/states.sh
           bash scripts/verify/ports.sh
           bash scripts/verify/workspace.sh
       # The same suites under Git Bash. Informational until they have been seen
@@ -107,6 +108,7 @@ jobs:
           bash scripts/verify/sync.sh
           bash scripts/verify/tree.sh
           bash scripts/verify/stash.sh
+          bash scripts/verify/states.sh
       - name: Terminal suite (Windows, cmd.exe — informational)
         if: matrix.os == 'windows-latest'
         continue-on-error: true

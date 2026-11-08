@@ -92,6 +92,10 @@ async function openPage(browser, server, scenario, opts = {}) {
     submoduleStatuses: opts.submoduleStatuses ?? [],
     branches: opts.branches ?? BRANCHES,
     stashes: opts.stashes ?? [],
+    /** What states_list answers: four slots and "Before going back". */
+    states: opts.states ?? { states: [], before: null, max: 4, next_free: "1", limit: 99 },
+    /** states_set_max fails with this text (a number below a saved state). */
+    statesMaxError: opts.statesMaxError ?? null,
     stashDetail: opts.stashDetail ?? STASH_DETAIL,
     /** {[cmd]: {code, message, guidance}} — that command answers with a refusal. */
     refuse: opts.refuse ?? {},
@@ -213,6 +217,27 @@ async function openPage(browser, server, scenario, opts = {}) {
               return Promise.resolve(cfg.branches);
             case "changes_stash_list":
               return Promise.resolve(cfg.stashes);
+            case "states_list":
+              return Promise.resolve(cfg.states);
+            case "states_save":
+              return done(`Saved state ${args.slot}.`, args.repoPath);
+            case "states_restore":
+              return done(`Back to state ${args.slot}.`, args.repoPath);
+            case "states_delete":
+              return done(`Deleted state ${args.slot}.`, args.repoPath);
+            case "states_set_max": {
+              if (cfg.statesMaxError) return Promise.reject(cfg.statesMaxError);
+              const used = new Set(cfg.states.states.map((x) => Number(x.slot)));
+              let free = null;
+              for (let n = 1; n <= args.max; n++) {
+                if (!used.has(n)) {
+                  free = String(n);
+                  break;
+                }
+              }
+              cfg.states = { ...cfg.states, max: args.max, next_free: free };
+              return Promise.resolve(cfg.states);
+            }
             case "changes_stash_show":
               return Promise.resolve(cfg.stashDetail);
             case "changes_reset":
@@ -4966,6 +4991,147 @@ try {
   }
 
   // -----------------------------------------------------------------
+  section("States: save where you are, go back to it — four slots and “Before going back”");
+  {
+    const now = Math.floor(Date.now() / 1000);
+    const st = (over) => ({
+      slot: "1",
+      oid: "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      name: "my first stage",
+      branch: "main",
+      head: "aaaa1111",
+      head_short: "aaaa111",
+      head_subject: "commit 1",
+      saved: now - 120,
+      changed: 3,
+      staged: 1,
+      new_files: 1,
+      branch_gone: false,
+      commits_since: 0,
+      pushed_since: 0,
+      upstream: "origin/main",
+      before_of: null,
+      subs: [],
+      ...over,
+    });
+    const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+    const card = (page) => page.evaluate(() => document.querySelector("[data-states-card]")?.innerText ?? "");
+    let page = await open(SCENARIOS.dirty);
+    await page.waitForFunction(() => document.querySelector("[data-states-card]"), { timeout: 4000 }).catch(() => null);
+    let c = await card(page);
+    ok("the States card is on the Changes tab: 0 of 4, one row to save a new state", c.includes("States") && c.includes("0 of 4") && c.includes("No state saved yet") && !!(await page.$('[data-state-new] [data-state-save="1"]')));
+    ok("  it says what a state holds", c.includes("the commit, the branch and every changed file"));
+    await page.evaluate(() => document.querySelector('[data-state-save="1"]').click());
+    await sleep(150);
+    const m = await page.evaluate(() => document.querySelector('[data-state-modal="save"]')?.innerText ?? "");
+    ok("Save state here says what is saved: the branch, the commit, the changes", m.includes("main") && m.includes("changed file"));
+    await page.type('input[aria-label="State name"]', "before the refactor");
+    await page.evaluate(() => document.querySelector('[data-state-modal="save"] [data-state-confirm]').click());
+    await sleep(300);
+    let sv = await calls(page, "states_save");
+    ok("  Save sends the slot and the name (nothing to replace)", sv.length === 1 && sv[0].slot === "1" && sv[0].name === "before the refactor" && sv[0].replace === null, JSON.stringify(sv));
+    const maxField = () => page.$eval('input[aria-label="How many states to keep"]', (el) => el.value);
+    ok("Keep up to N states: the repository's own number, 4 to begin with", (await maxField()) === "4" && c.includes("states in this repository"));
+    await page.click('input[aria-label="How many states to keep"]', { clickCount: 3 });
+    await page.type('input[aria-label="How many states to keep"]', "12");
+    await page.keyboard.press("Enter");
+    await sleep(300);
+    const mx = await calls(page, "states_set_max");
+    ok("  a new number is sent for this repository", mx.length === 1 && mx[0].max === 12, JSON.stringify(mx));
+    ok("  and the card counts against it", (await card(page)).includes("0 of 12") && (await maxField()) === "12");
+    await page.close();
+
+    page = await open(SCENARIOS.dirty, { states: { states: [st({}), st({ slot: "2", oid: "6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b", name: "second" })], before: null, max: 2, next_free: null, limit: 99 } });
+    await page.waitForFunction(() => document.querySelector('[data-state-slot="2"]'), { timeout: 4000 }).catch(() => null);
+    ok("every slot in use: no save row, and it says how to make room", !(await page.$("[data-state-new]")) && (await card(page)).includes("All 2 are in use") && (await card(page)).includes("2 of 2"));
+    await page.close();
+
+    page = await open(SCENARIOS.dirty, {
+      states: { states: [st({ slot: "6", oid: "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c" })], before: null, max: 6, next_free: "1", limit: 99 },
+      statesMaxError: "Command execution error: State 6 is saved above 4. Delete it first, or keep at least 6.",
+    });
+    await page.waitForFunction(() => document.querySelector('[data-state-slot="6"]'), { timeout: 4000 }).catch(() => null);
+    await page.click('input[aria-label="How many states to keep"]', { clickCount: 3 });
+    await page.type('input[aria-label="How many states to keep"]', "4");
+    await page.keyboard.press("Enter");
+    await sleep(300);
+    ok("lowering below a saved state is refused in words, the number kept", (await page.evaluate(() => document.querySelector("[data-state-max-error]")?.innerText ?? "")).startsWith("State 6 is saved above 4") && (await maxField()) === "6");
+    await page.close();
+
+    page = await open(SCENARIOS.dirty, {
+      states: { states: [st({})], before: st({ slot: "before", oid: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", name: "Before going back", before_of: "my first stage", head_short: "cccc333", changed: 2, staged: 0, new_files: 1 }), max: 4, next_free: "2", limit: 99 },
+    });
+    await page.waitForFunction(() => document.querySelector('[data-state-slot="1"]'), { timeout: 4000 }).catch(() => null);
+    c = await card(page);
+    ok("a saved state shows its name, branch, commit and files", c.includes("1 of 4") && c.includes("my first stage") && c.includes("aaaa111") && c.includes("3 changed files (1 staged, 1 new)"));
+    ok("  “Before going back” has its own row, naming the state it was before", c.includes("Before going back to “my first stage”") && !!(await page.$("[data-state-before]")));
+    await page.evaluate(() => document.querySelector('[data-state-back="1"]').click());
+    await sleep(150);
+    let b = await page.evaluate(() => document.querySelector('[data-state-modal="back"]')?.innerText ?? "");
+    ok("Go back asks first, saying exactly what happens", b.includes("Your files become exactly as saved: 3 changed files") && b.includes("saved first as “Before going back”"));
+    ok("  with nothing pushed since, there is one way: Go back", !!(await page.$('[data-state-modal="back"] [data-state-confirm]')) && !(await page.$("[data-state-pushed]")));
+    ok("  and nothing ran yet", (await calls(page, "states_restore")).length === 0);
+    await page.evaluate(() => document.querySelector('[data-state-modal="back"] [data-state-confirm]').click());
+    await sleep(300);
+    let rs = await calls(page, "states_restore");
+    ok("  Go back names the state by its commit", rs.length === 1 && rs[0].slot === "1" && rs[0].oid === st({}).oid && rs[0].newBranch === null && rs[0].allowPushed === false, JSON.stringify(rs));
+    await page.evaluate(() => document.querySelector('[data-state-back="before"]').click());
+    await sleep(150);
+    await page.evaluate(() => document.querySelector('[data-state-modal="back"] [data-state-confirm]').click());
+    await sleep(300);
+    rs = await calls(page, "states_restore");
+    ok("“Go back to it” returns to “Before going back”", rs.length === 2 && rs[1].slot === "before");
+    await page.evaluate(() => document.querySelector('[data-state-delete="1"]').click());
+    await sleep(150);
+    ok("Delete asks first", (await page.evaluate(() => document.querySelector('[data-state-modal="delete"]')?.innerText ?? "")).includes("It leaves the list") && (await calls(page, "states_delete")).length === 0);
+    await page.evaluate(() => document.querySelector('[data-state-modal="delete"] [data-state-confirm]').click());
+    await sleep(300);
+    const dl = await calls(page, "states_delete");
+    ok("  then deletes that state, by its commit", dl.length === 1 && dl[0].slot === "1" && dl[0].oid === st({}).oid);
+    await page.evaluate(() => document.querySelector('[data-state-replace="1"]').click());
+    await sleep(150);
+    ok("Save here again warns the state leaves the slot", (await page.evaluate(() => document.querySelector('[data-state-modal="save"]')?.innerText ?? "")).includes("leaves this slot"));
+    await page.evaluate(() => document.querySelector('[data-state-modal="save"] [data-state-confirm]').click());
+    await sleep(300);
+    sv = await calls(page, "states_save");
+    ok("  and replaces only the one shown", sv.length === 1 && sv[0].slot === "1" && sv[0].replace === st({}).oid);
+    await page.close();
+
+    const pushed = st({ commits_since: 2, pushed_since: 2, subs: [{ path: "lib", downloaded: true, changed: 1, branch: "main", pushed_since: 1 }] });
+    page = await open(SCENARIOS.dirty, { states: { states: [pushed], before: null, max: 4, next_free: "2", limit: 99 } });
+    await page.waitForFunction(() => document.querySelector('[data-state-slot="1"]'), { timeout: 4000 }).catch(() => null);
+    ok("the row says the branch gained commits since", (await card(page)).includes("main has 2 commits since"));
+    await page.evaluate(() => document.querySelector('[data-state-back="1"]').click());
+    await sleep(150);
+    b = await page.evaluate(() => document.querySelector('[data-state-modal="back"]')?.innerText ?? "");
+    ok("pushed commits since: it explains, and asks how", b.includes("2 commits made since are already pushed to origin/main") && b.includes("next push would be refused unless forced"));
+    ok("  offering a new branch and moving it back anyway — no plain Go back", !!(await page.$("[data-state-new-branch]")) && !!(await page.$("[data-state-anyway]")) && !(await page.$('[data-state-modal="back"] [data-state-confirm]')));
+    ok("  with a new branch name ready", (await page.$eval('input[aria-label="New branch name"]', (el) => el.value)) === "main-my-first-stage");
+    ok("  and the repositories inside are named, with what happens to a pushed one", b.includes("The repositories inside go back too: lib") && b.includes("lib has pushed commits since"));
+    await page.evaluate(() => document.querySelector("[data-state-new-branch]").click());
+    await sleep(300);
+    rs = await calls(page, "states_restore");
+    ok("  Go back on a new branch sends that name", rs.length === 1 && rs[0].newBranch === "main-my-first-stage" && rs[0].allowPushed === false);
+    await page.evaluate(() => document.querySelector('[data-state-back="1"]').click());
+    await sleep(150);
+    await page.evaluate(() => document.querySelector("[data-state-anyway]").click());
+    await sleep(300);
+    rs = await calls(page, "states_restore");
+    ok("  Move main back anyway says so", rs.length === 2 && rs[1].newBranch === null && rs[1].allowPushed === true);
+    await page.close();
+
+    page = await open(SCENARIOS.dirty, { refuse: { states_restore: { code: "no-state", message: "That state isn't there any more — the list was out of date." } }, states: { states: [st({})], before: null, max: 4, next_free: "2", limit: 99 } });
+    await page.waitForFunction(() => document.querySelector('[data-state-slot="1"]'), { timeout: 4000 }).catch(() => null);
+    const lists = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "states_list").length);
+    const before = await lists();
+    await page.evaluate(() => document.querySelector('[data-state-back="1"]').click());
+    await sleep(150);
+    await page.evaluate(() => document.querySelector('[data-state-modal="back"] [data-state-confirm]').click());
+    await sleep(400);
+    ok("a state that changed meanwhile is refused, said, and the list read again", (await card(page)).includes("The list was out of date") && (await lists()) > before);
+    await page.close();
+  }
+
   section("Stashes");
   {
     const page = await open(SCENARIOS.withStashes, { stashes: STASHES });

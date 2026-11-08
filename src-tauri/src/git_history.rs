@@ -572,7 +572,7 @@ pub fn parse_shortlog(out: &str) -> Vec<AuthorCount> {
 /// The names GitSwitch gives its own backup branches: before an update, a
 /// reset, a commit-audit rewrite.
 fn safety_prefixes() -> impl Iterator<Item = &'static str> {
-    crate::sync::BACKUP_PREFIXES.iter().copied().chain([crate::tree::RESET_BACKUP_PREFIX, "gitswitch-backup-"])
+    crate::sync::BACKUP_PREFIXES.iter().copied().chain([crate::tree::RESET_BACKUP_PREFIX, crate::states::STATE_BACKUP_PREFIX, "gitswitch-backup-"])
 }
 
 /// One of GitSwitch's own backup branches — a safety net, not anyone's work.

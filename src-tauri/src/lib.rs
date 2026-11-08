@@ -42,6 +42,7 @@ pub(crate) fn lfs_sha(secret: &str) -> String {
 }
 mod submodules;
 mod stash;
+mod states;
 mod sync;
 mod tree;
 mod signing;
@@ -185,6 +186,11 @@ pub fn run() {
             commands::changes_stash_list,
             commands::changes_stash_show,
             commands::changes_stash_file_diff,
+            commands::states_list,
+            commands::states_save,
+            commands::states_restore,
+            commands::states_delete,
+            commands::states_set_max,
             commands::changes_stash_push,
             commands::changes_stash_apply,
             commands::changes_stash_drop,

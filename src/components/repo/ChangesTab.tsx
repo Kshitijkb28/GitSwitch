@@ -16,6 +16,7 @@ import { SubmoduleSection, needsSection, sectionId } from "../changes/SubmoduleS
 import { LfsCard } from "../changes/LfsCard";
 import { LfsFilesModal, formatBytes } from "../changes/LfsFilesModal";
 import { StashesCard } from "../changes/StashesCard";
+import { StatesCard } from "../changes/StatesCard";
 import { StashModal } from "../changes/StashModal";
 import { SyncPausedCard } from "../changes/SyncCard";
 import { ResultCard } from "../changes/ResultCard";
@@ -857,6 +858,14 @@ export function ChangesTab({
                 openBranchFormFor={branchFormFor}
                 sectionPaths={sectionPaths}
                 onJumpToSection={jumpToSubmodule}
+              />
+
+              <StatesCard
+                repoPath={repoPath}
+                status={status}
+                busy={anyBusy}
+                refreshKey={subRefresh}
+                run={(key, fn) => apply(key, fn)}
               />
 
               <StashesCard

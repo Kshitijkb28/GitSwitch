@@ -1681,6 +1681,7 @@ export interface OpResult {
   sync?: SyncOutcome;
   tree?: TreeOutcome;
   stash?: StashOutcome;
+  state?: StateOutcome;
   /** Submodules a push would leave a clone unable to check out, or could not check. */
   unpushed_submodules?: SubmodulePush[];
   /**
@@ -1806,6 +1807,97 @@ export interface StashOutcome {
   kept: boolean;
   recovery: string | null;
   not_stashed_submodules: string[];
+}
+
+/** A repository inside a saved state (a submodule or a nested repository). */
+export interface StateSub {
+  path: string;
+  /** Checked out now: its part can come back. */
+  downloaded: boolean;
+  changed: number;
+  branch: string | null;
+  /** Commits on its saved branch since that are already pushed (that branch is kept). */
+  pushed_since: number;
+}
+
+/** A saved state: where the repository was — commit, branch, staged and every changed file. */
+export interface RepoState {
+  /** "1".."4" or "before". */
+  slot: string;
+  oid: string;
+  name: string;
+  /** null: HEAD was detached. */
+  branch: string | null;
+  head: string;
+  head_short: string;
+  head_subject: string;
+  /** Seconds since 1970. */
+  saved: number;
+  changed: number;
+  staged: number;
+  new_files: number;
+  branch_gone: boolean;
+  /** Commits the branch gained since (they leave it on Go back, kept on a backup branch). */
+  commits_since: number;
+  /** Of those, already pushed. */
+  pushed_since: number;
+  upstream: string | null;
+  /** For "Before going back": the state that was gone back to. */
+  before_of: string | null;
+  subs: StateSub[];
+}
+
+export interface StatesList {
+  /** The saved states, by slot. */
+  states: RepoState[];
+  before: RepoState | null;
+  /** How many this repository keeps (its own setting; 4 until changed). */
+  max: number;
+  /** The slot a new state goes into; null when every slot is in use. */
+  next_free: string | null;
+  /** The most it can be set to. */
+  limit: number;
+}
+
+export interface StateOutcome {
+  /** save | restore | delete */
+  action: string;
+  slot: string;
+  name: string;
+  oid: string | null;
+  branch_before: string | null;
+  branch_after: string | null;
+  head_before: string | null;
+  head_after: string | null;
+  before_saved: string | null;
+  new_branch: string | null;
+  backup: string | null;
+  recovery: string | null;
+  notes: string[];
+}
+
+/** The four state slots and the automatic "Before going back". */
+export async function statesList(repoPath: string): Promise<StatesList> {
+  return invoke("states_list", { repoPath });
+}
+
+/** Save where the repository is now into a slot; `replace`: the state shown there, to replace it. */
+export async function statesSave(repoPath: string, slot: string, name: string | null, replace: string | null): Promise<OpResult> {
+  return invoke("states_save", { repoPath, slot, name, replace });
+}
+
+/** Go back to a state (named by the oid shown). `newBranch`: on a new branch; `allowPushed`: past pushed commits anyway. */
+export async function statesRestore(repoPath: string, slot: string, oid: string, newBranch: string | null, allowPushed: boolean): Promise<OpResult> {
+  return invoke("states_restore", { repoPath, slot, oid, newBranch, allowPushed });
+}
+
+export async function statesDelete(repoPath: string, slot: string, oid: string): Promise<OpResult> {
+  return invoke("states_delete", { repoPath, slot, oid });
+}
+
+/** Keep up to `max` states in this repository; refused below a slot that holds one. Answers with the list. */
+export async function statesSetMax(repoPath: string, max: number): Promise<StatesList> {
+  return invoke("states_set_max", { repoPath, max });
 }
 
 export async function changesSubmoduleStatuses(repoPath: string): Promise<SubmoduleStatus[]> {

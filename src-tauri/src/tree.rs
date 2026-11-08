@@ -733,7 +733,7 @@ fn kept_pointer_note(paths: &[String]) -> String {
 
 /// A branch name nothing else uses yet: two resets within the same second
 /// must not fail the second one.
-async fn free_backup_name(repo: &str, prefix: &str) -> String {
+pub(crate) async fn free_backup_name(repo: &str, prefix: &str) -> String {
     let base = format!("{}{}", prefix, sync::stamp());
     let mut name = base.clone();
     let mut n = 1;
@@ -903,7 +903,8 @@ pub async fn delete_branch(repo_path: &str, name: &str, force: bool) -> Result<O
     let valid = validate_branch_name(name).is_ok();
     let full = format!("refs/heads/{}", name);
     let tip = if valid { sync::oid(Path::new(repo_path), &full).await } else { None };
-    let unique = if tip.is_some() { count(repo_path, &[&full, "--not", &format!("--exclude={}", full), "--all"]).await } else { 0 };
+    // Saved states are no home for a branch's commits: they don't count.
+    let unique = if tip.is_some() { count(repo_path, &[&full, "--not", &format!("--exclude={}", full), "--exclude=refs/gitswitch/*", "--all"]).await } else { 0 };
     let intent = TreeIntent::DeleteBranch {
         is_current: before.branch.as_deref() == Some(name),
         exists: tip.is_some(),

@@ -1545,6 +1545,41 @@ pub async fn changes_stash_file_diff(repo_path: String, index: usize, path: Stri
     crate::stash::stash_file_diff(&repo_path, index, &path).await
 }
 
+/// The four state slots and the automatic "Before going back".
+#[tauri::command]
+pub async fn states_list(repo_path: String) -> Result<crate::states::StatesList, AppError> {
+    crate::states::list(&repo_path).await
+}
+
+/// Save where the repository is now (commit, branch, staged, every changed
+/// and new file, and the repositories inside it) into a slot. `replace`: the
+/// state the page showed there, to replace it.
+#[tauri::command]
+pub async fn states_save(repo_path: String, slot: String, name: Option<String>, replace: Option<String>) -> Result<OpResult, AppError> {
+    Box::pin(crate::states::save(&repo_path, &slot, name.as_deref(), replace.as_deref())).await
+}
+
+/// Go back to a state (named by the oid the page showed). What is there now
+/// is saved as "Before going back" first. `new_branch`: put it on a new
+/// branch; `allow_pushed`: move the branch back past pushed commits anyway.
+#[tauri::command]
+pub async fn states_restore(repo_path: String, slot: String, oid: String, new_branch: Option<String>, allow_pushed: bool) -> Result<OpResult, AppError> {
+    Box::pin(crate::states::restore(&repo_path, &slot, &oid, new_branch.as_deref(), allow_pushed)).await
+}
+
+/// Delete a state (named by the oid the page showed).
+#[tauri::command]
+pub async fn states_delete(repo_path: String, slot: String, oid: String) -> Result<OpResult, AppError> {
+    Box::pin(crate::states::delete(&repo_path, &slot, &oid)).await
+}
+
+/// How many states this repository keeps (its own setting; refused below a
+/// slot that holds a state). Answers with the list as it now stands.
+#[tauri::command]
+pub async fn states_set_max(repo_path: String, max: usize) -> Result<crate::states::StatesList, AppError> {
+    Box::pin(crate::states::set_max(&repo_path, max)).await
+}
+
 /// `git stash push` (never `--all`): ignored files stay where they are.
 #[tauri::command]
 pub async fn changes_stash_push(repo_path: String, message: Option<String>, include_untracked: bool) -> Result<OpResult, AppError> {
