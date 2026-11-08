@@ -9,6 +9,16 @@
 # (Git Bash), where python3/shasum may be missing and native binaries cannot
 # open MSYS paths (/c/Users/…) handed to them through environment variables.
 PY="$(command -v python3 || command -v python)"
+# Python reads and writes UTF-8, and ends lines with "\n", on every runner. On
+# Windows its pipes default to the ANSI code page (cp1252: the backend's UTF-8
+# "café" was read as "cafÃ©") and print() writes "\r\n", whose CR survives
+# $(...); pyenv/sitecustomize.py sets the line ends there. And no bytecode:
+# importing it would leave a __pycache__ folder inside the repository.
+export PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1
+if command -v cygpath >/dev/null 2>&1; then
+  PYTHONPATH="$(cygpath -w "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pyenv")${PYTHONPATH:+;$PYTHONPATH}"
+  export PYTHONPATH
+fi
 sha256file() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1; else sha256sum "$1" | cut -d' ' -f1; fi; }
 # realdir <dir> -> the real, native path of a directory (symlinks resolved;
 # Windows: long-name mixed form C:/Users/…)
@@ -30,6 +40,12 @@ verify_init() {
   # Tokens (a kept "Sign in with GitHub") go to files here, never the real
   # keychain: the debug build honours this, a release build ignores it.
   export GITSWITCH_TOKEN_DIR="$SB/tokens"
+  # The GitHub CLI's sign-ins stay out of reach too: on Windows gh keeps them
+  # under %APPDATA%, not HOME, and a suite once had the real gh hand this
+  # machine's token to its fake API. A token in the environment would win over
+  # any config, so none is passed on (a check that wants one sets it itself).
+  export GH_CONFIG_DIR="$HOME/.config/gh"
+  unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
   # Windows: the app finds its data folder and ~/.ssh through the system, not
   # HOME, so without these a suite's profiles land in the real store (they
   # once showed up as "Ports" and "Workspaces" in the installed app).

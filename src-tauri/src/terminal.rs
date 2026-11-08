@@ -25,6 +25,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -457,6 +458,49 @@ pub fn close_all() {
     }
 }
 
+/// What ConPTY asks the terminal the moment a shell connects: where is the
+/// cursor (DSR, `ESC[6n`)? portable-pty always opens the pseudoconsole with
+/// PSEUDOCONSOLE_INHERIT_CURSOR, and the console then shows nothing at all
+/// until it is answered. In the app xterm.js answers by itself; the drivers
+/// below play the terminal, so they answer too.
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+const CURSOR_REQUEST: &str = "\u{1b}[6n";
+/// The answer, as a terminal gives it (row 1, column 1).
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+const CURSOR_REPORT: &str = "\u{1b}[1;1R";
+/// The Enter key as a terminal sends it. cmd.exe under ConPTY does not take a
+/// bare LF as Enter: it lands in the line as Ctrl+Enter and nothing runs.
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+const ENTER: &str = if cfg!(windows) { "\r" } else { "\n" };
+
+/// Answer every cursor-position request the console has made so far. An
+/// answer counts as activity: whoever waits for quiet then waits for what the
+/// shell prints once it is free to print.
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+fn answer_cursor_requests(id: &str, requests: &AtomicUsize, answered: &AtomicUsize, last: &Mutex<Instant>) {
+    while answered.load(Ordering::SeqCst) < requests.load(Ordering::SeqCst) {
+        answered.fetch_add(1, Ordering::SeqCst);
+        let _ = write(id, CURSOR_REPORT);
+        if let Ok(mut t) = last.lock() {
+            *t = Instant::now();
+        }
+    }
+}
+
+/// Windows: the request comes before anything the shell prints, but a slow
+/// start can leave it later than the first quiet spell — which would then be
+/// taken for a shell that has settled. Elsewhere there is nothing to wait for.
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+fn wait_for_cursor_request(id: &str, requests: &AtomicUsize) {
+    if !cfg!(windows) {
+        return;
+    }
+    let start = Instant::now();
+    while requests.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(5) && is_open(id) {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Open a shell, run one line in it, and return everything it printed.
 ///
 /// The sandbox suite uses this: it exercises the real pty, the real shell and
@@ -473,9 +517,12 @@ pub fn run_once(repo_path: &str, script: &str, timeout: Duration) -> Result<Stri
 pub fn run_once_with_prelude(repo_path: &str, script: &str, timeout: Duration) -> Result<(String, String), AppError> {
     let collected = Arc::new(Mutex::new(String::new()));
     let last = Arc::new(Mutex::new(Instant::now()));
+    let requests = Arc::new(AtomicUsize::new(0));
     let out = collected.clone();
     let tick = last.clone();
+    let asks = requests.clone();
     let id = open_with(repo_path, 200, 50, move |chunk| {
+        asks.fetch_add(chunk.matches(CURSOR_REQUEST).count(), Ordering::SeqCst);
         if let Ok(mut s) = out.lock() {
             s.push_str(&chunk);
         }
@@ -490,9 +537,11 @@ pub fn run_once_with_prelude(repo_path: &str, script: &str, timeout: Duration) -
     // first prompt then arrive interleaved with the command's output, which
     // makes an assertion about that output a race. Waiting for the shell to
     // settle first is what makes this deterministic.
+    let answered = AtomicUsize::new(0);
     let settle = |quiet: Duration, limit: Duration| {
         let start = Instant::now();
         loop {
+            answer_cursor_requests(&id, &requests, &answered, &last);
             let idle = last.lock().map(|t| t.elapsed()).unwrap_or(quiet);
             if idle >= quiet || start.elapsed() >= limit || !is_open(&id) {
                 return;
@@ -500,15 +549,16 @@ pub fn run_once_with_prelude(repo_path: &str, script: &str, timeout: Duration) -
             std::thread::sleep(Duration::from_millis(25));
         }
     };
+    wait_for_cursor_request(&id, &requests);
     settle(Duration::from_millis(350), Duration::from_secs(5));
     // The banner and the first prompt are not the answer — but they are the prelude.
     let prelude = collected.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
 
     write(&id, script)?;
-    write(&id, "\n")?;
+    write(&id, ENTER)?;
     settle(Duration::from_millis(600), timeout);
 
-    let _ = write(&id, "exit\n");
+    let _ = write(&id, "exit").and_then(|_| write(&id, ENTER));
     std::thread::sleep(Duration::from_millis(120));
     close(&id);
     Ok((prelude, collected.lock().map(|s| s.clone()).unwrap_or_default()))
@@ -521,9 +571,12 @@ pub fn run_once_with_prelude(repo_path: &str, script: &str, timeout: Duration) -
 pub fn run_resized(repo_path: &str, script: &str, first: (u16, u16), second: (u16, u16), timeout: Duration) -> Result<(String, String), AppError> {
     let collected = Arc::new(Mutex::new(String::new()));
     let last = Arc::new(Mutex::new(Instant::now()));
+    let requests = Arc::new(AtomicUsize::new(0));
     let out = collected.clone();
     let tick = last.clone();
+    let asks = requests.clone();
     let id = open_with(repo_path, first.0, first.1, move |chunk| {
+        asks.fetch_add(chunk.matches(CURSOR_REQUEST).count(), Ordering::SeqCst);
         if let Ok(mut s) = out.lock() {
             s.push_str(&chunk);
         }
@@ -532,9 +585,11 @@ pub fn run_resized(repo_path: &str, script: &str, first: (u16, u16), second: (u1
         }
         true
     })?;
+    let answered = AtomicUsize::new(0);
     let settle = |quiet: Duration, limit: Duration| {
         let start = Instant::now();
         loop {
+            answer_cursor_requests(&id, &requests, &answered, &last);
             let idle = last.lock().map(|t| t.elapsed()).unwrap_or(quiet);
             if idle >= quiet || start.elapsed() >= limit || !is_open(&id) {
                 return;
@@ -551,11 +606,12 @@ pub fn run_resized(repo_path: &str, script: &str, first: (u16, u16), second: (u1
             *t = Instant::now();
         }
     };
+    wait_for_cursor_request(&id, &requests);
     settle(Duration::from_millis(350), Duration::from_secs(5));
     let _ = take(); // the banner and the first prompt are not the answer
 
     write(&id, script)?;
-    write(&id, "\n")?;
+    write(&id, ENTER)?;
     asked();
     settle(Duration::from_millis(600), timeout);
     let before = take();
@@ -566,12 +622,12 @@ pub fn run_resized(repo_path: &str, script: &str, first: (u16, u16), second: (u1
     settle(Duration::from_millis(350), Duration::from_secs(5));
     let _ = take();
     write(&id, script)?;
-    write(&id, "\n")?;
+    write(&id, ENTER)?;
     asked();
     settle(Duration::from_millis(600), timeout);
     let after = take();
 
-    let _ = write(&id, "exit\n");
+    let _ = write(&id, "exit").and_then(|_| write(&id, ENTER));
     std::thread::sleep(Duration::from_millis(120));
     close(&id);
     Ok((before, after))

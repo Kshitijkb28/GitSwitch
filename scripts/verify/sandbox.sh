@@ -5,6 +5,7 @@
 set -u
 source "$(dirname "$0")/lib.sh"
 verify_init sandbox "Sandbox User" "sandbox@example.test"
+IS_WIN=0; command -v cygpath >/dev/null 2>&1 && IS_WIN=1
 
 # --- setup: bare "remote" + a clone ------------------------------------------
 git init -q --bare "$SB/remote.git"
@@ -23,10 +24,17 @@ ok "status sees 1 modified + 2 untracked" "$(printf '%s' "$OUT" | jqf unstaged_c
 OUT=$(probe stage "$SB/work" "my file.txt")
 ok "stages a filename containing a space" "$(printf '%s' "$OUT" | jqf headline)" "Staged."
 ok "  and it is staged now" "$(git -C "$SB/work" diff --cached --name-only)" "my file.txt"
-OUT=$(probe stage "$SB/work" "$(printf 'weird\nname.txt')")
-ok "stages a filename containing a newline" "$(git -C "$SB/work" diff --cached --name-only -z | tr '\0' '|')" "weird"
-OUT=$(probe unstage "$SB/work" "my file.txt")
-ok "unstages it again" "$(git -C "$SB/work" diff --cached --name-only)" "weird"
+if [ "$IS_WIN" = 1 ]; then
+  # NTFS holds no newline in a name: Git Bash writes a private-use character in
+  # its place, so git sees another name and this case cannot arise there.
+  echo "  SKIPPED: a file name holding a newline cannot exist on Windows, so it cannot be staged there"
+  OUT=$(probe unstage "$SB/work" "my file.txt")
+else
+  OUT=$(probe stage "$SB/work" "$(printf 'weird\nname.txt')")
+  ok "stages a filename containing a newline" "$(git -C "$SB/work" diff --cached --name-only -z | tr '\0' '|')" "weird"
+  OUT=$(probe unstage "$SB/work" "my file.txt")
+  ok "unstages it again" "$(git -C "$SB/work" diff --cached --name-only)" "weird"
+fi
 ok "  the space file left the index" "$(git -C "$SB/work" diff --cached --name-only | grep -c 'my file' || true)" "0"
 
 section "Staging refuses to guess"
@@ -363,11 +371,22 @@ echo "Hi \$who! You've successfully authenticated, but GitHub does not provide s
 exit 1
 FAKESSH
 chmod +x "$FAKE/ssh"
+# Windows starts a program by its .exe and cannot run that script as ssh, so
+# there the same stand-in is compiled (fakes/ssh.rs), told where the real ssh
+# is. And a PATH entry has to be in the /c/… form: Git Bash splits a C:/…
+# entry at its colon when it hands PATH to a Windows program.
+FAKE_PATH="$FAKE"
+if [ "$IS_WIN" = 1 ]; then
+  FAKE_PATH="$(cygpath -u "$FAKE")"
+  FAKE_REAL_SSH="$(cygpath -w "$REAL_SSH")"; case "$FAKE_REAL_SSH" in *.exe) ;; *) FAKE_REAL_SSH="$FAKE_REAL_SSH.exe" ;; esac
+  export FAKE_REAL_SSH
+  HOME="$REAL_HOME" rustc --edition 2021 -C debuginfo=0 -o "$FAKE/ssh.exe" "$VERIFY_DIR/fakes/ssh.rs" || { echo "could not compile the fake ssh"; exit 1; }
+fi
 # The alias names a key; every other host names one that does not exist, so
 # this machine's own ~/.ssh keys never leak into the answers.
 printf 'Host gh-work\n  HostName github.com\n  User git\n  IdentityFile %s\n  IdentitiesOnly yes\nHost *\n  IdentityFile %s\n' "$SB/keys/alias_key" "$SB/keys/none" > "$SB/sshcfg"
 WJ="$("$PY" -c 'import json,sys;print(json.dumps({"repoPath":sys.argv[1],"refresh":False}))' "$SB/work")"
-who() { PATH="$FAKE:$PATH" GITSWITCH_SSH_CONFIG="$SB/sshcfg" GITSWITCH_GITHUB_API="http://127.0.0.1:9" PROBE_OP=invoke PROBE_CMD=changes_push_identity PROBE_JSON="$WJ" "$BIN" probe --ignored --nocapture 2>/dev/null | sed -n 's/^PROBE_OUT //p'; }
+who() { PATH="$FAKE_PATH:$PATH" GITSWITCH_SSH_CONFIG="$SB/sshcfg" GITSWITCH_GITHUB_API="http://127.0.0.1:9" PROBE_OP=invoke PROBE_CMD=changes_push_identity PROBE_JSON="$WJ" "$BIN" probe --ignored --nocapture 2>/dev/null | sed -n 's/^PROBE_OUT //p'; }
 ok "a local-path remote involves no account" "$(who | jqf value.via)" "local"
 git -C "$SB/work" remote set-url --push origin git@github.com:acme/thing.git
 git -C "$SB/work" config core.sshCommand "ssh -i $SB/keys/work_key -o IdentitiesOnly=yes"
@@ -424,6 +443,10 @@ section "A repository behind an SSH alias for GitHub has its size asked like git
 # 8 MiB, and a gh that lists no account: no sign-in of this machine is used.
 printf 'Host gl-work\n  HostName gitlab.example.com\n  User git\n' >> "$SB/sshcfg"
 printf '#!/bin/sh\nexit 1\n' > "$FAKE/gh"; chmod +x "$FAKE/gh"
+if [ "$IS_WIN" = 1 ]; then
+  printf 'fn main() { std::process::exit(1) }\n' > "$SB/fake-gh.rs"
+  HOME="$REAL_HOME" rustc --edition 2021 -C debuginfo=0 -o "$FAKE/gh.exe" "$SB/fake-gh.rs" || { echo "could not compile the fake gh"; exit 1; }
+fi
 "$PY" - "$SB/size-api.log" > "$SB/size-api-port" <<'PYAPI' &
 import http.server, sys, json
 log = sys.argv[1]
@@ -445,7 +468,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SB/size-api-port" ] && break; sleep 0.5
 SIZE_API="http://127.0.0.1:$(cat "$SB/size-api-port")"
 size_of() {
   local j; j="$("$PY" -c 'import json,sys;print(json.dumps({"url":sys.argv[1]}))' "$1")"
-  PATH="$FAKE:$PATH" GITSWITCH_SSH_CONFIG="$SB/sshcfg" GITSWITCH_GITHUB_API="$SIZE_API" pinvoke clone_size_estimate "$j" \
+  PATH="$FAKE_PATH:$PATH" GITSWITCH_SSH_CONFIG="$SB/sshcfg" GITSWITCH_GITHUB_API="$SIZE_API" pinvoke clone_size_estimate "$j" \
     | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print("none" if v is None else "%s %s" % (v["repo"], v["kb"]))'
 }
 ok "an SSH alias for github.com is asked about like github.com" "$(size_of git@gh-work:acme/thing.git)" "acme/thing 8192"

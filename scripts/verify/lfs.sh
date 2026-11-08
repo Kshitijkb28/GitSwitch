@@ -5,6 +5,7 @@
 set -u
 source "$(dirname "$0")/lib.sh"
 verify_init lfs "LFS Tester" "lfs@example.test"
+IS_WIN=0; command -v cygpath >/dev/null 2>&1 && IS_WIN=1
 
 if ! git lfs version >/dev/null 2>&1; then
   echo "git-lfs is not installed; skipping (install with: brew install git-lfs)"
@@ -99,7 +100,14 @@ section "git-lfs missing from this machine"
 # holds one is replaced by a shadow directory linking to everything else in
 # it, so git (which may live in the same /usr/bin, as on Ubuntu) keeps working
 # while `git lfs` becomes "not a git command" — the real missing-tool state.
-NOLFS="$SB/nolfs"; mkdir -p "$NOLFS"; STRIPPED=""
+# Each shadow becomes a PATH entry, so on Windows it has to be in the /c/… form:
+# $SB is C:/…, and Git Bash splits a PATH entry at that colon (as sandbox.sh
+# notes for its fake ssh). There `ln -s` makes copies — no symlinks without
+# Developer Mode — and the copied git runs without its exec path, which only
+# makes `git lfs` more surely "not a git command".
+NOLFS="$SB/nolfs"
+if command -v cygpath >/dev/null 2>&1; then NOLFS="$(cygpath -u "$NOLFS")"; fi
+mkdir -p "$NOLFS"; STRIPPED=""
 while IFS= read -r d; do
   [ -n "$d" ] || continue
   if [ -x "$d/git-lfs" ] || [ -x "$d/git-lfs.exe" ]; then
@@ -281,16 +289,26 @@ git add -A >/dev/null; git commit -qm "wildcard names" >/dev/null; git push -q o
 cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" globs 2>/dev/null
 stub_or_content() { [ "$(wc -c < "$1" | tr -d ' ')" -lt 200 ] && echo stub || echo content; }
 
-OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"st*r.bin\"]}")
-ok "a name holding * downloads" "$(wc -c < "$SB/globs/st*r.bin" | tr -d ' ')" "111"
-ok "  and the file it would have globbed onto is untouched" "$(stub_or_content "$SB/globs/star.bin")" "stub"
+# NTFS holds no * or ? in a name (Git Bash writes a private-use character in
+# its place), so on Windows those two files are other names and only [ ] is real.
+if [ "$IS_WIN" = 1 ]; then
+  echo "  SKIPPED: a file name holding * cannot exist on Windows, so it cannot be downloaded there"
+else
+  OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"st*r.bin\"]}")
+  ok "a name holding * downloads" "$(wc -c < "$SB/globs/st*r.bin" | tr -d ' ')" "111"
+  ok "  and the file it would have globbed onto is untouched" "$(stub_or_content "$SB/globs/star.bin")" "stub"
+fi
 OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"x[1].bin\"]}")
 ok "a name holding [ ] downloads itself, not the file its class would match" \
   "$(wc -c < "$SB/globs/x[1].bin" | tr -d ' ')" "333"
 ok "  and x1.bin is left alone" "$(stub_or_content "$SB/globs/x1.bin")" "stub"
-OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"q?r.bin\"]}")
-ok "a name holding ? downloads itself" "$(wc -c < "$SB/globs/q?r.bin" | tr -d ' ')" "555"
-ok "  and qZr.bin is left alone" "$(stub_or_content "$SB/globs/qZr.bin")" "stub"
+if [ "$IS_WIN" = 1 ]; then
+  echo "  SKIPPED: a file name holding ? cannot exist on Windows, so it cannot be downloaded there"
+else
+  OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"q?r.bin\"]}")
+  ok "a name holding ? downloads itself" "$(wc -c < "$SB/globs/q?r.bin" | tr -d ' ')" "555"
+  ok "  and qZr.bin is left alone" "$(stub_or_content "$SB/globs/qZr.bin")" "stub"
+fi
 ok "  the progress file lives in the repository, not in shared temp" \
   "$(ls "$SB/globs/.git/" | grep -c gitswitch-lfs || true)" "0"
 
@@ -304,8 +322,13 @@ section "A git-lfs error that leaves no file missing is a note, not a failure"
 # git-lfs stopped after it wrote the last file (or failing on an object whose
 # file is already here) exits with an error although nothing is missing. A
 # git-lfs that does the whole pull and then exits 2 is exactly that case.
-LFS_REAL="$(command -v git-lfs)"; mkdir -p "$SB/lfs-stops"
-cat > "$SB/lfs-stops/git-lfs" <<WRAP
+LFS_REAL="$(command -v git-lfs)"
+# A PATH entry, so the /c/… form on Windows (see the shadow PATH above). git
+# runs it, not the app — and Git for Windows runs a #!/bin/sh script on PATH.
+STOPS="$SB/lfs-stops"
+if command -v cygpath >/dev/null 2>&1; then STOPS="$(cygpath -u "$STOPS")"; fi
+mkdir -p "$STOPS"
+cat > "$STOPS/git-lfs" <<WRAP
 #!/bin/sh
 if [ "\$1" = "pull" ]; then
   "$LFS_REAL" "\$@"
@@ -314,17 +337,17 @@ if [ "\$1" = "pull" ]; then
 fi
 exec "$LFS_REAL" "\$@"
 WRAP
-chmod +x "$SB/lfs-stops/git-lfs"
+chmod +x "$STOPS/git-lfs"
 cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" warn 2>/dev/null
 git -C "$SB/warn" lfs install --local >/dev/null 2>&1
-OUT=$(PATH="$SB/lfs-stops:$PATH" probe lfs_pull "$SB/warn")
+OUT=$(PATH="$STOPS:$PATH" probe lfs_pull "$SB/warn")
 ok "(git-lfs itself exits with an error here)" "$(printf '%s' "$OUT" | jqf advice.git_said)" "stopped after writing the last file"
 ok "a git-lfs error that leaves no stub behind is not a failure" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf lfs.pointers)" "True:0"
 ok "  and the result still says git-lfs reported an error" "$(printf '%s' "$OUT" | jqf detail)" "git-lfs still exited with an error, but no file is missing"
 # The same git-lfs where a stub is left: then it is a failure, as before.
 cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" warn-left 2>/dev/null
 git -C "$SB/warn-left" lfs install --local >/dev/null 2>&1
-cat > "$SB/lfs-stops/git-lfs" <<WRAP
+cat > "$STOPS/git-lfs" <<WRAP
 #!/bin/sh
 if [ "\$1" = "pull" ]; then
   echo "error: git-lfs was stopped before writing anything" >&2
@@ -332,7 +355,7 @@ if [ "\$1" = "pull" ]; then
 fi
 exec "$LFS_REAL" "\$@"
 WRAP
-OUT=$(PATH="$SB/lfs-stops:$PATH" probe lfs_pull "$SB/warn-left")
+OUT=$(PATH="$STOPS:$PATH" probe lfs_pull "$SB/warn-left")
 ok "  while one that leaves stubs is still a failure" "$(printf '%s' "$OUT" | jqf ok):$([ "$(printf '%s' "$OUT" | jqf lfs.pointers)" -gt 0 ] && echo stubs-left)" "False:stubs-left"
 
 section "The large files of submodules: a clone and a Download bring them as the repository's own"

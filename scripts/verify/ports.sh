@@ -37,27 +37,33 @@ PYSRV
 start_server() { # <args> -> PORT PID CHILD
   : > "$SB/server.out"
   if [ "$IS_WIN" = 1 ]; then
-    probe term_run "$SB/proj/work" "start /B $PY $SB/server.py $1 > $SB/server.out" >/dev/null 2>&1
+    # cmd.exe cannot run an MSYS path (/c/…: "Invalid switch"), and a server
+    # attached to the drawer's console ends with it when the probe closes the
+    # shell. pythonw has no console, so it outlives the shell as nohup does.
+    local pyw; pyw="$("$PY" -c 'import os,sys;print(os.path.join(os.path.dirname(sys.executable),"pythonw.exe"))')"
+    probe term_run "$SB/proj/work" "start \"\" /B \"$pyw\" $SB/server.py $1 > $SB/server.out" >/dev/null 2>&1
   else
     probe term_run "$SB/proj/work" "nohup $PY $SB/server.py $1 > $SB/server.out 2>&1 & disown" >/dev/null 2>&1
   fi
   for i in $(seq 1 40); do [ -s "$SB/server.out" ] && break; sleep 0.25; done
   cat "$SB/server.out"
 }
-alive() { kill -0 "$1" 2>/dev/null; }
+# Git Bash's kill knows MSYS pids only; a process cmd.exe started has none.
+alive() { if [ "$IS_WIN" = 1 ]; then tasklist //FI "PID eq $1" //FO CSV //NH 2>/dev/null | grep -q "\"$1\""; else kill -0 "$1" 2>/dev/null; fi; }
 
 section "A listener is named with its process, its folder and its repository"
 read -r PORT PID CHILD < <(start_server "")
-ok "(a server started from the drawer's shell)" "$([ -n "${PID:-}" ] && alive "$PID" && echo running || echo "not running: $(cat "$SB/server.out")")" "running"
+# Not "running"/"not running": the second contains the first.
+ok "(a server started from the drawer's shell)" "$([ -n "${PID:-}" ] && alive "$PID" && echo started || echo "NOT STARTED: $(cat "$SB/server.out")")" "started"
 L=$(pinvoke ports_list '{}')
 ROW=$(printf '%s' "$L" | "$PY" -c 'import sys,json;rows=json.load(sys.stdin)["value"]["rows"];r=[x for x in rows if x["pid"]==int(sys.argv[1])];print(json.dumps(r[0]) if r else "{}")' "$PID")
 ok "the server is listed on its port" "$(printf '%s' "$ROW" | jqf port):$(printf '%s' "$ROW" | jqf proto)" "$PORT:tcp"
-ok "  with the folder it runs from" "$(printf '%s' "$ROW" | jqf cwd)" "$SB/proj/work"
-ok "  attributed to the repository and its profile" "$(printf '%s' "$ROW" | jqf clone.name):$(printf '%s' "$ROW" | jqf clone.profile_name)" "work:Ports"
 if [ "$IS_WIN" = 0 ]; then
+  ok "  with the folder it runs from" "$(printf '%s' "$ROW" | jqf cwd)" "$SB/proj/work"
+  ok "  attributed to the repository and its profile" "$(printf '%s' "$ROW" | jqf clone.name):$(printf '%s' "$ROW" | jqf clone.profile_name)" "work:Ports"
   ok "  marked as started from a GitSwitch terminal" "$(printf '%s' "$ROW" | jqf ours)" "True"
 else
-  echo "  SKIPPED: a process's environment is not readable on Windows, so 'ours' cannot be known there"
+  echo "  SKIPPED: a process's folder and environment are not read on Windows (ports::gather says so), so its folder, repository and 'ours' cannot be known there"
 fi
 ok "  on localhost, and stoppable" "$(printf '%s' "$ROW" | jqf scope):$(printf '%s' "$ROW" | jqf killable)" "loopback:True"
 NAME=$(printf '%s' "$ROW" | jqf name)
@@ -78,12 +84,24 @@ ok "  nor the drawer's own shell" "$(probe ports_kill_shell "$SB/proj/work")" "t
 
 section "Stop ends the server and its child; a port is freed"
 OUT=$(pinvoke ports_kill "{\"pid\":$PID,\"force\":false,\"name\":\"$NAME\"}")
-ok "Stop ends it" "$(printf '%s' "$OUT" | jqf value.ended):$(printf '%s' "$OUT" | jqf value.how)" "True:term"
+if [ "$IS_WIN" = 0 ]; then
+  ok "Stop ends it" "$(printf '%s' "$OUT" | jqf value.ended):$(printf '%s' "$OUT" | jqf value.how)" "True:term"
+else
+  # Stop is taskkill without /F, which only asks a program's windows to
+  # close: a server with none (python, node) can only be ended forcefully,
+  # and Stop says so.
+  ok "Stop asks politely, and says when that was not enough" "$(printf '%s' "$OUT" | jqf value.ended):$(printf '%s' "$OUT" | jqf value.how)" "False:taskkill"
+  ok "  naming Force stop" "$(printf '%s' "$OUT" | jqf value.message)" "Force stop"
+  OUT=$(pinvoke ports_kill "{\"pid\":$PID,\"force\":true,\"name\":\"$NAME\"}")
+  ok "Force stop ends it" "$(printf '%s' "$OUT" | jqf value.ended):$(printf '%s' "$OUT" | jqf value.how)" "True:taskkill-force"
+fi
 sleep 1
 ok "  the server is gone" "$(alive "$PID" && echo alive || echo gone)" "gone"
 if [ "$IS_WIN" = 0 ]; then
   ok "  and its child died with it — the process group was signalled" "$(alive "$CHILD" && echo alive || echo gone):$(printf '%s' "$OUT" | jqf value.group)" "gone:True"
   alive "$CHILD" && kill "$CHILD" 2>/dev/null
+else
+  ok "  and its child died with it — taskkill /T ends the tree" "$(alive "$CHILD" && echo alive || echo gone)" "gone"
 fi
 ok "  the port is no longer listed" "$(pinvoke ports_list '{}' | "$PY" -c 'import sys,json;rows=json.load(sys.stdin)["value"]["rows"];print(any(x["port"]==int(sys.argv[1]) for x in rows))' "$PORT")" "False"
 

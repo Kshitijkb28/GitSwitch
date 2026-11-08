@@ -28,7 +28,9 @@ mkdir -p "$SB/clones"   # the clone destination parent must exist
 
 section "Clone (full)"
 OUT=$(probe clone "" "$SB/origin.git,$SB/clones,plain")
-ok "clones into the named folder" "$(printf '%s' "$OUT" | jqf path)" "$SB/clones/plain"
+# The backend joins the name on with the system's separator (C:/…/clones\plain
+# on Windows, as the Clone page expects); compare the place, not the spelling.
+ok "clones into the named folder" "$(printf '%s' "$OUT" | jqf path | tr '\\' /)" "$SB/clones/plain"
 ok "  and the files are really there" "$([ -f "$SB/clones/plain/src/a.txt" ] && echo yes || echo no)" "yes"
 ok "  with full history" "$(git -C "$SB/clones/plain" rev-list --count HEAD)" "3"
 
@@ -48,7 +50,7 @@ ok "  no large-files count was claimed" "$(printf '%s' "$TRACE" | "$PY" -c 'impo
 
 section "Sparse clone"
 OUT=$(probe sparse_clone "" "$SB/origin.git,$SB/clones,sparse")
-ok "sparse clone succeeds" "$(printf '%s' "$OUT" | jqf path)" "$SB/clones/sparse"
+ok "sparse clone succeeds" "$(printf '%s' "$OUT" | jqf path | tr '\\' /)" "$SB/clones/sparse"
 OUT=$(probe sparse_info "$SB/clones/sparse")
 ok "  lists the repo's top-level folders" "$(printf '%s' "$OUT" | jqf available_dirs)" "docs"
 ok "  and reports the branch" "$(printf '%s' "$OUT" | jqf branch)" "main"

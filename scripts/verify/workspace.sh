@@ -17,8 +17,9 @@ mkdir -p "$P"
 # A folder that is no repository. The sandbox itself may sit inside one (a
 # checkout of GitSwitch, when GITSWITCH_VERIFY_TMP points into it), and git
 # would then find that repository above it — so this one lives in the system's
-# temp folder, which is inside none.
-PLAIN="$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-plain.XXXXXX")"
+# temp folder, which is inside none. In its native form: on Windows mktemp
+# answers /tmp/… (or /c/…), which the backend cannot open.
+PLAIN="$(realdir "$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-plain.XXXXXX")")"
 trap 'rm -rf "$PLAIN"' EXIT
 "$PY" - "$SB/profile.json" "$P" <<'JSONPY'
 import json, sys
@@ -50,10 +51,14 @@ for c in d.get("copies", []): print("%s:%s:%s:%s" % (c["label"], c["offset"], c[
 ncopies() { copies "$1" | grep -c . || true; }
 # envvar <json from workspace_env> <NAME> -> the value, or <unset>
 envvar() { printf '%s' "$1" | "$PY" -c 'import sys,json;d=json.load(sys.stdin);print(dict(d["env"]).get(sys.argv[1], "<unset>"))' "$2"; }
+# What a person reads: ConPTY often ends a line by moving the cursor to the
+# next row's first column instead of printing CR LF, and sets the window title
+# (OSC) as commands run; neither is text on the screen.
 strip() { "$PY" -c "
 import sys,json,re
 d=json.load(sys.stdin)
-print(re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()][B0]|\r', '', d.get(sys.argv[1], '')))" "$1"; }
+o=re.sub(r'\x1b\[[0-9]+;1H', '\n', d.get(sys.argv[1], ''))
+print(re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\\\)?|\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()][B0]|\r', '', o))" "$1"; }
 # term <repo> <line> -> what a real shell opened there printed
 term() { probe term_run "$1" "$2" | strip output; }
 prelude() { probe term_run_prelude "$1" "true" | strip prelude; }
@@ -102,11 +107,14 @@ ok "  the Compose project" "$(envvar "$E" COMPOSE_PROJECT_NAME)" "gamma-$GID"
 ok "  the workspace's folder and name" "$(envvar "$E" GITSWITCH_WORKSPACE_PATH):$(envvar "$E" GITSWITCH_WORKSPACE_NAME)" "$P/gamma:gamma"
 OUT=$(term "$P/gamma" "$(say 'echo "[$GITSWITCH_WORKSPACE;$GITSWITCH_PORT_OFFSET;$COMPOSE_PROJECT_NAME;$GITSWITCH_WORKSPACE_NAME]"' 'echo [%GITSWITCH_WORKSPACE%;%GITSWITCH_PORT_OFFSET%;%COMPOSE_PROJECT_NAME%;%GITSWITCH_WORKSPACE_NAME%]')")
 ok "a real shell opened in the copy sees all of it" "$OUT" "[$GID;200;gamma-$GID;gamma]"
-OUT=$(term "$P/gamma" "$(say 'sh -c '"'"'echo child=$GITSWITCH_PORT_OFFSET'"'"'' 'cmd /c echo child=%GITSWITCH_PORT_OFFSET%')")
+# cmd.exe expands %VAR% in the typed line before cmd /c runs; %^VAR% reaches
+# the child as %VAR%, so it is the child that expands it.
+OUT=$(term "$P/gamma" "$(say 'sh -c '"'"'echo child=$GITSWITCH_PORT_OFFSET'"'"'' 'cmd /c echo child=%^GITSWITCH_PORT_OFFSET%')")
 ok "  and so does a process it starts — an agent, a dev server" "$OUT" "child=200"
 
 section "The first copy exports no Compose name; the banner says what the shell got"
-OUT=$(term "$P/zeta" "$(say 'echo "[$COMPOSE_PROJECT_NAME]"' 'echo [%COMPOSE_PROJECT_NAME%]')")
+# cmd.exe prints an undefined %VAR% as typed, never as nothing.
+OUT=$(term "$P/zeta" "$(say 'echo "[$COMPOSE_PROJECT_NAME]"' 'if defined COMPOSE_PROJECT_NAME (echo [%COMPOSE_PROJECT_NAME%]) else (echo [])')")
 ok "zeta's shell has no COMPOSE_PROJECT_NAME — its containers keep their names" "$(printf '%s' "$OUT" | grep -c '^\[\]$' || true)" "1"
 B=$(prelude "$P/zeta")
 ok "the first line of zeta's shell is its banner" "$B" "GitSwitch workspace #$ZID · zeta · port offset 0 (\$GITSWITCH_PORT_OFFSET)"

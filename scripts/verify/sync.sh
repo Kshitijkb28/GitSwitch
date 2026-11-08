@@ -8,6 +8,7 @@ set -u
 source "$(dirname "$0")/lib.sh"
 verify_init sync "Sync Tester" "sync@example.test"
 SB="$(realdir "$SB")"
+IS_WIN=0; command -v cygpath >/dev/null 2>&1 && IS_WIN=1
 
 subjects() { git -C "$1" log --format=%s "$2" | tr '\n' '|'; }
 head_of() { git -C "$1" rev-parse HEAD; }
@@ -1128,6 +1129,11 @@ OUT=$(probe sync_run "$W/local")
 ok "the update keeps it too, and says so once" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf detail):$(printf '%s' "$OUT" | jqf sync.own_dropped)" "True:As previewed: 1 commit of yours on top of 1 incoming.:[]"
 ok "  old.txt is gone, as my commit said" "$([ -e "$W/local/old.txt" ] && echo present || echo gone)" "gone"
 # A file whose name is pathspec magic to git: compared as a name, not read as magic.
+if [ "$IS_WIN" = 1 ]; then
+  # NTFS holds no ":" in a name (Git Bash writes a private-use character in its
+  # place), so git never sees a file called :notes there.
+  echo "  SKIPPED: a file called :notes cannot exist on Windows, so its commit cannot be made there"
+else
 mini fc
 W="$SB/fc"
 printf 'note 1\n' > "$W/upstream/:notes"; git -C "$W/upstream" add -- ":(literal):notes"; git -C "$W/upstream" commit -qm "super: notes"; git -C "$W/upstream" push -q origin main 2>/dev/null
@@ -1138,6 +1144,7 @@ OUT=$(probe sync_plan "$W/local")
 ok "a commit to a file called :notes is previewed as kept" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(c['subject'],c['already_upstream']) for c in d['superproject']['own_commits']])")" "[('edit my notes', False)]"
 OUT=$(probe sync_run "$W/local")
 ok "  and kept" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf detail)" "True:As previewed: 1 commit of yours on top of 1 incoming."
+fi
 
 section "A clone of mine where upstream adds a submodule is adopted only when it sits on the recorded commit"
 mini ad
