@@ -6,11 +6,13 @@ exactly the class of bug the unit tests and the mocked UI checks cannot see:
 a command that was never registered, a name typo, or an argument whose
 camelCase spelling doesn't match the Rust parameter.
 """
+import json
 import os
 import re
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+SRC_TS = f"{ROOT}/src"
 commands_rs = open(f"{ROOT}/src-tauri/src/commands.rs").read()
 # Strip line comments: a comment after an attribute would hide the fn that follows.
 commands_rs = re.sub(r"//[^\n]*", "", commands_rs)
@@ -18,6 +20,8 @@ lib_rs = open(f"{ROOT}/src-tauri/src/lib.rs").read()
 api_ts = open(f"{ROOT}/src/lib/api.ts").read()
 
 INJECTED = {"app"}  # tauri injects these, the frontend never sends them
+# ...as it does any parameter of a type it supplies itself, whatever its name.
+INJECTED_TYPE = re.compile(r"^(?:tauri::)?(?:(?:AppHandle|Window|WebviewWindow|Webview)\b|State\s*<)")
 
 
 def camel(name: str) -> str:
@@ -44,16 +48,31 @@ def split_params(text: str):
 
 
 # --- Rust: every #[tauri::command] and its parameters -----------------------
+def balanced_params(text: str, open_at: int) -> str:
+    """The parameter list from the `(` at `open_at` to its matching `)`: a
+    type such as `Vec<(String, String)>` holds parentheses of its own."""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_at + 1 : i]
+    return text[open_at + 1 :]
+
+
 rust = {}
 for m in re.finditer(
-    r"#\[tauri::command\]\s*(?:#\[[^\]]*\]\s*)*pub\s+(?:async\s+)?fn\s+(\w+)\s*\(([^)]*)\)",
+    r"#\[tauri::command\]\s*(?:#\[[^\]]*\]\s*)*pub\s+(?:async\s+)?fn\s+(\w+)\s*\(",
     commands_rs,
 ):
-    name, params = m.group(1), m.group(2)
+    name, params = m.group(1), balanced_params(commands_rs, m.end() - 1)
     args = set()
     for p in split_params(params):
-        pname = p.split(":")[0].strip()
-        if pname and pname not in INJECTED:
+        pname, _, ptype = p.partition(":")
+        pname, ptype = pname.strip(), ptype.strip()
+        if pname and pname not in INJECTED and not INJECTED_TYPE.match(ptype):
             args.add(camel(pname))
     rust[name] = args
 
@@ -112,6 +131,25 @@ print(f"commands registered      : {len(registered)}")
 print(f"commands called from UI  : {checked}")
 if unused:
     print(f"defined but never called : {', '.join(unused)}")
+
+# --- plugin JS imports ↔ granted capabilities -------------------------------
+# A page that imports `@tauri-apps/plugin-<name>` calls that plugin's commands
+# directly; the main window's capability must grant them, or the call fails at
+# runtime with a permission error nobody sees in tsc. (The app's own Rust
+# commands, like changes_open_path, need no grant: core:default covers them.)
+plugin_imports = set()
+for root, _dirs, files in os.walk(SRC_TS):
+    for f in files:
+        if f.endswith((".ts", ".tsx")):
+            text = open(os.path.join(root, f), encoding="utf-8").read()
+            plugin_imports.update(re.findall(r'from "@tauri-apps/plugin-([a-z-]+)"', text))
+cap_path = os.path.join(ROOT, "src-tauri", "capabilities", "default.json")
+with open(cap_path, encoding="utf-8") as fh:
+    granted = json.load(fh).get("permissions", [])
+for name in sorted(plugin_imports):
+    if not any(str(p).startswith(f"{name}:") or (isinstance(p, dict) and str(p.get("identifier", "")).startswith(f"{name}:")) for p in granted):
+        failures.append(f"@tauri-apps/plugin-{name} is imported but capabilities/default.json grants nothing for {name}:")
+print(f"plugin imports granted   : {', '.join(sorted(plugin_imports)) or 'none'}")
 
 if failures:
     print()

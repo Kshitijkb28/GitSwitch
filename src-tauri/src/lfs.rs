@@ -44,6 +44,8 @@ pub struct LfsStatus {
     pub more_pointers: usize,
     /// One plain sentence.
     pub summary: String,
+    /// How to install git-lfs on this platform — for the card, when it is missing.
+    pub install_hint: String,
 }
 
 /// Parse `git lfs ls-files`: one `<oid> <*|-> <path>` line per tracked file.
@@ -372,7 +374,10 @@ pub fn summarise(installed: bool, uses_lfs: bool, tracked: usize, pointers: usiz
         return "This repository doesn't use Git LFS.".to_string();
     }
     if !installed {
-        return "This repository uses Git LFS, but git-lfs isn't installed on this Mac — large files will stay as pointer stubs until it is.".to_string();
+        return format!(
+            "This repository uses Git LFS, but git-lfs isn't installed on this computer — large files will stay as pointer stubs until it is. Install it with {}.",
+            install_hint()
+        );
     }
     if tracked == 0 {
         return "Git LFS is set up here, but no files in this checkout are tracked by it.".to_string();
@@ -404,7 +409,7 @@ pub fn missing_lfs_message(stderr: &str) -> Option<String> {
         || stderr.contains("not found");
     if mentions_lfs && missing {
         Some(
-            "This repository requires Git LFS (its config sets filter.lfs.required), but git-lfs isn't installed on this Mac, so git refuses to read its files. Install it with `brew install git-lfs` and try again."
+            format!("This repository requires Git LFS (its config sets filter.lfs.required), but git-lfs isn't installed on this computer, so git refuses to read its files. Install it with {} and try again.", install_hint())
                 .to_string(),
         )
     } else {
@@ -515,8 +520,23 @@ pub fn progress_path(repo_path: &str) -> PathBuf {
 /// How far the download running in this repository has got, or `None` when
 /// nothing has been reported yet.
 pub fn read_progress(repo_path: &str) -> Option<LfsProgress> {
-    let raw = std::fs::read_to_string(progress_path(repo_path)).ok()?;
-    latest_progress(&raw)
+    latest_progress(&read_tail(&progress_path(repo_path), 64 * 1024)?)
+}
+
+/// The last `max` bytes of a file, from a whole line on: git-lfs appends a
+/// line per update, so the file of a long download grows for hours and a
+/// twice-a-second poll must not read all of it each time.
+fn read_tail(path: &Path, max: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let from = len.saturating_sub(max);
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).to_string();
+    // Started mid-file: the first line may be cut, so it is not trusted.
+    Some(if from > 0 { text.split_once('\n').map(|(_, rest)| rest.to_string()).unwrap_or_default() } else { text })
 }
 
 /// One scan of the checkout, shared by the card's counts and the file browser
@@ -638,6 +658,7 @@ impl LfsListing {
             uses_lfs: self.uses_lfs,
             filters_configured: self.filters_configured,
             tracked: self.total,
+            install_hint: install_hint(),
             pointers: self.missing,
             more_pointers: self.missing.saturating_sub(pointer_paths.len().min(MAX_LISTED)),
             pointer_paths: pointer_paths.into_iter().take(MAX_LISTED).collect(),
@@ -690,12 +711,36 @@ pub async fn lfs_status(repo_path: &str) -> Result<LfsStatus, AppError> {
         pointers,
         pointer_paths: pointer_paths.into_iter().take(MAX_LISTED).collect(),
         more_pointers,
+        install_hint: install_hint(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_progress_file_is_read_from_its_tail() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-lfs-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("p");
+        // A long download's file: many lines, the last one the latest.
+        let mut text = String::new();
+        for i in 1..=20000 {
+            text.push_str(&format!("download {}/20000 {}/9999999 media/file{}.bin\n", i, i * 100, i));
+        }
+        std::fs::write(&f, &text).unwrap();
+        let tail = read_tail(&f, 4096).unwrap();
+        assert!(tail.len() <= 4096, "only the tail is read: {}", tail.len());
+        let last = latest_progress(&tail).expect("the latest line is in the tail");
+        assert_eq!((last.done, last.total, last.file.as_str()), (20000, 20000, "media/file20000.bin"));
+        // The first, possibly cut line is dropped, so no half line is parsed.
+        assert!(tail.starts_with("download "), "{}", &tail[..40.min(tail.len())]);
+        // A short file is read whole.
+        std::fs::write(&f, "download 1/2 5/10 a.bin\n").unwrap();
+        assert_eq!(latest_progress(&read_tail(&f, 4096).unwrap()).unwrap().done, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn ls_files_separates_present_content_from_pointers() {
@@ -731,7 +776,7 @@ mod tests {
     fn a_missing_git_lfs_is_named_instead_of_blamed_on_the_network() {
         let stderr = "git-lfs filter-process: git-lfs: command not found\nfatal: the remote end hung up unexpectedly";
         let msg = missing_lfs_message(stderr).expect("recognised");
-        assert!(msg.contains("brew install git-lfs"));
+        assert!(msg.contains(&install_hint()), "{msg}");
         assert!(msg.contains("filter.lfs.required"));
         // A genuine network failure must not be mistaken for it.
         assert!(missing_lfs_message("fatal: the remote end hung up unexpectedly").is_none());

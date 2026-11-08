@@ -5,6 +5,7 @@
 set -u
 source "$(dirname "$0")/lib.sh"
 verify_init lfs "LFS Tester" "lfs@example.test"
+IS_WIN=0; command -v cygpath >/dev/null 2>&1 && IS_WIN=1
 
 if ! git lfs version >/dev/null 2>&1; then
   echo "git-lfs is not installed; skipping (install with: brew install git-lfs)"
@@ -60,12 +61,53 @@ ok "status says it doesn't use LFS" "$(printf '%s' "$OUT" | jqf uses_lfs)" "Fals
 OUT=$(probe lfs_pull "$SB/plain")
 ok "pull is refused by name, not by a git error" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-lfs"
 
+section "A switch in a complete repository brings its large files along"
+# Left to itself git downloads large files INSIDE the switch, through the
+# smudge filter, on a 180s clock with nothing moving on screen. The app makes
+# the switch write pointer stubs instantly and downloads afterwards on the
+# large-file clock — and when everything was present before, everything is
+# present after.
+git -C "$SB/author" switch -q -c lfs-branch
+head -c 3072 /dev/urandom > "$SB/author/branch-only.bin"
+git -C "$SB/author" add -A >/dev/null; git -C "$SB/author" commit -qm "a large file only this branch has"; git -C "$SB/author" push -q origin lfs-branch 2>/dev/null
+git -C "$SB/author" switch -q main
+cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" switcher 2>/dev/null
+probe lfs_pull "$SB/switcher" >/dev/null
+ok "the clone starts complete" "$(probe lfs_status "$SB/switcher" | jqf pointers)" "0"
+# A local branch to switch to (the app refuses to guess at a remote-only name).
+git -C "$SB/switcher" branch -q lfs-branch origin/lfs-branch
+OUT=$(probe tree_branch_switch "$SB/switcher" "lfs-branch")
+ok "the switch succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  and says it downloaded the branch's large file" "$(printf '%s' "$OUT" | jqf detail)" "Downloaded 1 LFS file."
+ok "  which really is content, not a stub" "$(wc -c < "$SB/switcher/branch-only.bin" | tr -d ' ')" "3072"
+ok "  the whole repository is still complete" "$(probe lfs_status "$SB/switcher" | jqf pointers)" "0"
+OUT=$(probe tree_branch_switch "$SB/switcher" "main")
+ok "switching back needs no download and says nothing about one" "$(printf '%s' "$OUT" | jqf detail | grep -c "LFS" || true)" "0"
+
+section "A switch in a deliberately partial repository stays partial, and says so"
+cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" partial 2>/dev/null
+git -C "$SB/partial" branch -q lfs-branch origin/lfs-branch
+probe lfs_pull_paths "$SB/partial" "model.bin" >/dev/null
+ok "one of two files was downloaded on purpose" "$(probe lfs_status "$SB/partial" | jqf pointers)" "1"
+OUT=$(probe tree_branch_switch "$SB/partial" "lfs-branch")
+ok "the switch succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  the new large file is a stub, like the one left out before" "$(printf '%s' "$OUT" | jqf detail)" "2 LFS files here are a pointer stub"
+ok "  no download was forced on a partial checkout" "$([ "$(wc -c < "$SB/partial/branch-only.bin" | tr -d ' ')" -lt 200 ] && echo stub || echo content)" "stub"
+ok "  and what was downloaded before is still here" "$(wc -c < "$SB/partial/model.bin" | tr -d ' ')" "4096"
+
 section "git-lfs missing from this machine"
 # git-lfs is a separate binary git finds via PATH. Every PATH directory that
 # holds one is replaced by a shadow directory linking to everything else in
 # it, so git (which may live in the same /usr/bin, as on Ubuntu) keeps working
 # while `git lfs` becomes "not a git command" — the real missing-tool state.
-NOLFS="$SB/nolfs"; mkdir -p "$NOLFS"; STRIPPED=""
+# Each shadow becomes a PATH entry, so on Windows it has to be in the /c/… form:
+# $SB is C:/…, and Git Bash splits a PATH entry at that colon (as sandbox.sh
+# notes for its fake ssh). There `ln -s` makes copies — no symlinks without
+# Developer Mode — and the copied git runs without its exec path, which only
+# makes `git lfs` more surely "not a git command".
+NOLFS="$SB/nolfs"
+if command -v cygpath >/dev/null 2>&1; then NOLFS="$(cygpath -u "$NOLFS")"; fi
+mkdir -p "$NOLFS"; STRIPPED=""
 while IFS= read -r d; do
   [ -n "$d" ] || continue
   if [ -x "$d/git-lfs" ] || [ -x "$d/git-lfs.exe" ]; then
@@ -82,7 +124,9 @@ OUT=$(PATH="$STRIPPED" probe lfs_status "$SB/work")
 ok "the status says git-lfs is not installed" "$(printf '%s' "$OUT" | jqf installed)" "False"
 ok "  in words a person can act on" "$(printf '%s' "$OUT" | jqf summary)" "isn't installed"
 OUT=$(PATH="$STRIPPED" probe lfs_pull "$SB/work")
-ok "pull is refused with the install hint" "$(printf '%s' "$OUT" | jqf refusal.message)" "brew install git-lfs"
+# The hint names the platform's installer (lfs::install_hint).
+case "$(uname -s)" in Darwin) LFS_HINT="brew install git-lfs";; Linux) LFS_HINT="apt install git-lfs";; *) LFS_HINT="git-lfs.com";; esac
+ok "pull is refused with the install hint" "$(printf '%s' "$OUT" | jqf refusal.message)" "$LFS_HINT"
 # With filter.lfs.required set, git status itself fails in this state, and its
 # own words ("the remote end hung up unexpectedly") read like a network outage.
 # git only runs the filter for a file whose stat data changed, so touch one to
@@ -127,10 +171,17 @@ ok "  none is a pointer stub" "$(printf '%s' "$OUT" | jqf lfs.pointers_left)" "0
 ok "  the fresh clone's filters had to be set up first" "$(printf '%s' "$OUT" | jqf lfs.configured_now)" "True"
 ok "  the note says what arrived" "$(printf '%s' "$OUT" | jqf lfs.note)" "Downloaded 3 large files"
 ok "  the file holds real bytes" "$(wc -c < "$SB/clones/lfsclone/model.bin" | tr -d ' ')" "4096"
+# What the Clone page was shown meanwhile: the Large files phase opened at
+# none of the stubs and closed at the measured count (a local download of a
+# few KB is over before the first half-second read, so only the ends are certain).
+TRACE=$(probe_trace)
+ok "  the progress line opened the Large files phase at none of the stubs" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;p=[p for p in json.load(sys.stdin) if p["phase"]=="Large files" and p.get("done") is not None][0];print(p["done"],"of",p["total"])')" "0 of"
+ok "  and the last thing recorded was Large files, every stub fetched — the measured count" "$(printf '%s' "$TRACE" | "$PY" -c 'import sys,json;p=json.load(sys.stdin)[-1];print(p["phase"],p["done"]==p["total"],p["percent"])')" "Large files True 100"
 OUT=$(probe clone "" "$SB/remote.git,$SB/clones,nolfs,nosub")
 ok "without the option the stubs stay" "$(printf '%s' "$OUT" | jqf lfs.pointers_left)" "3"
 ok "  and the result points at the Changes page" "$(printf '%s' "$OUT" | jqf lfs.note)" "Changes"
 ok "  the file is still a stub" "$([ "$(wc -c < "$SB/clones/nolfs/model.bin" | tr -d ' ')" -lt 200 ] && echo stub || echo content)" "stub"
+ok "  and without the option no large-files count was ever claimed" "$(probe_trace | "$PY" -c 'import sys,json;print([p for p in json.load(sys.stdin) if p["phase"]=="Large files" and p.get("done") is not None])')" "[]"
 OUT=$(probe sparse_clone "" "$SB/remote.git,$SB/clones,sparse")
 ok "a sparse clone has no LFS report yet (nothing is checked out)" "$(printf '%s' "$OUT" | jqf lfs)" "None"
 OUT=$(probe sparse_set "$SB/clones/sparse" "assets,lfs")
@@ -238,16 +289,26 @@ git add -A >/dev/null; git commit -qm "wildcard names" >/dev/null; git push -q o
 cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" globs 2>/dev/null
 stub_or_content() { [ "$(wc -c < "$1" | tr -d ' ')" -lt 200 ] && echo stub || echo content; }
 
-OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"st*r.bin\"]}")
-ok "a name holding * downloads" "$(wc -c < "$SB/globs/st*r.bin" | tr -d ' ')" "111"
-ok "  and the file it would have globbed onto is untouched" "$(stub_or_content "$SB/globs/star.bin")" "stub"
+# NTFS holds no * or ? in a name (Git Bash writes a private-use character in
+# its place), so on Windows those two files are other names and only [ ] is real.
+if [ "$IS_WIN" = 1 ]; then
+  echo "  SKIPPED: a file name holding * cannot exist on Windows, so it cannot be downloaded there"
+else
+  OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"st*r.bin\"]}")
+  ok "a name holding * downloads" "$(wc -c < "$SB/globs/st*r.bin" | tr -d ' ')" "111"
+  ok "  and the file it would have globbed onto is untouched" "$(stub_or_content "$SB/globs/star.bin")" "stub"
+fi
 OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"x[1].bin\"]}")
 ok "a name holding [ ] downloads itself, not the file its class would match" \
   "$(wc -c < "$SB/globs/x[1].bin" | tr -d ' ')" "333"
 ok "  and x1.bin is left alone" "$(stub_or_content "$SB/globs/x1.bin")" "stub"
-OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"q?r.bin\"]}")
-ok "a name holding ? downloads itself" "$(wc -c < "$SB/globs/q?r.bin" | tr -d ' ')" "555"
-ok "  and qZr.bin is left alone" "$(stub_or_content "$SB/globs/qZr.bin")" "stub"
+if [ "$IS_WIN" = 1 ]; then
+  echo "  SKIPPED: a file name holding ? cannot exist on Windows, so it cannot be downloaded there"
+else
+  OUT=$(invoke_json changes_lfs_pull_paths "{\"repoPath\":\"$SB/globs\",\"paths\":[\"q?r.bin\"]}")
+  ok "a name holding ? downloads itself" "$(wc -c < "$SB/globs/q?r.bin" | tr -d ' ')" "555"
+  ok "  and qZr.bin is left alone" "$(stub_or_content "$SB/globs/qZr.bin")" "stub"
+fi
 ok "  the progress file lives in the repository, not in shared temp" \
   "$(ls "$SB/globs/.git/" | grep -c gitswitch-lfs || true)" "0"
 
@@ -256,6 +317,71 @@ OUT=$(probe lfs_pull "$SB/browse")
 ok "everything else arrives" "$(printf '%s' "$OUT" | jqf lfs.pointers)" "0"
 ok "  including the file in the folder that was skipped before" "$(wc -c < "$SB/browse/media/audio/tone.bin" | tr -d ' ')" "1536"
 ok "  no progress file is left behind" "$(probe lfs_progress "$SB/browse")" "null"
+
+section "A git-lfs error that leaves no file missing is a note, not a failure"
+# git-lfs stopped after it wrote the last file (or failing on an object whose
+# file is already here) exits with an error although nothing is missing. A
+# git-lfs that does the whole pull and then exits 2 is exactly that case.
+LFS_REAL="$(command -v git-lfs)"
+# A PATH entry, so the /c/… form on Windows (see the shadow PATH above). git
+# runs it, not the app — and Git for Windows runs a #!/bin/sh script on PATH.
+STOPS="$SB/lfs-stops"
+if command -v cygpath >/dev/null 2>&1; then STOPS="$(cygpath -u "$STOPS")"; fi
+mkdir -p "$STOPS"
+cat > "$STOPS/git-lfs" <<WRAP
+#!/bin/sh
+if [ "\$1" = "pull" ]; then
+  "$LFS_REAL" "\$@"
+  echo "error: git-lfs was stopped after writing the last file" >&2
+  exit 2
+fi
+exec "$LFS_REAL" "\$@"
+WRAP
+chmod +x "$STOPS/git-lfs"
+cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" warn 2>/dev/null
+git -C "$SB/warn" lfs install --local >/dev/null 2>&1
+OUT=$(PATH="$STOPS:$PATH" probe lfs_pull "$SB/warn")
+ok "(git-lfs itself exits with an error here)" "$(printf '%s' "$OUT" | jqf advice.git_said)" "stopped after writing the last file"
+ok "a git-lfs error that leaves no stub behind is not a failure" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf lfs.pointers)" "True:0"
+ok "  and the result still says git-lfs reported an error" "$(printf '%s' "$OUT" | jqf detail)" "git-lfs still exited with an error, but no file is missing"
+# The same git-lfs where a stub is left: then it is a failure, as before.
+cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" warn-left 2>/dev/null
+git -C "$SB/warn-left" lfs install --local >/dev/null 2>&1
+cat > "$STOPS/git-lfs" <<WRAP
+#!/bin/sh
+if [ "\$1" = "pull" ]; then
+  echo "error: git-lfs was stopped before writing anything" >&2
+  exit 2
+fi
+exec "$LFS_REAL" "\$@"
+WRAP
+OUT=$(PATH="$STOPS:$PATH" probe lfs_pull "$SB/warn-left")
+ok "  while one that leaves stubs is still a failure" "$(printf '%s' "$OUT" | jqf ok):$([ "$(printf '%s' "$OUT" | jqf lfs.pointers)" -gt 0 ] && echo stubs-left)" "False:stubs-left"
+
+section "The large files of submodules: a clone and a Download bring them as the repository's own"
+# A superproject with a large file of its own and a submodule with another.
+git init -q --bare "$SB/slfs-lib.git"; git clone -q "$SB/slfs-lib.git" "$SB/slfs-lib-author" 2>/dev/null
+( cd "$SB/slfs-lib-author" && git lfs install --local >/dev/null 2>&1 && git lfs track "*.bin" >/dev/null && head -c 2222 /dev/urandom > lib.bin && git add -A >/dev/null && git commit -qm "lib: a large file" && git push -q origin main 2>/dev/null )
+git init -q --bare "$SB/slfs.git"; git clone -q "$SB/slfs.git" "$SB/slfs-author" 2>/dev/null
+( cd "$SB/slfs-author" && git lfs install --local >/dev/null 2>&1 && git lfs track "*.bin" >/dev/null && head -c 1111 /dev/urandom > own.bin \
+  && GIT_LFS_SKIP_SMUDGE=1 git submodule add -q "$SB/slfs-lib.git" lib 2>/dev/null && git add -A >/dev/null && git commit -qm "super: own large file, and lib" && git push -q origin main 2>/dev/null )
+OUT=$(probe clone "" "$SB/slfs.git,$SB/clones,slfs-clone,submodules,lfs")
+ok "a clone with submodules and large files brings the submodule's large files too" "$(wc -c < "$SB/clones/slfs-clone/lib/lib.bin" | tr -d ' ')" "2222"
+ok "  and its result names them, by submodule" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print([(s["path"], s["report"]["pointers_left"]) for s in json.load(sys.stdin)["submodule_lfs"]])')" "[('lib', 0)]"
+OUT=$(probe clone "" "$SB/slfs.git,$SB/clones,slfs-nolfs,submodules")
+ok "without the option the submodule's stubs are named, not left silent" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print([(s["path"], s["report"]["pointers_left"] > 0) for s in json.load(sys.stdin)["submodule_lfs"]])')" "[('lib', True)]"
+# A clone without its submodules, its own large files all here; then Download.
+probe clone "" "$SB/slfs.git,$SB/clones,slfs-later,nosub,lfs" >/dev/null
+OUT=$(invoke_json changes_submodule_update "{\"repoPath\":\"$SB/clones/slfs-later\",\"paths\":[\"lib\"]}")
+ok "a submodule downloaded later brings its large files when the repository's own are all here" "$(wc -c < "$SB/clones/slfs-later/lib/lib.bin" | tr -d ' ')" "2222"
+ok "  and says so" "$(printf '%s' "$OUT" | jqf value.detail)" "Git LFS in lib:"
+# Under a push block the submodule's large files still arrive: git-lfs is set
+# up before the block's hook goes in, and the block chains git-lfs's own.
+probe clone "" "$SB/slfs.git,$SB/clones,slfs-blocked,nosub,lfs" >/dev/null
+probe push_mode "$SB/clones/slfs-blocked" "guardrail" >/dev/null
+OUT=$(invoke_json changes_submodule_update "{\"repoPath\":\"$SB/clones/slfs-blocked\",\"paths\":[\"lib\"]}")
+ok "under a push block a downloaded submodule's large files still arrive, and it is blocked too" "$(wc -c < "$SB/clones/slfs-blocked/lib/lib.bin" | tr -d ' '):$(git -C "$SB/clones/slfs-blocked/lib" config --local --get gitswitch.pushBlockedBy)" "2222:superproject"
+ok "  git-lfs's own push hook is kept, behind the block's" "$(ls "$(git -C "$SB/clones/slfs-blocked/lib" rev-parse --path-format=absolute --git-path hooks)" | grep -c '^pre-push.gitswitch-saved$')" "1"
 
 section "Objects missing from the server"
 cd "$SB" && GIT_LFS_SKIP_SMUDGE=1 git clone -q "$SB/remote.git" work2 2>/dev/null

@@ -25,6 +25,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,9 @@ struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The shell's process id: the Ports page refuses to stop it, and the
+    /// test that proves none is left behind reads it.
+    pid: Option<u32>,
 }
 
 impl Drop for Session {
@@ -51,8 +55,14 @@ fn sessions() -> &'static Mutex<HashMap<String, Session>> {
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The pids of every shell the drawer has open: the Ports page must never
+/// offer to stop one (closing the drawer is how).
+pub(crate) fn shell_pids() -> Vec<u32> {
+    sessions().lock().map(|m| m.values().filter_map(|s| s.pid).collect()).unwrap_or_default()
+}
+
 fn app_dir() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("com.gitswitch.app"))
+    Some(crate::paths::data_dir()?.join("com.gitswitch.app"))
 }
 
 fn shim_dir() -> Option<PathBuf> {
@@ -62,6 +72,16 @@ fn shim_dir() -> Option<PathBuf> {
 /// The real git, found the way the shell would but ignoring our own shim, so a
 /// regenerated shim can never end up calling itself.
 fn real_git(skip: &Path) -> PathBuf {
+    // On macOS the push lock is written through the system git (/usr/bin/git),
+    // into that git's system config. A Homebrew git first on PATH reads a
+    // different system config and would walk straight past the lock — so the
+    // shim hands off to the same git the lock was written with.
+    if cfg!(target_os = "macos") {
+        let sys = crate::push_lock::system_git();
+        if sys.is_absolute() && sys.is_file() {
+            return sys;
+        }
+    }
     let exe = if cfg!(windows) { "git.exe" } else { "git" };
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -181,62 +201,49 @@ exec "{real_git}" "$@"
     )
 }
 
-/// Windows has no `/bin/sh` on PATH by default, so the same three guards are
-/// written as a batch file.
-pub fn shim_cmd(real_git: &str) -> String {
-    format!(
-        r##"@echo off
-setlocal
-set "VERB="
-for %%a in (%*) do if not defined VERB (
-  set "ARG=%%a"
-  setlocal enabledelayedexpansion
-  if not "!ARG:~0,1!"=="-" ( endlocal & set "VERB=%%a" ) else ( endlocal )
-)
-if /I "%VERB%"=="push" if defined GIT_CONFIG_NOSYSTEM (
-  echo GitSwitch: this push would skip the system git config, which is where a push lock lives. 1>&2
-  exit /b 1
-)
-if /I "%VERB%"=="push" if defined GIT_CONFIG_SYSTEM (
-  echo GitSwitch: this push would skip the system git config, which is where a push lock lives. 1>&2
-  exit /b 1
-)
-echo %* | findstr /C:"--no-verify" >nul && (
-  echo GitSwitch: --no-verify skips the identity guard that stops commits from the wrong account. 1>&2
-  exit /b 1
-)
-if /I "%VERB%"=="push" (
-  echo %* | findstr /C:"--force" >nul && (
-    echo GitSwitch never force-pushes. Use your own Terminal if you really mean to. 1>&2
-    exit /b 1
-  )
-)
-"{real_git}" %*
-"##,
-        real_git = real_git,
-    )
-}
+/// The guard binary (the `git-shim` crate), bundled beside the app like the
+/// lock helper. On Windows it is copied into the shim directory as `git.exe`.
+const SHIM_BIN_NAME: &str = "gitswitch-git-shim";
 
-/// Write the shim and return the directory to put first on PATH.
-fn install_shim() -> Result<PathBuf, AppError> {
+/// Write the shim; return the directory to put first on PATH and the real git
+/// the session should hand off to.
+fn install_shim() -> Result<(PathBuf, PathBuf), AppError> {
     let dir = shim_dir().ok_or_else(|| AppError::Command("No application data directory".into()))?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| AppError::Command(format!("Could not create {}: {}", dir.display(), e)))?;
     let git = real_git(&dir);
-    let (name, body) = if cfg!(windows) {
-        ("git.cmd", shim_cmd(&git.to_string_lossy()))
-    } else {
-        ("git", shim_script(&git.to_string_lossy()))
-    };
-    let path = dir.join(name);
-    std::fs::write(&path, body)
+    if cfg!(windows) {
+        // No /bin/sh here, and a batch file cannot parse arguments faithfully;
+        // the guard is a small console program instead, which reads the real
+        // git from GITSWITCH_REAL_GIT (set on the session below).
+        let src = crate::push_lock::bundled_sidecar_path(SHIM_BIN_NAME).ok_or_else(|| {
+            AppError::Command(format!("The terminal's git guard ({}.exe) is not beside the app", SHIM_BIN_NAME))
+        })?;
+        let dst = dir.join("git.exe");
+        let unchanged = match (std::fs::metadata(&src), std::fs::metadata(&dst)) {
+            (Ok(a), Ok(b)) => a.len() == b.len() && a.modified().ok() == b.modified().ok(),
+            _ => false,
+        };
+        if !unchanged {
+            // A shell that is still open may hold the old file; then the old
+            // guard keeps serving it and the next open gets the new one.
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                if !dst.is_file() {
+                    return Err(AppError::Command(format!("Could not place the git guard: {}", e)));
+                }
+            }
+        }
+        return Ok((dir, git));
+    }
+    let path = dir.join("git");
+    std::fs::write(&path, shim_script(&git.to_string_lossy()))
         .map_err(|e| AppError::Command(format!("Could not write the git shim: {}", e)))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
     }
-    Ok(dir)
+    Ok((dir, git))
 }
 
 fn default_shell() -> String {
@@ -277,7 +284,7 @@ where
             repo_path
         )));
     }
-    let shim = install_shim()?;
+    let (shim, real_git) = install_shim()?;
 
     let pair = native_pty_system()
         .openpty(PtySize {
@@ -301,6 +308,9 @@ where
     cmd.env_remove("GIT_CONFIG_GLOBAL");
     cmd.env("TERM", "xterm-256color");
     cmd.env("GITSWITCH_TERMINAL", "1");
+    // The git the guard hands off to. The sh shim has it baked in; the
+    // Windows guard reads it from here.
+    cmd.env("GITSWITCH_REAL_GIT", real_git.as_os_str());
     let path = match std::env::var_os("PATH") {
         Some(existing) => {
             let mut dirs = vec![shim.clone()];
@@ -312,6 +322,14 @@ where
         None => shim.to_string_lossy().to_string(),
     };
     cmd.env("PATH", path);
+    // The workspace: what tells this checkout apart from another copy of the
+    // same project — its id, port offset and (for a later copy) Compose
+    // project name — exported so every server and agent started here
+    // inherits them.
+    let ws = crate::workspace::env_for(repo_path);
+    for (k, v) in &ws.env {
+        cmd.env(k, v);
+    }
 
     let child = pair
         .slave
@@ -329,9 +347,13 @@ where
         .take_writer()
         .map_err(|e| AppError::Command(format!("Could not write to the terminal: {}", e)))?;
     let killer = child.clone_killer();
+    let pid = child.process_id();
 
     let id = uuid::Uuid::new_v4().to_string();
     let done_id = id.clone();
+    // One dim line before the shell's first prompt: which workspace this is
+    // and what it was given, so a port already taken has an explanation.
+    sink(format!("\u{1b}[2m{}\u{1b}[0m\r\n", ws.banner));
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = [0u8; 8192];
@@ -366,9 +388,29 @@ where
                 master: pair.master,
                 writer,
                 killer,
+                pid,
             },
         );
+
+    // Wait for the shell itself. On unix the reader's EOF already says it
+    // exited; on Windows ConPTY sends no EOF until the master is closed, so
+    // without this a shell that had exited stayed "open" forever. Waiting also
+    // reaps the process, so a closed terminal never leaves a zombie behind.
+    let wait_id = id.clone();
+    let mut child = child;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        if let Ok(mut map) = sessions().lock() {
+            map.remove(&wait_id);
+        }
+    });
     Ok(id)
+}
+
+/// The shell's process id, while the session is open.
+#[allow(dead_code)] // the leak test below
+fn session_pid(id: &str) -> Option<u32> {
+    sessions().lock().ok().and_then(|m| m.get(id).and_then(|s| s.pid))
 }
 
 pub fn write(id: &str, data: &str) -> Result<(), AppError> {
@@ -416,17 +458,71 @@ pub fn close_all() {
     }
 }
 
+/// What ConPTY asks the terminal the moment a shell connects: where is the
+/// cursor (DSR, `ESC[6n`)? portable-pty always opens the pseudoconsole with
+/// PSEUDOCONSOLE_INHERIT_CURSOR, and the console then shows nothing at all
+/// until it is answered. In the app xterm.js answers by itself; the drivers
+/// below play the terminal, so they answer too.
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+const CURSOR_REQUEST: &str = "\u{1b}[6n";
+/// The answer, as a terminal gives it (row 1, column 1).
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+const CURSOR_REPORT: &str = "\u{1b}[1;1R";
+/// The Enter key as a terminal sends it. cmd.exe under ConPTY does not take a
+/// bare LF as Enter: it lands in the line as Ctrl+Enter and nothing runs.
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+const ENTER: &str = if cfg!(windows) { "\r" } else { "\n" };
+
+/// Answer every cursor-position request the console has made so far. An
+/// answer counts as activity: whoever waits for quiet then waits for what the
+/// shell prints once it is free to print.
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+fn answer_cursor_requests(id: &str, requests: &AtomicUsize, answered: &AtomicUsize, last: &Mutex<Instant>) {
+    while answered.load(Ordering::SeqCst) < requests.load(Ordering::SeqCst) {
+        answered.fetch_add(1, Ordering::SeqCst);
+        let _ = write(id, CURSOR_REPORT);
+        if let Ok(mut t) = last.lock() {
+            *t = Instant::now();
+        }
+    }
+}
+
+/// Windows: the request comes before anything the shell prints, but a slow
+/// start can leave it later than the first quiet spell — which would then be
+/// taken for a shell that has settled. Elsewhere there is nothing to wait for.
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+fn wait_for_cursor_request(id: &str, requests: &AtomicUsize) {
+    if !cfg!(windows) {
+        return;
+    }
+    let start = Instant::now();
+    while requests.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(5) && is_open(id) {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Open a shell, run one line in it, and return everything it printed.
 ///
 /// The sandbox suite uses this: it exercises the real pty, the real shell and
 /// the real shim, which is the only way to prove the guards actually fire.
 #[allow(dead_code)] // driven by the test-only probe, which the app build omits
 pub fn run_once(repo_path: &str, script: &str, timeout: Duration) -> Result<String, AppError> {
+    run_once_with_prelude(repo_path, script, timeout).map(|(_, out)| out)
+}
+
+/// `run_once`, and also what the shell showed before the line was typed —
+/// the workspace banner and the first prompt — so a suite can check the
+/// banner is the first thing a person sees.
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+pub fn run_once_with_prelude(repo_path: &str, script: &str, timeout: Duration) -> Result<(String, String), AppError> {
     let collected = Arc::new(Mutex::new(String::new()));
     let last = Arc::new(Mutex::new(Instant::now()));
+    let requests = Arc::new(AtomicUsize::new(0));
     let out = collected.clone();
     let tick = last.clone();
+    let asks = requests.clone();
     let id = open_with(repo_path, 200, 50, move |chunk| {
+        asks.fetch_add(chunk.matches(CURSOR_REQUEST).count(), Ordering::SeqCst);
         if let Ok(mut s) = out.lock() {
             s.push_str(&chunk);
         }
@@ -441,9 +537,11 @@ pub fn run_once(repo_path: &str, script: &str, timeout: Duration) -> Result<Stri
     // first prompt then arrive interleaved with the command's output, which
     // makes an assertion about that output a race. Waiting for the shell to
     // settle first is what makes this deterministic.
+    let answered = AtomicUsize::new(0);
     let settle = |quiet: Duration, limit: Duration| {
         let start = Instant::now();
         loop {
+            answer_cursor_requests(&id, &requests, &answered, &last);
             let idle = last.lock().map(|t| t.elapsed()).unwrap_or(quiet);
             if idle >= quiet || start.elapsed() >= limit || !is_open(&id) {
                 return;
@@ -451,19 +549,88 @@ pub fn run_once(repo_path: &str, script: &str, timeout: Duration) -> Result<Stri
             std::thread::sleep(Duration::from_millis(25));
         }
     };
+    wait_for_cursor_request(&id, &requests);
     settle(Duration::from_millis(350), Duration::from_secs(5));
-    if let Ok(mut s) = collected.lock() {
-        s.clear(); // the banner and the first prompt are not the answer
-    }
+    // The banner and the first prompt are not the answer — but they are the prelude.
+    let prelude = collected.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
 
     write(&id, script)?;
-    write(&id, "\n")?;
+    write(&id, ENTER)?;
     settle(Duration::from_millis(600), timeout);
 
-    let _ = write(&id, "exit\n");
+    let _ = write(&id, "exit").and_then(|_| write(&id, ENTER));
     std::thread::sleep(Duration::from_millis(120));
     close(&id);
-    Ok(collected.lock().map(|s| s.clone()).unwrap_or_default())
+    Ok((prelude, collected.lock().map(|s| s.clone()).unwrap_or_default()))
+}
+
+/// Open a shell at one size, run a line, resize it, run the line again, and
+/// return what each run printed — the proof that a resize reaches the shell
+/// (`stty size` is the line the suite uses). Sizes are (cols, rows).
+#[allow(dead_code)] // driven by the test-only probe, which the app build omits
+pub fn run_resized(repo_path: &str, script: &str, first: (u16, u16), second: (u16, u16), timeout: Duration) -> Result<(String, String), AppError> {
+    let collected = Arc::new(Mutex::new(String::new()));
+    let last = Arc::new(Mutex::new(Instant::now()));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let out = collected.clone();
+    let tick = last.clone();
+    let asks = requests.clone();
+    let id = open_with(repo_path, first.0, first.1, move |chunk| {
+        asks.fetch_add(chunk.matches(CURSOR_REQUEST).count(), Ordering::SeqCst);
+        if let Ok(mut s) = out.lock() {
+            s.push_str(&chunk);
+        }
+        if let Ok(mut t) = tick.lock() {
+            *t = Instant::now();
+        }
+        true
+    })?;
+    let answered = AtomicUsize::new(0);
+    let settle = |quiet: Duration, limit: Duration| {
+        let start = Instant::now();
+        loop {
+            answer_cursor_requests(&id, &requests, &answered, &last);
+            let idle = last.lock().map(|t| t.elapsed()).unwrap_or(quiet);
+            if idle >= quiet || start.elapsed() >= limit || !is_open(&id) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let take = || collected.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
+    // Quiet is measured from the moment something was asked: without this a
+    // shell that had already been silent for a while counts as settled before
+    // it has answered at all.
+    let asked = || {
+        if let Ok(mut t) = last.lock() {
+            *t = Instant::now();
+        }
+    };
+    wait_for_cursor_request(&id, &requests);
+    settle(Duration::from_millis(350), Duration::from_secs(5));
+    let _ = take(); // the banner and the first prompt are not the answer
+
+    write(&id, script)?;
+    write(&id, ENTER)?;
+    asked();
+    settle(Duration::from_millis(600), timeout);
+    let before = take();
+
+    resize(&id, second.0, second.1)?;
+    // The shell redraws its prompt when it is told its window changed.
+    asked();
+    settle(Duration::from_millis(350), Duration::from_secs(5));
+    let _ = take();
+    write(&id, script)?;
+    write(&id, ENTER)?;
+    asked();
+    settle(Duration::from_millis(600), timeout);
+    let after = take();
+
+    let _ = write(&id, "exit").and_then(|_| write(&id, ENTER));
+    std::thread::sleep(Duration::from_millis(120));
+    close(&id);
+    Ok((before, after))
 }
 
 #[allow(dead_code)] // used by run_once above
@@ -474,6 +641,33 @@ pub fn is_open(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Closing a terminal must end its shell — and reap it, or a zombie would
+    /// still answer `kill -0`. This used to be a `pgrep` count in console.sh,
+    /// which compared before and after and could not tell a leak from noise.
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_terminal_leaves_no_shell_behind() {
+        let dir = std::env::temp_dir();
+        let id = match open_with(&dir.to_string_lossy(), 80, 24, |_| true) {
+            Ok(id) => id,
+            Err(_) => return, // no shell on this machine (a bare container): nothing to prove
+        };
+        let pid = session_pid(&id).expect("the session knows its shell's pid") as i32;
+        // SAFETY: signal 0 only checks that the process exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the shell is running");
+        close(&id);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            // ESRCH once it is gone AND reaped; a zombie still answers 0.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                assert!(!is_open(&id));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the shell (pid {}) outlived its terminal", pid);
+    }
 
     #[test]
     fn a_character_split_across_two_reads_is_carried_not_mangled() {

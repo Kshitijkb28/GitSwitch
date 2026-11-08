@@ -1,39 +1,35 @@
-import { useState, useEffect, useRef, useCallback } from "react";
-import { useNavigate } from "react-router-dom";
+import { useState, useEffect, useRef, useCallback, type SubmitEvent } from "react";
 import {
-  GitBranch,
   GitMerge,
   Loader2,
   ChevronLeft,
   ChevronRight,
   Search,
-  RefreshCw,
   CloudDownload,
   CheckCircle2,
   Crosshair,
   X,
-  Box,
-  Radar,
+  UserRound,
 } from "lucide-react";
-import { GitHubIcon } from "../components/GitHubIcon";
-import { Button } from "../components/Button";
-import { Checkbox } from "../components/Checkbox";
-import { Card } from "../components/Card";
-import { Badge } from "../components/Badge";
-import { Input } from "../components/Input";
-import { Select } from "../components/Select";
-import { useToast } from "../components/Toast";
-import { ResultCard } from "../components/changes/ResultCard";
-import { CommitDetailPanel } from "../components/history/CommitDetailPanel";
-import { usePersistedState, writePersisted } from "../lib/persist";
-import { useRefreshOnFocus } from "../lib/focus";
-import { useGitJob } from "../lib/gitJobs";
-import * as api from "../lib/api";
+import { Button } from "../Button";
+import { Checkbox } from "../Checkbox";
+import { Card } from "../Card";
+import { Badge } from "../Badge";
+import { Input } from "../Input";
+import { Select } from "../Select";
+import { useToast } from "../Toast";
+import { ResultCard } from "../changes/ResultCard";
+import { CommitDetailPanel } from "../history/CommitDetailPanel";
+import { usePersistedState } from "../../lib/persist";
+import { useGitJob } from "../../lib/gitJobs";
+import * as api from "../../lib/api";
+import { formatWhen } from "../../lib/time";
 
 /** Refusals the detail panel answers inline (a note, a re-asked question) — it stays open for these. */
 const PANEL_HANDLES = new Set(["would-drop-pushed", "merge-commit-needs-mainline"]);
 
 const PAGE_SIZE = 50;
+const BRANCH_PAGE = 50;
 const ROW_H = 46;
 const LANE_W = 16;
 const LANE_COLORS = [
@@ -41,7 +37,6 @@ const LANE_COLORS = [
   "#a78bfa", "#22d3ee", "#fb7185", "#4ade80",
 ];
 const laneColor = (l: number) => LANE_COLORS[l % LANE_COLORS.length];
-const laneX = (l: number) => l * LANE_W + 10;
 
 /** How stale the ahead/behind numbers are — they're only as good as the last fetch. */
 function fetchAgo(secs: number | null): string {
@@ -55,12 +50,17 @@ function fetchAgo(secs: number | null): string {
 /** One row of the commit graph: rails passing through, the dot, and the
  *  connectors that fan out to a merge's parents. Mirrors `git log --graph`. */
 function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
-  const width = (maxLane + 1) * LANE_W + 10;
+  // Many lanes narrow, never push the subject away: the graph keeps to 176 px.
+  // Fractional widths: the last lane always lands inside the 176 px, however many there are.
+  const laneW = Math.min(LANE_W, 166 / (maxLane + 1));
+  const laneX = (l: number) => l * laneW + 8;
+  const width = Math.min((maxLane + 1) * laneW + 10, 176);
   const mid = ROW_H / 2;
   const continues = c.parent_lanes.includes(c.lane);
+  const dot = Math.max(2.5, Math.min(4, laneW / 4));
 
   return (
-    <svg width={width} height={ROW_H} className="shrink-0 overflow-visible">
+    <svg width={width} height={ROW_H} className="shrink-0 overflow-hidden">
       {c.active_lanes
         .filter((l) => l !== c.lane)
         .map((l) => (
@@ -70,11 +70,13 @@ function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
             stroke={laneColor(l)} strokeWidth={2} opacity={0.55}
           />
         ))}
-      {/* own lane: always comes from above; continues below only if a parent keeps it */}
-      <line
-        x1={laneX(c.lane)} y1={0} x2={laneX(c.lane)} y2={mid}
-        stroke={laneColor(c.lane)} strokeWidth={2} opacity={0.55}
-      />
+      {/* own lane: from above unless this is a tip; continues below only if a parent keeps it */}
+      {c.from_above !== false && (
+        <line
+          x1={laneX(c.lane)} y1={0} x2={laneX(c.lane)} y2={mid}
+          stroke={laneColor(c.lane)} strokeWidth={2} opacity={0.55}
+        />
+      )}
       {continues && (
         <line
           x1={laneX(c.lane)} y1={mid} x2={laneX(c.lane)} y2={ROW_H}
@@ -92,7 +94,7 @@ function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
           />
         ))}
       <circle
-        cx={laneX(c.lane)} cy={mid} r={c.is_merge ? 5.5 : 4}
+        cx={laneX(c.lane)} cy={mid} r={c.is_merge ? dot + 1.5 : dot}
         fill={c.is_merge ? "#18181b" : laneColor(c.lane)}
         stroke={laneColor(c.lane)} strokeWidth={2}
       />
@@ -100,26 +102,63 @@ function GraphCell({ c, maxLane }: { c: api.HistoryCommit; maxLane: number }) {
   );
 }
 
-/** "staging ↑2 ↓1" — the submodule's own branch against its own upstream. */
-function subLabel(m: api.SubmoduleInfo): string {
-  const parts = [m.path];
-  if (m.own_ahead > 0) parts.push(`↑${m.own_ahead}`);
-  if (m.own_behind > 0) parts.push(`↓${m.own_behind}`);
-  return parts.join(" ");
+interface Props {
+  /** The repository — or the submodule in scope — whose history this is. */
+  repo: string;
+  /** The account filter's profile id ("" = all) and that profile's email, for "only mine". */
+  account: string;
+  accountEmail: string;
+  /** The accounts have been read: until then `accountEmail` is empty for a reason that will pass. */
+  accountsReady: boolean;
+  visible: boolean;
+  /** Bumped by the page when the repository moved (a fetch, a pull, any operation). */
+  reloadKey: number;
+  onOpenChanges: () => void;
+  /** This tab moved the repository (a fetch, a detach, a reset…): the strip must re-read it. */
+  onRepoChanged: () => void;
+  /** The repository has submodules: pointer-only commits can be hidden. */
+  hasSubmodules: boolean;
 }
 
-export function History() {
+/** The most `--author` patterns one history read is given (the Windows command line has a limit). */
+const MAX_AUTHOR_FILTER = 200;
+/** How many people the backend lists at most: a list that long may be cut short. */
+const AUTHORS_LISTED = 300;
+
+/**
+ * What a person is filtered by. An address is matched whole by the backend
+ * (it wraps it in its angle brackets). A commit with no address, or with one
+ * that is not an address (`jdoe <jdoe>`, an import), is matched by its whole
+ * identity, anchored at both ends — a bare name would also mean everyone
+ * whose name or address merely contains it.
+ */
+function personKey(a: api.AuthorCount): string {
+  return a.email.includes("@") ? a.email : `${a.name} <${a.email}>`;
+}
+
+/** A bot or a CI identity, by the names and addresses they use. */
+function isBot(a: api.AuthorCount): boolean {
+  return /\[bot\]/i.test(a.name) || /^(github|github actions)$/i.test(a.name.trim()) || /\[bot\]|noreply@github\.com|^actions@|^ci@|dependabot|renovate|github-actions/i.test(a.email);
+}
+
+/**
+ * Branches, the commit graph and the detail panel: what used to be the whole
+ * History page, minus its picker, Fetch and Check GitHub, which now sit above
+ * the tabs.
+ */
+export function HistoryTab({ repo, account, accountEmail, accountsReady, visible, reloadKey: outerReload, onOpenChanges, onRepoChanged, hasSubmodules }: Props) {
   const toast = useToast();
-  const navigate = useNavigate();
-  const [repos, setRepos] = useState<api.RepoRef[]>([]);
-  const [superRepo, setSuperRepo] = usePersistedState("history.repo", "");
-  /** A submodule path inside `superRepo` being browsed instead of the repository itself. */
-  const [sub, setSub] = usePersistedState("history.sub", "");
-  const [subs, setSubs] = useState<api.SubmoduleInfo[]>([]);
-  /** Everything below works on this path: the repository, or the chosen submodule inside it. */
-  const repo = sub && superRepo ? `${superRepo}/${sub}` : superRepo;
-  const [account, setAccount] = usePersistedState("history.account", ""); // profile id, "" = all
   const [onlyMine, setOnlyMine] = usePersistedState("history.onlyMine", false);
+  // The people filter: an author email, "" for everyone. It beats "only this
+  // account" when both are set, since it is the more specific choice.
+  const [author, setAuthor] = usePersistedState("history.author", "");
+  // CI bumps fill a superproject's history; this hides commits that move
+  // nothing but submodule pointers.
+  const [hidePointerOnly, setHidePointerOnly] = usePersistedState("history.hidePointerOnly", false);
+  // What a push would send: the commits no remote-tracking branch has.
+  const [onlyUnpushed, setOnlyUnpushed] = usePersistedState("history.onlyUnpushed", false);
+  const [authors, setAuthors] = useState<api.AuthorCount[]>([]);
+  const authorsSeq = useRef(0);
   const [branches, setBranches] = useState<api.BranchInfo[]>([]);
   const [rev, setRev] = usePersistedState("history.rev", "--all");
   const [page, setPage] = useState<api.HistoryPage | null>(null);
@@ -131,34 +170,22 @@ export function History() {
   const [detail, setDetail] = useState<api.CommitDetail | null>(null);
   /** What "Go to commit" resolved — carried into the panel so the chooser needn't ask again. */
   const [target, setTarget] = useState<api.CommitTarget | null>(null);
-  const [repoStatus, setRepoStatus] = useState<api.RepoStatus | null>(null);
+  const [head, setHead] = useState<api.HeadInfo | null>(null);
   const [gotoText, setGotoText] = useState("");
   const [gotoError, setGotoError] = useState<string | null>(null);
   const [gotoBusy, setGotoBusy] = useState(false);
-  /** "Check GitHub": what is new on the remote branch, read without downloading anything. */
-  const [peek, setPeek] = useState<api.RemotePeek | null>(null);
-  const [peeking, setPeeking] = useState(false);
   /** The outcome of the last action taken from the detail panel. */
   const [result, setResult] = useState<api.OpResult | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const job = useGitJob(repo);
-  const [loadingRepos, setLoadingRepos] = useState(true);
   const [loadingBranches, setLoadingBranches] = useState(false);
   const [loadingPage, setLoadingPage] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sync, setSync] = useState<api.SyncStatus | null>(null);
-  const [fetching, setFetching] = useState(false);
+  const [, setFetching] = useState(false);
   const [autoFetch, setAutoFetch] = usePersistedState("history.autoFetch", false);
   const [reloadKey, setReloadKey] = useState(0);
   const pageSeq = useRef(0);
-
-  const accounts = Array.from(
-    new Map(
-      repos.map((r) => [r.profile_id, { id: r.profile_id, name: r.profile_name, email: r.profile_email }])
-    ).values()
-  );
-  const accountEmail = accounts.find((a) => a.id === account)?.email ?? "";
-  const visibleRepos = account ? repos.filter((r) => r.profile_id === account) : repos;
 
   const isRange = rev.includes("..");
 
@@ -184,26 +211,10 @@ export function History() {
     }
   }, []);
 
-  /** ls-remote — asks the remote where its branch is, writes nothing at all. */
-  async function doPeek() {
-    if (!repo) return;
-    setPeeking(true);
-    setError(null);
-    try {
-      setPeek(await api.historyPeek(repo));
-    } catch (e) {
-      setError(String(e));
-      setPeek(null);
-    } finally {
-      setPeeking(false);
-    }
-  }
-
   /** git fetch — updates remote refs only; the working tree is never touched. */
   async function doFetch(path = repo, silent = false) {
     if (!path) return;
     setFetching(true);
-    setPeek(null); // a fetch makes the check's answer stale
     if (!silent) setError(null);
     try {
       const res = await api.historyFetch(path);
@@ -211,6 +222,7 @@ export function History() {
       await loadSync(path, rev);
       await loadMergeInfo(path, rev);
       setReloadKey((k) => k + 1); // re-read the commit page with fresh refs
+      onRepoChanged();
       if (!silent) toast.success(res.message);
     } catch (e) {
       if (!silent) setError(String(e));
@@ -228,51 +240,23 @@ export function History() {
 
 
 
-  const loadRepos = useCallback(() => {
-    let cancelled = false;
-    api.historyListRepos()
-      .then((r) => {
-        if (cancelled) return;
-        setRepos(r);
-        // Keep the remembered repo only if it still exists.
-        setSuperRepo((prev) =>
-          prev && r.some((x) => x.path === prev) ? prev : r[0]?.path ?? ""
-        );
-      })
-      .catch((e) => !cancelled && setError(String(e)))
-      .finally(() => !cancelled && setLoadingRepos(false));
-    return () => { cancelled = true; };
-  }, [setSuperRepo]);
-  useEffect(loadRepos, [loadRepos]);
-
-  // The repository's populated, mapped submodules — each can be browsed as its
-  // own history. A remembered submodule that no longer exists falls back to the
-  // repository itself.
+  // The page above says when the repository moved (a fetch, a pull, any
+  // operation on the Changes tab): re-read everything that could have changed.
   useEffect(() => {
-    if (!superRepo) {
-      setSubs([]);
-      return;
-    }
-    let cancelled = false;
-    api.changesSubmodules(superRepo)
-      .then((list) => {
-        if (cancelled) return;
-        const usable = list.filter((m) => m.initialised && m.listed && m.gitdir_valid);
-        setSubs(usable);
-        setSub((cur) => (cur && !usable.some((m) => m.path === cur) ? "" : cur));
-      })
-      .catch(() => !cancelled && setSubs([]));
-    return () => { cancelled = true; };
-  }, [superRepo, reloadKey, setSub]);
-  // Repos get cloned and deleted outside the app; re-scan on return.
-  useRefreshOnFocus(loadRepos);
+    if (!outerReload || !repo) return;
+    loadBranches(repo);
+    loadSync(repo, rev);
+    loadMergeInfo(repo, rev);
+    setReloadKey((k) => k + 1);
+  }, [outerReload]);
 
   const loadBranches = useCallback(async (path: string) => {
     if (!path) return;
     setLoadingBranches(true);
-    // The repo status says which branch HEAD is on (or that it is detached) —
-    // the branch list alone can't tell a detached HEAD from an unborn one.
-    api.changesRepoStatus(path).then(setRepoStatus).catch(() => setRepoStatus(null));
+    // Which branch HEAD is on (or that it is detached): the branch list alone
+    // can't tell a detached HEAD from an unborn one. Three git reads, not the
+    // Changes page's whole status.
+    api.historyHead(path).then(setHead).catch(() => setHead(null));
     try {
       setBranches(await api.historyBranches(path));
     } catch (e) {
@@ -284,8 +268,8 @@ export function History() {
   }, []);
 
   const currentBranch =
-    repoStatus?.branch ?? branches.find((b) => b.is_current && !b.is_remote)?.name ?? null;
-  const detached = repoStatus ? repoStatus.detached : branches.length > 0 && !currentBranch;
+    head?.branch ?? branches.find((b) => b.is_current && !b.is_remote)?.name ?? null;
+  const detached = head ? head.detached : branches.length > 0 && !currentBranch;
 
   async function openCommit(hash: string, resolved: api.CommitTarget | null = null) {
     try {
@@ -303,7 +287,7 @@ export function History() {
   }
 
   /** "Go to commit": any id, short id or ref the user typed. */
-  async function gotoCommit(e: React.FormEvent) {
+  async function gotoCommit(e: SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     const text = gotoText.trim();
     if (!text || !repo) return;
@@ -357,6 +341,7 @@ export function History() {
       // A reset or a new branch changes which branches contain this one.
       await loadMergeInfo(repo, rev);
       setReloadKey((k) => k + 1);
+      onRepoChanged();
       return r;
     } catch (e) {
       setError(String(e));
@@ -386,37 +371,87 @@ export function History() {
       setResult(null);
       setDetail(null);
       setTarget(null);
-      setPeek(null);
+      setBranchQuery("");
     }
     loadBranches(repo);
   }, [repo, loadBranches]);
 
-  // If the chosen account doesn't own the current repo, move to one it does —
-  // otherwise the picker would show a repo the filter says shouldn't be there.
-  useEffect(() => {
-    if (!account) return;
-    const owned = repos.filter((r) => r.profile_id === account);
-    if (owned.length > 0 && !owned.some((r) => r.path === superRepo)) {
-      setSuperRepo(owned[0].path);
-    }
-  }, [account, repos, superRepo]);
-
+  // The people filter resolves to a list of emails: one person, "me", or
+  // everyone who is not a bot. Null means everyone.
+  const people = authors.filter((a) => !isBot(a));
+  const bots = authors.length - people.length;
+  const mine = accountEmail ? authors.find((a) => a.email.toLowerCase() === accountEmail.toLowerCase()) : undefined;
+  // How "me" is asked for: an address as it is (the backend matches it whole);
+  // an account "address" without an @ (an import's `sam <sam>`) by the whole
+  // identity when that person is in the list, else by the address in its
+  // brackets — a bare word would also mean everyone whose name or address
+  // contains it.
+  const meFilter: string[] | null = !accountEmail ? null : accountEmail.includes("@") ? [accountEmail] : mine ? [personKey(mine)] : [`<${accountEmail}>`];
+  // "People only" is the list of everyone who is not a bot, so it is offered
+  // only while there is a bot to leave out and the list is one git can be
+  // handed whole — cut short, it would hide people instead of bots.
+  const peopleOffered = bots > 0 && people.length > 0 && people.length <= MAX_AUTHOR_FILTER && authors.length < AUTHORS_LISTED;
+  const effectiveAuthors: string[] | null =
+    author === "me"
+      ? meFilter
+      : author === "people"
+        ? peopleOffered
+          ? people.map(personKey)
+          : null
+        : author
+          ? [author]
+          : onlyMine
+            ? meFilter
+            : null;
+  const authorsKey = JSON.stringify(effectiveAuthors);
+  // "Just me" before the accounts are read would be everyone's commits under
+  // that label; the page waits (and says it is loading) until they are.
+  const awaitingMe = !accountsReady && (author === "me" || (!author && onlyMine && !!account));
   useEffect(() => {
     if (!repo) return;
+    if (awaitingMe) {
+      setLoadingPage(true);
+      return;
+    }
     const seq = ++pageSeq.current;
     setLoadingPage(true);
-    api.historyPage(
-      repo,
-      rev,
-      offset,
-      PAGE_SIZE,
-      appliedSearch || null,
-      onlyMine && accountEmail ? accountEmail : null
-    )
-      .then((p) => { if (pageSeq.current === seq) { setPage(p); setError(null); } })
+    api.historyPage(repo, rev, offset, PAGE_SIZE, appliedSearch || null, effectiveAuthors, hasSubmodules && hidePointerOnly, onlyUnpushed)
+      .then((p) => {
+        if (pageSeq.current !== seq) return;
+        // The history shrank under a later page (a reset, a push with "only
+        // not pushed" on): go back to the last page that exists. Terminates —
+        // the offset only ever drops, towards a real page or the first.
+        if (offset > 0 && p.commits.length === 0) {
+          setOffset(p.total > 0 ? Math.floor((p.total - 1) / PAGE_SIZE) * PAGE_SIZE : 0);
+          return;
+        }
+        setPage(p);
+        setError(null);
+      })
       .catch((e) => { if (pageSeq.current === seq) { setError(String(e)); setPage(null); } })
       .finally(() => { if (pageSeq.current === seq) setLoadingPage(false); });
-  }, [repo, rev, offset, appliedSearch, reloadKey, onlyMine, accountEmail]);
+  }, [repo, rev, offset, appliedSearch, reloadKey, authorsKey, hidePointerOnly, hasSubmodules, awaitingMe, onlyUnpushed]);
+
+  // Who commits here — read once per repository and revision, never polled.
+  useEffect(() => {
+    if (!repo) { setAuthors([]); return; }
+    const seq = ++authorsSeq.current;
+    api.historyAuthors(repo, rev)
+      .then((list) => { if (authorsSeq.current === seq) setAuthors(list); })
+      .catch(() => { if (authorsSeq.current === seq) setAuthors([]); });
+  }, [repo, rev, reloadKey]);
+  // A person who is not in this revision's list is no filter at all — and so
+  // is a preset that does not apply here (kept from another repository).
+  const iCommitHere = !!mine;
+  useEffect(() => {
+    if (!author || !authors.length) return;
+    // "Just me" cannot be judged before the accounts are read: the people
+    // usually arrive first, and the preset would be thrown away on every visit.
+    if (author === "me" && !accountsReady) return;
+    const stale = author === "me" ? !iCommitHere : author === "people" ? !peopleOffered : !authors.some((a) => personKey(a) === author);
+    if (stale) setAuthor("");
+  }, [authors, author, iCommitHere, peopleOffered, setAuthor, accountsReady]);
+  const authorName = author === "me" ? "me" : author === "people" ? "people only" : (authors.find((a) => personKey(a) === author)?.name ?? author);
 
   useEffect(() => {
     loadSync(repo, rev);
@@ -427,7 +462,6 @@ export function History() {
   useEffect(() => {
     if (!repo || !autoFetch) return;
     doFetch(repo, true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repo, autoFetch]);
 
   async function selectBranch(name: string) {
@@ -437,163 +471,24 @@ export function History() {
     await loadMergeInfo(repo, name);
   }
 
-  const visibleBranches = branches.filter((b) => b.is_remote === showRemote);
+  // GitSwitch's own backup branches are a safety net, not work: they sit
+  // under a closed "Backups (n)" — unless one is the branch being viewed.
+  const visibleBranches = branches.filter((b) => b.is_remote === showRemote && (!b.is_backup || rev === b.name));
+  const backupBranches = showRemote ? [] : branches.filter((b) => !b.is_remote && b.is_backup && rev !== b.name);
+  // A repository can have hundreds of branches: a filter, and the list grows
+  // fifty at a time as it is scrolled — as every long list in the app does.
+  const [branchQuery, setBranchQuery] = useState("");
+  const [branchShown, setBranchShown] = useState(BRANCH_PAGE);
+  const q = branchQuery.trim().toLowerCase();
+  const filteredBranches = q ? visibleBranches.filter((b) => b.name.toLowerCase().includes(q)) : visibleBranches;
+  useEffect(() => setBranchShown(BRANCH_PAGE), [branchQuery, showRemote, repo]);
   const totalPages = page ? Math.max(1, Math.ceil(page.total / PAGE_SIZE)) : 1;
   const currentPage = Math.floor(offset / PAGE_SIZE) + 1;
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-start justify-between gap-4 flex-wrap">
-        <div className="min-w-0">
-          <h1 className="text-2xl font-bold text-zinc-100">History</h1>
-          <p className="text-sm text-zinc-400 mt-1">
-            Browse branches, commits and how they merged — one repo at a time.
-          </p>
-        </div>
-        <div className="flex items-center gap-2 min-w-0 flex-wrap">
-          <div className="w-52 max-w-full">
-            <Select
-              value={account}
-              onChange={(v) => { setAccount(v); setOffset(0); if (!v) setOnlyMine(false); }}
-              placeholder="All accounts"
-              optionIcon={<GitHubIcon size={14} />}
-              options={[
-                { value: "", label: "All accounts" },
-                ...accounts.map((a) => ({ value: a.id, label: a.name })),
-              ]}
-            />
-          </div>
-          <div className="w-64 max-w-full">
-            <Select
-              value={superRepo}
-              onChange={(v) => { setSuperRepo(v); setSub(""); }}
-              searchable
-              searchLabel="Search repositories"
-              placeholder={loadingRepos ? "Loading repos…" : "Pick a repository…"}
-              optionIcon={<GitBranch size={14} />}
-              options={visibleRepos.map((r) => ({
-                value: r.path,
-                label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
-              }))}
-            />
-          </div>
-          {subs.length > 0 && (
-            <div className="w-56 max-w-full">
-              <Select
-                value={sub}
-                onChange={(v) => { setSub(v); setOffset(0); }}
-                placeholder="This repository"
-                optionIcon={<Box size={14} />}
-                options={[
-                  { value: "", label: "This repository" },
-                  ...subs.map((m) => ({ value: m.path, label: subLabel(m) })),
-                ]}
-              />
-            </div>
-          )}
-          <Button
-            variant="secondary"
-            onClick={() => doFetch()}
-            disabled={!repo || fetching}
-            className="min-w-[8.25rem]" // fits "Fetching…" (≈125px), so the label swap never shifts Refresh
-            title={
-              sub
-                ? `git fetch inside ${sub} — updates that submodule's remote branches only`
-                : "git fetch — updates remote branches only, never your working tree; submodules are fetched on demand"
-            }
-          >
-            <CloudDownload size={16} className={fetching ? "animate-pulse" : ""} />
-            {fetching ? "Fetching…" : "Fetch"}
-          </Button>
-          <Button
-            variant="secondary"
-            onClick={doPeek}
-            disabled={!repo || peeking}
-            className="min-w-[8.5rem]"
-            title="Asks the remote where the branch is now — downloads nothing, writes nothing in this folder"
-          >
-            <Radar size={16} className={peeking ? "animate-pulse" : ""} />
-            {peeking ? "Checking…" : "Check GitHub"}
-          </Button>
-          <Button
-            variant="secondary"
-            onClick={() => { loadRepos(); loadBranches(repo); setOffset(0); setReloadKey((k) => k + 1); }}
-            disabled={!repo || loadingBranches}
-          >
-            <RefreshCw size={16} className={loadingBranches ? "animate-spin" : ""} />
-            Refresh
-          </Button>
-          <form onSubmit={gotoCommit} className="flex items-center gap-2 min-w-0">
-            <Input
-              aria-label="Go to commit"
-              placeholder="commit id, short id or ref"
-              value={gotoText}
-              onChange={(e) => { setGotoText(e.target.value); if (gotoError) setGotoError(null); }}
-              disabled={!repo}
-              spellCheck={false}
-              containerClassName="w-56 max-w-full"
-              className="font-mono text-sm"
-            />
-            <Button type="submit" variant="secondary" disabled={!repo || gotoBusy || !gotoText.trim()} title="Open a commit by its id or a ref like main~3">
-              {gotoBusy ? <Loader2 size={16} className="animate-spin" /> : <Crosshair size={16} />}
-              Go
-            </Button>
-          </form>
-        </div>
-      </div>
-
+    <div className={`space-y-6 ${visible ? "" : "hidden"}`} role="tabpanel" aria-label="History">
       {gotoError && (
-        <p className="text-sm text-red-400 break-words -mt-3">{gotoError}</p>
-      )}
-
-      {peek && (
-        <div className={`flex flex-wrap items-center gap-2 text-sm -mt-2 ${peek.changed ? "text-amber-200" : "text-zinc-400"}`}>
-          <Radar size={14} className={`shrink-0 ${peek.changed ? "text-amber-400" : "text-emerald-400"}`} />
-          <span className="break-words">{peek.message}</span>
-          {peek.changed && !peek.branch_gone && (
-            <Button size="sm" variant="secondary" onClick={() => doFetch()} disabled={fetching}>
-              Fetch now
-            </Button>
-          )}
-          <button type="button" onClick={() => setPeek(null)} className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer">
-            dismiss
-          </button>
-        </div>
-      )}
-
-      {subs.length > 0 && (
-        <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-400 -mt-2">
-          {sub ? (
-            <>
-              <Box size={13} className="text-emerald-400 shrink-0" />
-              <span>
-                Browsing inside <span className="font-mono text-zinc-200">{sub}</span> — branches, commits, Fetch and every action here belong to this submodule.
-              </span>
-              <button
-                type="button"
-                onClick={() => { setSub(""); setOffset(0); }}
-                className="text-emerald-400 hover:text-emerald-300 cursor-pointer"
-              >
-                Back to the repository
-              </button>
-            </>
-          ) : (
-            <>
-              <span className="text-zinc-500">Submodules:</span>
-              {subs.map((m) => (
-                <button
-                  key={m.path}
-                  type="button"
-                  onClick={() => { setSub(m.path); setOffset(0); }}
-                  title={`Browse this submodule's history — ${m.summary}`}
-                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border border-zinc-700/60 bg-zinc-800/40 hover:border-emerald-500/50 hover:text-zinc-100 cursor-pointer font-mono"
-                >
-                  {subLabel(m)}
-                </button>
-              ))}
-            </>
-          )}
-        </div>
+        <p className="text-sm text-red-400 break-words">{gotoError}</p>
       )}
 
       {error && (
@@ -607,25 +502,13 @@ export function History() {
           result={result}
           busy={busyKey !== null}
           onDismiss={() => setResult(null)}
+          onAlignSubmodules={(paths) => void onAction("align", () => api.changesSubmoduleAlign(repo, paths))}
           extraAction={{
             label: "Open in Changes",
-            onClick: () => {
-              writePersisted("changes.repo", repo);
-              navigate("/changes");
-            },
+            onClick: onOpenChanges,
             primary: !result.ok || (result.status?.conflicted_count ?? 0) > 0,
           }}
         />
-      )}
-
-      {!loadingRepos && repos.length === 0 && (
-        <Card className="text-center py-10">
-          <GitBranch size={32} className="mx-auto text-zinc-600 mb-3" />
-          <h3 className="text-lg font-medium text-zinc-300">No repositories found</h3>
-          <p className="text-sm text-zinc-500 mt-1">
-            Assign folders to a profile and GitSwitch will list the repos inside them here.
-          </p>
-        </Card>
       )}
 
       {repo && sync && (
@@ -728,9 +611,19 @@ export function History() {
                   );
                 })}
                 <span className="ml-auto text-xs text-zinc-600">
-                  {visibleBranches.length}
+                  {q ? `${filteredBranches.length} of ${visibleBranches.length}` : visibleBranches.length}
                 </span>
               </div>
+              {visibleBranches.length > 3 && (
+                <Input
+                  aria-label="Filter branches"
+                  placeholder="Filter branches"
+                  value={branchQuery}
+                  onChange={(e) => setBranchQuery(e.target.value)}
+                  containerClassName="mb-2"
+                  className="py-1.5 text-sm"
+                />
+              )}
 
               <button
                 onClick={() => selectBranch("--all")}
@@ -749,8 +642,16 @@ export function History() {
                   Reading branches…
                 </div>
               ) : (
-                <div className="space-y-1.5 max-h-[26rem] overflow-y-auto pr-1">
-                  {visibleBranches.map((b) => (
+                <div
+                  className="space-y-1.5 max-h-[26rem] overflow-y-auto pr-1"
+                  onScroll={(e) => {
+                    const el = e.currentTarget;
+                    if (el.scrollHeight - el.scrollTop - el.clientHeight < 64) {
+                      setBranchShown((n) => (n < filteredBranches.length ? n + BRANCH_PAGE : n));
+                    }
+                  }}
+                >
+                  {filteredBranches.slice(0, branchShown).map((b) => (
                     <button
                       key={b.name}
                       onClick={() => selectBranch(b.name)}
@@ -779,6 +680,37 @@ export function History() {
                       No {showRemote ? "remote" : "local"} branches.
                     </p>
                   )}
+                  {visibleBranches.length > 0 && filteredBranches.length === 0 && (
+                    <p className="text-xs text-zinc-600 py-2">No branch matches “{branchQuery.trim()}”.</p>
+                  )}
+                  {filteredBranches.length > branchShown && (
+                    <p className="text-xs text-zinc-500 py-2">
+                      Showing {branchShown} of {filteredBranches.length}. Keep scrolling, or type to narrow it down.
+                    </p>
+                  )}
+                  {backupBranches.length > 0 && (
+                    <details className="pt-1">
+                      <summary
+                        className="text-xs text-zinc-500 cursor-pointer hover:text-zinc-400 select-none"
+                        title="Branches GitSwitch made before an update, a reset or a rewrite, so nothing is lost. Nothing deletes them by itself."
+                      >
+                        Backups ({backupBranches.length})
+                      </summary>
+                      <div className="space-y-1 mt-1">
+                        {backupBranches.map((b) => (
+                          <button
+                            key={b.name}
+                            onClick={() => selectBranch(b.name)}
+                            title={b.name}
+                            className="w-full text-left px-3 py-1.5 rounded-lg bg-zinc-900/60 border border-zinc-800 hover:border-zinc-600 cursor-pointer min-w-0"
+                          >
+                            <span className="block text-xs text-zinc-400 font-mono truncate">{b.name}</span>
+                            <span className="block text-[11px] text-zinc-600 truncate">{b.last_subject}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </details>
+                  )}
                 </div>
               )}
             </Card>
@@ -794,10 +726,37 @@ export function History() {
                     <p className="text-xs text-zinc-500 mb-2">
                       This branch is already contained in:
                     </p>
+                    {(mergeInfo.merged_by ?? []).length > 0 && (
+                      <div className="space-y-1 mb-2">
+                        {(mergeInfo.merged_by ?? []).map((m) =>
+                          m.how === "merge" && m.commit ? (
+                            <button
+                              key={m.branch}
+                              type="button"
+                              onClick={() => m.commit && openCommit(m.commit.hash)}
+                              className="block w-full text-left text-[11px] text-zinc-300 hover:text-white truncate cursor-pointer"
+                              title={`${m.commit.subject} — ${m.commit.author_name}, ${m.commit.date}`}
+                            >
+                              into <span className="font-mono">{m.branch}</span> by <span className="font-mono text-zinc-500">{m.commit.short}</span> {m.commit.subject}
+                            </button>
+                          ) : (
+                            <p key={m.branch} className="text-[11px] text-zinc-400 truncate">
+                              {m.how === "fast-forward" ? (
+                                <>into <span className="font-mono">{m.branch}</span> — fast-forward, no merge commit</>
+                              ) : (
+                                <><span className="font-mono">{m.branch}</span> — at the same commit</>
+                              )}
+                            </p>
+                          )
+                        )}
+                      </div>
+                    )}
                     <div className="flex flex-wrap gap-1.5">
-                      {mergeInfo.merged_into.map((b) => (
-                        <Badge key={b} variant="success">{b}</Badge>
-                      ))}
+                      {mergeInfo.merged_into
+                        .filter((b) => !(mergeInfo.merged_by ?? []).some((m) => m.branch === b))
+                        .map((b) => (
+                          <Badge key={b} variant="success">{b}</Badge>
+                        ))}
                     </div>
                   </>
                 ) : (
@@ -808,13 +767,22 @@ export function History() {
                 {mergeInfo.merges.length > 0 && (
                   <>
                     <p className="text-xs text-zinc-500 mt-3 mb-1.5">
-                      Merge commits on this branch ({mergeInfo.merges.length}):
+                      Merges in this branch's history:{" "}
+                      {mergeInfo.merges_truncated
+                        ? `newest ${mergeInfo.merges.length} of ${mergeInfo.merges_total ?? mergeInfo.merges.length}`
+                        : mergeInfo.merges.length}
                     </p>
                     <div className="space-y-1 max-h-40 overflow-y-auto pr-1">
                       {mergeInfo.merges.map((m) => (
-                        <p key={m.hash} className="text-[11px] text-zinc-400 truncate" title={m.subject}>
+                        <button
+                          key={m.hash}
+                          type="button"
+                          onClick={() => openCommit(m.hash)}
+                          className="block w-full text-left text-[11px] text-zinc-400 hover:text-zinc-200 truncate cursor-pointer"
+                          title={m.subject}
+                        >
                           <span className="font-mono text-zinc-600">{m.short}</span> {m.subject}
-                        </p>
+                        </button>
                       ))}
                     </div>
                   </>
@@ -826,9 +794,26 @@ export function History() {
           {/* ---------------- commits ---------------- */}
           <div className="flex-1 min-w-0 space-y-3">
             <Card>
+              <div className="flex flex-wrap items-center gap-2 mb-4">
+              <form onSubmit={gotoCommit} className="flex items-center gap-2 min-w-0">
+                <Input
+                  aria-label="Go to commit"
+                  placeholder="commit id, short id or ref"
+                  value={gotoText}
+                  onChange={(e) => { setGotoText(e.target.value); if (gotoError) setGotoError(null); }}
+                  disabled={!repo}
+                  spellCheck={false}
+                  containerClassName="w-56 max-w-full"
+                  className="font-mono text-sm"
+                />
+                <Button type="submit" variant="secondary" disabled={!repo || gotoBusy || !gotoText.trim()} title="Open a commit by its id or a ref like main~3">
+                  {gotoBusy ? <Loader2 size={16} className="animate-spin" /> : <Crosshair size={16} />}
+                  Go
+                </Button>
+              </form>
               <form
                 onSubmit={(e) => { e.preventDefault(); setOffset(0); setAppliedSearch(search); }}
-                className="flex gap-2 mb-4"
+                className="flex gap-2 flex-1 min-w-[16rem]"
               >
                 <Input
                   placeholder="Search commit messages…"
@@ -850,6 +835,76 @@ export function History() {
                   </Button>
                 )}
               </form>
+              </div>
+
+              {authors.length > 1 && (
+                <div className="flex items-center gap-2 mb-3 flex-wrap">
+                  <span className="text-xs text-zinc-500">People</span>
+                  <div className="w-72 max-w-full">
+                    <Select
+                      value={author}
+                      onChange={(v) => { setAuthor(v); setOffset(0); }}
+                      searchable
+                      searchLabel="Search people"
+                      placeholder="Everyone"
+                      optionIcon={<UserRound size={14} />}
+                      options={[
+                        { value: "", label: `Everyone · ${authors.reduce((n, a) => n + a.commits, 0).toLocaleString()}` },
+                        ...(mine ? [{ value: "me", label: `Just me · ${mine.commits.toLocaleString()}` }] : []),
+                        ...(peopleOffered
+                          ? [{ value: "people", label: `People only (hide bots and CI) · ${people.reduce((n, a) => n + a.commits, 0).toLocaleString()}` }]
+                          : []),
+                        ...authors.map((a) => ({
+                          value: personKey(a),
+                          label: `${a.name}${isBot(a) ? " (bot)" : ""} · ${a.commits.toLocaleString()}`,
+                        })),
+                      ]}
+                    />
+                  </div>
+                  {author && author !== "me" && author !== "people" && (
+                    <span className="text-[11px] text-zinc-600 font-mono truncate max-w-[16rem]">{author}</span>
+                  )}
+                </div>
+              )}
+
+              {hasSubmodules && (
+                <label className="flex items-start gap-2.5 mb-3 cursor-pointer select-none" title="A commit that changes nothing but submodule pointers — the bumps a CI makes — is left out of the list and the count">
+                  <Checkbox
+                    checked={hidePointerOnly}
+                    onChange={(v) => { setHidePointerOnly(v); setOffset(0); }}
+                    className="mt-0.5"
+                    aria-label="Hide pointer-only commits"
+                  />
+                  <span className="text-xs text-zinc-300">
+                    Hide pointer-only commits
+                    <span className="text-zinc-500"> — the ones that only move a submodule pointer</span>
+                  </span>
+                </label>
+              )}
+
+              <label className="flex items-start gap-2.5 mb-3 cursor-pointer select-none" title="Commits no remote-tracking branch has yet — any remote counts">
+                <Checkbox
+                  checked={onlyUnpushed}
+                  onChange={(v) => { setOnlyUnpushed(v); setOffset(0); }}
+                  className="mt-0.5"
+                  aria-label="Only commits not pushed yet"
+                />
+                <span className="text-xs text-zinc-300">
+                  Only commits not pushed yet
+                  <span className="text-zinc-500"> — the ones no remote-tracking branch has</span>
+                </span>
+              </label>
+
+              {page && !page.remote_refs && (
+                <p className="text-xs text-amber-300/90 mb-2 break-words">
+                  No remote-tracking branch here: nothing is known to be pushed, so the rows carry no mark.
+                </p>
+              )}
+              {page?.marks_error && (
+                <p className="text-xs text-amber-300/90 mb-2 break-words">
+                  Could not tell which commits a remote-tracking branch has, so the rows carry no mark: {page.marks_error}
+                </p>
+              )}
 
               {account && (
                 <label className="flex items-start gap-2.5 mb-3 cursor-pointer select-none">
@@ -872,12 +927,13 @@ export function History() {
               <div className="flex items-center justify-between gap-3 flex-wrap mb-2">
                 <p className="text-xs text-zinc-500">
                   {rev === "--all" ? "All branches" : rev}
-                  {onlyMine && accountEmail && " · this account only"}
+                  {author ? ` · by ${authorName}` : onlyMine && accountEmail ? " · this account only" : ""}
+                  {onlyUnpushed ? " · not pushed yet" : ""}
                   {page && (
                     <>
                       {" · "}
                       {page.total.toLocaleString()} commit{page.total === 1 ? "" : "s"}
-                      {page.total > 0 && (
+                      {page.commits.length > 0 && (
                         <>
                           {" · showing "}
                           {(offset + 1).toLocaleString()}–
@@ -898,7 +954,8 @@ export function History() {
               {page && page.commits.length === 0 && !loadingPage && (
                 <p className="text-sm text-zinc-500 py-6 text-center">
                   No commits{appliedSearch ? ` matching “${appliedSearch}”` : ""}
-                  {onlyMine ? " authored by this account" : ""}.
+                  {author ? ` by ${authorName}` : onlyMine ? " authored by this account" : ""}
+                  {onlyUnpushed ? " left that no remote-tracking branch has" : ""}.
                 </p>
               )}
 
@@ -918,22 +975,49 @@ export function History() {
                     <span className="text-sm text-zinc-200 truncate min-w-0 flex-1">
                       {c.subject}
                     </span>
-                    <span className="hidden xl:flex items-center gap-1 shrink-0 max-w-[26%] overflow-hidden">
-                      {c.refs.slice(0, 2).map((r) => (
-                        <Badge key={r} variant="default">{r}</Badge>
-                      ))}
-                    </span>
+                    {c.only_submodules && (
+                      <span
+                        className="hidden sm:inline text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-500 shrink-0 truncate max-w-[12rem]"
+                        title={`Changes nothing but the pointer of ${c.touches_submodules.join(", ")}`}
+                      >
+                        submodule bump: {c.touches_submodules.join(", ")}
+                      </span>
+                    )}
+                    {c.unpushed && page?.remote_refs && (
+                      <span
+                        className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 shrink-0"
+                        title="No remote-tracking branch has this commit: as far as this checkout knows, it exists only here"
+                      >
+                        not pushed
+                      </span>
+                    )}
+                    {c.refs.length > 0 && (
+                      // The first branch at every width; all of them in the title.
+                      <span className="flex items-center gap-1 shrink-0 max-w-[26%] overflow-hidden" title={c.refs.join(", ")}>
+                        <span className="min-w-0 max-w-[9rem] truncate">
+                          <Badge variant="default">{c.refs[0]}</Badge>
+                        </span>
+                        {c.refs[1] && (
+                          <span className="hidden xl:inline-flex min-w-0">
+                            <Badge variant="default">{c.refs[1]}</Badge>
+                          </span>
+                        )}
+                      </span>
+                    )}
                     <span className="hidden md:inline text-xs text-zinc-500 truncate min-w-0 max-w-[18%]">
                       {c.author_name}
                     </span>
-                    <span className="hidden sm:inline text-xs text-zinc-600 shrink-0 tabular-nums">
-                      {c.date.slice(0, 10)}
+                    <span
+                      className="hidden sm:inline text-xs text-zinc-600 shrink-0 tabular-nums"
+                      title={`${formatWhen(c.author_date || c.date).title}${c.author_date && c.author_date !== c.date ? ` · committed ${c.date}` : ""}`}
+                    >
+                      {formatWhen(c.author_date || c.date).text}
                     </span>
                   </button>
                 ))}
               </div>
 
-              {page && page.total > PAGE_SIZE && (
+              {page && (offset > 0 || page.total > PAGE_SIZE) && (
                 <div className="flex items-center justify-between gap-3 flex-wrap pt-4 mt-2 border-t border-zinc-800">
                   <Button
                     variant="secondary"
@@ -975,6 +1059,7 @@ export function History() {
           onClose={closePanel}
           onAction={onAction}
           onResolve={resolveCommit}
+          onOpenCommit={(h) => void openCommit(h)}
         />
       )}
     </div>
@@ -1015,7 +1100,7 @@ function TipCard({
             {tip.subject}
           </p>
           <p className="text-[11px] text-zinc-600 truncate mt-0.5">
-            {tip.author} · {tip.date.replace("T", " ").slice(0, 16)}
+            {tip.author} · <span title={formatWhen(tip.date).title}>{formatWhen(tip.date).text}</span>
           </p>
         </>
       ) : (

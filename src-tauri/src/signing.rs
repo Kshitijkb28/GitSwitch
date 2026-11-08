@@ -7,7 +7,7 @@ const BEGIN: &str = "# >>> GitSwitch managed signers (DO NOT EDIT) >>>";
 const END: &str = "# <<< GitSwitch managed signers (DO NOT EDIT) <<<";
 
 pub fn allowed_signers_path() -> PathBuf {
-    dirs::home_dir()
+    crate::paths::home_dir()
         .unwrap_or_default()
         .join(".ssh")
         .join("allowed_signers")
@@ -99,6 +99,27 @@ pub fn write_allowed_signers(profiles: &[Profile]) -> Result<usize, AppError> {
     Ok(count)
 }
 
+/// Whether ~/.ssh/allowed_signers holds GitSwitch's block.
+pub(crate) fn has_managed_signers() -> bool {
+    fs::read_to_string(allowed_signers_path()).is_ok_and(|c| c.lines().any(|l| l.trim() == BEGIN))
+}
+
+/// Take GitSwitch's block out of ~/.ssh/allowed_signers; hand-written entries
+/// stay. A file left with nothing in it is removed. False when there was no block.
+pub fn remove_managed_signers() -> Result<bool, AppError> {
+    if !has_managed_signers() {
+        return Ok(false);
+    }
+    let path = allowed_signers_path();
+    let rest = strip_managed(&fs::read_to_string(&path)?);
+    if rest.trim().is_empty() {
+        fs::remove_file(&path)?;
+    } else {
+        fs::write(&path, format!("{}\n", rest))?;
+    }
+    Ok(true)
+}
+
 /// The gitconfig stanza that turns on SSH commit signing for one profile.
 /// `user.signingkey` points at the PUBLIC key — that's what gpg.format=ssh wants.
 pub fn signing_config_block(profile: &Profile) -> Option<String> {
@@ -106,10 +127,11 @@ pub fn signing_config_block(profile: &Profile) -> Option<String> {
         return None;
     }
     let key = profile.ssh_key_path.as_ref()?;
+    // Quoted: a space or `#` in either path would otherwise end the value early.
     Some(format!(
-        "[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tallowedSignersFile = {}\n[user]\n\tsigningkey = {}.pub\n[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n",
-        crate::paths::norm(&allowed_signers_path().to_string_lossy()),
-        crate::paths::norm(key)
+        "[gpg]\n\tformat = ssh\n[gpg \"ssh\"]\n\tallowedSignersFile = {}\n[user]\n\tsigningkey = {}\n[commit]\n\tgpgsign = true\n[tag]\n\tgpgsign = true\n",
+        crate::paths::config_value(&crate::paths::norm(&allowed_signers_path().to_string_lossy())),
+        crate::paths::config_value(&format!("{}.pub", crate::paths::norm(key)))
     ))
 }
 
@@ -210,9 +232,12 @@ mod tests {
             is_default: false,
             allow_push: true,
             signing_enabled: signing,
+            remote_patterns: Vec::new(),
+            github_login: None,
             directories: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            push_over_ssh: None,
         }
     }
 
@@ -224,8 +249,8 @@ mod tests {
         assert!(block.contains("format = ssh"));
         // A backslash here would make git report "bad config line".
         assert!(!block.contains('\\'), "config values must never contain backslashes");
-        // SSH signing points signingkey at the PUBLIC half.
-        assert!(block.contains("signingkey = /k.pub"));
+        // SSH signing points signingkey at the PUBLIC half; values are quoted.
+        assert!(block.contains("signingkey = \"/k.pub\""), "{block}");
         assert!(block.contains("gpgsign = true"));
         assert!(block.contains("allowedSignersFile ="));
     }

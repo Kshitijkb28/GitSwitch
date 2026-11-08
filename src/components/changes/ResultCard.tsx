@@ -9,8 +9,12 @@ type Props = {
   busy: boolean;
   onDismiss: () => void;
   onRecordPointers?: () => void;
+  /** Checks out, in these submodules, the commits the repository records ("Align submodules"). */
+  onAlignSubmodules?: (paths: string[]) => void;
   /** Rendered after the guidance: e.g. "Open in Changes" / "Open in History". */
   extraAction?: { label: string; onClick: () => void; primary?: boolean };
+  /** Several at once (a push refused for more than one submodule); wins over `extraAction`. */
+  extraActions?: { label: string; onClick: () => void; primary?: boolean }[];
 };
 
 /** Undo/drop counts for a tree or stash outcome, in one sentence. */
@@ -26,7 +30,8 @@ function treeSentence(t: NonNullable<OpResult["tree"]>): string | null {
 }
 
 /** The outcome of the last operation: headline, detail, advice, undo lines. */
-export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAction }: Props) {
+export function ResultCard({ result, busy, onDismiss, onRecordPointers, onAlignSubmodules, extraAction, extraActions }: Props) {
+  const actions = extraActions ?? (extraAction ? [extraAction] : []);
   const tree = result.tree;
   const stash = result.stash;
   const treeLine = tree ? treeSentence(tree) : null;
@@ -45,15 +50,23 @@ export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAct
           {result.advice?.guidance && result.advice.guidance !== result.detail && (
             <p className="text-xs text-zinc-300 break-words">{result.advice.guidance}</p>
           )}
-          {extraAction && (
-            <div>
-              <Button size="sm" variant={extraAction.primary ? "primary" : "secondary"} onClick={extraAction.onClick} disabled={busy}>
-                {extraAction.label}
-              </Button>
+          {actions.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {actions.map((a) => (
+                <Button key={a.label} size="sm" variant={a.primary ? "primary" : "secondary"} onClick={a.onClick} disabled={busy}>
+                  {a.label}
+                </Button>
+              ))}
             </div>
           )}
           {result.pull?.recovery && (
             <p className="text-xs text-zinc-500 font-mono break-all">undo: {result.pull.recovery}</p>
+          )}
+          {(result.pull?.submodules_moved ?? 0) > 0 && (
+            <p className="text-xs text-sky-300/90 break-words">
+              {result.pull?.submodules_moved} submodule pointer{result.pull?.submodules_moved === 1 ? "" : "s"} moved — this repository now
+              records other commits than are checked out. Update aligns them.
+            </p>
           )}
           {result.pull?.autostash_conflict && (
             <p className="text-xs text-amber-300/90 break-words">
@@ -69,10 +82,24 @@ export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAct
             </p>
           )}
           {tree && (tree.submodule_mismatch ?? []).length > 0 && (
-            <p className="text-xs text-amber-300/90 break-words">
-              {tree.submodule_mismatch.join(", ")} {tree.submodule_mismatch.length === 1 ? "sits" : "sit"} at a commit other than what
-              this branch records. Update submodules to align {tree.submodule_mismatch.length === 1 ? "it" : "them"}; their own changes are untouched.
-            </p>
+            <div className="space-y-1">
+              <p className="text-xs text-amber-300/90 break-words">
+                {tree.submodule_mismatch.join(", ")} {tree.submodule_mismatch.length === 1 ? "sits" : "sit"} at a commit other than what
+                this repository records. Align submodules checks out the commit{tree.submodule_mismatch.length === 1 ? "" : "s"} it
+                records; {tree.submodule_mismatch.length === 1 ? "its" : "their"} own branches and changes are untouched.
+              </p>
+              {onAlignSubmodules && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={busy}
+                  onClick={() => onAlignSubmodules(tree.submodule_mismatch)}
+                  title={`Checks out, inside ${tree.submodule_mismatch.join(", ")}, the commit this repository records. Nothing is fetched; their branches keep their commits.`}
+                >
+                  Align submodules
+                </Button>
+              )}
+            </div>
           )}
           {tree?.mapping_note && <p className="text-xs text-zinc-500 break-words">{tree.mapping_note}</p>}
           {tree?.recovery && (
@@ -91,6 +118,9 @@ export function ResultCard({ result, busy, onDismiss, onRecordPointers, extraAct
           )}
           {stash?.recovery && (
             <p className="text-xs text-zinc-500 font-mono break-all">undo: {stash.recovery}</p>
+          )}
+          {result.state?.action === "delete" && result.state.recovery && (
+            <p className="text-xs text-zinc-500 font-mono break-all">{result.state.recovery}</p>
           )}
           {result.submodules && result.submodules.listed > 0 && (
             <p className="text-xs text-zinc-400">

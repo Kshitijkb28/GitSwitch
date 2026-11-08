@@ -13,14 +13,16 @@ use std::collections::HashMap;
 /// 50 pages × 100 = 5,000 repos per account before we stop and say so.
 const MAX_PAGES: usize = 50;
 
-/// Overridable so the paging/SSO logic can be tested against a local fake API.
-fn api_base() -> String {
-    std::env::var("GITSWITCH_GITHUB_API")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "https://api.github.com".into())
-        .trim_end_matches('/')
-        .to_string()
+/// Overridable in a DEBUG build only, so the paging/SSO logic can be tested
+/// against a local fake API. A release build ignores the variable: every
+/// request here carries an account token, and an environment variable that
+/// redirects them is a way to steal it.
+pub(crate) fn api_base() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(s) = std::env::var("GITSWITCH_GITHUB_API").ok().filter(|s| !s.trim().is_empty()) {
+        return s.trim_end_matches('/').to_string();
+    }
+    "https://api.github.com".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,11 +112,17 @@ pub struct LocalClones {
     pub owner_profiles: HashMap<String, String>,
     /// owner (lowercase) -> "org-<id>" SSH user seen in local remotes
     pub org_ssh_users: HashMap<String, String>,
+    /// "owner/name" (lowercase) -> the folder a clone is still writing it into
+    #[serde(default)]
+    pub cloning: HashMap<String, String>,
+    /// "owner/name" (lowercase) -> every local copy, for repositories cloned more than once
+    #[serde(default)]
+    pub copies: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RepoAccount {
-    /// "gh:<account>" or "profile:<profile id>"
+    /// "gh:<login>" or "signin:<login>"
     pub key: String,
     pub label: String,
     pub source: String,
@@ -189,26 +197,101 @@ fn majority(counts: &HashMap<String, usize>) -> Option<String> {
 // Local knowledge: what's already cloned, and as which profile
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct LocalIndex {
+#[derive(Default, Clone)]
+pub(crate) struct LocalIndex {
     /// "owner/name" (lowercase) -> local path
     clones: HashMap<String, String>,
     /// owner (lowercase) -> profile id -> number of local repos
     owner_profiles: HashMap<String, HashMap<String, usize>>,
     /// owner (lowercase) -> "org-<id>" SSH user seen in local remotes
     org_ssh_users: HashMap<String, String>,
+    /// The remote (`github:owner/name`, else `url:<address>`) -> every
+    /// checkout of it, in scan order: the copies a workspace is told apart from.
+    pub(crate) by_remote: HashMap<String, Vec<String>>,
 }
 
-async fn local_index(profs: &[Profile]) -> LocalIndex {
+type IndexCache = std::sync::Mutex<Option<(std::time::Instant, String, LocalIndex)>>;
+
+fn index_cache() -> &'static IndexCache {
+    static CACHE: std::sync::OnceLock<IndexCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn index_key(profs: &[Profile]) -> String {
+    profs.iter().flat_map(|p| std::iter::once(p.id.as_str()).chain(p.directories.iter().map(String::as_str))).collect::<Vec<_>>().join("\0")
+}
+
+/// The local index for these profiles. Building it walks every profile
+/// folder and asks git for every clone's remote, so the pages of one listing
+/// share it for a minute (`fresh = false`). A read of what is on this Mac
+/// (`fresh = true`) always scans again — a clone deleted, moved or made
+/// behind the app's back shows at once — and leaves its result for the pages.
+pub(crate) async fn local_index(profs: &[Profile], fresh: bool) -> LocalIndex {
+    let key = index_key(profs);
+    if !fresh {
+        if let Ok(slot) = index_cache().lock() {
+            if let Some((at, k, idx)) = slot.as_ref() {
+                if *k == key && at.elapsed() < std::time::Duration::from_secs(60) {
+                    return idx.clone();
+                }
+            }
+        }
+    }
+    let idx = build_local_index(profs).await;
+    if let Ok(mut slot) = index_cache().lock() {
+        *slot = Some((std::time::Instant::now(), key, idx.clone()));
+    }
+    idx
+}
+
+/// The index as it stands, whatever its age — and, when it is older than a
+/// minute, a rebuild in the background for the next reader. For a page that
+/// must never wait for a scan (the Ports page reads every five seconds).
+pub(crate) async fn local_index_stale_ok(profs: &[Profile]) -> LocalIndex {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static REFRESHING: AtomicBool = AtomicBool::new(false);
+    let key = index_key(profs);
+    let cached = index_cache()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().filter(|(_, k, _)| *k == key).map(|(at, _, idx)| (*at, idx.clone())));
+    match cached {
+        Some((at, idx)) => {
+            if at.elapsed() >= std::time::Duration::from_secs(60) && !REFRESHING.swap(true, Ordering::SeqCst) {
+                let profs = profs.to_vec();
+                tokio::spawn(async move {
+                    let _ = local_index(&profs, true).await;
+                    REFRESHING.store(false, Ordering::SeqCst);
+                });
+            }
+            idx
+        }
+        None => local_index(profs, true).await,
+    }
+}
+
+async fn build_local_index(profs: &[Profile]) -> LocalIndex {
     let mut idx = LocalIndex::default();
     let mut seen = std::collections::HashSet::new();
+    let mut seen_real: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for p in profs {
         for dir in &p.directories {
             if !std::path::Path::new(dir).is_dir() {
                 continue;
             }
             for r in crate::repo_scan::scan_repos(dir.clone()).await.unwrap_or_default() {
-                if !seen.insert(r.path.clone()) || r.owner.is_empty() {
+                if !seen.insert(r.path.clone()) {
+                    continue;
+                }
+                // Every checkout of a remote, GitHub or not. One folder reached
+                // through two profile directories (a link) counts once.
+                if let Some(key) = crate::workspace::remote_key(&r.remote_url, &r.owner, &r.name) {
+                    let real = crate::paths::real_form(&r.path).unwrap_or_else(|| crate::paths::norm(&r.path));
+                    if seen_real.insert((key.clone(), real)) {
+                        idx.by_remote.entry(key).or_default().push(r.path.clone());
+                    }
+                }
+                if r.owner.is_empty() {
                     continue;
                 }
                 let key = format!("{}/{}", r.owner, r.name).to_ascii_lowercase();
@@ -246,16 +329,12 @@ pub async fn accounts() -> Vec<RepoAccount> {
             });
         }
     }
-    if let Ok(store) = profiles::load_profiles() {
-        for p in store.profiles {
-            if matches!(crate::credentials::get_token(&p.id), Ok(Some(_))) {
-                out.push(RepoAccount {
-                    key: format!("profile:{}", p.id),
-                    label: format!("{} (GitSwitch sign-in)", p.name),
-                    source: "GitSwitch sign-in".into(),
-                });
-            }
-        }
+    for s in crate::credentials::kept_signins() {
+        out.push(RepoAccount {
+            key: format!("signin:{}", s.login),
+            label: s.login,
+            source: "Sign in with GitHub".into(),
+        });
     }
     out
 }
@@ -264,18 +343,49 @@ pub(crate) async fn token_for(account: &str) -> Result<String, AppError> {
     if let Some(name) = account.strip_prefix("gh:") {
         return crate::gh_cli::gh_get_token(name).await;
     }
-    if let Some(id) = account.strip_prefix("profile:") {
-        return crate::credentials::get_token(id)?
-            .ok_or_else(|| AppError::NotFound("This profile has no saved GitHub sign-in.".into()));
+    if let Some(login) = crate::credentials::signin_login(account) {
+        return crate::credentials::signin_token(login)?
+            .ok_or_else(|| AppError::NotFound(format!("The sign-in for {} is not kept on this computer any more — sign in again on the GitHub page.", login)));
     }
     Err(AppError::Config(format!("Unknown account \"{}\"", account)))
 }
 
 /// Re-read only the local side of the picture: no GitHub call, no token.
+/// The clones still running into one of the profiles' folders, by "owner/name".
+fn cloning_now(profs: &[profiles::Profile]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for (dest, url) in crate::sparse::running_clone_list() {
+        // A folder as stored or as the disk spells it: the registry holds the
+        // clone under both forms too.
+        if !profs.iter().any(|p| p.directories.iter().any(|d| crate::paths::is_within(&dest, d) || crate::paths::real_form(d).is_some_and(|r| crate::paths::is_within(&dest, &r)))) {
+            continue;
+        }
+        if let Some((o, n)) = crate::repo_scan::parse_github_owner_name(&url) {
+            out.insert(format!("{}/{}", o, n).to_lowercase(), dest);
+        }
+    }
+    out
+}
+
 pub async fn local_clones() -> Result<LocalClones, AppError> {
     let store = profiles::load_profiles()?;
-    let idx = local_index(&store.profiles).await;
+    // Read before the scan and after it: a clone that ends while the scan
+    // runs was skipped by it, and must still be reported (as cloning) for the
+    // page to read once more, rather than in neither list.
+    let before = cloning_now(&store.profiles);
+    let idx = local_index(&store.profiles, true).await;
+    let mut cloning = cloning_now(&store.profiles);
+    for (k, v) in before {
+        cloning.entry(k).or_insert(v);
+    }
     Ok(LocalClones {
+        cloning,
+        copies: idx
+            .by_remote
+            .iter()
+            .filter(|(_, v)| v.len() >= 2)
+            .filter_map(|(k, v)| k.strip_prefix("github:").map(|name| (name.to_string(), v.clone())))
+            .collect(),
         clones: idx.clones,
         owner_profiles: idx
             .owner_profiles
@@ -365,7 +475,7 @@ pub async fn list_repos_with_token(account: &str, token: &str) -> Result<RepoLis
     }
 
     let store = profiles::load_profiles()?;
-    let idx = local_index(&store.profiles).await;
+    let idx = local_index(&store.profiles, false).await;
 
     let repos = map_repos(api_repos, &idx);
 
@@ -468,7 +578,7 @@ pub async fn list_repos_page(account: &str, page: u32, per_page: u32) -> Result<
     let has_more = next.is_some() && !truncated;
 
     let store = profiles::load_profiles()?;
-    let idx = local_index(&store.profiles).await;
+    let idx = local_index(&store.profiles, false).await;
     let repos = map_repos(api_repos, &idx);
     let suggested_profile_id = if page <= 1 {
         store

@@ -172,7 +172,7 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
     if f.sync_in_progress && !allowed_during_sync {
         return Some(refuse(
             "sync-in-progress",
-            "A sync is paused here. Continue or abort it first (the Changes page shows both).",
+            "An update is paused here. Continue or abort it first (the Changes tab shows both).",
         ));
     }
 
@@ -316,6 +316,21 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
                     "You're not on a branch. Switch to one before pulling.",
                 ));
             }
+            // A merge writes a new commit, and a rebase re-commits yours, both
+            // under whatever identity git has here — the same reason a commit
+            // is refused on a mismatch. A fast-forward writes nothing.
+            if *mode != PullMode::FfOnly && !f.identity_matches {
+                let expected = f.profile_email.clone().unwrap_or_default();
+                return Some(refuse(
+                    "identity-mismatch",
+                    format!(
+                        "This folder should commit as {} but git is set to {}. A {} would record commits under that identity — fix it first, or pull fast-forward only.",
+                        expected,
+                        f.identity_email,
+                        if *mode == PullMode::Rebase { "rebase" } else { "merge" }
+                    ),
+                ));
+            }
             if f.upstream.is_none() {
                 return Some(refuse(
                     "no-upstream",
@@ -350,13 +365,13 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
 
         Intent::Sync => {
             if f.unborn {
-                return Some(refuse("unborn-head", "There are no commits yet — nothing to sync."));
+                return Some(refuse("unborn-head", "There are no commits yet — nothing to update."));
             }
             if f.detached {
                 return Some(refuse("detached-head", "You're not on a branch. Check one out first."));
             }
             if f.upstream.is_none() {
-                return Some(refuse("no-upstream", "This branch isn't tracking a remote branch, so there is nothing to sync with."));
+                return Some(refuse("no-upstream", "This branch isn't tracking a remote branch, so there is nothing to update from."));
             }
             busy("sync")
         }
@@ -365,7 +380,7 @@ pub fn check(intent: &Intent, f: &StatusFacts) -> Option<Refusal> {
             if f.sync_in_progress {
                 None
             } else {
-                Some(refuse("no-sync", "No sync is paused here."))
+                Some(refuse("no-sync", "No update is paused here."))
             }
         }
 
@@ -417,6 +432,98 @@ pub fn pathspec_stdin(paths: &[String]) -> Result<Vec<u8>, AppError> {
 
 /// A path must stay inside the worktree. Paths come from our own status output,
 /// so this is a guard against a malformed request, not a user typo.
+/// The absolute, canonical path of `path` inside `repo_path` — or an error
+/// when it is not inside the repository (a `..`, an absolute path, a symlink
+/// that leaves it) or does not exist. Every command that hands a path to the
+/// operating system goes through this, so the JavaScript side never holds a
+/// general "open any path" capability.
+pub fn within_repo(repo_path: &str, path: &str) -> Result<PathBuf, AppError> {
+    validate_repo_path(path)?;
+    let base = std::fs::canonicalize(repo_path).map_err(|e| AppError::NotFound(format!("{}: {}", repo_path, e)))?;
+    let full = std::fs::canonicalize(base.join(path))
+        .map_err(|e| AppError::NotFound(format!("{} does not exist in this repository ({})", path, e)))?;
+    if !full.starts_with(&base) {
+        return Err(AppError::Command(format!("'{}' isn't a path inside this repository", path)));
+    }
+    Ok(full)
+}
+
+/// Would the system's "open" run this path rather than show it? An
+/// executable bit, or a bundle / launcher type by extension. Such a path is
+/// revealed in the file manager, never opened.
+pub fn opens_by_running(path: &std::path::Path) -> bool {
+    // What "open" runs everywhere: bundles, installers, shell scripts, launchers.
+    const LAUNCHERS: &[&str] = &[
+        "app", "command", "tool", "terminal", "pkg", "dmg", "scpt", "workflow", "action", "exe", "bat", "cmd", "ps1", "msi", "jar", "sh", "bash",
+        "zsh", "fish", "ksh", "csh", "desktop", "run", "appimage",
+    ];
+    // What Windows runs on a double-click — the script host, the shell, the
+    // registry editor, the Python launcher. There is no execute bit to ask.
+    #[cfg(windows)]
+    const PLATFORM: &[&str] = &[
+        "js", "jse", "vbs", "vbe", "wsf", "wsh", "hta", "scr", "pif", "com", "lnk", "msc", "cpl", "reg", "inf", "scf", "py", "pyw", "psm1", "psd1",
+        "msp", "mst", "application", "gadget", "iso", "vhd", "vhdx", "appref-ms", "settingcontent-ms", "library-ms",
+    ];
+    #[cfg(not(windows))]
+    const PLATFORM: &[&str] = &[];
+    let by_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            LAUNCHERS.contains(&e.as_str()) || PLATFORM.contains(&e.as_str())
+        })
+        .unwrap_or(false);
+    if by_ext {
+        return true;
+    }
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if meta.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// A canonical path the way the operating system's "open" wants it. On
+/// Windows `canonicalize` gives the verbatim form (`\\?\C:\…`), which the
+/// shell does not take; the prefix is dropped for it.
+pub fn shell_path(p: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p.to_path_buf()
+}
+
+/// Up to `max` bytes of a file, and whether there was more. The marker guard
+/// and the conflict view never need a whole file to decide.
+pub(crate) fn read_head(path: &std::path::Path, max: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)?.take(max as u64 + 1).read_to_end(&mut buf)?;
+    let more = buf.len() > max;
+    buf.truncate(max);
+    Ok((buf, more))
+}
+
+/// How much of a file the marker guard reads.
+pub(crate) const MARKER_SCAN_MAX: usize = 16 * 1024 * 1024;
+
 pub fn validate_repo_path(p: &str) -> Result<(), AppError> {
     let bad = p.is_empty()
         || p.starts_with('/')
@@ -437,7 +544,9 @@ pub fn validate_repo_path(p: &str) -> Result<(), AppError> {
 
 /// The argv for a push. Pure, so a test can prove what it can never contain.
 pub fn build_push_args(remote: &str, local_branch: &str, remote_ref: &str, set_upstream: bool) -> Vec<String> {
-    let mut a: Vec<String> = vec!["push".into(), "--porcelain".into()];
+    // `--progress`: the counters keep coming while bytes move, so the push is
+    // stopped only for silence (`stall`), never for the size of what it sends.
+    let mut a: Vec<String> = vec!["push".into(), "--porcelain".into(), "--progress".into()];
     if set_upstream {
         a.push("--set-upstream".into());
     }
@@ -519,6 +628,21 @@ pub struct PushOutcome {
     pub remote: String,
 }
 
+/// A submodule whose recorded commit this push advertises while no remote of
+/// the submodule has it — what `git push --recurse-submodules=check` looks
+/// for — or where that could not be checked. `state`: not-on-remote |
+/// not-here (the commit is not in the submodule's checkout) | not-populated.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct SubmodulePush {
+    pub path: String,
+    pub recorded: String,
+    pub recorded_short: String,
+    pub state: String,
+    /// Its checked-out branch; `None` when detached, where a push from it
+    /// needs a branch first.
+    pub branch: Option<String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct PullOutcome {
     pub mode: String,
@@ -534,6 +658,9 @@ pub struct PullOutcome {
     /// the conflicted files are in the tree and the stash entry is kept.
     pub autostash_conflict: bool,
     pub autostash_left: Option<String>,
+    /// Submodule pointers the pull moved: the repository now records other
+    /// commits for them than are checked out. Update aligns them.
+    pub submodules_moved: usize,
 }
 
 /// What every operation returns: whether it worked, what to tell the user, and
@@ -565,6 +692,16 @@ pub struct OpResult {
     pub tree: Option<crate::tree::TreeOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stash: Option<crate::stash::StashOutcome>,
+    /// Boxed: a debug build gives every OpResult temporary in every
+    /// operation's frames a stack slot of its own, and inline, this dozen
+    /// strings pushed `changes_sync_run` past a 2 MiB thread stack (see
+    /// every_heavy_command_future_stays_far_below_a_threads_stack).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<Box<crate::states::StateOutcome>>,
+    /// Submodules a push would leave a clone unable to check out (their
+    /// recorded commit is on no remote of theirs), or could not check.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unpushed_submodules: Vec<SubmodulePush>,
 }
 
 impl OpResult {
@@ -584,6 +721,8 @@ impl OpResult {
             sync: None,
             tree: None,
             stash: None,
+            state: None,
+            unpushed_submodules: Vec::new(),
         }
     }
 
@@ -644,7 +783,206 @@ pub(crate) fn advice_ctx<'a>(status: &'a RepoStatus) -> AdviceCtx<'a> {
 
 // --- Staging -------------------------------------------------------------
 
-pub async fn stage(repo_path: &str, paths: Vec<String>) -> Result<OpResult, AppError> {
+/// Lines (1-based) that still carry a conflict marker: every `<<<<<<<` that
+/// opens a hunk, finished or not, and a `>>>>>>>` with no hunk open — the
+/// shapes a half-done edit leaves behind. A bare `=======` on its own is not
+/// one (a Markdown heading underline looks exactly like it). `size` is the
+/// width git wrote: 7 unless the `conflict-marker-size` attribute says so.
+/// The same rule draws the conflict view, so the two never disagree.
+pub fn conflict_marker_lines(text: &str, size: usize) -> Vec<usize> {
+    let mut lines = Vec::new();
+    let mut open = false;
+    for (i, line) in text.lines().enumerate() {
+        match crate::git_status::marker_kind(line, size) {
+            Some('<') => {
+                open = true;
+                lines.push(i + 1);
+            }
+            Some('>') => {
+                if !open {
+                    lines.push(i + 1);
+                }
+                open = false;
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
+/// The marker width git writes for each path: 7, or what the
+/// `conflict-marker-size` attribute sets for it. One `check-attr` for all,
+/// the paths on its standard input so their number does not matter.
+pub(crate) async fn marker_sizes(repo: &std::path::Path, paths: &[String]) -> std::collections::BTreeMap<String, usize> {
+    let mut sizes = std::collections::BTreeMap::new();
+    if paths.is_empty() {
+        return sizes;
+    }
+    let mut stdin: Vec<u8> = Vec::new();
+    for p in paths {
+        stdin.extend_from_slice(p.as_bytes());
+        stdin.push(0);
+    }
+    let Ok(out) = GitCmd::at(repo).args(["check-attr", "--stdin", "-z", "conflict-marker-size"]).stdin_bytes(stdin).run().await else { return sizes };
+    if !out.ok() {
+        return sizes;
+    }
+    let fields: Vec<String> = out.stdout.split(|b| *b == 0).map(|p| String::from_utf8_lossy(p).to_string()).collect();
+    for rec in fields.chunks(3) {
+        if let [path, _attr, value] = rec {
+            if let Ok(n) = value.trim().parse::<usize>() {
+                if (3..=200).contains(&n) {
+                    sizes.insert(path.clone(), n);
+                }
+            }
+        }
+    }
+    sizes
+}
+
+pub(crate) fn marker_size_for(sizes: &std::collections::BTreeMap<String, usize>, path: &str) -> usize {
+    sizes.get(path).copied().unwrap_or(7)
+}
+
+/// The refusal for a file that still carries conflict markers.
+pub(crate) fn markers_refusal(path: &str, lines: &[usize]) -> Refusal {
+    let shown: Vec<String> = lines.iter().take(12).map(|n| n.to_string()).collect();
+    let more = lines.len().saturating_sub(shown.len());
+    refuse(
+        "conflict-markers",
+        format!(
+            "{} still contains conflict markers (line{} {}{}). Finish the edit, or Keep mine / Take theirs.",
+            path,
+            if lines.len() == 1 { "" } else { "s" },
+            shown.join(", "),
+            if more > 0 { format!(" and {} more", more) } else { String::new() }
+        ),
+    )
+}
+
+/// What one read of staged blobs may hold, and what the whole check may read.
+const MARKER_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const MARKER_SCAN_TOTAL: usize = 256 * 1024 * 1024;
+
+/// `git diff --cached --raw -z` records: the path and blob of every regular
+/// file the index adds or changes. Gitlinks and symlinks have no lines.
+fn parse_raw_blobs(raw: &[u8]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut it = raw.split(|b| *b == 0).filter(|t| !t.is_empty());
+    while let Some(meta) = it.next() {
+        if meta.first() != Some(&b':') {
+            continue;
+        }
+        let Some(path) = it.next() else { break };
+        let meta = String::from_utf8_lossy(meta);
+        let f: Vec<&str> = meta.split(' ').collect();
+        // ":<mode before> <mode after> <blob before> <blob after> <status>"
+        if f.len() >= 5 && f[1].starts_with("100") {
+            out.push((String::from_utf8_lossy(path).to_string(), f[3].to_string()));
+        }
+    }
+    out
+}
+
+/// `git cat-file --batch` output for the blobs asked for, in order: a header
+/// "<oid> blob <size>", the bytes, a newline — or "<oid> missing".
+fn first_marker_offence(batch_out: &[u8], batch: &[(String, String)], sizes: &std::collections::BTreeMap<String, usize>) -> Option<(String, Vec<usize>)> {
+    let mut rest = batch_out;
+    for (path, _) in batch {
+        let nl = rest.iter().position(|b| *b == b'\n')?;
+        let header = String::from_utf8_lossy(&rest[..nl]).to_string();
+        rest = &rest[nl + 1..];
+        let mut f = header.split(' ');
+        let (_, kind, size) = (f.next(), f.next(), f.next());
+        if kind != Some("blob") {
+            continue; // missing, or not a file's content
+        }
+        let size: usize = size?.parse().ok()?;
+        if rest.len() < size {
+            return None;
+        }
+        let content = &rest[..size];
+        rest = &rest[(size + 1).min(rest.len())..];
+        if content.iter().take(8000).any(|b| *b == 0) {
+            continue;
+        }
+        let lines = conflict_marker_lines(&String::from_utf8_lossy(content), marker_size_for(sizes, path));
+        if !lines.is_empty() {
+            return Some((path.clone(), lines));
+        }
+    }
+    None
+}
+
+/// The first staged text file that still carries conflict markers, read from
+/// the index — what `rebase --continue` or a commit would record. The diff
+/// names the staged blobs itself (no rename pairing, so a file moved while it
+/// was edited is still seen); they are read a batch at a time through
+/// `cat-file`, and judged by the same rule as "Mark resolved" and the
+/// conflict view. Nothing here depends on the person's colour, grep or diff
+/// settings, or on what an attribute calls binary.
+pub(crate) async fn staged_marker_offence(repo: &std::path::Path) -> Option<(String, Vec<usize>)> {
+    let out = GitCmd::at(repo)
+        .args(["diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames", "--no-color", "--diff-filter=AMT"])
+        .run()
+        .await
+        .ok()?;
+    if !out.ok() {
+        return None;
+    }
+    let staged = parse_raw_blobs(&out.stdout);
+    if staged.is_empty() {
+        return None;
+    }
+    let paths: Vec<String> = staged.iter().map(|(p, _)| p.clone()).collect();
+    let sizes = marker_sizes(repo, &paths).await;
+    // How large each blob is, before any of them is read.
+    let ids = |list: &[(String, String)]| -> Vec<u8> { list.iter().flat_map(|(_, oid)| format!("{}\n", oid).into_bytes()).collect() };
+    let check = GitCmd::at(repo).args(["cat-file", "--batch-check"]).stdin_bytes(ids(&staged)).run().await.ok()?;
+    if !check.ok() {
+        return None;
+    }
+    let blob_sizes: Vec<Option<usize>> = String::from_utf8_lossy(&check.stdout)
+        .lines()
+        .map(|l| {
+            let mut f = l.split(' ');
+            match (f.next(), f.next(), f.next()) {
+                (_, Some("blob"), Some(n)) => n.parse().ok(),
+                _ => None,
+            }
+        })
+        .collect();
+    let mut budget = MARKER_SCAN_TOTAL;
+    let mut batch: Vec<(String, String)> = Vec::new();
+    let mut batch_bytes = 0usize;
+    for (i, entry) in staged.iter().enumerate() {
+        let Some(size) = blob_sizes.get(i).copied().flatten() else { continue };
+        if size == 0 || size > MARKER_SCAN_MAX {
+            continue;
+        }
+        if size > budget {
+            break;
+        }
+        budget -= size;
+        batch_bytes += size;
+        batch.push(entry.clone());
+        if batch_bytes >= MARKER_BATCH_BYTES {
+            let read = GitCmd::at(repo).args(["cat-file", "--batch"]).stdin_bytes(ids(&batch)).private_output().run().await.ok()?;
+            if let Some(hit) = first_marker_offence(&read.stdout, &batch, &sizes) {
+                return Some(hit);
+            }
+            batch.clear();
+            batch_bytes = 0;
+        }
+    }
+    if batch.is_empty() {
+        return None;
+    }
+    let read = GitCmd::at(repo).args(["cat-file", "--batch"]).stdin_bytes(ids(&batch)).private_output().run().await.ok()?;
+    first_marker_offence(&read.stdout, &batch, &sizes)
+}
+
+pub async fn stage(repo_path: &str, paths: Vec<String>, allow_markers: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Stage, &StatusFacts::from(&before)) {
         return Ok(OpResult::refused(r, before));
@@ -655,6 +993,21 @@ pub async fn stage(repo_path: &str, paths: Vec<String>) -> Result<OpResult, AppE
         .filter(|e| e.kind == "conflicted" && paths.contains(&e.path))
         .map(|e| e.path.clone())
         .collect();
+    // "Mark resolved" on a file whose markers are still in it would stage the
+    // markers as the resolution. Refuse by name; the page offers "anyway".
+    if !allow_markers && !conflicted_before.is_empty() {
+        let sizes = marker_sizes(std::path::Path::new(repo_path), &conflicted_before).await;
+        for p in &conflicted_before {
+            let Ok((bytes, _)) = read_head(&std::path::Path::new(repo_path).join(p), MARKER_SCAN_MAX) else { continue };
+            if bytes.iter().take(8000).any(|b| *b == 0) {
+                continue;
+            }
+            let lines = conflict_marker_lines(&String::from_utf8_lossy(&bytes), marker_size_for(&sizes, p));
+            if !lines.is_empty() {
+                return Ok(OpResult::refused(markers_refusal(p, &lines), before));
+            }
+        }
+    }
 
     let stdin = pathspec_stdin(&paths)?;
     let out = GitCmd::at(repo_path)
@@ -1000,7 +1353,211 @@ pub fn parse_shortstat(s: &str) -> (usize, usize, usize) {
 
 // --- Push ----------------------------------------------------------------
 
-pub async fn push(repo_path: &str, set_upstream: bool) -> Result<OpResult, AppError> {
+/// What `push()` knows before choosing where the branch goes.
+#[derive(Debug, Default, Clone)]
+pub struct PushInputs {
+    pub branch: String,
+    /// The upstream as `git status` shows it (`origin/main`, or `dev` for a
+    /// branch that tracks a local one).
+    pub upstream: Option<String>,
+    pub branch_remote: Option<String>,
+    pub merge_ref: Option<String>,
+    pub push_remote: Option<String>,
+    pub push_default: Option<String>,
+    /// Every remote's name.
+    pub remotes: Vec<String>,
+    /// The caller asked for `--set-upstream`: the "Publish" button.
+    pub set_upstream: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PushTarget {
+    pub remote: String,
+    pub remote_ref: String,
+    pub set_upstream: bool,
+}
+
+/// Where a push goes, by the same rules as git's default (`push.default =
+/// simple`). An upstream of the SAME name is pushed to. One of a different
+/// name is refused: a branch started from `origin/main` with tracking would
+/// otherwise send its commits straight into main — git's own default refuses
+/// exactly this. A branch that tracks a local branch has no remote branch to
+/// go to. With no upstream the remote is the one git would choose
+/// (`pushRemote`, `pushDefault`, `branch.remote`, `origin`), or the only one
+/// there is; the branch is then published under its own name. "Publish"
+/// (`set_upstream`) always means: this name, on that remote, tracked from now
+/// on.
+pub fn resolve_push_target(i: &PushInputs) -> Result<PushTarget, Refusal> {
+    let own = format!("refs/heads/{}", i.branch);
+    let value = |s: &Option<String>| s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let branch_remote = value(&i.branch_remote);
+    let tracks_local = branch_remote.as_deref() == Some(".");
+    let upstream_remote = branch_remote.clone().filter(|r| r != ".");
+
+    // 1. Which remote — git's own precedence: branch.<b>.pushRemote, then
+    //    remote.pushDefault (a fork, in a triangular workflow), then the
+    //    upstream's remote, then origin, then the only one there is.
+    let picked = value(&i.push_remote).or_else(|| value(&i.push_default)).or_else(|| upstream_remote.clone());
+    let remote = match picked {
+        Some(r) => r,
+        None if i.remotes.iter().any(|r| r == "origin") => "origin".to_string(),
+        None if i.remotes.len() == 1 => i.remotes[0].clone(),
+        None if i.remotes.is_empty() => {
+            return Err(refuse(
+                "no-remote",
+                "This repository has no remote to push to. Add one first — `git remote add origin <url>` in the terminal.",
+            ))
+        }
+        None => {
+            return Err(refuse(
+                "ambiguous-remote",
+                format!(
+                    "This branch has no upstream and there are {} remotes ({}), none called origin. Tell git which one to use — `git config remote.pushDefault <name>` — or push once from the terminal with `git push -u <remote> {}`.",
+                    i.remotes.len(),
+                    i.remotes.join(", "),
+                    i.branch
+                ),
+            ))
+        }
+    };
+
+    // 2. A branch tracking a LOCAL branch has no remote branch to go to.
+    if tracks_local && !i.set_upstream {
+        return Err(refuse(
+            "local-upstream",
+            format!(
+                "This branch tracks the local branch `{}`, not a remote one, so a push has nowhere to go. Publish it as `{}/{}` instead.",
+                i.upstream.as_deref().unwrap_or("?"),
+                remote,
+                i.branch
+            ),
+        ));
+    }
+
+    // 3. Pushing to the upstream's own remote: the branch there must have the
+    //    same name (`push.default = simple`), or a branch started from
+    //    `origin/main` with tracking would send its commits into main. A
+    //    DIFFERENT remote (pushRemote / pushDefault) is a triangular workflow:
+    //    git pushes the branch under its own name there and asks nothing.
+    if let (Some(_), Some(up_remote)) = (&i.upstream, &upstream_remote) {
+        if *up_remote == remote {
+            let merge = value(&i.merge_ref).unwrap_or_else(|| own.clone());
+            if merge != own && !i.set_upstream {
+                let there = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+                return Err(refuse(
+                    "upstream-name-differs",
+                    format!(
+                        "This branch tracks `{remote}/{there}`, which has a different name, so pushing would send your commits into `{there}`. Publish it as `{remote}/{branch}` instead.",
+                        branch = i.branch
+                    ),
+                ));
+            }
+            let re_pointed = merge != own;
+            return Ok(PushTarget { remote, remote_ref: own, set_upstream: i.set_upstream || re_pointed });
+        }
+        return Ok(PushTarget { remote, remote_ref: own, set_upstream: i.set_upstream });
+    }
+
+    // No remote upstream: publish under the branch's own name, tracked from now on.
+    Ok(PushTarget { remote, remote_ref: own, set_upstream: true })
+}
+
+/// Every submodule pointer the commits being pushed set — `since..HEAD` for
+/// the remote's current tip, every commit no remote-tracking branch of that
+/// remote has for a first publish — and whether the commit each points at is
+/// on a remote-tracking branch of the remote a clone would fetch it from. A
+/// clone may check out any of the pushed commits, so an intermediate pointer
+/// counts as much as HEAD's (`git push --recurse-submodules=check` walks the
+/// same commits). Read with -z, so a path with non-ASCII bytes is itself.
+pub(crate) async fn submodules_needing_push(repo_path: &str, remote: &str, since: Option<&str>) -> Vec<SubmodulePush> {
+    let repo = std::path::Path::new(repo_path);
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        "-z".into(),
+        "--raw".into(),
+        "--no-abbrev".into(),
+        "--no-renames".into(),
+        "--ignore-submodules=none".into(),
+        "--diff-filter=AMT".into(),
+        "--format=".into(),
+    ];
+    match since {
+        Some(base) => args.push(format!("{}..HEAD", base)),
+        None => args.extend(["HEAD".to_string(), "--not".to_string(), format!("--remotes={}", remote)]),
+    }
+    let Ok(out) = GitCmd::at(repo_path).args(args.iter().map(String::as_str)).run().await else { return Vec::new() };
+    if !out.ok() {
+        return Vec::new();
+    }
+    // `:<srcmode> <dstmode> <src> <dst> <status>\0<path>\0`, per change.
+    let toks: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+    let mut pointers: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        if t.first() == Some(&b':') {
+            let header = String::from_utf8_lossy(t).to_string();
+            let f: Vec<&str> = header.split(' ').collect();
+            if f.len() >= 5 && f[1] == "160000" {
+                if let Some(p) = toks.get(i + 1) {
+                    pointers.insert((String::from_utf8_lossy(p).to_string(), f[3].to_string()));
+                }
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    if pointers.is_empty() {
+        return Vec::new();
+    }
+    let declared = crate::submodules::parse_gitmodules(&crate::submodules::gitmodules_listing(repo).await);
+    let super_url = GitCmd::at(repo_path)
+        .args(["config", "--get", &format!("remote.{}.url", remote)])
+        .ok_text()
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut out_list = Vec::new();
+    for (path, recorded) in pointers {
+        let sub = repo.join(&path);
+        let populated = sub.join(".git").exists() && GitCmd::at(&sub).args(["rev-parse", "--git-dir"]).ok_text().await.is_some();
+        let branch = if populated {
+            GitCmd::at(&sub).args(["symbolic-ref", "-q", "--short", "HEAD"]).ok_text().await.map(|b| b.trim().to_string()).filter(|b| !b.is_empty())
+        } else {
+            None
+        };
+        let state = if !populated {
+            "not-populated"
+        } else if !GitCmd::at(&sub).args(["cat-file", "-e", &format!("{}^{{commit}}", recorded)]).run().await.map(|o| o.ok()).unwrap_or(false) {
+            "not-here"
+        } else {
+            let which = crate::submodules::clone_remote(&sub, declared.get(&path).and_then(|m| m.url.as_deref()), super_url.as_deref()).await;
+            if crate::submodules::on_remote(&sub, &recorded, which.as_deref()).await {
+                continue;
+            }
+            "not-on-remote"
+        };
+        out_list.push(SubmodulePush { recorded_short: recorded.chars().take(7).collect(), recorded, path, state: state.into(), branch });
+    }
+    out_list
+}
+
+/// One sentence per submodule the push check could not clear, for a push
+/// that went ahead. "Has" means a remote-tracking branch here has it: what
+/// this checkout knows, which a fetch may update.
+fn submodule_push_notes(checks: &[SubmodulePush]) -> Vec<String> {
+    checks
+        .iter()
+        .map(|s| match s.state.as_str() {
+            "not-on-remote" => format!("Pushed anyway: {} records {}, which none of its remote-tracking branches has here — push {} too.", s.path, s.recorded_short, s.path),
+            "not-here" => format!("{} records {}, a commit its checkout here does not have, so whether a remote has it could not be checked.", s.path, s.recorded_short),
+            _ => format!("{} is not initialised here, so whether a remote has {} could not be checked.", s.path, s.recorded_short),
+        })
+        .collect()
+}
+
+pub async fn push(repo_path: &str, set_upstream: bool, allow_unpushed_submodules: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Push, &StatusFacts::from(&before)) {
         return Ok(OpResult::refused(r, before));
@@ -1012,36 +1569,67 @@ pub async fn push(repo_path: &str, set_upstream: bool) -> Result<OpResult, AppEr
         ));
     };
 
-    // Which remote, and which ref on it.
-    let (remote, remote_ref) = match &before.upstream {
-        Some(up) => {
-            let remote = up.split('/').next().unwrap_or("origin").to_string();
-            let merge_ref = GitCmd::at(repo_path)
-                .args(["config", "--get", &format!("branch.{}.merge", branch)])
-                .ok_text()
-                .await
-                .filter(|s| s.starts_with("refs/heads/"))
-                .unwrap_or_else(|| format!("refs/heads/{}", branch));
-            (remote, merge_ref)
-        }
-        None => (
-            before
-                .push
-                .remotes
-                .first()
-                .map(|r| r.name.clone())
-                .unwrap_or_else(|| "origin".into()),
-            format!("refs/heads/{}", branch),
-        ),
+    // Which remote, and which branch there — from git's own records
+    // (`branch.<b>.remote` / `.merge`), not parsed out of the upstream's
+    // display name, which a remote named with a slash or a branch tracking a
+    // LOCAL branch (`remote = .`) would both defeat.
+    let cfg = |key: String| GitCmd::at(repo_path).args(["config", "--get", key.as_str()]).ok_text();
+    let inputs = PushInputs {
+        branch: branch.clone(),
+        upstream: before.upstream.clone(),
+        branch_remote: cfg(format!("branch.{}.remote", branch)).await,
+        merge_ref: cfg(format!("branch.{}.merge", branch)).await,
+        push_remote: cfg(format!("branch.{}.pushRemote", branch)).await,
+        push_default: cfg("remote.pushDefault".to_string()).await,
+        remotes: before.push.remotes.iter().map(|r| r.name.clone()).collect(),
+        set_upstream,
     };
+    let target = match resolve_push_target(&inputs) {
+        Ok(t) => t,
+        Err(r) => return Ok(OpResult::refused(r, before)),
+    };
+    let PushTarget { remote, remote_ref, set_upstream: needs_upstream } = target;
     crate::git_exec::validate_remote_name(&remote)?;
     crate::git_exec::validate_branch_name(&branch)?;
-
-    let needs_upstream = before.upstream.is_none() || set_upstream;
+    // What this push advertises: every submodule pointer the remote's tip does
+    // not already record must point at a commit some remote of the submodule
+    // has, or a clone of the pushed branch cannot check it out — the check
+    // `git push --recurse-submodules=check` makes. Refused with the
+    // submodules named; pushing anyway is the person's call.
+    let remote_tip = GitCmd::at(repo_path)
+        .args(["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{}/{}^{{commit}}", remote, remote_ref.trim_start_matches("refs/heads/"))])
+        .ok_text()
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let sub_checks = submodules_needing_push(repo_path, &remote, remote_tip.as_deref()).await;
+    let unpushed: Vec<&SubmodulePush> = sub_checks.iter().filter(|s| s.state == "not-on-remote").collect();
+    if !unpushed.is_empty() && !allow_unpushed_submodules {
+        let msg = if unpushed.len() == 1 {
+            let s = unpushed[0];
+            let how = if s.state == "not-on-remote" && s.branch.is_none() {
+                "(it is detached — start a branch there first)"
+            } else {
+                "(or fetch it, if that commit was pushed from elsewhere)"
+            };
+            format!(
+                "{} records {}, which none of {}'s remote-tracking branches has — as far as this checkout knows. Anyone fetching this push could not check it out. Push {} first {}, or push anyway.",
+                s.path, s.recorded_short, s.path, s.path, how
+            )
+        } else {
+            format!(
+                "{} record commits that none of their remote-tracking branches has — as far as this checkout knows. Anyone fetching this push could not check them out. Push them first (or fetch them, if those commits were pushed from elsewhere), or push anyway.",
+                unpushed.iter().map(|s| format!("{} ({})", s.path, s.recorded_short)).collect::<Vec<_>>().join(", ")
+            )
+        };
+        let mut r = OpResult::refused(refuse("submodules-unpushed", msg), before);
+        r.unpushed_submodules = sub_checks;
+        return Ok(r);
+    }
     let args = build_push_args(&remote, &branch, &remote_ref, needs_upstream);
     let out = GitCmd::at(repo_path)
         .args(args)
-        .timeout(NET_TIMEOUT)
+        .stall(crate::git_exec::net_stall())
         .run()
         .await?;
 
@@ -1071,15 +1659,20 @@ pub async fn push(repo_path: &str, set_upstream: bool) -> Result<OpResult, AppEr
     } else {
         format!("Pushed to {}.", remote)
     };
-    let detail = outcome
+    let mut detail = outcome
         .refs
         .iter()
         .map(|r| format!("{} {}", r.to, r.summary))
         .collect::<Vec<_>>()
         .join(", ");
+    let notes = submodule_push_notes(&sub_checks);
+    if !notes.is_empty() {
+        detail = format!("{} {}", detail, notes.join(" ")).trim().to_string();
+    }
 
     Ok(OpResult {
         push: Some(outcome),
+        unpushed_submodules: sub_checks,
         ..OpResult::done(headline, detail, after)
     })
 }
@@ -1112,23 +1705,81 @@ pub fn parse_push_porcelain(out: &str) -> Vec<PushedRef> {
 /// and `branch.<n>.rebase`, so the same button could merge for one user and
 /// rebase for another. Fetch and integrate are separate, and the mode the user
 /// picked is the command that runs.
-pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bool) -> Result<OpResult, AppError> {
+/// `source`: integrate a named remote-tracking branch ("origin/main") instead
+/// of the branch's upstream — every Pull rule still applies, with it standing
+/// in for the upstream.
+pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bool, source: Option<&str>) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
-    if let Some(r) = check(&Intent::Pull { mode, autostash }, &StatusFacts::from(&before)) {
+    let mut facts = StatusFacts::from(&before);
+    if let Some(src) = source {
+        facts.upstream = Some(src.to_string());
+    }
+    if let Some(r) = check(&Intent::Pull { mode, autostash }, &facts) {
         return Ok(OpResult::refused(r, before));
     }
+    if let Some(src) = source {
+        return Box::pin(pull_from(repo_path, before, mode, with_lfs, autostash, src)).await;
+    }
     let upstream = before.upstream.clone().unwrap_or_default();
-    let remote = upstream.split('/').next().unwrap_or("origin").to_string();
+    // The remote by git's own record, so a remote named with a slash is read
+    // whole and a branch tracking a LOCAL branch is told apart.
+    let branch = before.branch.clone().unwrap_or_default();
+    let branch_remote = GitCmd::at(repo_path)
+        .args(["config", "--get", &format!("branch.{}.remote", branch)])
+        .ok_text()
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if branch_remote.as_deref() == Some(".") {
+        return Ok(OpResult::refused(
+            refuse(
+                "local-upstream",
+                format!(
+                    "This branch tracks the local branch `{}`, not a remote one, so there is nothing to fetch. To bring its commits in, merge or rebase onto `{}` from the terminal.",
+                    upstream, upstream
+                ),
+            ),
+            before,
+        ));
+    }
+    let remote = branch_remote.unwrap_or_else(|| upstream.split('/').next().unwrap_or("origin").to_string());
+    Box::pin(pull_integrate(repo_path, before, mode, with_lfs, autostash, remote, upstream)).await
+}
+
+/// Pull from a named remote-tracking branch: the configured remote it starts
+/// with (the longest, so a remote named with a slash is read whole), the rest
+/// its branch.
+async fn pull_from(repo_path: &str, before: RepoStatus, mode: PullMode, with_lfs: bool, autostash: bool, src: &str) -> Result<OpResult, AppError> {
+    let remotes: Vec<String> = GitCmd::at(repo_path).args(["remote"]).ok_text().await.unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    let Some(remote) = remotes.iter().filter(|r| src.starts_with(&format!("{}/", r))).max_by_key(|r| r.len()).cloned() else {
+        return Ok(OpResult::refused(refuse("no-such-remote", format!("`{}` doesn't start with a remote of this repository.", src)), before));
+    };
+    crate::git_exec::validate_branch_name(&src[remote.len() + 1..])?;
+    Box::pin(pull_integrate(repo_path, before, mode, with_lfs, autostash, remote, src.to_string())).await
+}
+
+/// The fetch and the merge or rebase of a pull, `upstream` being the
+/// remote-tracking branch integrated (`<remote>/<branch>`).
+async fn pull_integrate(repo_path: &str, before: RepoStatus, mode: PullMode, with_lfs: bool, autostash: bool, remote: String, upstream: String) -> Result<OpResult, AppError> {
+    let named = before.upstream.as_deref() != Some(upstream.as_str());
     crate::git_exec::validate_remote_name(&remote)?;
     let head_before = before.head_oid.clone().unwrap_or_default();
 
     // Fetch only the remote's own refs: no refspec, no --prune, no --tags, so
-    // nothing local can move in this step.
+    // nothing local can move in this step. No submodule recursion either —
+    // `fetch.recurseSubmodules=on-demand` would fail the whole pull on one
+    // unreachable submodule remote. `--progress`, so a big fetch is stopped
+    // only when it goes silent, never for taking long — and kept as a pack
+    // (`fetch.unpackLimit=1`), because git reports nothing at all while it
+    // unpacks a fetch of under a hundred objects, however big they are.
     let fetched = GitCmd::at(repo_path)
-        .args(["fetch", "--quiet", "--", &remote])
-        .timeout(NET_TIMEOUT)
+        .for_fetch()
+        .args(["fetch", "--progress", "--no-recurse-submodules", "--", &remote])
         .run()
         .await?;
+    if fetched.ok() {
+        crate::git_exec::housekeeping(repo_path).await;
+    }
     if !fetched.ok() {
         let after = snapshot(repo_path).await?;
         let a = git_advice::explain(GitOp::Fetch, &fetched.stderr, &advice_ctx(&after));
@@ -1137,7 +1788,34 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
 
     // Fully qualified, so a local branch of the same name can't win.
     let upstream_ref = format!("refs/remotes/{}", upstream);
-    let out = GitCmd::at(repo_path)
+    if named {
+        if GitCmd::at(repo_path).args(["rev-parse", "--verify", "--quiet", &upstream_ref]).ok_text().await.is_none() {
+            let after = snapshot(repo_path).await?;
+            return Ok(OpResult::refused(refuse("no-such-remote-branch", format!("{} has no branch `{}` — nothing to rebase onto.", remote, &upstream[remote.len() + 1..])), after));
+        }
+        // A rebase re-writes my commits: never one a remote branch already
+        // has, which only a force push could replace — GitSwitch never does.
+        if mode == PullMode::Rebase {
+            let count = |args: Vec<String>| async move { GitCmd::at(repo_path).args(args).ok_text().await.and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0) };
+            let mine = count(vec!["rev-list".into(), "--count".into(), format!("{}..HEAD", upstream_ref)]).await;
+            let unpushed = count(vec!["rev-list".into(), "--count".into(), "HEAD".into(), "--not".into(), upstream_ref.clone(), "--remotes".into()]).await;
+            if mine > unpushed {
+                let after = snapshot(repo_path).await?;
+                return Ok(OpResult::refused(
+                    refuse(
+                        "would-rewrite-pushed",
+                        format!("{} of the commits a rebase onto {} would re-write are already on a remote branch, and only a force push could replace them. Pull with merge instead.", mine - unpushed, upstream),
+                    ),
+                    after,
+                ));
+            }
+        }
+    }
+    // Large files are downloaded after, by the step below, not inside the
+    // merge or rebase on its 180s clock (see LfsAround).
+    let lfs = lfs_before(repo_path, &before).await;
+    let out = lfs
+        .apply(GitCmd::at(repo_path))
         .args(build_integrate_args(mode, &upstream_ref, autostash))
         .timeout(NET_TIMEOUT)
         .run()
@@ -1214,6 +1892,7 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
         },
         autostash_conflict,
         autostash_left: if autostash_conflict { Some("stash@{0}".to_string()) } else { None },
+        submodules_moved: after.entries.iter().filter(|e| e.is_submodule && e.sub_commit_changed).count(),
     };
 
     if autostash_conflict {
@@ -1311,7 +1990,9 @@ pub async fn pull(repo_path: &str, mode: PullMode, with_lfs: bool, autostash: bo
 
 // --- Submodules ----------------------------------------------------------
 
-pub async fn submodule_update(repo_path: &str) -> Result<OpResult, AppError> {
+/// `paths`: only these submodules (the ones never initialised, from the UI);
+/// `None` means every listed one — the clone-time behaviour.
+pub async fn submodule_update(repo_path: &str, paths: Option<Vec<String>>) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Submodule, &StatusFacts::from(&before)) {
         return Ok(OpResult::refused(r, before));
@@ -1332,8 +2013,110 @@ pub async fn submodule_update(repo_path: &str) -> Result<OpResult, AppError> {
     // Reuse the clone path's per-submodule loop: a batch `submodule update`
     // aborts on the first gitlink missing from .gitmodules and leaves the rest
     // cloned-but-empty.
-    let report = crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url).await;
+    if let Some(p) = &paths {
+        for path in p {
+            validate_repo_path(path)?;
+        }
+    }
+    // A populated submodule this moves — to the commit recorded for it — must
+    // lose nothing: no changes, operation or conflicts inside, no commit only
+    // its detached HEAD (or a nested one's: `--recursive` moves those too)
+    // holds. One that was never checked out has nothing to lose.
+    let mut was_populated: Vec<String> = Vec::new();
+    if let Some(p) = &paths {
+        let mut blockers: Vec<Refusal> = Vec::new();
+        for path in p {
+            let dir = PathBuf::from(repo_path).join(path);
+            if !(crate::sparse::own_repository(&dir).await && crate::sparse::is_checked_out(&dir).await) {
+                continue;
+            }
+            was_populated.push(path.clone());
+            let recorded = crate::tree::recorded_gitlink(repo_path, path).await;
+            if let Some(r) = Box::pin(crate::tree::submodule_move_blocker(repo_path, path, recorded.as_deref(), true)).await? {
+                blockers.push(r);
+            }
+        }
+        if let Some(first) = blockers.first() {
+            let message = blockers.iter().map(|r| r.message.as_str()).collect::<Vec<_>>().join(" ");
+            return Ok(OpResult::refused(refuse(&first.code, message), before));
+        }
+    }
+    let guarded = before.push.repo_blocked || before.push.lock.locked;
+    // What was really there before — checked out, not an interrupted
+    // download's leftovers, which the download clears and fetches again: what
+    // this download populates gets the repository's push treatment and its
+    // large-file step.
+    let mut populated_before = Vec::new();
+    for p in crate::push_guard::populated_submodules(std::path::Path::new(repo_path)).await {
+        if crate::sparse::is_checked_out(&std::path::Path::new(repo_path).join(&p)).await {
+            populated_before.push(p);
+        }
+    }
+    // Progress is recorded under the repository's path, for the page's strip,
+    // and removed when the download is over (however it ended).
+    let report = {
+        let _progress = crate::sparse::ProgressGuard::hold(repo_path);
+        let profile = crate::git_status::owning_profile_id(repo_path);
+        Box::pin(crate::sparse::update_submodules(&PathBuf::from(repo_path), None, None, &url, paths.as_deref(), Some(repo_path), profile.as_deref())).await
+    };
+    // A submodule this download populated — nested ones included — under a
+    // blocked or locked repository gets the same guard-rail at once; the
+    // lock's own layer for it is Repair's.
+    let mut inherited = String::new();
+    let fresh: Vec<String> = crate::push_guard::populated_submodules(std::path::Path::new(repo_path)).await.into_iter().filter(|p| !populated_before.contains(p)).collect();
+    // Their large files are fetched when the repository's own are all here
+    // (whoever keeps those keeps these) — and git-lfs is set up in them before
+    // any push guard is, so the guard chains its hook instead of git-lfs
+    // refusing to install next to the guard's.
+    let lfs_requested = !fresh.is_empty() && crate::lfs::lfs_status(repo_path).await.ok().is_some_and(|s| s.uses_lfs && s.installed && s.pointers == 0);
+    if lfs_requested {
+        for rel in &fresh {
+            lfs_setup_before_guard(&PathBuf::from(repo_path).join(rel).to_string_lossy()).await;
+        }
+    }
+    if guarded && !fresh.is_empty() {
+        let notes = crate::push_guard::cover_submodules(repo_path, Some(&fresh)).await;
+        inherited = if !notes.is_empty() {
+            format!(" Could not extend the push block to: {}.", notes.join("; "))
+        } else if before.push.lock.locked {
+            let out = Box::pin(crate::push_lock::lock_downloaded_submodules(repo_path, &fresh)).await;
+            if out.applied() {
+                " Pushes are locked here, so the downloaded submodule(s) were locked too, with the repository's lock.".to_string()
+            } else {
+                format!(
+                    " Pushes are locked here; the downloaded submodule(s) got the same guard-rail but not the lock ({}) — Repair (administrator) under Push access adds it.",
+                    out.message.trim_end_matches('.')
+                )
+            }
+        } else {
+            " Pushes are blocked here, so the downloaded submodule(s) got the same guard-rail.".to_string()
+        };
+    }
+    // The large files of what this download populated: fetched as decided
+    // above, said either way — a submodule's stubs are never left silent.
+    let mut lfs_notes = String::new();
+    if !fresh.is_empty() {
+        let _progress = crate::sparse::ProgressGuard::hold(repo_path);
+        for s in Box::pin(crate::sparse::lfs_in_submodules(std::path::Path::new(repo_path), Some(&fresh), lfs_requested, Some(repo_path))).await {
+            lfs_notes.push_str(&format!(" Git LFS in {}: {}", s.path, s.report.note));
+        }
+    }
     let after = snapshot(repo_path).await?;
+    // `git submodule update` can exit 0 and leave a populated one where it
+    // was (`update = none` somewhere git reads it, a merge of an ancestor):
+    // measured here, never assumed from the exit code.
+    let mut stuck: Vec<String> = Vec::new();
+    for path in &was_populated {
+        if report.failed_paths.contains(path) {
+            continue;
+        }
+        let dir = PathBuf::from(repo_path).join(path);
+        if let (Some(h), Some(r)) = (crate::sync::oid(&dir, "HEAD").await, crate::tree::recorded_gitlink(repo_path, path).await) {
+            if h != r {
+                stuck.push(format!("{} is at {}, not the recorded {}", path, crate::sync::short(&h), crate::sync::short(&r)));
+            }
+        }
+    }
 
     let headline = format!("{} of {} submodule(s) up to date.", report.downloaded, report.listed);
     let mut detail = String::new();
@@ -1343,10 +2126,25 @@ pub async fn submodule_update(repo_path: &str) -> Result<OpResult, AppError> {
             report.unlisted
         ));
     }
+    if !report.cleared.is_empty() {
+        detail.push_str(&format!("An interrupted download of {} was cleared before downloading again. ", report.cleared.join(", ")));
+    }
     if let Some(err) = &report.error {
         detail.push_str(err);
     }
+    detail.push_str(&inherited);
+    detail.push_str(&lfs_notes);
+    let detail = detail.trim().to_string();
 
+    if !stuck.is_empty() {
+        let advice = Advice {
+            headline: "Not every submodule reached the commit this repository records.".to_string(),
+            guidance: format!("Not moved: {}. {}", stuck.join("; "), detail).trim().to_string(),
+            action: None,
+            git_said: String::new(),
+        };
+        return Ok(OpResult { submodules: Some(report), ..OpResult::failed(advice, after) });
+    }
     Ok(OpResult {
         submodules: Some(report),
         ..OpResult::done(headline, detail, after)
@@ -1366,8 +2164,13 @@ pub struct LfsFetch {
     /// The repository had no LFS filters, so `git lfs install --local` was run
     /// first — without it `git lfs pull` exits 0 and downloads nothing.
     pub configured_now: bool,
-    /// git-lfs failed. The caller decides how loudly to say so.
+    /// git-lfs failed and files are still missing. The caller decides how
+    /// loudly to say so.
     pub error: Option<Advice>,
+    /// git-lfs exited with an error, yet no file is missing — an object it
+    /// could not fetch whose file is already here, or a stop after the last
+    /// file was written. Said, never reported as a failure.
+    pub warning: Option<Advice>,
 }
 
 impl LfsFetch {
@@ -1377,6 +2180,91 @@ impl LfsFetch {
             fetched: 0,
             configured_now: false,
             error: None,
+            warning: None,
+        }
+    }
+}
+
+/// Large files around a command that rewrites the worktree: a switch, a hard
+/// reset, a revert, a cherry-pick, the merge or rebase of a pull.
+///
+/// Left to itself, git downloads every large file such a command touches
+/// INSIDE the command, through the smudge filter: on a local timeout, with
+/// nothing on screen moving, and a kill at the deadline leaves the worktree
+/// half written. So the command runs with `GIT_LFS_SKIP_SMUDGE=1` — pointer
+/// stubs are written instantly — and the download is a separate step on the
+/// large-file clock, with its progress banner. When every large file was
+/// present before, the download runs so that stays true; a deliberately
+/// partial checkout (one folder downloaded) is left partial, and said.
+pub(crate) struct LfsAround {
+    skip: bool,
+    complete_before: bool,
+}
+
+impl LfsAround {
+    /// For a command that does not touch the worktree.
+    pub(crate) fn none() -> Self {
+        LfsAround { skip: false, complete_before: false }
+    }
+
+    pub(crate) fn apply(&self, cmd: GitCmd) -> GitCmd {
+        if self.skip {
+            cmd.env("GIT_LFS_SKIP_SMUDGE", "1")
+        } else {
+            cmd
+        }
+    }
+}
+
+pub(crate) async fn lfs_before(repo: &str, before: &RepoStatus) -> LfsAround {
+    if !before.uses_lfs {
+        return LfsAround::none();
+    }
+    match crate::lfs::lfs_status(repo).await {
+        Ok(s) if s.installed => LfsAround { skip: true, complete_before: s.pointers == 0 },
+        // Without git-lfs there is no smudge filter to wait on.
+        _ => LfsAround::none(),
+    }
+}
+
+/// After the command succeeded: what became of the large files, as a sentence
+/// (with its leading space) for the result's detail — or nothing to add.
+pub(crate) async fn lfs_after(repo: &str, plan: &LfsAround) -> String {
+    if !plan.skip {
+        return String::new();
+    }
+    if plan.complete_before {
+        return match fetch_lfs_content(repo).await {
+            Ok(done) => match done.error {
+                Some(a) => format!(" The large files didn't download: {} The LFS card can fetch them.", a.headline),
+                None if done.fetched > 0 => {
+                    format!(" Downloaded {} LFS file{}.", done.fetched, if done.fetched == 1 { "" } else { "s" })
+                }
+                None => String::new(),
+            },
+            Err(e) => format!(" The large files didn't download: {}", e),
+        };
+    }
+    match crate::lfs::lfs_status(repo).await {
+        Ok(s) if s.pointers > 0 => format!(
+            " {} LFS file{} here {} a pointer stub; the LFS card downloads them.",
+            s.pointers,
+            if s.pointers == 1 { "" } else { "s" },
+            if s.pointers == 1 { "is" } else { "are" }
+        ),
+        _ => String::new(),
+    }
+}
+
+/// git-lfs's own setup (its filters and hooks) in a repository that uses large
+/// files and has none — run BEFORE a push guard adds its pre-push hook: git-lfs
+/// refuses to install over a hook that is not its own, while the guard keeps
+/// and chains whatever hook it finds. The other way round, every large file
+/// would stay a stub.
+pub(crate) async fn lfs_setup_before_guard(dir: &str) {
+    if let Ok(s) = crate::lfs::lfs_status(dir).await {
+        if s.uses_lfs && s.installed && !s.filters_configured {
+            let _ = GitCmd::at(dir).args(["lfs", "install", "--local"]).timeout(LOCAL_TIMEOUT).run().await;
         }
     }
 }
@@ -1385,6 +2273,13 @@ impl LfsFetch {
 /// one that doesn't use LFS, has no stubs, or has no git-lfs installed simply
 /// reports that nothing was done.
 pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppError> {
+    Box::pin(fetch_lfs_content_reporting(repo_path, crate::lfs::progress_path(repo_path))).await
+}
+
+/// The same, with git-lfs's progress written to `progress_at` — the file the
+/// page polls. A submodule's download after an update reports into the
+/// superproject's, which is the one the page is looking at.
+pub(crate) async fn fetch_lfs_content_reporting(repo_path: &str, progress_at: std::path::PathBuf) -> Result<LfsFetch, AppError> {
     let before = crate::lfs::lfs_status(repo_path).await?;
     if !before.uses_lfs || !before.installed || before.pointers == 0 {
         return Ok(LfsFetch::nothing_to_do(before));
@@ -1409,12 +2304,13 @@ pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppEr
                 fetched: 0,
                 configured_now: false,
                 error: Some(advice),
+                warning: None,
             });
         }
         configured_now = true;
     }
 
-    let progress = crate::lfs::ProgressFile::start_at(crate::lfs::progress_path(repo_path));
+    let progress = crate::lfs::ProgressFile::start_at(progress_at);
     let out = GitCmd::at(repo_path)
         .args(["lfs", "pull"])
         // Gigabytes of large files are normal; a transfer that is still moving
@@ -1426,17 +2322,27 @@ pub(crate) async fn fetch_lfs_content(repo_path: &str) -> Result<LfsFetch, AppEr
         .await?;
     drop(progress);
 
-    // Measure, don't assume: count the stubs again.
+    // Measure, don't assume: count the stubs again. The exit code is not the
+    // answer either way — git-lfs also fails on an object whose file is
+    // already here, or is stopped after it wrote the last one. Every stub
+    // filled, with every file still counted (a scan that failed would list
+    // none and read as "nothing missing"), is a warning, not a failure.
     let after = crate::lfs::lfs_status(repo_path).await?;
     let fetched = before.pointers.saturating_sub(after.pointers);
-    let error = if out.ok() {
-        None
+    let complete = after.pointers == 0 && after.tracked >= before.tracked;
+    let (error, warning) = if out.ok() {
+        (None, None)
     } else {
         let stderr = if out.stderr.is_empty() { out.text() } else { out.stderr.clone() };
-        Some(git_advice::explain(GitOp::Lfs, &stderr, &AdviceCtx::default()))
+        let advice = git_advice::explain(GitOp::Lfs, &stderr, &AdviceCtx::default());
+        if complete {
+            (None, Some(advice))
+        } else {
+            (Some(advice), None)
+        }
     };
 
-    Ok(LfsFetch { after, fetched, configured_now, error })
+    Ok(LfsFetch { after, fetched, configured_now, error, warning })
 }
 
 pub async fn lfs_pull(repo_path: &str) -> Result<OpResult, AppError> {
@@ -1453,7 +2359,7 @@ pub async fn lfs_pull(repo_path: &str) -> Result<OpResult, AppError> {
     if !lfs_before.installed {
         return Ok(OpResult::refused_alone(refuse(
             "lfs-not-installed",
-            "git-lfs isn't installed on this Mac, so the large files can't be downloaded. Install it (brew install git-lfs) and try again.",
+            format!("git-lfs isn't installed on this computer, so the large files can't be downloaded. Install it with {} and try again.", crate::lfs::install_hint()),
         )));
     }
     let before = snapshot(repo_path).await?;
@@ -1515,8 +2421,13 @@ pub async fn lfs_pull(repo_path: &str) -> Result<OpResult, AppError> {
     if configured_now {
         detail.push_str(" (LFS filters were not set up for this repository, so `git lfs install --local` was run first.)");
     }
+    if let Some(w) = &done.warning {
+        detail.push_str(&format!(" git-lfs still exited with an error, but no file is missing: {}", w.headline));
+    }
     Ok(OpResult {
         lfs: Some(lfs_after),
+        // git-lfs's own words stay under "what git said"; the card stays green.
+        advice: done.warning.map(|w| Advice { guidance: String::new(), action: None, ..w }),
         ..OpResult::done(headline, detail, after)
     })
 }
@@ -1541,7 +2452,7 @@ pub async fn lfs_pull_paths(repo_path: &str, paths: Vec<String>) -> Result<OpRes
     if !before.installed {
         return Ok(OpResult::refused_alone(refuse(
             "lfs-not-installed",
-            "git-lfs isn't installed on this Mac, so the large files can't be downloaded. Install it (brew install git-lfs) and try again.",
+            format!("git-lfs isn't installed on this computer, so the large files can't be downloaded. Install it with {} and try again.", crate::lfs::install_hint()),
         )));
     }
     let selected: Vec<String> = paths
@@ -1664,7 +2575,14 @@ pub async fn lfs_pull_paths(repo_path: &str, paths: Vec<String>) -> Result<OpRes
     let arrived = missing_before.saturating_sub(still_missing.len());
     let status = snapshot(repo_path).await?;
 
-    if let Some(stderr) = failure {
+    // git-lfs failed, yet everything asked for is here — and the scan still
+    // knows every path asked for, so an empty list is not a failed read: a
+    // warning on a green result, not a failure.
+    let mut warning: Option<Advice> = None;
+    if let Some(stderr) = failure.as_deref().filter(|_| still_missing.is_empty() && selected.iter().all(|p| after.knows(p))) {
+        warning = Some(git_advice::explain(GitOp::Lfs, stderr, &AdviceCtx::default()));
+    }
+    if let Some(stderr) = failure.filter(|_| warning.is_none()) {
         let advice = git_advice::explain(GitOp::Lfs, &stderr, &AdviceCtx::default());
         let names: Vec<String> = still_missing.iter().take(5).map(|f| f.path.clone()).collect();
         // Name what is still a stub. Reporting only a count is how a failure
@@ -1720,7 +2638,14 @@ pub async fn lfs_pull_paths(repo_path: &str, paths: Vec<String>) -> Result<OpRes
     if configured_now {
         detail.push_str(" (This repository's LFS filters weren't set up, so that was done first.)");
     }
-    Ok(OpResult { lfs: Some(after.to_status()), ..OpResult::done(headline, detail, status) })
+    if let Some(w) = &warning {
+        detail.push_str(&format!(" git-lfs still exited with an error, but no file asked for is missing: {}", w.headline));
+    }
+    Ok(OpResult {
+        lfs: Some(after.to_status()),
+        advice: warning.map(|w| Advice { guidance: String::new(), action: None, ..w }),
+        ..OpResult::done(headline, detail, status)
+    })
 }
 
 // --- Abort ---------------------------------------------------------------
@@ -1774,19 +2699,99 @@ async fn staged_is_empty(repo_path: &str) -> bool {
 /// --continue`, `revert --continue`, `am --continue`, or the commit that
 /// concludes a merge. A pick that became empty after the resolution is
 /// skipped (git would refuse to continue it) and the result says so.
-pub async fn continue_op(repo_path: &str) -> Result<OpResult, AppError> {
+/// A rebase paused on a plain `pick` whose conflict is resolved and staged:
+/// commit it here, as the commit it replays — its message letter for letter,
+/// its author and date — so `rebase --continue` has nothing left to commit.
+/// Left to git, the continue runs the message through the "editor" with
+/// cleanup=strip: every line starting with '#' goes. A subject like "#123 fix
+/// the parser" vanishes, and a message that is only such a line becomes an
+/// empty one git refuses, with no way on but Abort. Nothing staged (git skips
+/// the commit, and the caller measures that itself), or a stop that is not a
+/// plain pick (an edit or a fixup of somebody's own interactive rebase): left
+/// to git. Hooks are skipped, as git's own rebase skips them. Returns whether
+/// a commit was made.
+pub(crate) async fn commit_resolved_pick(repo: &std::path::Path) -> bool {
+    let Some(stopped) = git_file(repo, "rebase-merge/stopped-sha").await.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else { return false };
+    // The last line of `done` is the command the rebase stopped on.
+    let Some(done) = git_file(repo, "rebase-merge/done").await else { return false };
+    let last = done.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+    if !(last.starts_with("pick ") || last.starts_with("p ")) || git_file(repo, "rebase-merge/amend").await.is_some() {
+        return false;
+    }
+    // Options of that rebase a plain commit would not honour (dates, signing):
+    // git's own continue then, as before.
+    for opt in ["rebase-merge/cdate_is_adate", "rebase-merge/ignore_date", "rebase-merge/gpg_sign_opt"] {
+        if git_file(repo, opt).await.is_some() {
+            return false;
+        }
+    }
+    let signoff = git_file(repo, "rebase-merge/signoff").await.is_some();
+    // The stop must still be open — not committed already, by an earlier try
+    // or by hand — and the continue must not be about to refuse: git refuses
+    // it for unstaged edits to tracked files, and a commit made before that
+    // refusal would be committed a second time on the retry.
+    if !stop_is_open(repo).await {
+        return false;
+    }
+    let unstaged = GitCmd::at(repo).pinned().args(["diff", "--quiet", "--ignore-submodules", "--"]).run().await.map(|o| o.code != 0).unwrap_or(true);
+    if unstaged {
+        return false;
+    }
+    let staged = GitCmd::at(repo).pinned().args(["diff", "--cached", "--quiet", "--ignore-submodules=none", "HEAD", "--"]).run().await.map(|o| o.code == 1).unwrap_or(false);
+    if !staged {
+        return false;
+    }
+    let mut args = vec!["commit", "--quiet", "--no-verify", "--cleanup=verbatim", "--allow-empty-message"];
+    if signoff {
+        args.push("--signoff");
+    }
+    args.extend(["-C", stopped.as_str()]);
+    GitCmd::at(repo).pinned().args(args).timeout(NET_TIMEOUT).run().await.map(|o| o.ok()).unwrap_or(false)
+}
+
+/// The pick a rebase stopped on has not been committed yet: git writes the
+/// message it would commit with to MERGE_MSG at the stop, and the commit —
+/// by `rebase --continue`, by the app, or by hand — removes it.
+pub(crate) async fn stop_is_open(repo: &std::path::Path) -> bool {
+    git_file(repo, "MERGE_MSG").await.is_some()
+}
+
+/// A file of the repository's git directory, read whole; `None` when it is not there.
+async fn git_file(repo: &std::path::Path, name: &str) -> Option<String> {
+    let p = GitCmd::at(repo).args(["rev-parse", "--path-format=absolute", "--git-path", name]).ok_text().await?;
+    std::fs::read_to_string(p.trim()).ok()
+}
+
+pub async fn continue_op(repo_path: &str, allow_markers: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     if let Some(r) = check(&Intent::Continue, &StatusFacts::from(&before)) {
         return Ok(OpResult::refused(r, before));
+    }
+    // What is staged is what the continue records: markers left in a staged
+    // file would be committed as the resolution.
+    if !allow_markers {
+        if let Some((file, lines)) = staged_marker_offence(std::path::Path::new(repo_path)).await {
+            return Ok(OpResult::refused(markers_refusal(&file, &lines), before));
+        }
     }
     let op = before.operation.clone().unwrap();
     let cmd = op.continue_command.clone().unwrap_or_default();
     let mut args: Vec<String> = cmd.split_whitespace().skip(1).map(|s| s.to_string()).collect();
     let mut skipped = false;
     let picks = matches!(op.kind.as_str(), "rebase" | "rebase-interactive" | "cherry-pick" | "revert");
-    if picks && staged_is_empty(repo_path).await {
+    // A rebase stop that was committed already (by hand, or by the app on a
+    // try git then refused) has nothing left to skip or to commit.
+    // (Only the merge backend writes a stop this way; the apply backend has no
+    // MERGE_MSG at all, and keeps the old behaviour.)
+    let committed_already = op.kind.starts_with("rebase")
+        && git_file(std::path::Path::new(repo_path), "rebase-merge/stopped-sha").await.is_some()
+        && !stop_is_open(std::path::Path::new(repo_path)).await;
+    if picks && !committed_already && staged_is_empty(repo_path).await {
         args = vec![args[0].clone(), "--skip".into()];
         skipped = true;
+    } else if op.kind.starts_with("rebase") && !committed_already {
+        // The resolved commit keeps its message, whatever it starts with.
+        commit_resolved_pick(std::path::Path::new(repo_path)).await;
     }
     let out = GitCmd::at(repo_path)
         .pinned()
@@ -1889,6 +2894,31 @@ mod tests {
         }
     }
 
+    /// A command whose async work outgrows a thread's stack (2 MiB) crashes
+    /// without a word — an Update's Continue once did, in a debug build, when
+    /// its nested steps grew. The heavy nested steps are `Box::pin`ned; this
+    /// catches a future that grows grossly. (The overflow itself came from how
+    /// deep the debug build's poll frames nest, which a size cannot show: the
+    /// live harness, which drives every operation for real, is what finds it.)
+    #[test]
+    fn every_heavy_command_future_stays_far_below_a_threads_stack() {
+        let sizes: Vec<(&str, usize)> = vec![
+            ("sync_run", std::mem::size_of_val(&crate::sync::sync_run("/x", crate::sync::RunOptions { stash: true, bundles: false, with_lfs: false, fingerprint: Vec::new() }))),
+            ("sync_continue", std::mem::size_of_val(&crate::sync::sync_continue("/x", false))),
+            ("sync_abort", std::mem::size_of_val(&crate::sync::sync_abort("/x"))),
+            ("sync_plan", std::mem::size_of_val(&crate::sync::sync_plan("/x", true, true))),
+            ("submodule_update", std::mem::size_of_val(&submodule_update("/x", None))),
+            ("pull", std::mem::size_of_val(&pull("/x", PullMode::Rebase, true, true, None))),
+            ("push", std::mem::size_of_val(&push("/x", false, false))),
+            ("full_clone", std::mem::size_of_val(&crate::sparse::full_clone("u", "/p", None, None, true, true))),
+            ("repo_status", std::mem::size_of_val(&crate::git_status::repo_status("/x"))),
+        ];
+        for (name, size) in &sizes {
+            eprintln!("future size {}: {} bytes", name, size);
+            assert!(*size < 64 * 1024, "{} builds a {} byte future: Box::pin its heavy nested steps", name, size);
+        }
+    }
+
     #[test]
     fn push_sets_upstream_only_when_asked() {
         let with = build_push_args("origin", "main", "refs/heads/main", true);
@@ -1898,9 +2928,124 @@ mod tests {
     }
 
     #[test]
-    fn push_honours_a_differently_named_upstream_branch() {
+    fn the_refspec_builder_sends_the_branch_wherever_it_is_told() {
         let args = build_push_args("origin", "local-name", "refs/heads/remote-name", false);
         assert_eq!(args.last().unwrap(), "refs/heads/local-name:refs/heads/remote-name");
+    }
+
+    fn tracking(branch: &str, remote: &str, merge: &str) -> PushInputs {
+        PushInputs {
+            branch: branch.into(),
+            upstream: Some(format!("{}/{}", remote, merge)),
+            branch_remote: Some(remote.into()),
+            merge_ref: Some(format!("refs/heads/{}", merge)),
+            remotes: vec![remote.into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_push_goes_to_an_upstream_of_the_same_name() {
+        let t = resolve_push_target(&tracking("main", "origin", "main")).unwrap();
+        assert_eq!(t, PushTarget { remote: "origin".into(), remote_ref: "refs/heads/main".into(), set_upstream: false });
+    }
+
+    #[test]
+    fn a_branch_started_from_main_with_tracking_is_not_pushed_into_main() {
+        // `git switch -c feature origin/main` leaves feature tracking main.
+        // Pushing "to the upstream" would land the feature's commits in main.
+        let r = resolve_push_target(&tracking("feature", "origin", "main")).unwrap_err();
+        assert_eq!(r.code, "upstream-name-differs");
+        assert!(r.message.contains("origin/main") && r.message.contains("origin/feature"), "{}", r.message);
+        // Publishing it under its own name is the way out, and re-points the upstream.
+        let i = PushInputs { set_upstream: true, ..tracking("feature", "origin", "main") };
+        let t = resolve_push_target(&i).unwrap();
+        assert_eq!(t, PushTarget { remote: "origin".into(), remote_ref: "refs/heads/feature".into(), set_upstream: true });
+    }
+
+    #[test]
+    fn a_remote_named_with_a_slash_is_read_whole_from_the_config() {
+        let mut i = tracking("main", "team/gh", "main");
+        i.upstream = Some("team/gh/main".into());
+        let t = resolve_push_target(&i).unwrap();
+        assert_eq!(t.remote, "team/gh");
+    }
+
+    #[test]
+    fn a_branch_tracking_a_local_branch_is_refused_and_can_be_published() {
+        let i = PushInputs {
+            branch: "feature".into(),
+            upstream: Some("dev".into()),
+            branch_remote: Some(".".into()),
+            merge_ref: Some("refs/heads/dev".into()),
+            remotes: vec!["origin".into()],
+            ..Default::default()
+        };
+        let r = resolve_push_target(&i).unwrap_err();
+        assert_eq!(r.code, "local-upstream");
+        assert!(r.message.contains("`dev`") && r.message.contains("origin/feature"), "{}", r.message);
+        let t = resolve_push_target(&PushInputs { set_upstream: true, ..i }).unwrap();
+        assert_eq!(t, PushTarget { remote: "origin".into(), remote_ref: "refs/heads/feature".into(), set_upstream: true });
+    }
+
+    #[test]
+    fn without_an_upstream_the_remote_is_the_one_git_would_pick() {
+        let base = PushInputs { branch: "b".into(), remotes: vec!["fork".into(), "upstream".into()], ..Default::default() };
+        // pushRemote beats everything…
+        let i = PushInputs { push_remote: Some("fork".into()), push_default: Some("upstream".into()), ..base.clone() };
+        assert_eq!(resolve_push_target(&i).unwrap().remote, "fork");
+        // …then remote.pushDefault…
+        let i = PushInputs { push_default: Some("upstream".into()), ..base.clone() };
+        assert_eq!(resolve_push_target(&i).unwrap().remote, "upstream");
+        // …then branch.<b>.remote…
+        let i = PushInputs { branch_remote: Some("fork".into()), ..base.clone() };
+        assert_eq!(resolve_push_target(&i).unwrap().remote, "fork");
+        // …then origin, if there is one…
+        let i = PushInputs { remotes: vec!["zeta".into(), "origin".into()], ..base.clone() };
+        assert_eq!(resolve_push_target(&i).unwrap().remote, "origin");
+        // …then the only remote. Alphabetical order never decides.
+        let i = PushInputs { remotes: vec!["zeta".into()], ..base.clone() };
+        assert_eq!(resolve_push_target(&i).unwrap().remote, "zeta");
+        let r = resolve_push_target(&base).unwrap_err();
+        assert_eq!(r.code, "ambiguous-remote");
+        assert!(r.message.contains("fork, upstream"), "{}", r.message);
+        let r = resolve_push_target(&PushInputs { remotes: vec![], ..base }).unwrap_err();
+        assert_eq!(r.code, "no-remote");
+        // And publishing always sets the upstream.
+        let i = PushInputs { branch: "b".into(), remotes: vec!["origin".into()], ..Default::default() };
+        assert!(resolve_push_target(&i).unwrap().set_upstream);
+    }
+
+    #[test]
+    fn push_default_or_push_remote_wins_over_the_upstreams_remote_and_needs_no_same_name() {
+        // Triangular: track upstream's main, push to the fork. git pushes
+        // `main -> fork/main` and `feature -> fork/feature` with no complaint.
+        let mut i = tracking("main", "origin", "main");
+        i.remotes = vec!["origin".into(), "fork".into()];
+        i.push_default = Some("fork".into());
+        let t = resolve_push_target(&i).unwrap();
+        assert_eq!(t, PushTarget { remote: "fork".into(), remote_ref: "refs/heads/main".into(), set_upstream: false });
+        let mut f = tracking("feature", "origin", "main");
+        f.remotes = vec!["origin".into(), "fork".into()];
+        f.push_default = Some("fork".into());
+        let t = resolve_push_target(&f).unwrap();
+        assert_eq!(t.remote, "fork");
+        assert_eq!(t.remote_ref, "refs/heads/feature");
+        // branch.<b>.pushRemote beats remote.pushDefault.
+        f.push_remote = Some("origin".into());
+        let r = resolve_push_target(&f).unwrap_err();
+        assert_eq!(r.code, "upstream-name-differs", "back on the upstream's remote, the same-name rule applies again");
+    }
+
+    #[test]
+    fn a_merge_or_rebase_pull_with_the_wrong_identity_is_refused_but_a_fast_forward_is_not() {
+        let f = StatusFacts { identity_matches: false, identity_email: "me@home".into(), profile_email: Some("me@work".into()), ..clean() };
+        for mode in [PullMode::Merge, PullMode::Rebase] {
+            let r = check(&Intent::Pull { mode, autostash: false }, &f).unwrap();
+            assert_eq!(r.code, "identity-mismatch");
+            assert!(r.message.contains("me@work") && r.message.contains("me@home"), "{}", r.message);
+        }
+        assert!(check(&Intent::Pull { mode: PullMode::FfOnly, autostash: false }, &f).is_none());
     }
 
     #[test]
@@ -2206,7 +3351,7 @@ mod tests {
             assert!(r.message.contains("git rebase --abort"));
         }
         // Resolving a conflict is exactly the work an operation in progress needs.
-        assert!(check(&Intent::Tree(crate::tree::TreeIntent::ResolveSide { has_paths: true, submodule_selected: false, not_conflicted_selected: false }), &f).is_none());
+        assert!(check(&Intent::Tree(crate::tree::TreeIntent::ResolveSide { has_paths: true, not_conflicted_selected: false }), &f).is_none());
     }
 
     #[test]
@@ -2238,7 +3383,7 @@ mod tests {
         }
         assert!(check(&Intent::Stage, &f).is_none());
         // Resolution work is allowed: taking a side, and recovering a file from the autostash.
-        assert!(check(&Intent::Tree(crate::tree::TreeIntent::ResolveSide { has_paths: true, submodule_selected: false, not_conflicted_selected: false }), &f).is_none());
+        assert!(check(&Intent::Tree(crate::tree::TreeIntent::ResolveSide { has_paths: true, not_conflicted_selected: false }), &f).is_none());
         assert!(check(&Intent::Stash(crate::stash::StashIntent::RestoreFile { exists: true, in_stash: true }), &f).is_none());
         assert!(check(&Intent::SyncContinue, &f).is_none());
         assert!(check(&Intent::SyncAbort, &f).is_none());
@@ -2252,6 +3397,104 @@ mod tests {
     #[test]
     fn continue_needs_an_operation_a_continue_command_and_no_conflicts() {
         assert_eq!(check(&Intent::Continue, &clean()).unwrap().code, "nothing-to-continue");
+    }
+
+    #[test]
+    fn staged_blobs_are_read_from_the_raw_diff_and_the_batch() {
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let z = "0".repeat(40);
+        // Two files, a gitlink and a symlink: only the files have lines.
+        let raw = format!(
+            ":100644 100644 {z} {a} M\0src/one.txt\0:000000 100755 {z} {b} A\0with space.sh\0:160000 160000 {z} {a} M\0sub\0:000000 120000 {z} {b} A\0link\0"
+        );
+        let staged = parse_raw_blobs(raw.as_bytes());
+        assert_eq!(staged, vec![("src/one.txt".to_string(), a.clone()), ("with space.sh".to_string(), b.clone())]);
+        // A path that stops being a symlink and becomes a file has lines to read; the reverse has none.
+        let types = format!(":120000 100644 {z} {a} T\0was-a-link\0:100644 120000 {z} {b} T\0now-a-link\0");
+        assert_eq!(parse_raw_blobs(types.as_bytes()), vec![("was-a-link".to_string(), a.clone())]);
+        // The batch: a clean file, a missing object, then one with a marker — at a width its attribute sets.
+        let clean = "fine\n";
+        let marked = "x\n<<<<< HEAD\ny\n";
+        let list = vec![("clean.txt".to_string(), a.clone()), ("gone.txt".to_string(), z.clone()), ("narrow.txt".to_string(), b.clone())];
+        let out = format!("{a} blob {}\n{clean}\n{z} missing\n{b} blob {}\n{marked}\n", clean.len(), marked.len());
+        let mut sizes = std::collections::BTreeMap::new();
+        assert_eq!(first_marker_offence(out.as_bytes(), &list, &sizes), None, "five is not a marker at the default width");
+        sizes.insert("narrow.txt".to_string(), 5);
+        assert_eq!(first_marker_offence(out.as_bytes(), &list, &sizes), Some(("narrow.txt".to_string(), vec![2])));
+        // A bare CRLF marker is one; a binary blob is skipped; a cut-off batch is no answer.
+        let crlf = "<<<<<<<\r\nmine\r\n=======\r\n";
+        let bin = "\0\0<<<<<<< HEAD\n";
+        let list = vec![("bin.dat".to_string(), a.clone()), ("crlf.txt".to_string(), b.clone())];
+        let out = format!("{a} blob {}\n{bin}\n{b} blob {}\n{crlf}\n", bin.len(), crlf.len());
+        assert_eq!(first_marker_offence(out.as_bytes(), &list, &std::collections::BTreeMap::new()), Some(("crlf.txt".to_string(), vec![1])));
+        assert_eq!(first_marker_offence(&out.as_bytes()[..60], &list, &std::collections::BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn windows_double_click_types_count_as_programs_only_there() {
+        let p = std::path::Path::new("tools/run.js");
+        assert_eq!(opens_by_running(p), cfg!(windows));
+        assert!(opens_by_running(std::path::Path::new("Build.app")), "a bundle is a program even as a directory");
+        assert!(opens_by_running(std::path::Path::new("setup.Command")));
+        assert!(!opens_by_running(std::path::Path::new("README.md")));
+        // What "open" runs on every platform, in any case.
+        for name in ["a.terminal", "a.action", "a.ksh", "a.csh", "a.AppImage", "A.APP"] {
+            assert!(opens_by_running(std::path::Path::new(name)), "{name}");
+        }
+        // What Windows runs on a double-click, and nothing else does.
+        for name in ["a.vbs", "a.hta", "a.lnk", "a.reg", "a.py", "a.scr", "a.appref-ms", "A.JS"] {
+            assert_eq!(opens_by_running(std::path::Path::new(name)), cfg!(windows), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_path_goes_to_the_shell_without_the_verbatim_prefix() {
+        // An ordinary path is handed over as it is, on every platform.
+        assert_eq!(shell_path(std::path::Path::new("/repos/r/a.txt")), PathBuf::from("/repos/r/a.txt"));
+        #[cfg(windows)]
+        {
+            assert_eq!(shell_path(std::path::Path::new(r"\\?\C:\r\a.txt")), PathBuf::from(r"C:\r\a.txt"));
+            assert_eq!(shell_path(std::path::Path::new(r"\\?\UNC\srv\share\a.txt")), PathBuf::from(r"\\srv\share\a.txt"));
+            assert_eq!(shell_path(std::path::Path::new(r"C:\r\a.txt")), PathBuf::from(r"C:\r\a.txt"));
+        }
+    }
+
+    #[test]
+    fn programs_are_revealed_never_opened() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, "hello").unwrap();
+        assert!(!opens_by_running(&text));
+        assert!(opens_by_running(&dir.join("Installer.pkg")));
+        assert!(opens_by_running(&dir.join("run.command")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let exe = dir.join("tool");
+            std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(opens_by_running(&exe));
+        }
+        assert!(!opens_by_running(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn conflict_markers_are_found_by_opener_and_orphan_close() {
+        let text = "a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> theirs\nb\n<<<<<<< ours\nunfinished\n";
+        assert_eq!(conflict_marker_lines(text, 7), vec![2, 8], "a half-done hunk is still a marker");
+        assert!(conflict_marker_lines("=======\n<<<<<<<<\nnot markers\n", 7).is_empty(), "a bare separator is a heading; eight is not a marker");
+        assert_eq!(conflict_marker_lines(">>>>>>> left over\n", 7), vec![1], "an orphan close is a leftover");
+        assert_eq!(conflict_marker_lines("<<<<<<<<<< HEAD\nx\n>>>>>>>>>> theirs\n", 10), vec![1], "the width follows conflict-marker-size");
+        assert!(conflict_marker_lines("<<<<<<<<<< HEAD\n", 7).is_empty());
+        assert!(conflict_marker_lines("clean\n", 7).is_empty());
+        let r = markers_refusal("shared.txt", &[3, 12]);
+        assert_eq!(r.code, "conflict-markers");
+        assert!(r.message.contains("shared.txt still contains conflict markers (lines 3, 12)"));
+        let many: Vec<usize> = (1..=20).collect();
+        assert!(markers_refusal("big.txt", &many).message.contains("12 and 8 more"), "{}", markers_refusal("big.txt", &many).message);
         let bisect = StatusFacts {
             operation: Some("bisect".into()),
             abort_command: Some("git bisect reset".into()),

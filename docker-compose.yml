@@ -1,14 +1,47 @@
-# Build the Linux installers with one command:
-#   docker compose run --rm builder
+# GitSwitch in Docker.
 #
-# Output installers appear in ./dist-linux on your host.
-# This only builds an image and runs a one-shot container that exits — it does
-# NOT create long-running services and does not touch any other containers.
+#   docker compose run --rm builder   Linux installers into ./dist-linux (one-shot)
+#   docker compose up app             the built app   -> http://localhost:6080/vnc.html
+#   docker compose up dev             `tauri dev` on this checkout -> the same address
+#
+# The screen is served on localhost only. app keeps its home (profiles, keys)
+# in a named volume; dev keeps node_modules, the Rust target and the built
+# sidecars in named volumes, so the host's own are never overwritten by Linux
+# builds (nor left owned by the container's root).
 services:
   builder:
     build:
       context: .
       dockerfile: Dockerfile
+      target: builder
     image: gitswitch-builder
     volumes:
       - ./dist-linux:/out
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: app
+    image: gitswitch-app
+    ports:
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - gitswitch-home:/home/gitswitch
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: dev
+    image: gitswitch-dev
+    ports:
+      - "127.0.0.1:6080:6080"
+    volumes:
+      - .:/app
+      - gitswitch-node-modules:/app/node_modules
+      - gitswitch-target:/app/src-tauri/target
+      - gitswitch-sidecars:/app/src-tauri/binaries
+volumes:
+  gitswitch-home:
+  gitswitch-node-modules:
+  gitswitch-target:
+  gitswitch-sidecars:

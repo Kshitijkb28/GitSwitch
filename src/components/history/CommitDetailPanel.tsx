@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type SubmitEvent } from "react";
 import {
   X,
   FileText,
@@ -21,6 +21,7 @@ import { useToast } from "../Toast";
 import { DiffView } from "../changes/DiffPanel";
 import { useGitJob } from "../../lib/gitJobs";
 import * as api from "../../lib/api";
+import { copyText } from "../../lib/clipboard";
 import type {
   CommitDetail,
   CommitTarget,
@@ -30,6 +31,9 @@ import type {
   ResetMode,
   TreeCommitRef,
 } from "../../lib/api";
+
+/** Files listed for a commit before "Show all". */
+const FILES_SHOWN = 200;
 
 type Props = {
   detail: CommitDetail;
@@ -43,6 +47,8 @@ type Props = {
   /** Runs one git operation; the page owns busy state, toasts, the result card and reloads. */
   onAction: (key: string, fn: () => Promise<OpResult>) => Promise<OpResult | undefined>;
   onResolve: (hash: string) => Promise<CommitTarget | null>;
+  /** Opens another commit in this panel (a parent). */
+  onOpenCommit?: (hash: string) => void;
 };
 
 type Mode = null | "goback" | "branch";
@@ -56,32 +62,6 @@ function isDirty(s: RepoStatus | null): boolean {
   return s.staged_count + s.unstaged_count > 0;
 }
 
-/** Clipboard write with a fallback for webviews that hide `navigator.clipboard`. */
-async function copyText(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // fall through to the textarea trick
-  }
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    ta.setAttribute("readonly", "");
-    ta.style.position = "fixed";
-    ta.style.opacity = "0";
-    ta.style.pointerEvents = "none";
-    document.body.appendChild(ta);
-    ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    return ok;
-  } catch {
-    return false;
-  }
-}
 
 /** A dark-theme radio, drawn the same way Checkbox is (the native one paints white). */
 function Radio({
@@ -135,6 +115,7 @@ export function CommitDetailPanel({
   onClose,
   onAction,
   onResolve,
+  onOpenCommit,
 }: Props) {
   const toast = useToast();
   const job = useGitJob(repoPath);
@@ -166,6 +147,10 @@ export function CommitDetailPanel({
 
   // --- file diffs ------------------------------------------------------------
   const [openFile, setOpenFile] = useState<string | null>(null);
+  // A commit can touch thousands of files (a vendored tree, a formatter run):
+  // the first ones are listed, the rest on request.
+  const [allFiles, setAllFiles] = useState(false);
+  useEffect(() => setAllFiles(false), [detail.hash]);
   const [fileDiff, setFileDiff] = useState<FileDiff | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
@@ -257,7 +242,7 @@ export function CommitDetailPanel({
     afterAction(await onAction("reset", () => api.changesReset(repoPath, detail.hash, m, m === "hard" && stash)));
   }
 
-  async function createBranch(e: FormEvent) {
+  async function createBranch(e: SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     const name = branchName.trim();
     if (!name) return;
@@ -299,7 +284,7 @@ export function CommitDetailPanel({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-3xl max-h-[85vh] overflow-y-auto rounded-xl border border-zinc-700/50 bg-zinc-900 p-6 shadow-2xl min-w-0">
+      <div className={`relative w-full ${openFile ? "max-w-5xl" : "max-w-3xl"} max-h-[85vh] overflow-y-auto rounded-xl border border-zinc-700/50 bg-zinc-900 p-6 shadow-2xl min-w-0`}>
         <div className="flex items-start justify-between gap-3 mb-4">
           <div className="min-w-0">
             <h2 className="text-lg font-semibold text-zinc-100 break-words">
@@ -496,9 +481,15 @@ export function CommitDetailPanel({
             {detail.parents.length === 0 && (
               <p className="text-zinc-400">none (root commit)</p>
             )}
-            {detail.parents.map((p) => (
-              <p key={p} className="text-zinc-300 font-mono truncate">{p.slice(0, 12)}</p>
-            ))}
+            {detail.parents.map((p) =>
+              onOpenCommit ? (
+                <button key={p} type="button" onClick={() => onOpenCommit(p)} className="block text-left text-zinc-300 hover:text-white font-mono truncate cursor-pointer" title={`Open ${p}`}>
+                  {p.slice(0, 12)}
+                </button>
+              ) : (
+                <p key={p} className="text-zinc-300 font-mono truncate">{p.slice(0, 12)}</p>
+              )
+            )}
           </div>
         </div>
 
@@ -516,7 +507,7 @@ export function CommitDetailPanel({
           <span className="text-[11px] text-zinc-600">— click one to see its diff</span>
         </div>
         <div className={`space-y-1 pr-1 min-w-0 ${openFile ? "" : "max-h-64 overflow-y-auto"}`}>
-          {detail.files.map((f) => {
+          {(allFiles ? detail.files : detail.files.slice(0, FILES_SHOWN)).map((f) => {
             const open = openFile === f.path;
             return (
               <div key={f.path} className="min-w-0">
@@ -548,7 +539,7 @@ export function CommitDetailPanel({
                   )}
                 </button>
                 {open && (
-                  <div className="mt-1 mb-2 rounded-lg border border-zinc-700/40 bg-zinc-900/70 max-h-96 overflow-auto min-w-0">
+                  <div className="mt-1 mb-2 rounded-lg border border-zinc-700/40 bg-zinc-900/70 min-w-0" data-commit-diff>
                     <DiffView diff={fileDiff} loading={diffLoading} error={diffError} />
                   </div>
                 )}
@@ -557,6 +548,15 @@ export function CommitDetailPanel({
           })}
           {detail.files.length === 0 && (
             <p className="text-xs text-zinc-600">No file changes (empty or merge commit).</p>
+          )}
+          {!allFiles && detail.files.length > FILES_SHOWN && (
+            <button
+              type="button"
+              onClick={() => setAllFiles(true)}
+              className="text-xs text-emerald-400 hover:text-emerald-300 cursor-pointer py-1"
+            >
+              Show all {detail.files.length.toLocaleString()} files
+            </button>
           )}
         </div>
       </div>

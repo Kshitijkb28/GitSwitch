@@ -2,7 +2,7 @@ import { useState } from "react";
 import { AlertTriangle, Box, ChevronDown, ChevronRight, CircleSlash, FolderOpen, Play } from "lucide-react";
 import { Badge } from "../Badge";
 import { Button } from "../Button";
-import { CommitBox } from "./CommitBox";
+import { CommitBox, type GuardAction } from "./CommitBox";
 import { DiffPanel } from "./DiffPanel";
 import { TreeLists, type DiscardVariant } from "./TreeLists";
 import * as api from "../../lib/api";
@@ -18,7 +18,10 @@ export function needsSection(s: RepoStatus): boolean {
   return s.entries.length > 0 || s.ahead > 0 || !!s.operation || s.detached || s.conflicted_count > 0;
 }
 
-type Apply = (key: string, fn: () => Promise<OpResult>, target?: string) => Promise<OpResult | undefined>;
+/** The "…anyway" a conflict-markers refusal offers: the refused call again, markers allowed. */
+export type MarkersRetry = { label: string; run: () => void };
+export type ApplyOptions = { quietRefusal?: string; markers?: MarkersRetry };
+type Apply = (key: string, fn: () => Promise<OpResult>, target?: string, opts?: ApplyOptions) => Promise<OpResult | undefined>;
 
 type Props = {
   sub: SubmoduleStatus;
@@ -35,6 +38,8 @@ type Props = {
   /** Asks first — the page owns the confirmation, keyed to this submodule. */
   onDiscard: (paths: string[], variant: DiscardVariant) => void;
   onSwitchBranch?: () => void;
+  onGuard?: (action: GuardAction) => void;
+  guardBusy?: boolean;
 };
 
 /**
@@ -56,6 +61,8 @@ export function SubmoduleSection({
   onOpenRepo,
   onDiscard,
   onSwitchBranch,
+  onGuard,
+  guardBusy,
 }: Props) {
   const st = sub.status;
   const path = st.path;
@@ -70,6 +77,13 @@ export function SubmoduleSection({
     committed !== null && (parentStatus === committed.parent || parentRow?.sub_commit_changed === true);
   const changed = st.entries.filter((e) => e.kind === "tracked").length;
   const message = draft || (st.merge_message ?? "");
+
+  // Stage / continue inside this submodule, each with its "…anyway" retry on
+  // the same path, so a marker refusal here never re-runs on the parent.
+  const stageHere = (paths: string[], allow: boolean) =>
+    apply("stage", () => api.changesStage(path, paths, allow), path, allow ? undefined : { markers: { label: "Mark resolved anyway", run: () => void stageHere(paths, true) } });
+  const continueHere = (allow: boolean) =>
+    apply("continue", () => api.changesContinue(path, allow), path, allow ? undefined : { markers: { label: "Continue anyway", run: () => void continueHere(true) } });
 
   const onCommit = async () => {
     const parentAtCommit = parentStatus;
@@ -155,7 +169,7 @@ export function SubmoduleSection({
                     ? // The sync owns this rebase: the backend refuses a plain
                       // continue/abort here, the same way the parent's own
                       // banner yields to the sync card.
-                      "it belongs to the paused sync. Finish it with Continue sync / Abort sync above."
+                      "it belongs to the paused update. Finish it with Continue update / Abort update above."
                     : op.detail || "Finish it, or abort to go back."}
                 </span>
               </p>
@@ -165,7 +179,7 @@ export function SubmoduleSection({
                   variant="primary"
                   disabled={busy || st.conflicted_count > 0}
                   title={st.conflicted_count > 0 ? "Resolve and stage every conflicted file first" : op.continue_command}
-                  onClick={() => apply("continue", () => api.changesContinue(path), path)}
+                  onClick={() => void continueHere(false)}
                 >
                   <Play size={13} />
                   Continue in {sub.path}
@@ -190,7 +204,7 @@ export function SubmoduleSection({
             status={st}
             busy={busy}
             onOpen={setDiffFor}
-            onStage={(paths) => apply("stage", () => api.changesStage(path, paths), path)}
+            onStage={(paths) => void stageHere(paths, false)}
             onUnstage={(paths) => apply("unstage", () => api.changesUnstage(path, paths), path)}
             onDiscard={onDiscard}
             onResolveSide={(paths, side) => apply("resolve", () => api.changesResolveSide(path, paths, side), path)}
@@ -206,6 +220,8 @@ export function SubmoduleSection({
             onCommit={onCommit}
             onSwitchBranch={onSwitchBranch}
             scopeLabel={sub.path}
+            onGuard={onGuard}
+            guardBusy={guardBusy}
           />
 
           {showFooter && committed && (

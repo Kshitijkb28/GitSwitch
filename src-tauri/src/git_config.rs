@@ -1,11 +1,34 @@
 use crate::error::AppError;
+use crate::paths::{config_subsection, config_value, norm, shell_quote};
 use crate::profiles::{load_profiles, Profile};
 use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
 
+/// The directory git itself calls `~`: `$HOME` first on every platform; on
+/// Windows, when HOME is unset, `HOMEDRIVE`+`HOMEPATH`, then `USERPROFILE`.
+/// `dirs::home_dir()` answers USERPROFILE regardless, so for a Git Bash or
+/// MSYS user with HOME set the app would write a config where git never looks.
+pub(crate) fn git_home() -> PathBuf {
+    if let Some(h) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        return PathBuf::from(h);
+    }
+    #[cfg(windows)]
+    {
+        if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
+            let mut s = drive;
+            s.push(&path);
+            return PathBuf::from(s);
+        }
+        if let Some(u) = std::env::var_os("USERPROFILE").filter(|u| !u.is_empty()) {
+            return PathBuf::from(u);
+        }
+    }
+    dirs::home_dir().unwrap_or_default()
+}
+
 fn get_gitconfig_path() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".gitconfig")
+    git_home().join(".gitconfig")
 }
 
 const MAX_BACKUPS: usize = 5;
@@ -53,6 +76,28 @@ fn prune_backups(path: &std::path::Path) {
 /// with last-match-wins, so this makes a nested repo folder correctly override
 /// its parent folder's profile (and matches the UI's longest-prefix logic).
 fn build_includeif_blocks(profiles: &[Profile]) -> String {
+    let mut blocks = String::new();
+
+    // Remote rules FIRST, so a folder rule below — the more deliberate
+    // statement about one place on disk — wins where both match (git applies
+    // the last matching include).
+    let mut remote_entries: Vec<(String, String)> = Vec::new();
+    for profile in profiles {
+        for pattern in &profile.remote_patterns {
+            for glob in remote_globs(pattern) {
+                remote_entries.push((glob, get_profile_gitconfig_path(profile)));
+            }
+        }
+    }
+    remote_entries.sort();
+    for (glob, path) in remote_entries {
+        blocks.push_str(&format!(
+            "[includeIf \"hasconfig:remote.*.url:{}\"]\n\tpath = {}\n\n",
+            config_subsection(&glob),
+            config_value(&path)
+        ));
+    }
+
     let mut entries: Vec<(String, String)> = Vec::new();
     for profile in profiles {
         for dir in &profile.directories {
@@ -60,18 +105,103 @@ fn build_includeif_blocks(profiles: &[Profile]) -> String {
                 crate::paths::gitdir_pattern(dir),
                 get_profile_gitconfig_path(profile),
             ));
+            // git matches the repository's real path first (links resolved,
+            // letters as the disk spells them) and the path it was reached by
+            // only from a shell that went there that way: a folder named
+            // through a symbolic link, or stored in another letter case, is
+            // written both ways, so the profile applies however the
+            // repository is opened.
+            if let Some(real) = crate::paths::real_form(dir).filter(|r| *r != crate::paths::norm(dir)) {
+                entries.push((crate::paths::gitdir_pattern(&real), get_profile_gitconfig_path(profile)));
+            }
         }
     }
     entries.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+    entries.dedup();
 
-    let mut blocks = String::new();
     for (dir, path) in entries {
         blocks.push_str(&format!(
             "[includeIf \"gitdir:{}\"]\n\tpath = {}\n\n",
-            dir, path
+            config_subsection(&dir),
+            config_value(&path)
         ));
     }
     blocks
+}
+
+/// GitHub owner and repository names are case-insensitive; git's `hasconfig`
+/// match is not. Each letter becomes a two-member character class so
+/// `github.com/Acme/Thing` and `github.com/acme/thing` both match.
+fn case_insensitive_glob(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 4);
+    for c in s.chars() {
+        if c.is_ascii_alphabetic() {
+            out.push('[');
+            out.push(c.to_ascii_uppercase());
+            out.push(c.to_ascii_lowercase());
+            out.push(']');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The URL globs one remote rule stands for. `hasconfig:remote.*.url` is
+/// matched against each remote's URL as written in the repository's config
+/// (no `insteadOf` rewriting), so every spelling GitHub hands out is listed:
+/// HTTPS, scp-like SSH, and `ssh://` with and without the port. An `owner/`
+/// rule covers every repository of that owner; `owner/repo` covers that one
+/// repository with or without `.git`. A full glob is used as it is.
+pub fn remote_globs(pattern: &str) -> Vec<String> {
+    const GITHUB: &[&str] = &["https://github.com/", "git@github.com:", "ssh://git@github.com/", "ssh://git@github.com:22/"];
+    if pattern.starts_with("https://") || pattern.starts_with("http://") || pattern.starts_with("ssh://") || pattern.starts_with("git@") {
+        return vec![pattern.to_string()];
+    }
+    let trimmed = pattern.trim_end_matches('/');
+    let (owner, repo) = match trimmed.split_once('/') {
+        Some((o, r)) => (o, Some(r)),
+        None => (trimmed, None),
+    };
+    if owner.is_empty() {
+        return Vec::new();
+    }
+    let owner = case_insensitive_glob(owner);
+    let mut out = Vec::new();
+    match repo.filter(|r| !r.is_empty()) {
+        None => {
+            for prefix in GITHUB {
+                out.push(format!("{}{}/**", prefix, owner));
+            }
+        }
+        Some(r) => {
+            let r = case_insensitive_glob(r);
+            for prefix in GITHUB {
+                out.push(format!("{}{}/{}", prefix, owner, r));
+                out.push(format!("{}{}/{}.git", prefix, owner, r));
+            }
+        }
+    }
+    out
+}
+
+/// The `[user]` section a profile commits as. Quoted: a `#` in a name or a
+/// `;` in an email would otherwise be read as the start of a comment.
+fn user_section(profile: &Profile) -> String {
+    format!(
+        "[user]\n\tname = {}\n\temail = {}\n",
+        config_value(&profile.git_name),
+        config_value(&profile.git_email)
+    )
+}
+
+/// The command git runs to reach a remote over SSH with exactly this key.
+/// git hands it to `sh -c`, so the path is shell-quoted: a space in it would
+/// otherwise split into a key called `My` and a host called `Keys/id`.
+/// Shared with the clone path, which passes the same string on the command
+/// line (`-c core.sshCommand=…`), where it needs no config-file quoting.
+pub(crate) fn ssh_command_for(key: &str) -> String {
+    format!("ssh -i {} -o IdentitiesOnly=yes", shell_quote(&norm(key)))
 }
 
 /// NOTE: every path written into a git config VALUE must use forward slashes.
@@ -79,21 +209,34 @@ fn build_includeif_blocks(profiles: &[Profile]) -> String {
 /// `C:\Users\me\...` produces `fatal: bad config line` and makes the entire
 /// ~/.gitconfig unreadable — not just for GitSwitch, for every git command.
 fn get_profile_gitconfig_path(profile: &Profile) -> String {
-    let data_dir = dirs::data_dir().unwrap_or_default();
+    let data_dir = crate::paths::data_dir().unwrap_or_default();
     let app_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
     crate::paths::norm(&format!("{}/{}.gitconfig", app_dir.display(), profile.id))
+}
+
+/// HTTPS clones push over SSH with the profile's key: the push only — fetch,
+/// clone, LFS downloads and submodule updates stay on HTTPS. Never beside the
+/// push block (that would turn a blocked push into one over SSH), and a
+/// repository's own block or lock still wins: it names each remote's exact
+/// URL, a longer prefix than these.
+fn push_over_ssh_section() -> &'static str {
+    "[url \"git@github.com:\"]\n\tpushInsteadOf = https://github.com/\n\tpushInsteadOf = http://github.com/\n"
 }
 
 /// Config block that makes `git push` fail locally with a recognizable error
 /// ("remote helper 'gitswitch-push-blocked' aborted") while leaving fetch/pull
 /// untouched — pushes get their URL rewritten to a scheme git can't handle.
 ///
-/// pushInsteadOf is a literal prefix match, so cover every common github.com
-/// remote form. Known limits (documented in the UI): custom ssh-config host
-/// aliases and remotes with an explicit remote.<name>.pushurl are not caught,
-/// a LONGER rewrite in any scope wins over these (git picks the longest
-/// match), and `GIT_CONFIG_NOSYSTEM` / another git binary skip config
-/// altogether. This section is only ever written into per-folder include
+/// pushInsteadOf is a literal prefix match, and git uses the longest one that
+/// matches. The empty prefix at the end matches every URL — an organisation's
+/// `org-<id>@github.com:`, `https://user@github.com/`, an ssh alias, another
+/// host, a local path — so every remote of every repository in the profile's
+/// folders is rewritten, whatever its address; the github.com forms before it
+/// rewrite those to a shorter, readable URL. Known limits (documented in the
+/// UI): git never applies it to a remote's explicit remote.<name>.pushurl, a
+/// longer rewrite of the person's own wins, and a git that does not read this
+/// user's global config (another HOME, GIT_CONFIG_GLOBAL) never sees it.
+/// This section is only ever written into per-folder include
 /// files, never the main ~/.gitconfig: a block there would apply to every
 /// folder, and undoing it per folder would need a longer rewrite for each URL
 /// form. The push lock (push_lock.rs) is the variant that needs the
@@ -108,34 +251,83 @@ fn push_block_section() -> &'static str {
      \tpushInsteadOf = ssh://git@ssh.github.com:443/\n\
      \tpushInsteadOf = https://github.com/\n\
      \tpushInsteadOf = http://github.com/\n\
-     \tpushInsteadOf = github.com:\n"
+     \tpushInsteadOf = github.com:\n\
+     \tpushInsteadOf = \"\"\n"
 }
 
-fn write_profile_gitconfig(profile: &Profile) -> Result<(), AppError> {
-    let data_dir = dirs::data_dir().ok_or(AppError::Config("Cannot find data dir".into()))?;
-    let config_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
-    fs::create_dir_all(&config_dir)?;
+/// Everything one folder profile's include file says. Pure, so a test can
+/// hand it to `git config -f` and check git reads back what was meant.
+/// The default profile's part of ~/.gitconfig: identity, key, and signing —
+/// signing applies wherever no folder or remote-rule profile does.
+fn default_section(p: &Profile) -> String {
+    let mut s = user_section(p);
+    s.push('\n');
+    if let Some(ref key_path) = p.ssh_key_path {
+        s.push_str(&format!("[core]\n\tsshCommand = {}\n\n", config_value(&ssh_command_for(key_path))));
+    }
+    if let Some(block) = crate::signing::signing_config_block(p) {
+        s.push_str(&block);
+        s.push('\n');
+    }
+    s
+}
 
-    let path = config_dir.join(format!("{}.gitconfig", profile.id));
+/// Whether the default profile signs: a profile that does not then has to
+/// say so, or its commits would be signed with the default's key.
+fn default_signs(profiles: &[Profile]) -> bool {
+    profiles.iter().any(|p| p.is_default && crate::signing::signing_config_block(p).is_some())
+}
 
-    let mut content = format!("[user]\n\tname = {}\n\temail = {}\n", profile.git_name, profile.git_email);
+fn profile_gitconfig_content(profile: &Profile, default_signs: bool) -> String {
+    let mut content = user_section(profile);
 
     if let Some(ref key_path) = profile.ssh_key_path {
         content.push_str(&format!(
-            "[core]\n\tsshCommand = ssh -i {} -o IdentitiesOnly=yes\n",
-            crate::paths::norm(key_path)
+            "[core]\n\tsshCommand = {}\n",
+            config_value(&ssh_command_for(key_path))
         ));
     }
 
     if !profile.allow_push {
         content.push_str(push_block_section());
+    } else if profile.ssh_key_path.is_some() && profile.push_over_ssh == Some(true) {
+        content.push_str(push_over_ssh_section());
     }
 
-    if let Some(block) = crate::signing::signing_config_block(profile) {
-        content.push_str(&block);
+    match crate::signing::signing_config_block(profile) {
+        Some(block) => content.push_str(&block),
+        // Not signing here, while the default does everywhere else: its
+        // signing off, and git's own signing format back (openpgp), so a
+        // repository that signs with its own GPG key still can, and a stray
+        // `-S` fails loudly instead of signing with the default's key.
+        None if default_signs => content.push_str("[gpg]\n\tformat = openpgp\n[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n"),
+        None => {}
     }
+    content
+}
 
-    fs::write(&path, content)?;
+fn write_profile_gitconfig(profile: &Profile, default_signs: bool) -> Result<(), AppError> {
+    let data_dir = crate::paths::data_dir().ok_or(AppError::Config("Cannot find data dir".into()))?;
+    let config_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
+    fs::create_dir_all(&config_dir)?;
+
+    let path = config_dir.join(format!("{}.gitconfig", profile.id));
+    fs::write(&path, profile_gitconfig_content(profile, default_signs))?;
+    Ok(())
+}
+
+/// Rewrite every folder profile's include file from the store: identity, key
+/// and push block as this build writes them. Run at start-up, so a block
+/// written by an older build gets what this one writes without the profile
+/// being saved again. ~/.gitconfig itself is not touched.
+pub fn refresh_profile_includes() -> Result<(), AppError> {
+    let store = load_profiles()?;
+    let signs = default_signs(&store.profiles);
+    for profile in &store.profiles {
+        if !profile.directories.is_empty() || !profile.remote_patterns.is_empty() {
+            write_profile_gitconfig(profile, signs)?;
+        }
+    }
     Ok(())
 }
 
@@ -161,14 +353,7 @@ pub fn apply_git_config() -> Result<(), AppError> {
     new_content.push_str("\n# >>> GitSwitch managed (DO NOT EDIT) >>>\n");
 
     if let Some(default_profile) = store.profiles.iter().find(|p| p.is_default) {
-        new_content.push_str(&format!("[user]\n\tname = {}\n\temail = {}\n\n", default_profile.git_name, default_profile.git_email));
-
-        if let Some(ref key_path) = default_profile.ssh_key_path {
-            new_content.push_str(&format!(
-                "[core]\n\tsshCommand = ssh -i {} -o IdentitiesOnly=yes\n\n",
-                crate::paths::norm(key_path)
-            ));
-        }
+        new_content.push_str(&default_section(default_profile));
 
         // Intentionally NO push-block here: a block in the main config would
         // apply to every folder, and a folder profile could only undo it with a
@@ -176,9 +361,10 @@ pub fn apply_git_config() -> Result<(), AppError> {
         // profile always allows pushes.
     }
 
+    let signs = default_signs(&store.profiles);
     for profile in &store.profiles {
-        if !profile.directories.is_empty() {
-            write_profile_gitconfig(profile)?;
+        if !profile.directories.is_empty() || !profile.remote_patterns.is_empty() {
+            write_profile_gitconfig(profile, signs)?;
         }
     }
     new_content.push_str(&build_includeif_blocks(&store.profiles));
@@ -199,7 +385,7 @@ pub fn apply_git_config() -> Result<(), AppError> {
 }
 
 fn cleanup_orphan_gitconfigs(store: &crate::profiles::ProfileStore) {
-    let Some(data_dir) = dirs::data_dir() else { return };
+    let Some(data_dir) = crate::paths::data_dir() else { return };
     let config_dir = data_dir.join("com.gitswitch.app").join("gitconfigs");
     let Ok(entries) = fs::read_dir(&config_dir) else { return };
 
@@ -219,6 +405,25 @@ fn cleanup_orphan_gitconfigs(store: &crate::profiles::ProfileStore) {
             let _ = fs::remove_file(&path);
         }
     }
+}
+
+/// The ~/.gitconfig that holds GitSwitch's block, if one does.
+pub(crate) fn managed_gitconfig() -> Option<PathBuf> {
+    let path = get_gitconfig_path();
+    fs::read_to_string(&path).ok().filter(|c| c.contains(">>> GitSwitch managed")).map(|_| path)
+}
+
+/// Take GitSwitch's block out of ~/.gitconfig (after a backup), leaving every
+/// other line as it was. False when there was no block.
+pub fn remove_managed_block() -> Result<bool, AppError> {
+    let Some(path) = managed_gitconfig() else { return Ok(false) };
+    backup_file(&path)?;
+    let mut cleaned = remove_gitswitch_sections(&fs::read_to_string(&path)?);
+    if !cleaned.is_empty() {
+        cleaned.push('\n');
+    }
+    fs::write(&path, cleaned)?;
+    Ok(true)
 }
 
 fn remove_gitswitch_sections(content: &str) -> String {
@@ -288,10 +493,32 @@ mod tests {
             is_default: false,
             allow_push: true,
             signing_enabled: false,
+            remote_patterns: Vec::new(),
+            github_login: None,
             directories: dirs.iter().map(|s| s.to_string()).collect(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            push_over_ssh: None,
         }
+    }
+
+    #[test]
+    fn https_clones_push_over_ssh_only_where_the_profile_has_a_key_and_may_push() {
+        let ssh = "[url \"git@github.com:\"]\n\tpushInsteadOf = https://github.com/\n\tpushInsteadOf = http://github.com/\n";
+        let mut p = mk_profile("p", &["/w"]);
+        p.ssh_key_path = Some("/k/id_work".into());
+        assert!(!profile_gitconfig_content(&p, false).contains("[url \"git@github.com:\"]"), "nothing said: pushes go as before");
+        p.push_over_ssh = Some(true);
+        assert!(profile_gitconfig_content(&p, false).contains(ssh), "turned on, with a key and pushes allowed: over SSH");
+        p.push_over_ssh = Some(false);
+        assert!(!profile_gitconfig_content(&p, false).contains("[url \"git@github.com:\"]"), "turned off");
+        p.push_over_ssh = Some(true);
+        p.allow_push = false;
+        let blocked = profile_gitconfig_content(&p, false);
+        assert!(!blocked.contains("[url \"git@github.com:\"]") && blocked.contains("gitswitch-push-blocked://"), "a blocked push never becomes one over SSH");
+        p.allow_push = true;
+        p.ssh_key_path = None;
+        assert!(!profile_gitconfig_content(&p, false).contains("[url \"git@github.com:\"]"), "no key, nothing to push with");
     }
 
     #[test]
@@ -319,6 +546,24 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_named_through_a_link_is_written_both_ways() {
+        let root = std::env::temp_dir().join(format!("gitswitch-includeif-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Real")).expect("dirs");
+        let root = std::fs::canonicalize(&root).expect("canonical");
+        std::os::unix::fs::symlink(root.join("Real"), root.join("link")).expect("symlink");
+        let (link, real) = (root.join("link").to_string_lossy().to_string(), root.join("Real").to_string_lossy().to_string());
+        let block = build_includeif_blocks(&[mk_profile("l", &[&link])]);
+        assert!(block.contains(&format!("gitdir:{}/", link)), "{block}");
+        assert!(block.contains(&format!("gitdir:{}/", real)), "{block}");
+        // A folder that is its own real path is written once.
+        let block = build_includeif_blocks(&[mk_profile("r", &[&real])]);
+        assert_eq!(block.matches("gitdir:").count(), 1, "{block}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn config_values_never_contain_backslashes() {
         // Regression guard: a Windows path written verbatim into a git config
@@ -332,14 +577,91 @@ mod tests {
         assert!(!includes.contains('\\'), "includeIf block: {includes}");
         assert!(includes.contains("gitdir:C:/Users/me/Work/"));
 
-        let ssh_line = format!(
-            "sshCommand = ssh -i {} -o IdentitiesOnly=yes",
-            crate::paths::norm(p.ssh_key_path.as_ref().unwrap())
-        );
+        let ssh_line = format!("sshCommand = {}", config_value(&ssh_command_for(p.ssh_key_path.as_ref().unwrap())));
         assert!(!ssh_line.contains('\\'), "{ssh_line}");
+        assert!(ssh_line.contains("ssh -i C:/Users/me/.ssh/id_key -o"), "{ssh_line}");
 
         let signing = crate::signing::signing_config_block(&p).unwrap();
         assert!(!signing.contains('\\'), "signing block: {signing}");
+    }
+
+    /// Ask git itself: write a profile file with every character that is
+    /// special somewhere in git's config syntax, read it back with
+    /// `git config -f`, and expect the original strings.
+    fn git_reads(file: &std::path::Path, key: &str) -> Option<String> {
+        let out = crate::spawn::command("git").args(["config", "-f"]).arg(file).args(["--get", key]).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string())
+    }
+
+    #[test]
+    fn what_git_reads_back_is_exactly_what_the_profile_said() {
+        if crate::spawn::command("git").arg("--version").output().is_err() {
+            return; // no git here: nothing to prove against
+        }
+        let mut p = mk_profile("quoted", &["/tmp/w"]);
+        p.git_name = r#"Ann #1 "The Hammer" O'Brien "#.into();
+        p.git_email = "ann;tag@example.test".into();
+        p.ssh_key_path = Some("/Users/me/My Keys/id_ed25519".into());
+        p.signing_enabled = true;
+        let dir = std::env::temp_dir().join(format!("gitswitch-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("p.gitconfig");
+        std::fs::write(&file, profile_gitconfig_content(&p, false)).unwrap();
+
+        assert_eq!(git_reads(&file, "user.name").as_deref(), Some(p.git_name.as_str()));
+        assert_eq!(git_reads(&file, "user.email").as_deref(), Some(p.git_email.as_str()));
+        assert_eq!(
+            git_reads(&file, "core.sshCommand").as_deref(),
+            Some("ssh -i '/Users/me/My Keys/id_ed25519' -o IdentitiesOnly=yes")
+        );
+        assert_eq!(git_reads(&file, "user.signingkey").as_deref(), Some("/Users/me/My Keys/id_ed25519.pub"));
+
+        // The include block: a folder with a quote and a space in its name.
+        let inc = build_includeif_blocks(&[mk_profile("inc", &[r#"/Users/me/Work "2024""#])]);
+        std::fs::write(&file, &inc).unwrap();
+        let listed = crate::spawn::command("git").args(["config", "-f"]).arg(&file).arg("--list").output().unwrap();
+        assert!(listed.status.success(), "git could not read the include block:\n{}\n{}", inc, String::from_utf8_lossy(&listed.stderr));
+        let text = String::from_utf8_lossy(&listed.stdout);
+        assert!(text.contains(r#"includeif.gitdir:/Users/me/Work "2024"/.path="#), "{}", text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_remote_rule_covers_every_spelling_github_hands_out_in_either_case() {
+        let globs = remote_globs("acme/");
+        assert_eq!(globs.len(), 4, "{globs:?}");
+        assert!(globs.contains(&"https://github.com/[Aa][Cc][Mm][Ee]/**".to_string()), "{globs:?}");
+        assert!(globs.contains(&"git@github.com:[Aa][Cc][Mm][Ee]/**".to_string()));
+        assert!(globs.contains(&"ssh://git@github.com/[Aa][Cc][Mm][Ee]/**".to_string()));
+        let one = remote_globs("acme/thing");
+        assert_eq!(one.len(), 8, "{one:?}");
+        assert!(one.contains(&"https://github.com/[Aa][Cc][Mm][Ee]/[Tt][Hh][Ii][Nn][Gg].git".to_string()));
+        assert!(one.contains(&"git@github.com:[Aa][Cc][Mm][Ee]/[Tt][Hh][Ii][Nn][Gg]".to_string()));
+        // Digits and punctuation are left alone; a full glob is passed through.
+        assert!(remote_globs("a-1.b/").iter().all(|g| g.contains("[Aa]-1.[Bb]/**")));
+        assert_eq!(remote_globs("https://gitlab.example.com/team/**"), vec!["https://gitlab.example.com/team/**"]);
+    }
+
+    #[test]
+    fn remote_rules_come_before_folder_rules_so_a_folder_wins_where_both_match() {
+        let mut remote = mk_profile("remote", &[]);
+        remote.remote_patterns = vec!["acme/".into()];
+        let folder = mk_profile("folder", &["/dev/work"]);
+        let block = build_includeif_blocks(&[folder, remote]);
+        let r = block.find("hasconfig:remote.*.url:").expect("remote block");
+        let d = block.find("gitdir:/dev/work/").expect("folder block");
+        assert!(r < d, "remote rules must be emitted first:\n{block}");
+        // And git can read the whole thing.
+        if std::process::Command::new("git").arg("--version").output().is_ok() {
+            let dir = std::env::temp_dir().join(format!("gitswitch-remote-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("inc.gitconfig");
+            std::fs::write(&file, &block).unwrap();
+            let listed = std::process::Command::new("git").args(["config", "-f"]).arg(&file).arg("--list").output().unwrap();
+            assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+            assert!(String::from_utf8_lossy(&listed.stdout).contains("includeif.hasconfig:remote.*.url:https://github.com/[Aa][Cc][Mm][Ee]/**.path="), "{}", String::from_utf8_lossy(&listed.stdout));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -353,7 +675,53 @@ mod tests {
         assert!(s.contains("pushInsteadOf = ssh://git@github.com/"));
         assert!(s.contains("pushInsteadOf = ssh://git@github.com:22/"));
         assert!(s.contains("pushInsteadOf = ssh://git@ssh.github.com:443/"));
+        // …and every other address: the empty prefix matches them all, and
+        // loses to any longer one.
+        assert!(s.contains("\tpushInsteadOf = \"\"\n"));
         // …but never fetches (a plain insteadOf would break pull/clone).
         assert!(!s.contains("\tinsteadOf"));
+    }
+}
+
+#[cfg(test)]
+mod default_signing_tests {
+    use super::*;
+
+    fn prof(id: &str, default: bool, signs: bool, key: Option<&str>) -> Profile {
+        use chrono::Utc;
+        Profile {
+            id: id.into(),
+            name: id.into(),
+            git_name: "n".into(),
+            git_email: "e@x.test".into(),
+            ssh_key_path: key.map(String::from),
+            is_default: default,
+            allow_push: true,
+            signing_enabled: signs,
+            remote_patterns: Vec::new(),
+            github_login: None,
+            directories: vec!["/w".into()],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            push_over_ssh: None,
+        }
+    }
+
+    #[test]
+    fn a_signing_default_signs_where_no_other_profile_applies() {
+        let d = prof("d", true, true, Some("/k/id"));
+        let s = default_section(&d);
+        assert!(s.contains("gpgsign = true") && s.contains("format = ssh") && s.contains("/k/id.pub"), "{s}");
+        assert!(default_signs(&[d]));
+    }
+
+    #[test]
+    fn a_profile_that_does_not_sign_says_so_only_under_a_signing_default() {
+        let p = prof("p", false, false, None);
+        assert!(profile_gitconfig_content(&p, true).contains("gpgsign = false"));
+        assert!(profile_gitconfig_content(&p, true).contains("[gpg]\n\tformat = openpgp"), "a non-signing profile takes git's own signing format back");
+        assert!(!profile_gitconfig_content(&p, false).contains("gpgsign"));
+        let signer = prof("s", false, true, Some("/k/s"));
+        assert!(profile_gitconfig_content(&signer, true).contains("gpgsign = true"));
     }
 }

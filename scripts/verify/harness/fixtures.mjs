@@ -89,7 +89,7 @@ export function lockedLock(over = {}) {
   });
 }
 
-function push(over = {}) {
+export function push(over = {}) {
   return {
     lock: lock(),
     profile_blocked: false,
@@ -128,6 +128,7 @@ function identity(over = {}) {
     signing_on: false,
     signing_key: null,
     guard: "none",
+    guard_email: null,
     ...over,
   };
 }
@@ -172,25 +173,35 @@ export function status(over = {}) {
 const SYNC_SUPER = {
   branch: "main",
   upstream: "origin/main",
+  remote: "origin",
   head: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
   upstream_oid: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
   ahead: 2,
   behind: 3,
   own_commits: [
-    { oid: "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "1111111", subject: "local unrelated", touches: [] },
-    { oid: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "2222222", subject: "seal work", touches: ["A"] },
+    { oid: "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "1111111", subject: "local unrelated", touches: [], author_name: "Other", author_email: "o@example.test", date: "2026-09-23T10:30:00+02:00", only_pointers: false, already_upstream: false },
+    { oid: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "2222222", subject: "seal work", touches: ["A"], author_name: "Other", author_email: "o@example.test", date: "2026-09-23T10:30:00+02:00", only_pointers: false, already_upstream: false },
   ],
   incoming: [
-    { oid: "3333333aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "3333333", subject: "super: bump B", touches: ["B"] },
-    { oid: "4444444aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "4444444", subject: "super: upstream work", touches: [] },
-    { oid: "5555555aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "5555555", subject: "super: bump A", touches: ["A"] },
+    { oid: "3333333aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "3333333", subject: "super: bump B", touches: ["B"], author_name: "Other", author_email: "o@example.test", date: "2026-09-23T10:30:00+02:00", only_pointers: true, already_upstream: false },
+    { oid: "4444444aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "4444444", subject: "super: upstream work", touches: [], author_name: "Other", author_email: "o@example.test", date: "2026-09-23T10:30:00+02:00", only_pointers: false, already_upstream: false },
+    { oid: "5555555aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", short: "5555555", subject: "super: bump A", touches: ["A"], author_name: "Other", author_email: "o@example.test", date: "2026-09-23T10:30:00+02:00", only_pointers: true, already_upstream: false },
   ],
   file_overlap: ["shared.txt"],
   dirty_count: 1,
   untracked: 1,
   will_stash: true,
+  remedies: [],
+  base_short: "e81d1c5",
+  dirty_paths: ["README.md"],
+  more_incoming: 0,
+  more_own: 0,
   notes: [],
 };
+/** A commit as the sync engine lists it: who, what, when. */
+function commit(short, subject, author_name = "Other", author_email = "o@example.test", date = "2026-09-23T10:00:00+02:00", over = {}) {
+  return { oid: short.padEnd(40, "a"), short, subject, touches: [], author_name, author_email, date, only_pointers: false, already_upstream: false, ...over };
+}
 const SYNC_SUB_A = {
   path: "A", name: "A", action: "rebase",
   reason: "your 1 commit is rebased onto 7a9d38a when the superproject rebase stops on its pointer",
@@ -199,13 +210,20 @@ const SYNC_SUB_A = {
   predicted_gitlink_conflict: true, branch: "main", detached: false, reattach_to: null,
   dirty_tracked: 1, untracked: 1, fetch_error: null,
   notes: ["its 1 uncommitted change is stashed and re-applied around the rebase"],
+  remedy: null,
+  incoming_commits: [commit("a2a2a2a", "A: upstream 2"), commit("a1a1a1a", "A: upstream 1")],
+  own_commits: [commit("a535d05", "A: my commit", "Me", "me@personal.test", "2026-09-22T18:00:00+02:00")],
+  has_nested: false,
 };
 const SYNC_SUB_B = {
   path: "B", name: "B", action: "fast-forward", reason: "moves forward to 3c3c3c3 (no commits of yours)",
   head: "84d0861aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", recorded: "84d0861aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   target: "3c3c3c3aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", rebase_onto: null,
   predicted_gitlink_conflict: false, branch: "main", detached: false, reattach_to: null,
-  dirty_tracked: 0, untracked: 0, fetch_error: null, notes: [],
+  dirty_tracked: 0, untracked: 0, fetch_error: null, notes: [], remedy: null,
+  incoming_commits: [commit("3c3c3c3", "B: upstream 1")],
+  own_commits: [],
+  has_nested: false,
 };
 export const SYNC_PLAN = {
   can_run: true,
@@ -218,17 +236,33 @@ export const SYNC_PLAN = {
   fingerprint: [["", SYNC_SUPER.upstream_oid], ["A", SYNC_SUB_A.target], ["B", SYNC_SUB_B.target]],
   summary: "Your 2 commits are replayed on top of 3 new commits from origin/main, rebasing the submodules that carry your work",
 };
+/** One of my commits is already upstream: the preview strikes it through and leaves it out of the count. */
+export const SYNC_PLAN_DROPPED = {
+  ...SYNC_PLAN,
+  superproject: { ...SYNC_SUPER, own_commits: [SYNC_SUPER.own_commits[0], { ...SYNC_SUPER.own_commits[1], already_upstream: true }] },
+};
+/** Level with upstream: only submodules move, the branch is not rebased. */
+export const SYNC_PLAN_LEVEL = {
+  ...SYNC_PLAN,
+  summary: "Only submodules need aligning.",
+  superproject: { ...SYNC_SUPER, behind: 0, incoming: [], more_incoming: 0, will_stash: false, file_overlap: [] },
+};
+/** More commits of mine than are listed, some of the older ones already upstream. */
+export const SYNC_PLAN_MANY = {
+  ...SYNC_PLAN,
+  superproject: { ...SYNC_SUPER, ahead: 35, more_own: 33, more_own_dropped: 3 },
+};
 export const SYNC_PLAN_NOSTASH = {
   ...SYNC_PLAN,
   can_run: false,
   blockers: ["Turn on stashing, or commit or stash your 1 uncommitted change first"],
-  superproject: { ...SYNC_SUPER, will_stash: false },
+  superproject: { ...SYNC_SUPER, will_stash: false, remedies: ["turn-on-stash"] },
 };
 export const SYNC_PLAN_BLOCKED = {
   ...SYNC_PLAN,
   can_run: false,
-  blockers: ["B: it is checked out at 2404a33 but this branch records 84d0861; commit that pointer (Record submodule pointers) or move it back before syncing"],
-  submodules: [SYNC_SUB_A, { ...SYNC_SUB_B, action: "blocked", head: "2404a33aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", reason: "it is checked out at 2404a33 but this branch records 84d0861; commit that pointer (Record submodule pointers) or move it back before syncing" }],
+  blockers: ["B: it is checked out at 2404a33 but this branch records 84d0861; commit that pointer (Record submodule pointers) or move it back before updating"],
+  submodules: [SYNC_SUB_A, { ...SYNC_SUB_B, action: "blocked", head: "2404a33aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", reason: "it is checked out at 2404a33 but this branch records 84d0861; commit that pointer (Record submodule pointers) or move it back before updating", remedy: "record-pointers" }],
 };
 export const SYNC_PLAN_NOTHING = {
   ...SYNC_PLAN,
@@ -236,14 +270,14 @@ export const SYNC_PLAN_NOTHING = {
   nothing_to_do: true,
   superproject: { ...SYNC_SUPER, ahead: 2, behind: 0, incoming: [], file_overlap: [] },
   submodules: [{ ...SYNC_SUB_A, action: "none", reason: "already at the commit upstream records", notes: [] }, { ...SYNC_SUB_B, action: "none", reason: "already at the commit upstream records" }],
-  summary: "Nothing to sync: main already has everything from origin/main",
+  summary: "Nothing to update: main already has everything from origin/main",
 };
 export const SYNC_OUTCOME = {
   phase: "done",
   needs_user: null,
   backups: [
-    { repo: "/repos/gitswitch", branch: "gitswitch-before-sync-20260923120000", oid: SYNC_SUPER.head, recovery: "git -C /repos/gitswitch reset --hard gitswitch-before-sync-20260923120000" },
-    { repo: "/repos/gitswitch/A", branch: "gitswitch-before-sync-20260923120000", oid: SYNC_SUB_A.head, recovery: "git -C /repos/gitswitch/A reset --hard gitswitch-before-sync-20260923120000" },
+    { repo: "/repos/gitswitch", branch: "gitswitch-before-update-20260923120000", oid: SYNC_SUPER.head, recovery: "git -C /repos/gitswitch reset --hard gitswitch-before-update-20260923120000" },
+    { repo: "/repos/gitswitch/A", branch: "gitswitch-before-update-20260923120000", oid: SYNC_SUB_A.head, recovery: "git -C /repos/gitswitch/A reset --hard gitswitch-before-update-20260923120000" },
   ],
   bundles: [],
   head_before: SYNC_SUPER.head,
@@ -254,8 +288,8 @@ export const SYNC_OUTCOME = {
   stashed: true,
   stash_left: false,
   submodules: [
-    { path: "A", action: "rebase", head_before: SYNC_SUB_A.head, head_after: "d1d1d1daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", recorded_after: "d1d1d1daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ok: true, note: "rebased onto 7a9d38a; 1 commit of yours on top" },
-    { path: "B", action: "fast-forward", head_before: SYNC_SUB_B.head, head_after: SYNC_SUB_B.target, recorded_after: SYNC_SUB_B.target, ok: true, note: "fast-forwarded to 3c3c3c3" },
+    { path: "A", action: "rebased", head_before: SYNC_SUB_A.head, head_after: "d1d1d1daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", recorded_after: "d1d1d1daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ok: true, note: "rebased onto 7a9d38a; 1 commit of yours on top" },
+    { path: "B", action: "fast-forwarded", head_before: SYNC_SUB_B.head, head_after: SYNC_SUB_B.target, recorded_after: SYNC_SUB_B.target, ok: true, note: "fast-forwarded to 3c3c3c3" },
   ],
   verified: { behind_zero: true, own_on_top: true, dirty_paths_unchanged: true, untracked_unchanged: true, submodules_aligned: true, no_conflicts_left: true },
   unrecorded_pointers: [],
@@ -264,19 +298,62 @@ export const SYNC_OUTCOME_UNRECORDED = {
   ...SYNC_OUTCOME,
   own_kept: [],
   incoming: 1,
-  submodules: [{ path: "B", action: "ahead", head_before: "9b9b9b9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", head_after: "9b9b9b9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", recorded_after: SYNC_SUB_B.target, ok: true, note: "left alone; your commits sit on top of the recorded commit" }],
+  submodules: [{ path: "B", action: "left-ahead", head_before: "9b9b9b9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", head_after: "9b9b9b9aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", recorded_after: SYNC_SUB_B.target, ok: true, note: "left alone; your commits sit on top of the recorded commit" }],
   unrecorded_pointers: ["B"],
 };
 export const SYNC_PAUSED = {
   phase: "rebasing",
   started_at: "2026-09-23T12:00:00Z",
-  needs_user: { where_: "superproject", paths: ["shared.txt"], hint: "Resolve the conflicts listed on this page, stage them, then Continue sync." },
+  needs_user: { where_: "superproject", paths: ["shared.txt"], hint: "Resolve the conflicts listed on this page, stage them, then Continue update.", at_commit: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
   root: "/repos/gitswitch",
   is_root: true,
+  unresolved: 1,
+  upstream: "origin/main",
+  sub_path: null,
+  sub_target: null,
+};
+/** A pointer the update could not place itself: nothing to resolve inside A, its row here has to be staged. */
+export const SYNC_HANDED_OVER = {
+  ...SYNC_PAUSED,
+  needs_user: {
+    where_: "submodule:A",
+    paths: ["A"],
+    hint: "A is checked out at 1111111 but your commit records 2222222. Put it where you want it (with your commits on top of 7a9d38a), stage it, then Continue update.",
+    at_commit: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  },
+  unresolved: 1,
+  handed_over: true,
 };
 export const SYNC_PAUSED_IN_SUB = {
   ...SYNC_PAUSED,
-  needs_user: { where_: "submodule:A", paths: ["A.txt"], hint: "Rebasing A onto 7a9d38a stopped on a conflict inside it. Open it as its own repository, resolve and stage, then Continue sync." },
+  needs_user: { where_: "submodule:A", paths: ["A.txt"], hint: "Rebasing A onto 7a9d38a stopped on a conflict inside it. Open it as its own repository, resolve and stage, then Continue update.", at_commit: "2222222aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  unresolved: 1,
+};
+
+/** A plain pull that moved two submodule pointers: the repository records commits that are not checked out. */
+export const PULL_MOVED_OUTCOME = {
+  mode: "fast-forward only",
+  head_before: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+  head_after: "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+  fast_forward: true,
+  commits_pulled: 2,
+  files_changed: 3,
+  conflicts: [],
+  recovery: "git reset --hard aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
+  autostash_conflict: false,
+  autostash_left: null,
+  submodules_moved: 2,
+};
+
+/** shared.txt mid-rebase, as the backend splits it: one conflict, both sides named. */
+export const CONFLICT_VIEW = {
+  path: "shared.txt",
+  binary: false,
+  marker_count: 1,
+  hunks: [{ line: 2, mine: ["shared line 2 (mine)"], base: [], theirs: ["shared line 2 (upstream)"] }],
+  truncated: false,
+  sides: { mine: "your commit being replayed", theirs: "origin/main" },
+  total_lines: 7,
 };
 
 
@@ -300,6 +377,15 @@ export const REBASE_OP = {
 
 export const SCENARIOS = {
   clean: status(),
+
+  // The identity guard is GitSwitch's and expects the profile's email…
+  guardOn: status({ identity: identity({ guard: "gitswitch", guard_email: "me@personal.test" }) }),
+  // …or an email the profile had before it was changed: it would refuse the commit.
+  guardStale: status({
+    identity: identity({ guard: "gitswitch", guard_email: "old@personal.test" }),
+    entries: [entry({ path: "src/staged.ts", staged: "M", unstaged: ".", staged_added: 1, staged_removed: 0 })],
+    staged_count: 1,
+  }),
 
   dirty: status({
     entries: [
@@ -476,12 +562,33 @@ export const SCENARIOS = {
     conflicted_count: 1,
     can_amend: false,
   }),
+  // Paused between the superproject's rebase and the submodule work: no git
+  // operation is in progress here, yet the update owns the repository.
+  syncPausedAligning: status({
+    has_submodules: true,
+    sync: { ...SYNC_PAUSED_IN_SUB, phase: "aligning", unresolved: 0 },
+  }),
+  // Paused on a file, every conflict resolved and staged: Continue update is live.
+  syncPausedResolved: status({
+    operation: REBASE_OP,
+    sync: { ...SYNC_PAUSED, unresolved: 0 },
+    can_amend: false,
+  }),
+  syncHandedOver: status({
+    operation: REBASE_OP,
+    sync: SYNC_HANDED_OVER,
+    has_submodules: true,
+    entries: [entry({ path: "A", kind: "conflicted", staged: "U", unstaged: "U", conflict: "both modified", is_submodule: true })],
+    conflicted_count: 1,
+    can_amend: false,
+  }),
   // The submodule's own page while its superproject's sync is paused inside it.
   syncPausedChild: status({
     path: "/repos/gitswitch/A",
     name: "A",
-    operation: REBASE_OP,
-    sync: { ...SYNC_PAUSED_IN_SUB, is_root: false },
+    // The backend names "theirs" as the parent's upstream's record for this submodule.
+    operation: { ...REBASE_OP, sides: { mine: "your commit being replayed", theirs: "origin/main's A (7a9d38a)" } },
+    sync: { ...SYNC_PAUSED_IN_SUB, is_root: false, sub_path: "A", sub_target: SYNC_SUB_A.rebase_onto },
     entries: [entry({ path: "A.txt", kind: "conflicted", staged: "U", unstaged: "U", conflict: "both modified" })],
     conflicted_count: 1,
     can_amend: false,
@@ -563,7 +670,7 @@ export const DIFF_BINARY = {
 };
 
 /** Submodules shaped like the real `argos`: 32 gitlinks, 5 of them mapped. */
-function sub(over = {}) {
+export function sub(over = {}) {
   return {
     path: "vendor/lib",
     name: "lib",
@@ -589,6 +696,12 @@ function sub(over = {}) {
     dirty_untracked_capped: false,
     state: "clean",
     summary: "up to date with what this repo records; on main",
+    gitdir_valid: true,
+    operation: null,
+    conflicted: 0,
+    upstream_remote: "origin",
+    recorded_on_remote: true,
+    own_unpushed: 0,
     ...over,
   };
 }
@@ -654,6 +767,7 @@ export const LFS_POINTERS = {
   version: "git-lfs/3.8.0",
   uses_lfs: true,
   filters_configured: false,
+  install_hint: "brew install git-lfs",
   tracked: 5,
   pointers: 5,
   pointer_paths: [
@@ -673,6 +787,7 @@ export const LFS_LISTING = {
   version: "git-lfs/3.8.0",
   uses_lfs: true,
   filters_configured: true,
+  install_hint: "brew install git-lfs",
   files: [
     { path: "model.bin", dir: "", size: 4096, present: true, downloaded: true },
     { path: "media/video/clip.bin", dir: "media/video", size: 3221225472, present: false, downloaded: false },
@@ -700,6 +815,7 @@ export const LFS_LISTING = {
 export const LFS_PRESENT = {
   ...LFS_POINTERS,
   filters_configured: true,
+  install_hint: "brew install git-lfs",
   pointers: 0,
   pointer_paths: [],
   summary: "All 5 LFS files are present.",
@@ -914,3 +1030,34 @@ export const BRANCH_DELETE_OUTCOME = {
   stash: null,
   recovery: "git -C /repos/gitswitch branch feature/login abc1234abc1234abc1234abc1234abc1234abc12",
 };
+
+/** One checkout's workspace, as workspace_info answers: a repository cloned once. `over` replaces fields. */
+export function workspaceInfo(over = {}) {
+  return {
+    path: "/repos/gitswitch", name: "gitswitch", id: "a1b2c3d4", kind: "clone", asked_path: "/repos/gitswitch", offset: 0, compose_project: null, remote: "me/gitswitch",
+    copies: [{ path: "/repos/gitswitch", label: "gitswitch", id: "a1b2c3d4", offset: 0, kind: "clone", is_this: true, profile_name: "Kirmada", branch: "main", detached: false, unborn: false, changed: 0 }],
+    note: null,
+    env: [["GITSWITCH_WORKSPACE", "a1b2c3d4"], ["GITSWITCH_WORKSPACE_PATH", "/repos/gitswitch"], ["GITSWITCH_WORKSPACE_NAME", "gitswitch"], ["GITSWITCH_PORT_OFFSET", "0"]],
+    banner: "GitSwitch workspace #a1b2c3d4 · gitswitch · port offset 0 ($GITSWITCH_PORT_OFFSET)",
+    warnings: [],
+    not_automated: "GitSwitch only tells you about the other copy — it never switches a branch, edits a port in your project, or renames containers that are already running. Those are your decisions.",
+    ...over,
+  };
+}
+export const WORKSPACE_ONE = workspaceInfo();
+const COPY_THIS = { path: "/repos/gitswitch", label: "Argos_06-10-26_V1", id: "a1b2c3d4", offset: 0, kind: "clone", is_this: true, profile_name: "Kirmada", branch: "main", detached: false, unborn: false, changed: 3 };
+const COPY_OTHER = { path: "/Users/me/Documents/Acme/Argos_08-10-26", label: "Argos_08-10-26", id: "2f9c1a7b", offset: 100, kind: "clone", is_this: false, profile_name: "Kirmada", branch: "main", detached: false, unborn: false, changed: 0 };
+/** Two copies of acme/argos, the other one clean. */
+export const WORKSPACE_TWO = workspaceInfo({ name: "Argos_06-10-26_V1", remote: "acme/argos", copies: [COPY_THIS, COPY_OTHER] });
+/** Two copies on main with changes in both: the amber note. */
+export const WORKSPACE_TWO_DIRTY = workspaceInfo({
+  name: "Argos_06-10-26_V1", remote: "acme/argos", copies: [COPY_THIS, { ...COPY_OTHER, changed: 1 }],
+  note: { level: "amber", text: "Both copies have main checked out with uncommitted changes (Argos_06-10-26_V1: 3 files, Argos_08-10-26: 1 file). Commits made in both will diverge and the second push will be refused — work on a branch per copy." },
+});
+/** This checkout is the second copy: offset 100 and a Compose project of its own. */
+export const WORKSPACE_TWO_OFFSET = workspaceInfo({
+  name: "Argos_08-10-26", id: "2f9c1a7b", offset: 100, compose_project: "argos_08-10-26-2f9c1a7b", remote: "acme/argos",
+  copies: [{ ...COPY_THIS, path: "/Users/me/Documents/Acme/Argos_06-10-26_V1", is_this: false, changed: 0 }, { ...COPY_OTHER, path: "/repos/gitswitch", is_this: true }],
+  env: [["GITSWITCH_WORKSPACE", "2f9c1a7b"], ["GITSWITCH_WORKSPACE_PATH", "/repos/gitswitch"], ["GITSWITCH_WORKSPACE_NAME", "Argos_08-10-26"], ["GITSWITCH_PORT_OFFSET", "100"], ["COMPOSE_PROJECT_NAME", "argos_08-10-26-2f9c1a7b"]],
+  banner: "GitSwitch workspace #2f9c1a7b · Argos_08-10-26 · port offset 100 ($GITSWITCH_PORT_OFFSET) · Compose project argos_08-10-26-2f9c1a7b (this copy's own)",
+});

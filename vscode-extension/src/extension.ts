@@ -1,11 +1,8 @@
 import * as vscode from "vscode";
-import { execFile } from "child_process";
-import { promisify } from "util";
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
-
-const run = promisify(execFile);
+import { git, fetchWatched } from "./gitrun";
+import { Profile, profilesPath, resolveIdentity } from "./resolve";
 
 /**
  * The extension deliberately does NOT reimplement GitSwitch's logic.
@@ -13,73 +10,10 @@ const run = promisify(execFile);
  * The desktop app owns the profiles and writes the includeIf rules into
  * ~/.gitconfig; git itself then resolves the identity. So the extension only
  * has to READ the same profiles.json and ASK git what it resolved — there is
- * one source of truth and the two can never drift apart.
+ * one source of truth and the two can never drift apart. Which profile owns a
+ * repository is decided as the app decides it (resolve.ts); git runs as the
+ * app runs it (gitrun.ts).
  */
-
-interface Profile {
-  id: string;
-  name: string;
-  git_name: string;
-  git_email: string;
-  ssh_key_path: string | null;
-  is_default: boolean;
-  allow_push: boolean;
-  signing_enabled?: boolean;
-  directories: string[];
-}
-
-/** Where the Tauri app stores its data (mirrors Rust's dirs::data_dir()). */
-function profilesPath(): string {
-  const home = os.homedir();
-  const dir =
-    process.platform === "darwin"
-      ? path.join(home, "Library", "Application Support")
-      : process.platform === "win32"
-      ? process.env.APPDATA ?? path.join(home, "AppData", "Roaming")
-      : process.env.XDG_DATA_HOME ?? path.join(home, ".local", "share");
-  return path.join(dir, "com.gitswitch.app", "profiles.json");
-}
-
-function loadProfiles(): Profile[] {
-  try {
-    const raw = fs.readFileSync(profilesPath(), "utf8");
-    return JSON.parse(raw).profiles ?? [];
-  } catch {
-    return [];
-  }
-}
-
-/** Windows mixes \ and /; compare paths without a separator style. */
-function norm(p: string): string {
-  const s = p.replace(/\\/g, "/").replace(/\/+$/, "");
-  return s || p;
-}
-function isWithin(child: string, parent: string): boolean {
-  const c = norm(child);
-  const p = norm(parent);
-  return c === p || c.startsWith(`${p}/`);
-}
-
-/** Longest matching folder wins — same rule the generated gitconfig follows. */
-function profileFor(repoPath: string, profiles: Profile[]): Profile | null {
-  let best: Profile | null = null;
-  let bestLen = -1;
-  for (const p of profiles) {
-    for (const d of p.directories) {
-      const dir = norm(d);
-      if (isWithin(repoPath, dir) && dir.length > bestLen) {
-        best = p;
-        bestLen = dir.length;
-      }
-    }
-  }
-  return best ?? profiles.find((p) => p.is_default) ?? null;
-}
-
-async function git(cwd: string, args: string[]): Promise<string> {
-  const { stdout } = await run("git", args, { cwd, timeout: 10_000 });
-  return stdout.trim();
-}
 
 interface Identity {
   repoRoot: string;
@@ -105,9 +39,8 @@ async function currentIdentity(): Promise<Identity | null> {
     return null; // not a git repo — nothing to say
   }
 
-  const [name, email, branch] = await Promise.all([
-    git(repoRoot, ["config", "user.name"]).catch(() => ""),
-    git(repoRoot, ["config", "user.email"]).catch(() => ""),
+  const [resolved, branch] = await Promise.all([
+    resolveIdentity(repoRoot, (cwd, args) => git(cwd, args)),
     git(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"]).catch(() => ""),
   ]);
 
@@ -127,18 +60,9 @@ async function currentIdentity(): Promise<Identity | null> {
     /* no upstream */
   }
 
-  const profile = profileFor(repoRoot, loadProfiles());
-  return {
-    repoRoot,
-    name,
-    email,
-    branch,
-    profile,
-    ahead,
-    behind,
-    // Only a real conflict counts: a profile exists AND git resolved something else.
-    mismatch: !!profile && !!email && profile.git_email.trim() !== email.trim(),
-  };
+  // Only a real conflict counts: a profile owns the repository AND git
+  // resolved someone else (letter case aside).
+  return { repoRoot, branch, ahead, behind, ...resolved };
 }
 
 let statusItem: vscode.StatusBarItem;
@@ -170,7 +94,7 @@ async function refresh(): Promise<void> {
       ``,
       `Committing as **${current.name || "(unset)"}** \`${current.email || "(unset)"}\``,
       current.profile
-        ? `Profile for this folder: **${current.profile.name}** \`${current.profile.git_email}\``
+        ? `Profile for this repository: **${current.profile.name}** \`${current.profile.git_email}\``
         : `No GitSwitch profile covers this folder — git is falling back to your global identity.`,
       warn
         ? `\n⚠️ **Mismatch** — this repo commits as \`${current.email}\` but the profile says \`${current.profile!.git_email}\`.`
@@ -226,7 +150,11 @@ async function showIdentity(): Promise<void> {
   }
 }
 
-/** fetch, never pull: refreshes remote refs without touching the working tree. */
+/**
+ * fetch, never pull: refreshes remote refs without touching the working tree.
+ * Stopped only when git goes quiet for minutes, or when cancelled — a big
+ * fetch on a slow link is not a failure.
+ */
 async function fetchStatus(): Promise<void> {
   const id = await currentIdentity();
   if (!id) {
@@ -234,12 +162,14 @@ async function fetchStatus(): Promise<void> {
     return;
   }
   await vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Window, title: "GitSwitch: fetching…" },
-    async () => {
+    { location: vscode.ProgressLocation.Notification, title: "GitSwitch: fetching…", cancellable: true },
+    async (_progress, token) => {
+      const abort = new AbortController();
+      token.onCancellationRequested(() => abort.abort());
       try {
-        await git(id.repoRoot, ["fetch", "--all", "--quiet"]);
+        await fetchWatched(id.repoRoot, { signal: abort.signal });
       } catch (e) {
-        vscode.window.showErrorMessage(`GitSwitch: fetch failed — ${e}`);
+        vscode.window.showErrorMessage(`GitSwitch: fetch failed — ${e instanceof Error ? e.message : e}`);
         return;
       }
       await refresh();

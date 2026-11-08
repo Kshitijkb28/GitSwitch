@@ -1,5 +1,5 @@
 import { ReactNode } from "react";
-import { Plus, Minus, Undo2, FileText, Box, CornerDownRight } from "lucide-react";
+import { Plus, Minus, Undo2, FileText, Box, CornerDownRight, ExternalLink, FolderOpen } from "lucide-react";
 import { Button } from "../Button";
 import type { ChangeEntry, Sides } from "../../lib/api";
 
@@ -73,6 +73,10 @@ interface Props {
   /** Submodule rows with their own section on the page get a jump link. */
   jumpableSubmodules?: string[];
   onJumpToSubmodule?: (path: string) => void;
+  /** Conflicts only: open the file in the system's default application, or reveal it. */
+  onOpenPath?: (path: string, reveal: boolean) => void;
+  /** An anchor the page can scroll to (`#conflicts`). */
+  id?: string;
 }
 
 export function ChangesList({
@@ -93,6 +97,8 @@ export function ChangesList({
   caption,
   jumpableSubmodules,
   onJumpToSubmodule,
+  onOpenPath,
+  id,
 }: Props) {
   if (entries.length === 0 && !emptyText) return null;
 
@@ -101,7 +107,7 @@ export function ChangesList({
   const resolvable = entries.filter((e) => !e.is_submodule).map((e) => e.path);
 
   return (
-    <div className="rounded-xl border border-zinc-700/50 bg-zinc-800/40">
+    <div id={id} className="rounded-xl border border-zinc-700/50 bg-zinc-800/40">
       <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-zinc-700/50">
         <div className="flex items-center gap-2 min-w-0">
           <span className={accent === "danger" ? "text-red-400" : "text-zinc-400"}>
@@ -221,6 +227,60 @@ export function ChangesList({
                       <CornerDownRight size={12} />
                       Inside ↓
                     </Button>
+                  )}
+                  {onOpenPath && onResolveSide && !e.is_submodule && (
+                    <>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy}
+                        onClick={() => onOpenPath(e.path, false)}
+                        title="Open in your editor — the application your system opens this file with"
+                        className="px-1.5"
+                      >
+                        <ExternalLink size={12} />
+                        Open in editor
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={busy}
+                        onClick={() => onOpenPath(e.path, true)}
+                        title="Reveal in the file manager"
+                        className="px-1.5"
+                      >
+                        <FolderOpen size={12} />
+                        Reveal
+                      </Button>
+                    </>
+                  )}
+                  {onResolveSide && e.is_submodule && e.kind === "conflicted" && (e.pointer_mine || e.pointer_theirs) && (
+                    <>
+                      {e.pointer_mine && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={busy}
+                          onClick={() => onResolveSide([e.path], "mine")}
+                          title={`Keep mine (${mine}): ${e.path} at ${e.pointer_mine.slice(0, 7)} — the submodule is checked out there and recorded`}
+                          className="px-1.5"
+                        >
+                          Keep mine
+                        </Button>
+                      )}
+                      {e.pointer_theirs && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={busy}
+                          onClick={() => onResolveSide([e.path], "theirs")}
+                          title={`Take theirs (${theirs}): ${e.path} at ${e.pointer_theirs.slice(0, 7)} — the submodule is checked out there and recorded`}
+                          className="px-1.5"
+                        >
+                          Take theirs
+                        </Button>
+                      )}
+                    </>
                   )}
                   {onResolveSide && !e.is_submodule && (
                     <>

@@ -2,7 +2,11 @@ use crate::commit_audit::{self, RepoAudit};
 use crate::credentials;
 use crate::doctor::{self, Finding};
 use crate::error::AppError;
+use crate::find_clones;
+use crate::gh_api::Gh;
 use crate::gh_cli;
+use crate::gh_repo;
+use crate::pulls;
 use crate::git_config;
 use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, FetchResult, MergeInfo, RepoRef, SyncStatus};
 use crate::git_remote::{self, RemoteChange};
@@ -14,7 +18,9 @@ use crate::github::{self, GitHubKey, GitHubUser, RepoPermissions};
 use crate::remote_repos::{self, LocalClones, RepoAccount, RepoListing};
 use crate::repo_scan::{self, ScannedRepo};
 use crate::oauth::{self, DeviceCodeResponse, OAuthTokenResponse};
+use crate::ports;
 use crate::profiles::{self, Profile};
+use crate::workspace;
 use crate::signing;
 use crate::sparse::{self, CertInfo, CloneResult, DestinationStatus, SparseInfo, SparseSetResult};
 use crate::submodules::{self, SubmoduleInfo};
@@ -29,7 +35,7 @@ pub fn get_profiles() -> Result<Vec<Profile>, AppError> {
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
-pub fn create_profile(
+pub async fn create_profile(
     app: tauri::AppHandle,
     name: String,
     git_name: String,
@@ -38,6 +44,9 @@ pub fn create_profile(
     directories: Vec<String>,
     allow_push: Option<bool>,
     signing_enabled: Option<bool>,
+    remote_patterns: Option<Vec<String>>,
+    github_login: Option<String>,
+    push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
     let profile = profiles::create_profile(
         name,
@@ -47,15 +56,58 @@ pub fn create_profile(
         directories,
         allow_push.unwrap_or(true),
         signing_enabled.unwrap_or(false),
+        remote_patterns.unwrap_or_default(),
+        github_login,
+        push_over_ssh,
     )?;
     git_config::apply_git_config()?;
+    // A guard in these folders that expected another profile's email.
+    log_guards(commit_audit::refresh_guards(&profile.directories).await);
     crate::tray::update_active_label(&app);
     Ok(profile)
 }
 
+/// A profile saved, its config written, and every identity guard in its old
+/// and new folders brought in line with the email that now owns them — the
+/// command without the tray, so the verification probe can run it.
+#[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
+pub(crate) async fn update_profile_core(
+    id: String,
+    name: Option<String>,
+    git_name: Option<String>,
+    git_email: Option<String>,
+    ssh_key_path: Option<String>,
+    directories: Option<Vec<String>>,
+    allow_push: Option<bool>,
+    signing_enabled: Option<bool>,
+    remote_patterns: Option<Vec<String>>,
+    github_login: Option<String>,
+    push_over_ssh: Option<bool>,
+) -> Result<Profile, AppError> {
+    let before = profiles::load_profiles()?.profiles.into_iter().find(|p| p.id == id);
+    let profile = profiles::update_profile(
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login, push_over_ssh,
+    )?;
+    git_config::apply_git_config()?;
+    // Only an email or a folder change can leave a guard expecting the wrong email.
+    let changed = before.as_ref().is_none_or(|b| b.git_email != profile.git_email || b.directories != profile.directories);
+    if changed {
+        let mut dirs = profile.directories.clone();
+        dirs.extend(before.map(|b| b.directories).unwrap_or_default());
+        log_guards(commit_audit::refresh_guards(&dirs).await);
+    }
+    Ok(profile)
+}
+
+fn log_guards(lines: Vec<String>) {
+    for line in lines {
+        eprintln!("GitSwitch: {}", line);
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // mirrors the profile form field-for-field
-pub fn update_profile(
+pub async fn update_profile(
     app: tauri::AppHandle,
     id: String,
     name: Option<String>,
@@ -65,20 +117,25 @@ pub fn update_profile(
     directories: Option<Vec<String>>,
     allow_push: Option<bool>,
     signing_enabled: Option<bool>,
+    remote_patterns: Option<Vec<String>>,
+    github_login: Option<String>,
+    push_over_ssh: Option<bool>,
 ) -> Result<Profile, AppError> {
-    let profile = profiles::update_profile(
-        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled,
-    )?;
-    git_config::apply_git_config()?;
+    let profile = update_profile_core(
+        id, name, git_name, git_email, ssh_key_path, directories, allow_push, signing_enabled, remote_patterns, github_login, push_over_ssh,
+    )
+    .await?;
     crate::tray::update_active_label(&app);
     Ok(profile)
 }
 
 #[tauri::command]
-pub fn delete_profile(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
-    credentials::delete_token(&id).ok();
+pub async fn delete_profile(app: tauri::AppHandle, id: String) -> Result<(), AppError> {
+    let dirs = profiles::load_profiles()?.profiles.into_iter().find(|p| p.id == id).map(|p| p.directories).unwrap_or_default();
     profiles::delete_profile(id)?;
     git_config::apply_git_config()?;
+    // A parent folder's profile may own these repositories now.
+    log_guards(commit_audit::refresh_guards(&dirs).await);
     crate::tray::update_active_label(&app);
     Ok(())
 }
@@ -136,26 +193,71 @@ pub async fn gh_logout(account: String) -> Result<String, AppError> {
     gh_cli::gh_logout(&account).await
 }
 
-/// Automate "Step 2": register a local key's public half on a specific gh account.
+/// Every gh login with its host and whether gh itself uses it (the active one).
+#[tauri::command]
+pub async fn gh_auth_accounts() -> Result<Vec<gh_cli::GhAccount>, AppError> {
+    gh_cli::gh_auth_status().await
+}
+
+/// Make a login the GitHub CLI's active account on a host.
+#[tauri::command]
+pub async fn gh_auth_switch(host: String, login: String) -> Result<String, AppError> {
+    gh_cli::gh_auth_switch(&host, &login).await
+}
+
+/// Start `gh auth login` in the browser: the one-time code and where to enter it.
+#[tauri::command]
+pub async fn gh_auth_login_start(host: Option<String>) -> Result<gh_cli::GhDevicePrompt, AppError> {
+    gh_cli::gh_auth_login_start(host.as_deref().unwrap_or("github.com")).await
+}
+
+/// Wait for the sign-in started above: the account gh signed in.
+#[tauri::command]
+pub async fn gh_auth_login_wait() -> Result<gh_cli::GhLogin, AppError> {
+    gh_cli::gh_auth_login_wait().await
+}
+
+/// End the sign-in in progress, if any.
+#[tauri::command]
+pub async fn gh_auth_login_cancel() -> Result<(), AppError> {
+    gh_cli::gh_auth_login_cancel();
+    Ok(())
+}
+
+/// Automate "Step 2": register a local key's public half on a specific
+/// account — a gh login, or a sign-in kept here ("signin:<login>").
 /// `key_path` is the PRIVATE key path; we read `<key_path>.pub`.
 #[tauri::command]
-pub async fn gh_register_ssh_key(
-    account: String,
-    key_path: String,
-    title: String,
-) -> Result<String, AppError> {
-    let token = gh_cli::gh_get_token(&account).await?;
+pub async fn gh_register_ssh_key(account: String, key_path: String) -> Result<String, AppError> {
+    let signin = credentials::signin_login(&account).map(str::to_string);
+    let token = match &signin {
+        Some(login) => credentials::signin_token(login)?.ok_or_else(|| AppError::NotFound(format!("The sign-in for {} is not kept on this computer any more — sign in again on the GitHub page.", login)))?,
+        None => gh_cli::gh_get_token(&account).await?,
+    };
+    let account = signin.clone().unwrap_or(account);
     let public_key = ssh_keys::get_public_key(&key_path)?;
-
-    match github::upload_ssh_key(&token, &title, &public_key).await {
-        Ok(k) => Ok(format!("Registered '{}' on {}", k.title, account)),
-        Err(AppError::Command(msg))
-            if msg.contains("already in use") || msg.contains("key is already") =>
-        {
-            Ok(format!("Key already registered on {}", account))
+    let title = ssh_keys::key_title(ssh_keys::computer_name().as_deref());
+    let (status, body, scope) = github::post_ssh_key(&token, &title, &public_key).await?;
+    // A kept sign-in is renewed on the GitHub page, not with gh.
+    if signin.is_some() {
+        match status {
+            401 => return Err(AppError::Command(format!("GitHub no longer accepts the sign-in kept for {} — sign in again on the GitHub page.", account))),
+            403 | 404 => return Err(AppError::Command(format!("The sign-in kept for {} may not add SSH keys — sign in again on the GitHub page, which asks GitHub for that.", account))),
+            _ => {}
         }
-        Err(e) => Err(e),
     }
+    // "Already in use" is a success only when THIS account holds the key:
+    // otherwise it is the wrong-account case the whole flow exists for.
+    let (mine, holder) = if status == 422 {
+        let material = |k: &str| k.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        let wanted = material(&public_key);
+        let mine = github::list_ssh_keys_github(&token).await.ok().map(|keys| keys.iter().any(|k| material(&k.key) == wanted));
+        let holder = if mine == Some(false) { ssh_keys::resolve_key_account(&key_path).await.ok().flatten() } else { None };
+        (mine, holder)
+    } else {
+        (None, None)
+    };
+    github::key_upload_outcome(&account, status, &body, scope.as_deref(), mine, holder.as_deref())
 }
 
 /// Automate "Step 5": which GitHub account does this key authenticate as?
@@ -186,6 +288,31 @@ pub async fn doctor_check_repos() -> Result<Vec<Finding>, AppError> {
     doctor::check_repos().await
 }
 
+/// Which account a push from this repository would authenticate as.
+/// `refresh` forgets the cached answers first (the Re-check button).
+#[tauri::command]
+pub async fn changes_push_identity(repo_path: String, refresh: bool) -> Result<crate::push_identity::PushIdentity, AppError> {
+    crate::push_identity::push_identity(&repo_path, refresh).await
+}
+
+/// Doctor, on request: can the account each repository pushes as see it on GitHub?
+#[tauri::command]
+pub async fn doctor_check_repo_access() -> Result<Vec<Finding>, AppError> {
+    doctor::check_repo_access().await
+}
+
+/// One of Doctor's own repairs, by the fix id its finding carries.
+#[tauri::command]
+pub async fn doctor_apply_fix(fix: String) -> Result<String, AppError> {
+    doctor::apply_fix(&fix).await
+}
+
+/// Doctor's repair for a `local-override` finding.
+#[tauri::command]
+pub async fn doctor_unset_local(repo_path: String, key: String) -> Result<String, AppError> {
+    doctor::unset_local(&repo_path, &key).await
+}
+
 #[tauri::command]
 pub async fn doctor_fix_ssh_config() -> Result<String, AppError> {
     tokio::task::spawn_blocking(doctor::fix_ssh_config)
@@ -199,6 +326,13 @@ pub async fn scan_repos(root: String) -> Result<Vec<ScannedRepo>, AppError> {
     repo_scan::scan_repos(root).await
 }
 
+/// Auto Assign's scan: the same, watched through `find_repos_progress` and
+/// stopped through `find_repos_cancel` with the same id.
+#[tauri::command]
+pub async fn scan_repos_tracked(scan_id: String, root: String) -> Result<repo_scan::TrackedScan, AppError> {
+    repo_scan::scan_tracked(scan_id, root).await
+}
+
 /// Auto-assign: what access does this token's account have on owner/repo?
 /// None = the account can't even see the repo.
 #[tauri::command]
@@ -208,6 +342,200 @@ pub async fn check_repo_access(
     repo: String,
 ) -> Result<Option<RepoPermissions>, AppError> {
     github::repo_permission(&token, &owner, &repo).await
+}
+
+// --- GitHub: pull requests, reviews, merging, collaborators ---
+// Every command names the account to act as ("gh:<login>" / "signin:<login>");
+// its token is looked up in Rust and never reaches the page.
+
+/// The GitHub repository behind a clone (or "owner/name"), and what each account may do there.
+#[tauri::command]
+pub async fn github_repo_context(repo_path: Option<String>, repo: Option<String>) -> Result<gh_repo::RepoContext, AppError> {
+    gh_repo::context(repo_path, repo).await
+}
+
+/// One page of a repository's pull requests: open, merged, closed (unmerged) or all.
+#[tauri::command]
+pub async fn github_pulls(account: String, owner: String, name: String, state: String, page: u32) -> Result<pulls::PullPage, AppError> {
+    pulls::list(&Gh::for_account(&account).await?, &owner, &name, &state, page).await
+}
+
+/// The account's repositories for the Pull requests page, each with its open
+/// pull requests, the ones asking the account for a review and the ones it opened.
+#[tauri::command]
+pub async fn github_pull_repos(account: String) -> Result<pulls::PullRepos, AppError> {
+    pulls::repos(&Gh::for_account(&account).await?).await
+}
+
+/// Pull requests across repositories: created by, review requested of, assigned to, or involving the account.
+#[tauri::command]
+pub async fn github_pulls_search(account: String, scope: String, state: String, repo: Option<String>, page: u32) -> Result<pulls::PullPage, AppError> {
+    pulls::search(&Gh::for_account(&account).await?, &scope, &state, repo.as_deref(), page).await
+}
+
+#[tauri::command]
+pub async fn github_pull(account: String, owner: String, name: String, number: u64) -> Result<pulls::PullDetail, AppError> {
+    pulls::detail(&Gh::for_account(&account).await?, &owner, &name, number).await
+}
+
+#[tauri::command]
+pub async fn github_pull_files(account: String, owner: String, name: String, number: u64) -> Result<pulls::PullFiles, AppError> {
+    pulls::files(&Gh::for_account(&account).await?, &owner, &name, number).await
+}
+
+#[tauri::command]
+pub async fn github_pull_commits(account: String, owner: String, name: String, number: u64) -> Result<Vec<pulls::PullCommit>, AppError> {
+    pulls::commits(&Gh::for_account(&account).await?, &owner, &name, number).await
+}
+
+/// Approve, ask for changes, or comment on a pull request.
+#[tauri::command]
+pub async fn github_pull_review(account: String, owner: String, name: String, number: u64, event: String, body: String) -> Result<pulls::Review, AppError> {
+    pulls::review(&Gh::for_account(&account).await?, &owner, &name, number, &event, &body).await
+}
+
+/// Merge with the head commit that was reviewed (GitHub refuses if it moved since).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn github_pull_merge(
+    account: String,
+    owner: String,
+    name: String,
+    number: u64,
+    method: String,
+    sha: String,
+    title: Option<String>,
+    message: Option<String>,
+    delete_branch: bool,
+) -> Result<pulls::MergeOutcome, AppError> {
+    pulls::merge(&Gh::for_account(&account).await?, &owner, &name, number, &method, &sha, title.as_deref(), message.as_deref(), delete_branch).await
+}
+
+#[tauri::command]
+pub async fn github_collaborators(account: String, owner: String, name: String) -> Result<gh_repo::People, AppError> {
+    gh_repo::people(&Gh::for_account(&account).await?, &owner, &name).await
+}
+
+#[tauri::command]
+pub async fn github_collaborator_add(account: String, owner: String, name: String, username: String, permission: String) -> Result<gh_repo::AddOutcome, AppError> {
+    gh_repo::add(&Gh::for_account(&account).await?, &owner, &name, &username, &permission).await
+}
+
+#[tauri::command]
+pub async fn github_collaborator_remove(account: String, owner: String, name: String, username: String) -> Result<(), AppError> {
+    gh_repo::remove(&Gh::for_account(&account).await?, &owner, &name, &username).await
+}
+
+#[tauri::command]
+pub async fn github_invitation_cancel(account: String, owner: String, name: String, id: u64) -> Result<(), AppError> {
+    gh_repo::cancel_invitation(&Gh::for_account(&account).await?, &owner, &name, id).await
+}
+
+// --- Find repositories: clones no profile folder holds ---
+
+/// The clones on this computer the Repository page does not list: under the
+/// places asked for, the folders that hold profile folders, the home folder.
+#[tauri::command]
+pub async fn find_unlisted_repos(scan_id: String, extra_roots: Vec<String>) -> Result<find_clones::FoundClones, AppError> {
+    find_clones::find_unlisted(scan_id, extra_roots).await
+}
+
+/// How far a search has got: folders looked at, repositories found,
+/// questions to GitHub answered.
+#[tauri::command]
+pub fn find_repos_progress(scan_id: String) -> Option<find_clones::FindProgress> {
+    find_clones::progress(&scan_id)
+}
+
+/// Stop a search wherever it is: the walk, or the questions to GitHub.
+#[tauri::command]
+pub fn find_repos_cancel(scan_id: String) {
+    find_clones::cancel(&scan_id)
+}
+
+/// What each signed-in account may do with each of these "owner/name"s.
+#[tauri::command]
+pub async fn repo_access_matrix(scan_id: String, repos: Vec<String>) -> Result<find_clones::AccessMatrix, AppError> {
+    find_clones::access_matrix(scan_id, repos).await
+}
+
+/// Each folder added to its profile, the store read afresh for each — a clone
+/// finishing or another page saving meanwhile loses nothing — then the config
+/// written once and the identity guards in those folders brought in line.
+/// What each guard expected before is returned, for Undo.
+pub(crate) async fn profile_folders_add_core(changes: Vec<find_clones::FolderChange>) -> Result<find_clones::FoldersAdded, AppError> {
+    let paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+    let before: Vec<Option<String>> = tokio::task::spawn_blocking(move || paths.iter().map(|p| find_clones::guard_expects(p)).collect())
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?;
+    let mut out = find_clones::FoldersAdded::default();
+    let mut touched = Vec::new();
+    for (c, guard_was) in changes.into_iter().zip(before) {
+        match profiles::add_folders(&c.profile_id, std::slice::from_ref(&c.path)) {
+            Ok(stored) => {
+                let path = stored.into_iter().next().unwrap_or(c.path);
+                touched.push(path.clone());
+                out.added.push(find_clones::FolderAdded { profile_id: c.profile_id, path, guard_was });
+            }
+            Err(e) => out.failed.push(find_clones::FolderFailed { profile_id: c.profile_id, path: c.path, why: e.to_string() }),
+        }
+    }
+    if !touched.is_empty() {
+        git_config::apply_git_config()?;
+        log_guards(commit_audit::refresh_guards(&touched).await);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn profile_folders_add(app: tauri::AppHandle, changes: Vec<find_clones::FolderChange>) -> Result<find_clones::FoldersAdded, AppError> {
+    let out = profile_folders_add_core(changes).await?;
+    crate::tray::update_active_label(&app);
+    Ok(out)
+}
+
+/// Undo of an add: each folder taken off its profile again, the config
+/// written, and a guard that expected another email before the add expects
+/// it again (with no profile owning the repository any more, the guards'
+/// own refresh leaves a guard as it is).
+pub(crate) async fn profile_folders_remove_core(changes: Vec<find_clones::FolderAdded>) -> Result<Vec<find_clones::FolderChange>, AppError> {
+    let mut removed = Vec::new();
+    for c in &changes {
+        for path in profiles::remove_folders(&c.profile_id, std::slice::from_ref(&c.path))? {
+            removed.push(find_clones::FolderChange { profile_id: c.profile_id.clone(), path });
+        }
+    }
+    if !removed.is_empty() {
+        git_config::apply_git_config()?;
+        let dirs: Vec<String> = removed.iter().map(|r| r.path.clone()).collect();
+        log_guards(commit_audit::refresh_guards(&dirs).await);
+    }
+    let restore: Vec<(String, String)> = changes.into_iter().filter_map(|c| c.guard_was.map(|e| (c.path, e))).collect();
+    let lines = tokio::task::spawn_blocking(move || {
+        let mut lines = Vec::new();
+        for (path, email) in restore {
+            let Some(now) = find_clones::guard_expects(&path) else { continue };
+            if now.trim().eq_ignore_ascii_case(email.trim()) {
+                continue;
+            }
+            match commit_audit::install_guard(&path, &email) {
+                Ok(_) => lines.push(format!("{}: the identity guard expects {} again (was {})", path, email, now)),
+                Err(e) => lines.push(format!("{}: the identity guard could not be put back to {}: {}", path, email, e)),
+            }
+        }
+        lines
+    })
+    .await
+    .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?;
+    log_guards(lines);
+    Ok(removed)
+}
+
+#[tauri::command]
+pub async fn profile_folders_remove(app: tauri::AppHandle, changes: Vec<find_clones::FolderAdded>) -> Result<Vec<find_clones::FolderChange>, AppError> {
+    let out = profile_folders_remove_core(changes).await?;
+    crate::tray::update_active_label(&app);
+    Ok(out)
 }
 
 /// Sparse checkout: partial-clone a repo (blob:none, no checkout).
@@ -310,14 +638,28 @@ pub async fn convert_repos_to_ssh(directory: String) -> Result<Vec<RemoteChange>
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
 }
 
+/// Keep a "Sign in with GitHub": its token in the system's credential store,
+/// its login in GitSwitch's list. Asked of GitHub first: the login kept is
+/// the one GitHub names for the token, never one the page passes.
 #[tauri::command]
-pub fn store_github_token(profile_id: String, token: String) -> Result<(), AppError> {
-    credentials::store_token(&profile_id, &token)
+pub async fn github_signin_keep(token: String) -> Result<GitHubUser, AppError> {
+    let user = github::verify_token(&token).await?;
+    credentials::keep_signin_token(&user.login, &token)?;
+    credentials::remember_signin(&user.login, user.id)?;
+    Ok(user)
 }
 
+/// Forget a kept sign-in: the token and the login.
 #[tauri::command]
-pub fn get_github_token(profile_id: String) -> Result<Option<String>, AppError> {
-    credentials::get_token(&profile_id)
+pub fn github_signin_forget(login: String) -> Result<(), AppError> {
+    credentials::forget_signin_token(&login)?;
+    credentials::forget_signin(&login)
+}
+
+/// The sign-ins kept here, newest first (no token is read to list them).
+#[tauri::command]
+pub fn github_signins() -> Vec<credentials::KeptSignIn> {
+    credentials::kept_signins()
 }
 
 #[tauri::command]
@@ -439,6 +781,9 @@ pub async fn history_branches(repo_path: String) -> Result<Vec<BranchInfo>, AppE
 
 /// Paginated: git log is fast, but a 100k-commit repo would still choke the UI
 /// if we handed it everything at once.
+// The page's filters are the IPC arguments, one each; a struct would change
+// the contract every frontend call site and harness fixture is written to.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn history_page(
     repo_path: String,
@@ -446,7 +791,9 @@ pub async fn history_page(
     offset: usize,
     limit: usize,
     search: Option<String>,
-    author: Option<String>,
+    authors: Option<Vec<String>>,
+    hide_pointer_only: Option<bool>,
+    unpushed_only: Option<bool>,
 ) -> Result<HistoryPage, AppError> {
     tokio::task::spawn_blocking(move || {
         git_history::history_page(
@@ -455,7 +802,9 @@ pub async fn history_page(
             offset,
             limit,
             search.as_deref(),
-            author.as_deref(),
+            authors.as_deref(),
+            hide_pointer_only.unwrap_or(false),
+            unpushed_only.unwrap_or(false),
         )
     })
     .await
@@ -488,6 +837,75 @@ pub async fn history_fetch(repo_path: String) -> Result<FetchResult, AppError> {
     tokio::task::spawn_blocking(move || git_history::fetch_repo(&repo_path))
         .await
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// Who commits on the viewed revision, most frequent first.
+#[tauri::command]
+pub async fn history_authors(repo_path: String, rev: String) -> Result<Vec<git_history::AuthorCount>, AppError> {
+    tokio::task::spawn_blocking(move || git_history::authors(&repo_path, &rev))
+        .await
+        .map_err(|e| AppError::Command(format!("task failed: {}", e)))?
+}
+
+/// Every listening port on this machine, who holds it, and where it runs from.
+#[tauri::command]
+pub async fn ports_list() -> Result<ports::PortsReport, AppError> {
+    ports::list().await
+}
+
+/// Stop the process holding a port; `name` is what the page listed, so a
+/// pid reused by another program is refused.
+#[tauri::command]
+pub async fn ports_kill(pid: u32, force: bool, name: String) -> Result<ports::KillOutcome, AppError> {
+    ports::kill(pid, force, &name).await
+}
+
+/// This checkout's workspace: its id, port offset and Compose project, the
+/// other copies of the same project among the profile folders, and the note
+/// when two of them share a branch with changes. Assigns what is missing.
+#[tauri::command]
+pub async fn workspace_info(path: String) -> Result<workspace::WorkspaceInfo, AppError> {
+    workspace::info(&path).await
+}
+
+/// The person chose this checkout's port offset.
+#[tauri::command]
+pub async fn workspace_set_offset(path: String, offset: u32) -> Result<workspace::WorkspaceInfo, AppError> {
+    workspace::set_offset(&path, offset).await
+}
+
+/// Stop a container, or every container of a Compose project.
+#[tauri::command]
+pub async fn ports_container_stop(id: String, project: Option<String>) -> Result<ports::ContainerStopOutcome, AppError> {
+    ports::container_stop(&id, project.as_deref()).await
+}
+
+/// The page a gitswitch:// link asked for before the page listened (the link
+/// that started the app); the page asks once, as soon as it listens.
+#[tauri::command]
+pub fn deep_link_take(pending: tauri::State<'_, crate::deep_link::Pending>) -> Option<&'static str> {
+    pending.take()
+}
+
+/// Live progress of a clone into `dest_path`, while it runs.
+#[tauri::command]
+pub async fn clone_progress(dest_path: String) -> Option<sparse::CloneProgress> {
+    sparse::clone_progress(&dest_path)
+}
+
+/// How big a GitHub repository is before cloning it, when GitHub will say.
+#[tauri::command]
+pub async fn clone_size_estimate(url: String) -> Option<sparse::CloneSizeEstimate> {
+    sparse::clone_size_estimate(&url).await
+}
+
+/// Which branch HEAD is on — or that it is detached or unborn. The one fact
+/// the branch list cannot give, read without the full repository status.
+#[tauri::command]
+pub async fn history_head(repo_path: String) -> Result<git_history::HeadInfo, AppError> {
+    tokio::task::spawn_blocking(move || git_history::head_info(&repo_path))
+        .await
+        .map_err(|e| AppError::Command(format!("task failed: {}", e)))?
 }
 
 /// Ahead/behind vs the remote, plus how stale that answer is.
@@ -589,6 +1007,175 @@ pub async fn push_lock_uninstall() -> JobOutcome {
     push_lock::uninstall_all().await
 }
 
+/// The Uninstall tab: the installed apps (`kind` "packages": Ubuntu's every package).
+#[tauri::command]
+pub async fn apps_list(kind: String) -> Result<crate::apps::AppList, AppError> {
+    Box::pin(crate::apps::list(kind)).await
+}
+
+/// An app's size, counted within a few seconds: (bytes, complete).
+#[tauri::command]
+pub async fn apps_size(id: String) -> Result<(u64, bool), AppError> {
+    crate::apps::size(id).await
+}
+
+/// The confirm step: what identifies the app is recorded, and how it will go is said.
+#[tauri::command]
+pub async fn apps_prepare(id: String) -> Result<crate::apps::Prepared, AppError> {
+    Box::pin(crate::apps::prepare(id)).await
+}
+
+#[tauri::command]
+pub async fn apps_uninstall(session: String) -> Result<crate::apps::Progress, AppError> {
+    Box::pin(crate::apps::uninstall(session)).await
+}
+
+#[tauri::command]
+pub async fn apps_status(session: String) -> Result<crate::apps::Progress, AppError> {
+    Box::pin(crate::apps::status(session)).await
+}
+
+/// "It's finished": is the app really gone?
+#[tauri::command]
+pub async fn apps_check_gone(session: String) -> Result<crate::apps::Progress, AppError> {
+    Box::pin(crate::apps::check_gone(session)).await
+}
+
+/// The removed app's leftovers (Windows: `registry` adds its keys under HKCU).
+#[tauri::command]
+pub async fn apps_scan(session: String, registry: bool) -> Result<crate::apps::LeftoverScan, AppError> {
+    Box::pin(crate::apps::scan(session, registry)).await
+}
+
+/// Move the ticked leftovers (ids from the scan) to the Trash.
+#[tauri::command]
+pub async fn apps_delete(scan: String, ids: Vec<String>) -> Result<Vec<crate::apps::Deleted>, AppError> {
+    Box::pin(crate::apps::delete(scan, ids)).await
+}
+
+#[tauri::command]
+pub fn apps_sessions() -> Vec<crate::apps::SessionSummary> {
+    crate::apps::sessions()
+}
+
+#[tauri::command]
+pub fn apps_forget(session: String) -> Result<(), AppError> {
+    crate::apps::forget(session)
+}
+
+#[tauri::command]
+pub fn apps_open_uninstaller(session: String) -> Result<(), AppError> {
+    crate::apps::open_vendor_uninstaller(session)
+}
+
+/// Windows: delete a program's files directly instead of running its uninstaller.
+#[tauri::command]
+pub async fn apps_force_remove(session: String) -> Result<crate::apps::Progress, AppError> {
+    Box::pin(crate::apps::force_remove(session)).await
+}
+
+/// Net speed: the speeds, the connection, usage and settings for the tab.
+#[tauri::command]
+pub async fn netspeed_snapshot() -> crate::netspeed::Snapshot {
+    crate::netspeed::snapshot()
+}
+
+/// Net speed: new settings (shown at once in the taskbar / menu bar).
+#[tauri::command]
+pub async fn netspeed_set_settings(app: tauri::AppHandle, settings: crate::netspeed::Settings) -> crate::netspeed::Settings {
+    crate::netspeed::set_settings(&app, settings)
+}
+
+/// What the speed bar shows.
+#[tauri::command]
+pub async fn netspeed_bar() -> crate::netspeed::BarText {
+    crate::netspeed::bar_text()
+}
+
+/// The speed bar back beside the clock (wherever it was dragged).
+#[tauri::command]
+pub async fn netspeed_bar_reset(app: tauri::AppHandle) {
+    crate::netspeed::bar_reset(&app)
+}
+
+/// The system's settings page for the taskbar's icons or location access.
+#[tauri::command]
+pub async fn netspeed_open_settings(which: String) -> Result<(), AppError> {
+    crate::netspeed::open_os_settings(&which)
+}
+
+/// The speed bar was double-clicked: the window, on the Net speed tab.
+#[tauri::command]
+pub async fn netspeed_show_tab(app: tauri::AppHandle) {
+    crate::netspeed::show_tab(&app)
+}
+
+#[tauri::command]
+pub async fn netspeed_speedtest_start() -> Result<(), AppError> {
+    crate::netspeed::speedtest::start().map_err(AppError::Config)
+}
+
+#[tauri::command]
+pub async fn netspeed_speedtest_status() -> crate::netspeed::speedtest::TestState {
+    crate::netspeed::speedtest::status()
+}
+
+#[tauri::command]
+pub async fn netspeed_speedtest_cancel() {
+    crate::netspeed::speedtest::cancel()
+}
+
+/// Apps uninstalled with GitSwitch before, no longer installed.
+#[tauri::command]
+pub fn apps_history() -> Vec<crate::apps::PastUninstall> {
+    crate::apps::history()
+}
+
+/// Look for an app's leftovers again: a new session to continue with.
+#[tauri::command]
+pub async fn apps_rescan(key: String) -> Result<String, AppError> {
+    Box::pin(crate::apps::rescan(key)).await
+}
+
+/// Close the app's own running processes, so its uninstall can go ahead.
+#[tauri::command]
+pub async fn apps_close(session: String) -> Result<crate::apps::Closed, AppError> {
+    Box::pin(crate::apps::close(session)).await
+}
+
+/// Windows: leftovers in use, deleted when Windows next starts.
+#[tauri::command]
+pub async fn apps_delete_at_restart(scan: String, ids: Vec<String>) -> Result<Vec<crate::apps::Deleted>, AppError> {
+    Box::pin(crate::apps::delete_at_restart(scan, ids)).await
+}
+
+/// What uninstalling GitSwitch would take back and remove, read now.
+#[tauri::command]
+pub async fn uninstall_plan() -> crate::uninstall::UninstallPlan {
+    Box::pin(crate::uninstall::plan()).await
+}
+
+/// Uninstalling, first step: take back what GitSwitch wrote outside its own
+/// folders (push locks behind the administrator prompt, repositories,
+/// ~/.gitconfig, allowed_signers, sign-ins unless `keep_data`).
+#[tauri::command]
+pub async fn uninstall_prepare(keep_data: bool) -> crate::uninstall::PrepareReport {
+    Box::pin(crate::uninstall::prepare(keep_data)).await
+}
+
+/// Uninstalling, last step: start the script that removes the data folders
+/// (unless `keep_data`) and the app once it has quit — then quit.
+#[tauri::command]
+pub async fn uninstall_finish(app: tauri::AppHandle, keep_data: bool) -> Result<crate::uninstall::FinishReport, AppError> {
+    let report = crate::uninstall::finish(keep_data)?;
+    tauri::async_runtime::spawn(async move {
+        // Long enough for the page to say what happens next.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        app.exit(0);
+    });
+    Ok(report)
+}
+
 /// Doctor's `lock-*` fixes.
 #[tauri::command]
 pub async fn push_lock_fix(fix: String) -> JobOutcome {
@@ -613,11 +1200,18 @@ pub async fn changes_repair_push_block(repo_path: String) -> Result<PushState, A
     git_status::repair_push_block_for(&repo_path).await
 }
 
+/// How far the repository's push block or lock reaches into its submodules.
+#[tauri::command]
+pub async fn changes_push_coverage(repo_path: String) -> Result<crate::push_guard::PushCoverage, AppError> {
+    let state = git_status::push_state_for(&repo_path).await?;
+    Ok(crate::push_guard::coverage(&repo_path, &state).await)
+}
+
 /// Stage the named files. Never "everything" by accident: an empty list is an
 /// error, and staging all is a separate command.
 #[tauri::command]
-pub async fn changes_stage(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
-    git_ops::stage(&repo_path, paths).await
+pub async fn changes_stage(repo_path: String, paths: Vec<String>, allow_markers: Option<bool>) -> Result<OpResult, AppError> {
+    git_ops::stage(&repo_path, paths, allow_markers.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -649,8 +1243,11 @@ pub async fn changes_commit(
 }
 
 #[tauri::command]
-pub async fn changes_push(repo_path: String, set_upstream: bool) -> Result<OpResult, AppError> {
-    git_ops::push(&repo_path, set_upstream).await
+/// `allow_unpushed_submodules`: push although a submodule's recorded commit is
+/// on none of that submodule's remotes — the person's call, after the refusal
+/// named it.
+pub async fn changes_push(repo_path: String, set_upstream: bool, allow_unpushed_submodules: Option<bool>) -> Result<OpResult, AppError> {
+    git_ops::push(&repo_path, set_upstream, allow_unpushed_submodules.unwrap_or(false)).await
 }
 
 /// `mode` is one of "ff-only", "merge", "rebase" — chosen by the user, never
@@ -663,9 +1260,10 @@ pub async fn changes_pull(
     mode: String,
     with_lfs: bool,
     autostash: bool,
+    source: Option<String>,
 ) -> Result<OpResult, AppError> {
     let mode = git_ops::PullMode::parse(&mode)?;
-    git_ops::pull(&repo_path, mode, with_lfs, autostash).await
+    git_ops::pull(&repo_path, mode, with_lfs, autostash, source.as_deref()).await
 }
 
 /// Every gitlink in the repo with its real state — where it moved, what is
@@ -676,8 +1274,16 @@ pub async fn changes_submodules(repo_path: String) -> Result<Vec<SubmoduleInfo>,
 }
 
 #[tauri::command]
-pub async fn changes_submodule_update(repo_path: String) -> Result<OpResult, AppError> {
-    git_ops::submodule_update(&repo_path).await
+pub async fn changes_submodule_update(repo_path: String, paths: Option<Vec<String>>) -> Result<OpResult, AppError> {
+    git_ops::submodule_update(&repo_path, paths).await
+}
+
+/// Check out, in the named submodules, the commit this repository records for
+/// each — a go-back's "Align submodules" and a row's "Check out <commit>".
+/// Local only.
+#[tauri::command]
+pub async fn changes_submodule_align(repo_path: String, paths: Vec<String>) -> Result<OpResult, AppError> {
+    Box::pin(crate::tree::align_submodules(&repo_path, paths)).await
 }
 
 /// Are this repo's large files really here, or still LFS pointer stubs?
@@ -706,6 +1312,21 @@ pub async fn changes_lfs_progress(repo_path: String) -> Option<LfsProgress> {
     lfs::read_progress(&repo_path)
 }
 
+/// Every git command this app has run, newest last. `since_id` is the highest
+/// id already seen, so a poll asks only for what is new; an empty `repo_path`
+/// means every repository.
+#[tauri::command]
+pub async fn console_entries(since_id: u64, repo_path: String) -> Vec<crate::cmdlog::Entry> {
+    crate::cmdlog::since(since_id, Some(&repo_path))
+}
+
+/// Forget the recorded commands. The log is a convenience, not a record of
+/// account — the push lock keeps its own, which this cannot touch.
+#[tauri::command]
+pub async fn console_clear() {
+    crate::cmdlog::clear();
+}
+
 /// Start a shell in this repository. Output arrives on `on_output` rather than
 /// as a return value: a terminal is the one thing in this app that streams.
 #[tauri::command]
@@ -715,6 +1336,9 @@ pub async fn terminal_open(
     rows: u16,
     on_output: tauri::ipc::Channel<String>,
 ) -> Result<String, AppError> {
+    // The checkout gets its workspace keys before the shell starts, so what
+    // the shell exports is what the Repository page shows.
+    workspace::ensure_assigned(&repo_path).await;
     crate::terminal::open(&repo_path, cols, rows, on_output)
 }
 
@@ -758,14 +1382,15 @@ pub async fn changes_sync_run(
     stash: bool,
     bundles: bool,
     fingerprint: Vec<(String, String)>,
+    with_lfs: Option<bool>,
 ) -> Result<OpResult, AppError> {
-    crate::sync::sync_run(&repo_path, crate::sync::RunOptions { stash, bundles, fingerprint }).await
+    crate::sync::sync_run(&repo_path, crate::sync::RunOptions { stash, bundles, with_lfs: with_lfs.unwrap_or(false), fingerprint }).await
 }
 
 /// Resume a paused sync after conflicts were resolved and staged.
 #[tauri::command]
-pub async fn changes_sync_continue(repo_path: String) -> Result<OpResult, AppError> {
-    crate::sync::sync_continue(&repo_path).await
+pub async fn changes_sync_continue(repo_path: String, allow_markers: Option<bool>) -> Result<OpResult, AppError> {
+    crate::sync::sync_continue(&repo_path, allow_markers.unwrap_or(false)).await
 }
 
 /// Undo a paused sync.
@@ -774,16 +1399,38 @@ pub async fn changes_sync_abort(repo_path: String) -> Result<OpResult, AppError>
     crate::sync::sync_abort(&repo_path).await
 }
 
-/// One commit recording submodule pointers that sit ahead of the branch.
+/// Open a file of the repository in the system's default application, or
+/// reveal it in the file manager. The path is checked to be inside the
+/// repository first (`within_repo`), so no "open any path" capability is
+/// granted to the JavaScript side.
 #[tauri::command]
-pub async fn changes_record_pointers(repo_path: String) -> Result<OpResult, AppError> {
-    crate::sync::record_pointers(&repo_path).await
+pub async fn changes_open_path(repo_path: String, path: String, reveal: bool) -> Result<(), AppError> {
+    let full = git_ops::shell_path(&git_ops::within_repo(&repo_path, &path)?);
+    if !reveal && git_ops::opens_by_running(&full) {
+        // The system "open" would run it, not show it.
+        return Err(AppError::Command(format!("{} is a program, not a text file — Reveal it instead of opening it.", path)));
+    }
+    let r = if reveal { tauri_plugin_opener::reveal_item_in_dir(&full) } else { tauri_plugin_opener::open_path(&full, None::<&str>) };
+    r.map_err(|e| AppError::Command(format!("Could not open {}: {}", path, e)))
+}
+
+/// A conflicted file split into its sides, for the resolution view.
+#[tauri::command]
+pub async fn changes_conflict_view(repo_path: String, path: String) -> Result<git_status::ConflictView, AppError> {
+    git_status::conflict_view(&repo_path, &path).await
+}
+
+/// One commit recording submodule pointers that sit ahead of the branch:
+/// every such submodule, or exactly `paths` (a row's "Record this pointer").
+#[tauri::command]
+pub async fn changes_record_pointers(repo_path: String, paths: Option<Vec<String>>) -> Result<OpResult, AppError> {
+    crate::sync::record_pointers(&repo_path, paths.as_deref()).await
 }
 
 /// Finish the operation in progress once its conflicts are staged.
 #[tauri::command]
-pub async fn changes_continue(repo_path: String) -> Result<OpResult, AppError> {
-    git_ops::continue_op(&repo_path).await
+pub async fn changes_continue(repo_path: String, allow_markers: Option<bool>) -> Result<OpResult, AppError> {
+    git_ops::continue_op(&repo_path, allow_markers.unwrap_or(false)).await
 }
 
 #[tauri::command]
@@ -896,6 +1543,41 @@ pub async fn changes_stash_show(repo_path: String, index: usize) -> Result<crate
 #[tauri::command]
 pub async fn changes_stash_file_diff(repo_path: String, index: usize, path: String) -> Result<git_status::FileDiff, AppError> {
     crate::stash::stash_file_diff(&repo_path, index, &path).await
+}
+
+/// The four state slots and the automatic "Before going back".
+#[tauri::command]
+pub async fn states_list(repo_path: String) -> Result<crate::states::StatesList, AppError> {
+    crate::states::list(&repo_path).await
+}
+
+/// Save where the repository is now (commit, branch, staged, every changed
+/// and new file, and the repositories inside it) into a slot. `replace`: the
+/// state the page showed there, to replace it.
+#[tauri::command]
+pub async fn states_save(repo_path: String, slot: String, name: Option<String>, replace: Option<String>) -> Result<OpResult, AppError> {
+    Box::pin(crate::states::save(&repo_path, &slot, name.as_deref(), replace.as_deref())).await
+}
+
+/// Go back to a state (named by the oid the page showed). What is there now
+/// is saved as "Before going back" first. `new_branch`: put it on a new
+/// branch; `allow_pushed`: move the branch back past pushed commits anyway.
+#[tauri::command]
+pub async fn states_restore(repo_path: String, slot: String, oid: String, new_branch: Option<String>, allow_pushed: bool) -> Result<OpResult, AppError> {
+    Box::pin(crate::states::restore(&repo_path, &slot, &oid, new_branch.as_deref(), allow_pushed)).await
+}
+
+/// Delete a state (named by the oid the page showed).
+#[tauri::command]
+pub async fn states_delete(repo_path: String, slot: String, oid: String) -> Result<OpResult, AppError> {
+    Box::pin(crate::states::delete(&repo_path, &slot, &oid)).await
+}
+
+/// How many states this repository keeps (its own setting; refused below a
+/// slot that holds a state). Answers with the list as it now stands.
+#[tauri::command]
+pub async fn states_set_max(repo_path: String, max: usize) -> Result<crate::states::StatesList, AppError> {
+    Box::pin(crate::states::set_max(&repo_path, max)).await
 }
 
 /// `git stash push` (never `--all`): ignored files stay where they are.

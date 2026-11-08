@@ -12,6 +12,10 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { useToast } from "../components/Toast";
 import * as api from "../lib/api";
+import { notePushChanged } from "../lib/console";
+import { copyText } from "../lib/clipboard";
+import { useNavigate } from "react-router-dom";
+import { RefreshButton } from "../components/RefreshButton";
 
 type Step = {
   key: string;
@@ -31,12 +35,18 @@ const SEVERITY_ORDER: Record<string, number> = { error: 0, warning: 1, info: 2, 
 
 export function Doctor() {
   const toast = useToast();
+  const navigate = useNavigate();
   const [findings, setFindings] = useState<api.Finding[]>([]);
   const [running, setRunning] = useState(false);
   const [currentStep, setCurrentStep] = useState<string | null>(null);
   const [doneSteps, setDoneSteps] = useState<string[]>([]);
   const [hasRun, setHasRun] = useState(false);
   const [fixing, setFixing] = useState<string | null>(null);
+  /** The access check, which asks GitHub about every repository: on request only. */
+  const [checkingAccess, setCheckingAccess] = useState(false);
+  const [accessChecked, setAccessChecked] = useState(false);
+  /** Its findings, kept apart: a re-run of the other checks does not drop them. */
+  const [accessFindings, setAccessFindings] = useState<api.Finding[]>([]);
   const [error, setError] = useState<string | null>(null);
   const runSeq = useRef(0);
 
@@ -88,26 +98,63 @@ export function Doctor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  async function checkAccess() {
+    setCheckingAccess(true);
+    setError(null);
+    try {
+      const res = await api.doctorCheckRepoAccess();
+      setAccessFindings(res);
+      setAccessChecked(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCheckingAccess(false);
+    }
+  }
+
   async function applyFix(finding: api.Finding) {
     if (!finding.fix) return;
     setFixing(finding.id + finding.title);
     setError(null);
     try {
-      if (finding.fix === "fix-ssh-config") {
+      if (finding.fix.startsWith("nav:")) {
+        navigate(finding.fix.slice("nav:".length));
+        return;
+      } else if (finding.fix.startsWith("copy:")) {
+        const ok = await copyText(finding.fix.slice("copy:".length));
+        if (ok) toast.success("Copied — paste it into a terminal");
+        else setError(`Couldn't copy — run it by hand:\n${finding.fix.slice("copy:".length)}`);
+        return;
+      } else if (/^(drop-folder|register-key|register-signing|assign):/.test(finding.fix)) {
+        toast.success(await api.doctorApplyFix(finding.fix));
+      } else if (finding.fix === "fix-ssh-config") {
         const msg = await api.doctorFixSshConfig();
         toast.success(msg);
       } else if (finding.fix.startsWith("convert-ssh:")) {
         const path = finding.fix.slice("convert-ssh:".length);
         const changes = await api.convertReposToSsh(path);
-        const changed = changes.filter((c) => c.changed).length;
-        toast.success(
-          changed > 0 ? "Remote converted to SSH" : "Nothing needed converting"
-        );
+        const changed = changes.filter((c) => c.changed);
+        toast.success(changed.length > 0 ? changed[0].note || "Remote converted to SSH" : "Nothing needed converting");
+      } else if (finding.fix.startsWith("unset-local:")) {
+        // unset-local:<key>:<repo path> — the key has no colon; the path may.
+        const rest = finding.fix.slice("unset-local:".length);
+        const cut = rest.indexOf(":");
+        const msg = await api.doctorUnsetLocal(rest.slice(cut + 1), rest.slice(0, cut));
+        toast.success(msg);
+      } else if (finding.fix.startsWith("respell-folders:")) {
+        // Saving the profile again stores each folder as the disk spells it.
+        const id = finding.fix.slice("respell-folders:".length);
+        const profile = (await api.getProfiles()).find((p) => p.id === id);
+        if (profile) {
+          await api.updateProfile({ id, directories: profile.directories });
+          toast.success(`"${profile.name}" now names its folders as the disk spells them`);
+        }
       } else if (finding.fix.startsWith("lock-")) {
         // Most of these open the administrator prompt; the outcome — cancelled
         // included — comes back as a sentence rather than an exception.
         const r = await api.pushLockFix(finding.fix);
         if (r.outcome === "applied") {
+          notePushChanged();
           toast.success(r.message);
         } else if (r.outcome === "manual-required" && r.command) {
           setError(`${r.message}\n${r.command}`);
@@ -116,6 +163,9 @@ export function Doctor() {
         }
       }
       await runChecks();
+      // A repository moved to another profile: what GitHub says about access
+      // is asked again, so the finding that was fixed goes and the rest stay.
+      if (finding.fix.startsWith("assign:") && accessChecked) await checkAccess();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -123,15 +173,16 @@ export function Doctor() {
     }
   }
 
-  const sorted = [...findings].sort(
+  const all = [...findings, ...accessFindings];
+  const sorted = [...all].sort(
     (a, b) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9)
   );
   const counts = {
-    error: findings.filter((f) => f.severity === "error").length,
-    warning: findings.filter((f) => f.severity === "warning").length,
-    info: findings.filter((f) => f.severity === "info").length,
+    error: all.filter((f) => f.severity === "error").length,
+    warning: all.filter((f) => f.severity === "warning").length,
+    info: all.filter((f) => f.severity === "info").length,
   };
-  const allClear = hasRun && !running && findings.length === 0;
+  const allClear = hasRun && !running && !checkingAccess && all.length === 0;
 
   return (
     <div className="space-y-6">
@@ -144,19 +195,22 @@ export function Doctor() {
             and that every push lock is still in place.
           </p>
         </div>
-        <Button onClick={runChecks} disabled={running}>
-          {running ? (
-            <>
-              <Loader2 size={16} className="animate-spin" />
-              Checking…
-            </>
-          ) : (
-            <>
-              <Stethoscope size={16} />
-              Run checks
-            </>
-          )}
-        </Button>
+        <div className="flex items-center gap-2">
+          <RefreshButton onClick={runChecks} busy={running} title="Run the checks again" />
+          <Button onClick={runChecks} disabled={running}>
+            {running ? (
+              <>
+                <Loader2 size={16} className="animate-spin" />
+                Checking…
+              </>
+            ) : (
+              <>
+                <Stethoscope size={16} />
+                Run checks
+              </>
+            )}
+          </Button>
+        </div>
       </div>
 
       {error && (
@@ -167,6 +221,29 @@ export function Doctor() {
 
       <Card>
         <div className="space-y-2">
+          <div className="flex items-center gap-2.5 text-sm flex-wrap">
+            {accessChecked && !checkingAccess ? (
+              <CheckCircle2 size={15} className="text-emerald-400 shrink-0" />
+            ) : checkingAccess ? (
+              <Loader2 size={15} className="animate-spin text-emerald-400 shrink-0" />
+            ) : (
+              <span className="w-[15px] h-[15px] rounded-full border border-zinc-700 shrink-0" />
+            )}
+            <span className={accessChecked || checkingAccess ? "text-zinc-300" : "text-zinc-600"}>
+              Repository access on GitHub
+            </span>
+            {!checkingAccess && (
+              <button
+                type="button"
+                onClick={checkAccess}
+                disabled={running}
+                className="text-xs text-emerald-400 hover:text-emerald-300 cursor-pointer disabled:text-zinc-600"
+                title="Asks GitHub, with your gh logins, whether the account each repository pushes as can see it"
+              >
+                {accessChecked ? "Check again" : "Check now"}
+              </button>
+            )}
+          </div>
           {STEPS.map((s) => {
             const done = doneSteps.includes(s.key);
             const active = currentStep === s.key;

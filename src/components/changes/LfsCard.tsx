@@ -84,7 +84,7 @@ export function LfsCard({ repoPath, busy, refreshKey, onPull, onBrowse }: Props)
             <div className="flex items-start gap-2 rounded-lg bg-amber-500/10 border border-amber-500/30 px-2.5 py-2">
               <AlertTriangle size={13} className="shrink-0 mt-0.5 text-amber-400" />
               <p className="text-xs text-amber-200/90 leading-relaxed">
-                Install it with <span className="font-mono">brew install git-lfs</span>, then
+                Install it with <span className="font-mono">{lfs.install_hint}</span>, then
                 come back here to download the files.
               </p>
             </div>

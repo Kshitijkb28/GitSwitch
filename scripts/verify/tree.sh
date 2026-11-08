@@ -145,6 +145,28 @@ OUT=$(probe tree_branch_create "$W" "nowhere,zzzz")
 ok "an unknown start point is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "not-a-commit"
 ok "  naming what was typed" "$(printf '%s' "$OUT" | jqf refusal.message)" "\`zzzz\` isn't a commit"
 
+section "Remote branches: listed by their name on the remote, checked out as a local branch that tracks them"
+git -C "$SB/other" switch -q -c remote-only
+printf 'remote work\n' > "$SB/other/remote.txt"; git -C "$SB/other" add -A >/dev/null; git -C "$SB/other" commit -qm "remote-only work"
+git -C "$SB/other" push -q origin remote-only 2>/dev/null; git -C "$SB/other" switch -q main
+git -C "$W" fetch -q origin 2>/dev/null
+REMOTE_TIP="$(git -C "$W" rev-parse refs/remotes/origin/remote-only)"
+OUT=$(probe branches "$W")
+rows() { printf '%s' "$OUT" | "$PY" -c 'import sys,json;print([(b["full_ref"],b["remote_branch"]) for b in json.load(sys.stdin) if b["name"]==sys.argv[1]])' "$1"; }
+ok "a branch only on the remote is listed, with its full ref and its name there" "$(rows origin/remote-only)" "[('refs/remotes/origin/remote-only', 'remote-only')]"
+ok "  a local branch has its full ref and no remote name" "$(rows main)" "[('refs/heads/main', None)]"
+OUT=$(probe tree_branch_create "$W" "remote-only,refs/remotes/origin/remote-only,switch")
+ok "Check out (create from the remote ref, switch) lands on a local branch of that name" "$(on_branch "$W")" "remote-only"
+ok "  at the remote's commit" "$(head_of "$W")" "$REMOTE_TIP"
+ok "  tracking the remote branch" "$(git -C "$W" rev-parse --abbrev-ref 'remote-only@{upstream}')" "origin/remote-only"
+ok "  with its files" "$(cat "$W/remote.txt")" "remote work"
+OUT=$(probe tree_branch_switch "$W" "main")
+ok "  and the way back is a plain switch" "$(on_branch "$W")" "main"
+OUT=$(probe tree_branch_create "$W" "remote-only,refs/remotes/origin/remote-only,switch")
+ok "checking it out again while the local branch exists is explained" "$(printf '%s' "$OUT" | jqf advice.headline)" "already exists"
+ok "  and nothing moves" "$(on_branch "$W") $(git -C "$W" rev-parse remote-only)" "main $REMOTE_TIP"
+git -C "$W" branch -q -D remote-only
+
 section "Detached HEAD: commits nobody holds are never left behind"
 git -C "$W" switch -q --detach; git -C "$W" commit -q --allow-empty -m "loose commit"
 OUT=$(probe tree_branch_switch "$W" "main")
@@ -162,7 +184,7 @@ git -C "$W" branch oldsub "$BEFORE_BUMP"
 OUT=$(probe tree_branch_switch "$W" "oldsub")
 ok "the switch succeeds" "$(printf '%s' "$OUT" | jqf ok)" "True"
 ok "  and names the mismatched submodule" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch)" "vendor/sub"
-ok "  in words" "$(printf '%s' "$OUT" | jqf detail)" "Update submodules to align them"
+ok "  in words" "$(printf '%s' "$OUT" | jqf detail)" "Align submodules checks out the commits it records"
 ok "  git shows the gitlink modified" "$(git -C "$W" status --porcelain -- vendor/sub)" " M vendor/sub"
 OUT=$(probe tree_branch_switch "$W" "main")
 ok "back on main nothing mismatches" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch)" "[]"
@@ -259,6 +281,33 @@ ok "  the backup still holds the merge" "$(git -C "$W" rev-parse "$BK")" "$MERGE
 OUT=$(probe tree_reset "$W" "HEAD,soft")
 ok "a reset to HEAD is nothing to do" "$(printf '%s' "$OUT" | jqf refusal.code)" "nothing-to-do"
 
+section "A hard reset never overwrites an untracked file without saying so"
+# A commit adds gen/out.txt; step back below it and recreate the file by hand,
+# exactly what a build tool does. A forward `git reset --hard` would replace
+# it without a word: git protects only the files it tracks.
+mkdir -p "$W/gen"; printf 'committed\n' > "$W/gen/out.txt"; git -C "$W" add -A >/dev/null; git -C "$W" commit -qm "adds gen/out.txt"
+FWD="$(head_of "$W")"
+git -C "$W" reset -q --hard HEAD~1
+mkdir -p "$W/gen"; printf 'mine, unsaved\n' > "$W/gen/out.txt"
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "the reset is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "untracked-in-the-way"
+ok "  naming the file" "$(printf '%s' "$OUT" | jqf refusal.message)" "gen/out.txt"
+ok "  the file is untouched" "$(cat "$W/gen/out.txt")" "mine, unsaved"
+ok "  and HEAD did not move" "$(head_of "$W")" "$(git -C "$W" rev-parse "$FWD~1")"
+git -C "$W" add gen/out.txt
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "a STAGED file at that path is the person's stated choice: the reset runs" "$(printf '%s' "$OUT" | jqf ok)" "True"
+ok "  and the committed content is in place" "$(cat "$W/gen/out.txt")" "committed"
+git -C "$W" reset -q --hard HEAD~1
+mkdir -p "$W/gen"; printf 'gen/\n' >> "$W/.gitignore"; printf 'ignored, unsaved\n' > "$W/gen/out.txt"
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "an ignored file in the way is just as lost, so it is refused too" "$(printf '%s' "$OUT" | jqf refusal.code)" "untracked-in-the-way"
+ok "  and kept" "$(cat "$W/gen/out.txt")" "ignored, unsaved"
+git -C "$W" checkout -q -- .gitignore; rm -rf "$W/gen"
+OUT=$(probe tree_reset "$W" "$FWD,hard")
+ok "with nothing in the way the same reset runs" "$(printf '%s' "$OUT" | jqf ok)" "True"
+git -C "$W" reset -q --hard HEAD~1
+
 section "Pushed means on any remote branch — for reset and undo alike"
 printf 'elsewhere\n' > "$W/else.txt"; git -C "$W" add -A >/dev/null; git -C "$W" commit -qm "pushed elsewhere"
 git -C "$W" push -q origin main:refs/heads/backup 2>/dev/null
@@ -354,6 +403,10 @@ git -C "$W" switch -q main; printf 'MINE\n' > "$W/c.txt"; git -C "$W" commit -qa
 C_MINE="$(head_of "$W")"
 git -C "$W" merge -q cf >/dev/null 2>&1
 ok "the merge conflicts" "$(git -C "$W" status --porcelain -- c.txt)" "UU c.txt"
+OUT=$(probe stage "$W" "c.txt")
+ok "marking it resolved with the markers still in it is refused by name" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "c.txt still contains conflict markers (line 1)"
+ok "  and nothing was staged" "$(git -C "$W" ls-files -u c.txt | wc -l | tr -d ' ')" "3"
 OUT=$(probe tree_resolve_side "$W" "mine,c.txt")
 ok "Keep mine during a merge keeps my content" "$(cat "$W/c.txt")" "MINE"
 ok "  the result says what ran" "$(printf '%s' "$OUT" | jqf tree.mapping_note)" "Keep mine ran \`git checkout --ours\`"
@@ -391,11 +444,22 @@ git -C "$W/vendor/sub" reset -q --hard HEAD~1; printf 'B\n' > "$W/vendor/sub/b.t
 git -C "$W" add vendor/sub >/dev/null; git -C "$W" commit -qm "record B"
 git -C "$W" merge -q subA >/dev/null 2>&1
 ok "a gitlink conflict" "$(git -C "$W" status --porcelain -- vendor/sub)" "UU vendor/sub"
-OUT=$(probe tree_resolve_side "$W" "mine,vendor/sub")
-ok "is not resolved by taking a side" "$(printf '%s' "$OUT" | jqf refusal.code)" "submodule-conflict"
+SUB_A="$(git -C "$W" rev-parse subA:vendor/sub)"; SUB_B="$(git -C "$W" rev-parse HEAD:vendor/sub)"
+OUT=$(probe status "$W")
+ok "  its row names the commit each side would record" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;e=[e for e in json.load(sys.stdin)['entries'] if e['path']=='vendor/sub'][0];print(e.get('pointer_mine'), e.get('pointer_theirs'))")" "$SUB_B $SUB_A"
+printf 'x\n' >> "$W/vendor/sub/b.txt"
+OUT=$(probe tree_resolve_side "$W" "theirs,vendor/sub")
+ok "taking a side over changes inside the submodule is refused" "$(printf '%s' "$OUT" | jqf refusal.code):$(git -C "$W/vendor/sub" rev-parse HEAD)" "submodule-changes:$SUB_B"
+git -C "$W/vendor/sub" checkout -q -- b.txt
+OUT=$(probe tree_resolve_side "$W" "theirs,vendor/sub")
+ok "Take theirs checks the submodule out at the other side's commit and records it" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$W/vendor/sub" rev-parse HEAD):$(git -C "$W" ls-files -s -- vendor/sub | awk '{print $2"/"$3}')" "True:$SUB_A:$SUB_A/0"
+ok "  the conflict is gone" "$(git -C "$W" diff --name-only --diff-filter=U | wc -l | tr -d ' ')" "0"
+ok "  the submodule's branch kept its own commit" "$(git -C "$W/vendor/sub" rev-parse main)" "$SUB_B"
+ok "  and the result names what it recorded" "$(printf '%s' "$OUT" | jqf detail)" "vendor/sub now records ${SUB_A:0:7}"
 OUT=$(probe tree_resolve_side "$W" "mine")
 ok "no paths is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "no-paths"
 probe abort "$W" >/dev/null
+git -C "$W/vendor/sub" switch -q main
 ok "  the merge is aborted" "$(porcelain "$W")" "clean"
 
 section "Discard everything"
@@ -463,5 +527,258 @@ OUT=$(probe commit_diff "$W" "$RENAME_SHA,docs/big.txt")
 ok "  and the old path's diff shows the deletion" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(" ".join(l["text"] for l in json.load(sys.stdin)["lines"] if l["kind"]=="meta"))')" "deleted file mode"
 OUT=$(probe commit_diff "$W" "$RENAME_SHA,docs/{big.txt => renamed.txt}")
 ok "  git's notation, sent back as a path, is an empty diff rather than an error" "$(printf '%s' "$OUT" | jqf empty_reason)" "No changes to this file"
+
+section "A renamed file cannot carry its conflict markers into the commit"
+M="$SB/markers"; git init -q -b main "$M"
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do printf 'line %s\n' "$i"; done > "$M/r.txt"
+git -C "$M" add -A >/dev/null; git -C "$M" commit -qm "r base"
+git -C "$M" switch -q -c rf; sed -i.bak 's/^line 10$/line 10 (theirs)/' "$M/r.txt"; rm -f "$M/r.txt.bak"; git -C "$M" commit -qam "r theirs"
+git -C "$M" switch -q main; sed -i.bak 's/^line 10$/line 10 (mine)/' "$M/r.txt"; rm -f "$M/r.txt.bak"; git -C "$M" commit -qam "r mine"
+git -C "$M" merge -q rf >/dev/null 2>&1
+ok "the merge conflicts" "$(git -C "$M" status --porcelain -- r.txt)" "UU r.txt"
+# "Resolved" by moving the file away, markers and all.
+cp "$M/r.txt" "$M/moved.txt"; git -C "$M" rm -q -f r.txt; git -C "$M" add moved.txt
+ok "  git sees a rename, which an edit-only filter would skip" "$(git -C "$M" diff --cached --name-status -M | cut -c1)" "R"
+OUT=$(probe continue "$M")
+ok "finishing the merge is refused: the markers would be committed" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the file where they are now, and the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "moved.txt still contains conflict markers (line 10)"
+ok "  and the merge is still open" "$([ -e "$M/.git/MERGE_HEAD" ] && echo open || echo closed)" "open"
+# A wider marker, as the conflict-marker-size attribute makes git write them.
+git -C "$M" merge --abort 2>/dev/null; git -C "$M" reset -q --hard; git -C "$M" clean -fdq
+printf 'r.txt conflict-marker-size=10\n' > "$M/.gitattributes"; git -C "$M" add .gitattributes; git -C "$M" commit -qm "wide markers"
+git -C "$M" merge -q rf >/dev/null 2>&1
+ok "with conflict-marker-size=10 git writes ten" "$(grep -c '^<<<<<<<<<< ' "$M/r.txt")" "1"
+OUT=$(probe stage "$M" "r.txt")
+ok "  and marking it resolved is still refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "r.txt still contains conflict markers (line 10)"
+OUT=$(pinvoke changes_conflict_view "{\"repoPath\":\"$M\",\"path\":\"r.txt\"}")
+ok "  the conflict view reads the same hunk" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin)['value'];print(d['marker_count'],d['hunks'][0]['mine'],d['hunks'][0]['theirs'])")" "1 ['line 10 (mine)'] ['line 10 (theirs)']"
+
+section "The marker check at Continue does not depend on settings, attributes or the marker's width"
+# Each time: a fresh conflict in r.txt, staged from a terminal with its markers, then Continue.
+fresh_conflict() { git -C "$M" merge --abort 2>/dev/null; git -C "$M" reset -q --hard; git -C "$M" clean -fdq; git -C "$M" merge -q rf >/dev/null 2>&1; }
+staged_then_continue() { git -C "$M" add r.txt; probe continue "$M" | jqf refusal.code; }
+fresh_conflict
+ok "staged with its markers, Continue is refused" "$(staged_then_continue)" "conflict-markers"
+git -C "$M" config color.ui always; fresh_conflict
+ok "  also with color.ui=always" "$(staged_then_continue)" "conflict-markers"
+git -C "$M" config --unset color.ui; git -C "$M" config color.grep always; fresh_conflict
+ok "  and with color.grep=always" "$(staged_then_continue)" "conflict-markers"
+git -C "$M" config --unset color.grep
+fresh_conflict; git -C "$M" merge --abort
+printf 'r.txt -diff conflict-marker-size=10\n' > "$M/.gitattributes"; git -C "$M" commit -qam "no diff for r.txt"
+fresh_conflict
+ok "  a file an attribute hides from diffs is still read" "$(staged_then_continue)" "conflict-markers"
+fresh_conflict; git -C "$M" merge --abort
+printf 'r.txt conflict-marker-size=5\n' > "$M/.gitattributes"; git -C "$M" commit -qam "narrow markers"
+fresh_conflict
+ok "with conflict-marker-size=5 git writes five" "$(grep -c '^<<<<< ' "$M/r.txt")" "1"
+ok "  and Continue is refused for them too" "$(staged_then_continue)" "conflict-markers"
+fresh_conflict; git -C "$M" merge --abort
+git -C "$M" rm -q .gitattributes; git -C "$M" commit -qm "default markers again"
+fresh_conflict
+# A hand edit that left bare markers, in a file saved with CRLF line endings.
+printf 'line 1\r\n<<<<<<<\r\nline 10 (mine)\r\n=======\r\nline 10 (theirs)\r\n>>>>>>>\r\nline 11\r\n' > "$M/r.txt"
+OUT=$(git -C "$M" add r.txt 2>/dev/null; probe continue "$M")
+ok "bare markers in a CRLF file are refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "r.txt still contains conflict markers (line 2)"
+ok "  nothing was committed in any of these" "$([ -e "$M/.git/MERGE_HEAD" ] && echo open || echo closed):$(git -C "$M" log --format=%s -1)" "open:default markers again"
+
+section "A path that changed its type is read for markers too"
+git -C "$M" merge --abort 2>/dev/null; git -C "$M" reset -q --hard; git -C "$M" clean -fdq
+# `link` is a symbolic link in the branch; during the merge it is staged as an ordinary file with markers in it.
+LB="$(printf 'r.txt' | git -C "$M" hash-object -w --stdin)"
+git -C "$M" update-index --add --cacheinfo "120000,$LB,link"; git -C "$M" commit -qm "a link"; git -C "$M" checkout -q -- link 2>/dev/null
+git -C "$M" merge -q rf >/dev/null 2>&1
+git -C "$M" checkout -q --ours -- r.txt; git -C "$M" add r.txt
+MB="$(printf 'a\n<<<<<<< HEAD\nmine\n=======\ntheirs\n>>>>>>> rf\nb\n' | git -C "$M" hash-object -w --stdin)"
+git -C "$M" update-index --cacheinfo "100644,$MB,link"
+ok "the staged change is a change of type" "$(git -C "$M" diff --cached --raw --no-abbrev -- link | cut -c1-14)" ":120000 100644"
+OUT=$(probe continue "$M")
+ok "  and Continue is refused for the markers in it" "$(printf '%s' "$OUT" | jqf refusal.code)" "conflict-markers"
+ok "  naming the path and the line" "$(printf '%s' "$OUT" | jqf refusal.message)" "link still contains conflict markers (line 2)"
+ok "  the merge is still open" "$([ -e "$M/.git/MERGE_HEAD" ] && echo open || echo closed)" "open"
+
+section "Thousands of staged files do not stall Continue"
+git -C "$M" merge --abort 2>/dev/null; git -C "$M" reset -q --hard; git -C "$M" clean -fdq
+# The other side of a merge adds 4,000 files; one conflict, resolved and staged. The check reads every
+# staged file through commands that answer while they are still being told what to read.
+git -C "$M" switch -q -c wide rf
+"$PY" -c "
+import os,sys
+d=os.path.join(sys.argv[1],'some','fairly','ordinary','source','dir'); os.makedirs(d)
+for i in range(4000):
+    with open(os.path.join(d,'file_%05d.txt'%i),'w') as f: f.write('content %d\n'%i)
+" "$M"
+git -C "$M" add -A >/dev/null; git -C "$M" commit -qm "four thousand files"; git -C "$M" switch -q main
+git -C "$M" merge -q wide >/dev/null 2>&1
+git -C "$M" checkout -q --ours -- r.txt; git -C "$M" add r.txt
+ok "the merge is open with 4,000 files staged" "$([ -e "$M/.git/MERGE_HEAD" ] && echo open || echo closed):$([ "$(git -C "$M" diff --cached --name-only | wc -l)" -ge 4000 ] && echo many || echo few)" "open:many"
+( probe continue "$M" > "$SB/wide.out" 2>/dev/null ) & WPID=$!
+WAITED=0; while kill -0 "$WPID" 2>/dev/null && [ "$WAITED" -lt 120 ]; do sleep 1; WAITED=$((WAITED+1)); done
+if kill -0 "$WPID" 2>/dev/null; then
+  # Only the probe's own descendants — gathered before the kill, since a killed parent's children re-parent to pid 1.
+  KIDS=""; gather() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do gather "$c"; done; KIDS="$KIDS $1"; }; gather "$WPID"
+  kill $KIDS 2>/dev/null
+  WIDE="still running after ${WAITED}s"
+else
+  WIDE="$(jqf ok < "$SB/wide.out"):$(jqf headline < "$SB/wide.out")"
+fi
+ok "Continue comes back, with the merge finished" "$WIDE" "True:"
+ok "  the merge is closed and the files are in it" "$([ -e "$M/.git/MERGE_HEAD" ] && echo open || echo closed):$(git -C "$M" ls-tree -r --name-only HEAD -- some | wc -l | tr -d ' ')" "closed:4000"
+
+section "Continue of a rebase keeps the stopped commit's message, commits it once, and honours the rebase's own options"
+# rb_world <dir> <subject of the commit that will conflict>
+rb_world() {
+  git init -q "$1"; printf 'l1\nl2\nl3\nl4\nl5\nl6\n' > "$1/f.txt"; printf 'n\n' > "$1/notes.txt"; git -C "$1" add -A >/dev/null; git -C "$1" commit -qm base
+  git -C "$1" switch -q -c other; printf 'l1\nl2 other\nl3\nl4\nl5\nl6\n' > "$1/f.txt"; git -C "$1" commit -qam "other: l2"
+  git -C "$1" switch -q main; printf 'l1\nl2 mine\nl3\nl4\nl5\nl6\n' > "$1/f.txt"; GIT_AUTHOR_DATE="2020-01-01T10:00:00+0000" git -C "$1" commit -qam "$2"
+  printf 'l1\nl2 mine\nl3\nl4\nl5\nl6 mine\n' > "$1/f.txt"; GIT_AUTHOR_DATE="2020-01-02T10:00:00+0000" git -C "$1" commit -qam "B more"
+}
+resolve_rb() { printf 'l1\nl2 both\nl3\nl4\nl5\nl6\n' > "$1/f.txt"; git -C "$1" add f.txt; }
+RB="$SB/rb"; rb_world "$RB" "#42 l2 mine"
+GIT_EDITOR=true git -C "$RB" -c rebase.backend=merge rebase other >/dev/null 2>&1
+resolve_rb "$RB"; printf 'edit\n' >> "$RB/notes.txt"          # an unstaged edit to another tracked file
+OUT=$(probe continue "$RB")
+ok "an unstaged edit elsewhere: Continue is refused by git, and nothing was committed" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$RB" log --format=%s -1)" "False:other: l2"
+git -C "$RB" checkout -q -- notes.txt
+OUT=$(probe continue "$RB")
+ok "  then Continue finishes: the stopped commit once, its '#' message whole" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$RB" log --format=%s other..HEAD | tr '\n' '|')" "True:B more|#42 l2 mine|"
+ok "  and it is not called skipped" "$(printf '%s' "$OUT" | jqf detail | grep -c skipped || true)" "0"
+ok "  with the author's date kept" "$(git -C "$RB" log --format=%at -1 HEAD~1)" "1577872800"
+RB2="$SB/rb2"; rb_world "$RB2" "#42 l2 mine"
+GIT_EDITOR=true git -C "$RB2" -c rebase.backend=merge rebase --signoff other >/dev/null 2>&1
+resolve_rb "$RB2"
+OUT=$(probe continue "$RB2")
+ok "a --signoff rebase: the resolved commit carries the trailer like its siblings" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$RB2" log --format=%B other..HEAD | grep -c '^Signed-off-by: ' || true):$(git -C "$RB2" log --format=%s -1 HEAD~1)" "True:2:#42 l2 mine"
+RB3="$SB/rb3"; rb_world "$RB3" "l2 mine"
+GIT_EDITOR=true git -C "$RB3" -c rebase.backend=merge rebase --committer-date-is-author-date other >/dev/null 2>&1
+resolve_rb "$RB3"
+OUT=$(probe continue "$RB3")
+ok "a --committer-date-is-author-date rebase keeps its dates: that stop is left to git" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$RB3" log --format='%at=%ct' -1 HEAD~1)" "True:1577872800=1577872800"
+# The apply backend (someone's own `git rebase --apply`): a resolution that leaves nothing is still skipped.
+RB4="$SB/rb4"; rb_world "$RB4" "l2 mine"
+GIT_EDITOR=true git -C "$RB4" rebase --apply other >/dev/null 2>&1
+git -C "$RB4" checkout -q --ours -- f.txt 2>/dev/null || git -C "$RB4" show other:f.txt > "$RB4/f.txt"; git -C "$RB4" add f.txt
+ok "an apply-backend stop, resolved to what is already there" "$([ -d "$RB4/.git/rebase-apply" ] && echo apply || echo other):$(git -C "$RB4" diff --cached --quiet HEAD && echo empty || echo staged)" "apply:empty"
+OUT=$(probe continue "$RB4")
+ok "  is skipped by Continue, and said so" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf detail):$(git -C "$RB4" log --format=%s other..HEAD | tr '\n' '|')" "True:The stopped commit had nothing left to apply after the resolution, so it was skipped.:B more|"
+
+section "Going back across a submodule pointer bump: a hard reset offers to align, soft and mixed keep the pointer change"
+AL="$SB/align"
+git init -q "$AL"; printf 'a\n' > "$AL/a.txt"; git -C "$AL" add -A >/dev/null; git -C "$AL" commit -qm "a"
+git -C "$AL" submodule add -q "$SB/sub.git" s 2>/dev/null; git -C "$AL" commit -qm "add s"
+S_OLD="$(git -C "$AL" rev-parse HEAD:s)"
+printf 'two\n' >> "$AL/s/file.txt"; git -C "$AL/s" commit -qam "s two"; S_NEW="$(git -C "$AL/s" rev-parse HEAD)"
+git -C "$AL" add s; git -C "$AL" commit -qm "bump s"; BUMP="$(git -C "$AL" rev-parse HEAD)"
+OUT=$(probe tree_reset "$AL" "HEAD~1,mixed")
+ok "a mixed reset back over the bump keeps the pointer change, unstaged" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch):$(git -C "$AL" status --porcelain -- s)" "[]: M s"
+ok "  and says so instead of offering to align it away" "$(printf '%s' "$OUT" | jqf detail)" "The submodule pointer change for s is kept with the other changes."
+git -C "$AL" reset -q --hard "$BUMP"
+OUT=$(probe tree_reset "$AL" "HEAD~1,soft")
+ok "a soft reset keeps it staged" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch):$(git -C "$AL" status --porcelain -- s)" "[]:M  s"
+ok "  and says so too" "$(printf '%s' "$OUT" | jqf detail)" "The submodule pointer change for s is kept with the other changes."
+git -C "$AL" reset -q --hard "$BUMP"
+OUT=$(probe tree_reset "$AL" "HEAD~1,hard")
+ok "a hard reset back over the bump names the submodule it left ahead" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch)" '["s"]'
+ok "  and offers to align it" "$(printf '%s' "$OUT" | jqf detail)" "Align submodules checks out the commits it records"
+ok "  git agrees s sits elsewhere" "$(git -C "$AL" status --porcelain -- s)" " M s"
+printf 'edit\n' >> "$AL/s/file.txt"
+OUT=$(probe tree_sub_align "$AL" "s")
+ok "aligning a submodule with changes inside is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "submodule-changes"
+ok "  and nothing moved" "$(git -C "$AL/s" rev-parse HEAD)" "$S_NEW"
+git -C "$AL/s" checkout -q -- file.txt
+git -C "$AL/s" switch -q --detach; git -C "$AL/s" commit -q --allow-empty -m "loose in s"; LOOSE="$(git -C "$AL/s" rev-parse HEAD)"
+OUT=$(probe tree_sub_align "$AL" "s")
+ok "aligning a submodule whose detached HEAD holds a commit no branch has is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "submodule-detached-commits"
+ok "  with the count" "$(printf '%s' "$OUT" | jqf refusal.message)" "1 commit(s) at s's checkout"
+ok "  and nothing moved" "$(git -C "$AL/s" rev-parse HEAD)" "$LOOSE"
+git -C "$AL/s" switch -q main 2>/dev/null
+OUT=$(probe tree_sub_align "$AL" "s")
+ok "Align checks out the commit the repository records" "$(printf '%s' "$OUT" | jqf ok):$(git -C "$AL/s" rev-parse HEAD)" "True:$S_OLD"
+ok "  the repository is clean again" "$(porcelain "$AL")" "clean"
+ok "  the submodule's branch kept its commit" "$(git -C "$AL/s" rev-parse main)" "$S_NEW"
+ok "  and the result says so" "$(printf '%s' "$OUT" | jqf detail)" "main still holds"
+ok "  nothing mismatches any more" "$(printf '%s' "$OUT" | jqf tree.submodule_mismatch)" "[]"
+REC="$(printf '%s' "$OUT" | jqf tree.recovery)"
+ok "  its undo puts the submodule back on its branch" "$( (cd "$AL" && sh -c "$REC" >/dev/null 2>&1); echo "rc=$?"):$(git -C "$AL/s" symbolic-ref -q --short HEAD)" "rc=0:main"
+git -C "$AL/s" checkout -q --detach "$S_OLD"
+OUT=$(probe tree_sub_align "$AL" "s")
+ok "a submodule already at the recorded commit is left alone" "$(printf '%s' "$OUT" | jqf headline)" "already at the commit this repository records"
+OUT=$(probe tree_sub_align "$AL" "a.txt")
+ok "a path that is no submodule is refused" "$(printf '%s' "$OUT" | jqf refusal.code)" "not-a-submodule"
+OUT=$(probe tree_sub_align "$AL" "s,a.txt")
+ok "one already aligned and one refused is a refusal, not a green \"every one is aligned\"" "$(printf '%s' "$OUT" | jqf ok):$(printf '%s' "$OUT" | jqf refusal.message)" "False:a.txt isn't a submodule of this repository. Already at the recorded commit: s."
+# Update to <recorded>: checked out whatever the configuration says, never over what it would lose.
+git -C "$AL" reset -q --hard "$BUMP"
+git -C "$AL" config submodule.s.update none
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$AL\",\"paths\":[\"s\"]}")
+ok "Update to <recorded> checks it out even where submodule.<name>.update says none" "$(printf '%s' "$OUT" | jqf value.ok):$(git -C "$AL/s" rev-parse HEAD)" "True:$S_NEW"
+git -C "$AL" config --unset submodule.s.update
+git -C "$AL/s" checkout -q --detach "$S_OLD"; git -C "$AL/s" commit -q --allow-empty -m "loose again"; LOOSE2="$(git -C "$AL/s" rev-parse HEAD)"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$AL\",\"paths\":[\"s\"]}")
+ok "Update to over a commit only a detached HEAD holds is refused" "$(printf '%s' "$OUT" | jqf value.refusal.code)" "submodule-detached-commits"
+ok "  and nothing moved" "$(git -C "$AL/s" rev-parse HEAD)" "$LOOSE2"
+git -C "$AL/s" checkout -q --detach "$S_OLD"; printf 'edit\n' >> "$AL/s/file.txt"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$AL\",\"paths\":[\"s\"]}")
+ok "Update to over changes inside is refused" "$(printf '%s' "$OUT" | jqf value.refusal.code)" "submodule-changes"
+ok "  and the change is still there" "$(git -C "$AL/s" status --porcelain)" " M file.txt"
+git -C "$AL/s" checkout -q -- file.txt
+# A nested submodule's loose commit stops it too: --recursive moves nested ones.
+git -C "$AL/s" switch -q main 2>/dev/null
+git -C "$AL/s" submodule add -q "$SB/orphan.git" n 2>/dev/null; git -C "$AL/s" commit -qm "s: add n"
+git -C "$AL/s/n" switch -q --detach; git -C "$AL/s/n" commit -q --allow-empty -m "loose in n"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$AL\",\"paths\":[\"s\"]}")
+ok "Update to over a commit only a nested submodule's detached HEAD holds is refused" "$(printf '%s' "$OUT" | jqf value.refusal.code):$(printf '%s' "$OUT" | jqf value.refusal.message)" "submodule-detached-commits:1 commit(s) at s/n's checkout"
+git -C "$AL/s/n" switch -q main 2>/dev/null
+# A nested record its submodule never fetched (s moved on, n did not): nothing of n would be lost.
+git -C "$AL/s" update-index --cacheinfo "160000,1111111111111111111111111111111111111111,n"
+OUT=$(pinvoke changes_submodule_update "{\"repoPath\":\"$AL\",\"paths\":[\"s\"]}")
+ok "a nested record its submodule has not fetched does not make Update to refuse" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print("refused: " + v["refusal"]["message"] if v.get("refusal") else "ran")')" "ran"
+
+section "A backup branch is marked as one, and never named as containing a branch"
+git init -q "$SB/bk"; printf '1\n' > "$SB/bk/f"; git -C "$SB/bk" add -A >/dev/null; git -C "$SB/bk" commit -qm one
+printf '2\n' > "$SB/bk/f"; git -C "$SB/bk" commit -qam two
+git -C "$SB/bk" branch topic HEAD~1
+probe tree_reset "$SB/bk" "HEAD~1,hard" >/dev/null
+BK_NAME="$(git -C "$SB/bk" for-each-ref --format='%(refname:short)' 'refs/heads/gitswitch-before-reset-*' | head -1)"
+ok "(the reset kept a backup branch)" "$BK_NAME" "gitswitch-before-reset-"
+OUT=$(probe branches "$SB/bk")
+ok "the branch list marks it as a backup, and only it" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(sorted((b["name"].split("-20")[0], b["is_backup"]) for b in json.load(sys.stdin) if not b["is_remote"]))')" "[('gitswitch-before-reset', True), ('main', False), ('topic', False)]"
+OUT=$(probe merge_info "$SB/bk" "topic")
+ok "a branch's \"already contained in\" never names a backup" "$(printf '%s' "$OUT" | jqf merged_into)" '["main"]'
+
+section "History's graph: lanes carry on across pages, a filtered list joins what it shows, and how a branch got in"
+HG="$SB/hgraph"; git init -q "$HG"
+for i in $(seq 1 60); do
+  if [ $((i % 2)) -eq 0 ]; then who="Other <other@example.test>"; else who="Me <me@example.test>"; fi
+  git -C "$HG" -c user.name="${who%% <*}" -c user.email="$(printf '%s' "$who" | sed 's/.*<\(.*\)>/\1/')" commit -q --allow-empty -m "c$i"
+done
+OUT=$(pinvoke history_page "{\"repoPath\":\"$HG\",\"rev\":\"HEAD\",\"offset\":50,\"limit\":50}")
+ok "page 2 carries the line on from page 1: its first row is no tip" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;c=json.load(sys.stdin)["value"]["commits"];print(len(c), c[0].get("from_above"), c[0]["lane"])')" "10 True 0"
+OUT=$(pinvoke history_page "{\"repoPath\":\"$HG\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":50}")
+ok "  and the newest commit is one" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;print(json.load(sys.stdin)["value"]["commits"][0].get("from_above"))')" "False"
+OUT=$(pinvoke history_page "{\"repoPath\":\"$HG\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":50,\"authors\":[\"me@example.test\"]}")
+ok "a list filtered by a person joins only the commits it shows: one lane, not one more per row" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["total"], v["max_lane"])')" "30 0"
+OUT=$(pinvoke history_page "{\"repoPath\":\"$HG\",\"rev\":\"HEAD\",\"offset\":0,\"limit\":50,\"search\":\"c1\"}")
+ok "  and so does one filtered by words" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["total"], v["max_lane"])')" "11 0"
+# How a branch got into main: a fast-forward, then a merge commit.
+git -C "$HG" switch -q -c ff; git -C "$HG" commit -q --allow-empty -m "ff work"; git -C "$HG" switch -q main 2>/dev/null || git -C "$HG" switch -q master
+git -C "$HG" merge -q --ff-only ff
+git -C "$HG" switch -q -c topic HEAD~3; git -C "$HG" commit -q --allow-empty -m "topic work"; git -C "$HG" switch -q -
+git -C "$HG" merge -q --no-ff -m "merge topic" topic
+OUT=$(pinvoke history_branch_merges "{\"repoPath\":\"$HG\",\"branch\":\"topic\"}")
+ok "a branch merged with a merge commit names that commit" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print([(m["how"], (m["commit"] or {}).get("subject")) for m in v["merged_by"]])')" "('merge', 'merge topic')"
+OUT=$(pinvoke history_branch_merges "{\"repoPath\":\"$HG\",\"branch\":\"ff\"}")
+ok "  one taken in by a fast-forward says so" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print([m["how"] for m in v["merged_by"]])')" "fast-forward"
+OUT=$(pinvoke history_branch_merges "{\"repoPath\":\"$HG\",\"branch\":\"HEAD\"}")
+ok "  and the merges are counted, not capped silently" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["merges_total"], v["merges_truncated"])')" "1 False"
+# A range hides commits too: its graph joins only what it lists.
+R2="$SB/hrange"; git init -q "$R2"
+git -C "$R2" commit -q --allow-empty -m c1; git -C "$R2" commit -q --allow-empty -m c2
+git -C "$R2" switch -q -c side HEAD~1; git -C "$R2" commit -q --allow-empty -m s1; git -C "$R2" switch -q -
+git -C "$R2" merge -q --no-ff -m m1 side
+OUT=$(pinvoke history_page "{\"repoPath\":\"$R2\",\"rev\":\"HEAD~1..HEAD\",\"offset\":0,\"limit\":50}")
+ok "a range joins only the commits it lists: no lane runs off to one it leaves out" "$(printf '%s' "$OUT" | "$PY" -c 'import sys,json;v=json.load(sys.stdin)["value"];print(v["total"], v["max_lane"])')" "2 0"
 
 verify_result

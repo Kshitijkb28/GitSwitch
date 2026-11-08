@@ -7,6 +7,10 @@ pub struct ScannedRepo {
     pub path: String,
     /// origin URL with any embedded token masked.
     pub remote_url: String,
+    /// origin's own push URL (`remote.origin.pushurl`), masked the same way —
+    /// only when it is set and differs from `remote_url`: pushes go there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_url: Option<String>,
     /// GitHub owner/name when the remote is a GitHub URL; empty otherwise.
     pub owner: String,
     pub name: String,
@@ -78,57 +82,77 @@ pub fn parse_github_owner_name(url: &str) -> Option<(String, String)> {
 /// Hide any credentials embedded in a remote URL — covers BOTH forms GitHub
 /// documents: `https://user:token@…` and the token-as-username `https://token@…`.
 pub(crate) fn mask_token(url: &str) -> String {
-    for scheme in ["https://", "http://"] {
-        if let Some(rest) = url.strip_prefix(scheme) {
-            if let Some((_creds, host)) = rest.split_once('@') {
-                return format!("{}***@{}", scheme, host);
-            }
-        }
-    }
-    url.to_string()
+    // One redactor for the whole app. This used to be two byte-identical
+    // copies that only understood a URL anchored at the start of the string;
+    // `cmdlog::redact` also catches one quoted back mid-sentence by git, and
+    // the bare `ghp_` token shapes. It still produces `***@`, which is what
+    // Doctor's remote-embedded-token check looks for.
+    crate::cmdlog::redact(url)
 }
 
-fn get_origin(dir: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["-C", &dir.to_string_lossy(), "remote", "get-url", "origin"])
-        .output()
-        .ok()?;
+pub(crate) fn git_text(dir: &std::path::Path, args: &[&str]) -> Option<String> {
+    let started = std::time::Instant::now();
+    let d = dir.to_string_lossy().to_string();
+    let out = crate::spawn::command("git").arg("-C").arg(&d).args(args).output().ok()?;
+    crate::cmdlog::record(
+        dir,
+        ["git", "-C", &d].iter().map(|a| a.to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
+        out.status.code().unwrap_or(-1),
+        started.elapsed(),
+        &String::from_utf8_lossy(&out.stdout),
+        &String::from_utf8_lossy(&out.stderr),
+    );
     if !out.status.success() {
         return None;
     }
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if url.is_empty() {
-        None
-    } else {
-        Some(url)
-    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
 }
 
-fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
-    let root_path = PathBuf::from(root);
-    if !root_path.is_dir() {
-        return Err(AppError::Config(format!("Folder not found: {}", root)));
-    }
+/// origin's URL, or — in a clone whose remote is called something else —
+/// the first remote's.
+/// The origin's URL as stored — or the first remote's, when there is no origin.
+pub(crate) fn get_origin(dir: &std::path::Path) -> Option<String> {
+    git_text(dir, &["remote", "get-url", "origin"]).or_else(|| {
+        let first = git_text(dir, &["remote"])?.lines().next()?.trim().to_string();
+        git_text(dir, &["remote", "get-url", &first])
+    })
+}
 
+/// Folders the walk passes over — unless one is itself a repository (a
+/// project called `build`, say).
+pub(crate) fn noise_folder(name: &str) -> bool {
+    name.starts_with('.') || matches!(name, "node_modules" | "target" | "Library" | "dist" | "build")
+}
+
+/// The repositories under `root`, as folders: up to five levels down, noise
+/// folders passed over, a repository's own subfolders never entered, a clone
+/// still being written left out. Nothing is asked of git — the Repository
+/// page's list and Find repositories' "already listed" are this same walk.
+pub(crate) fn walk_repo_dirs(root: &std::path::Path) -> Vec<PathBuf> {
+    walk_repo_dirs_observed(root, &mut |_, _, _| true)
+}
+
+/// `walk_repo_dirs`, telling `observe` about each folder it takes up — the
+/// folder, how many it has taken up so far and how many repositories it has
+/// found — and stopping, with what it found until then, once `observe`
+/// answers false. The walk itself is the same, folder for folder.
+pub(crate) fn walk_repo_dirs_observed(root: &std::path::Path, observe: &mut dyn FnMut(&std::path::Path, usize, usize) -> bool) -> Vec<PathBuf> {
     const MAX_DEPTH: u32 = 5;
-    let mut repos = Vec::new();
-    let mut stack = vec![(root_path, 0u32)];
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0u32)];
+    let mut folders = 0usize;
 
     while let Some((dir, depth)) = stack.pop() {
+        folders += 1;
+        if !observe(&dir, folders, out.len()) {
+            break;
+        }
         if dir.join(".git").exists() {
-            let (remote_url, owner, name) = match get_origin(&dir) {
-                Some(url) => {
-                    let (o, n) = parse_github_owner_name(&url).unwrap_or_default();
-                    (mask_token(&url), o, n)
-                }
-                None => (String::new(), String::new(), String::new()),
-            };
-            repos.push(ScannedRepo {
-                path: dir.to_string_lossy().to_string(),
-                remote_url,
-                owner,
-                name,
-            });
+            // A clone still writing this folder: not a repository yet.
+            if crate::sparse::clone_running_at(&dir.to_string_lossy()) {
+                continue;
+            }
+            out.push(dir);
             // Don't descend into a repo's own subfolders.
             continue;
         }
@@ -142,16 +166,43 @@ fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
                     continue;
                 }
                 let dirname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if dirname.starts_with('.')
-                    || matches!(dirname, "node_modules" | "target" | "Library" | "dist" | "build")
-                {
+                if noise_folder(dirname) && !path.join(".git").exists() {
                     continue;
                 }
                 stack.push((path, depth + 1));
             }
         }
     }
+    out
+}
 
+/// One repository folder as the scan reports it: its origin (masked), the
+/// GitHub owner/name behind it, and its own push URL.
+pub(crate) fn scanned_repo(dir: &std::path::Path) -> ScannedRepo {
+    let (remote_url, owner, name) = match get_origin(dir) {
+        Some(url) => {
+            let (o, n) = parse_github_owner_name(&url).unwrap_or_default();
+            (mask_token(&url), o, n)
+        }
+        None => (String::new(), String::new(), String::new()),
+    };
+    // The raw value: `get-url --push` would apply a push block's rewrite.
+    let push_url = git_text(dir, &["config", "--get", "remote.origin.pushurl"]).map(|u| mask_token(&u)).filter(|u| *u != remote_url);
+    ScannedRepo {
+        path: dir.to_string_lossy().to_string(),
+        remote_url,
+        push_url,
+        owner,
+        name,
+    }
+}
+
+fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
+    let root_path = PathBuf::from(root);
+    if !root_path.is_dir() {
+        return Err(AppError::Config(format!("Folder not found: {}", root)));
+    }
+    let mut repos: Vec<ScannedRepo> = walk_repo_dirs(&root_path).iter().map(|d| scanned_repo(d)).collect();
     repos.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(repos)
 }
@@ -160,6 +211,81 @@ fn scan_sync(root: &str) -> Result<Vec<ScannedRepo>, AppError> {
 /// Runs on a blocking thread — filesystem walks can be large.
 pub async fn scan_repos(root: String) -> Result<Vec<ScannedRepo>, AppError> {
     tokio::task::spawn_blocking(move || scan_sync(&root))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
+}
+
+/// A folder scan the page can watch and stop: what `scan_repos` finds, the
+/// folder it searched, and how many folders it took up.
+#[derive(Debug, Serialize, Default)]
+pub struct TrackedScan {
+    pub root: String,
+    pub repos: Vec<ScannedRepo>,
+    pub folders: usize,
+    /// Stopped before it ended: `repos` is then empty — half a list would
+    /// read as the whole folder.
+    pub cancelled: bool,
+}
+
+/// Progress is published every this many folders (and on each repository found).
+const PROGRESS_EVERY: usize = 256;
+
+pub(crate) fn scan_tracked_sync(root: &str, state: &crate::find_clones::ScanState) -> Result<TrackedScan, AppError> {
+    let root_path = PathBuf::from(root);
+    if !root_path.is_dir() {
+        return Err(AppError::Config(format!("Folder not found: {}", root)));
+    }
+    let mut out = TrackedScan { root: root.to_string(), ..Default::default() };
+    let mut last_found = 0usize;
+    let dirs = walk_repo_dirs_observed(&root_path, &mut |dir, folders, found| {
+        if state.cancelled() {
+            return false;
+        }
+        if folders == 1 || folders.is_multiple_of(PROGRESS_EVERY) || found != last_found {
+            last_found = found;
+            state.set(|p| {
+                p.phase = "looking".into();
+                p.folders = folders;
+                p.found = found;
+                p.place = dir.to_string_lossy().to_string();
+            });
+        }
+        out.folders = folders;
+        true
+    });
+    if state.cancelled() {
+        out.cancelled = true;
+        return Ok(out);
+    }
+    let total = dirs.len();
+    state.set(|p| {
+        p.phase = "reading".into();
+        p.found = total;
+        p.checked = 0;
+        p.total = total;
+    });
+    for (i, d) in dirs.iter().enumerate() {
+        if state.cancelled() {
+            out.cancelled = true;
+            out.repos.clear();
+            return Ok(out);
+        }
+        state.set(|p| {
+            p.checked = i;
+            p.place = d.to_string_lossy().to_string();
+        });
+        out.repos.push(scanned_repo(d));
+    }
+    out.repos.sort_by(|a, b| a.path.cmp(&b.path));
+    state.set(|p| p.checked = total);
+    Ok(out)
+}
+
+/// `scan_repos`, with progress and Stop through the scan id (polled like
+/// Find repositories' search).
+pub async fn scan_tracked(scan_id: String, root: String) -> Result<TrackedScan, AppError> {
+    let state = crate::find_clones::scan(&scan_id);
+    tokio::task::spawn_blocking(move || scan_tracked_sync(&root, &state))
         .await
         .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))?
 }
@@ -246,6 +372,79 @@ mod tests {
         assert!(has("repo_b"));
         assert!(!has("inner"), "must not descend into a repo");
         assert!(!has("dep"), "must skip node_modules");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_observed_walk_is_the_same_walk_and_can_stop() {
+        let base = std::env::temp_dir().join(format!("gitswitch_scan_observed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["a/.git", "a/vendor/inner/.git", "g/s/b/.git", "g/s/c/.git", "node_modules/dep/.git", "deep/1/2/3/4/5/six/.git", "x/y/z"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let plain = walk_repo_dirs(&base);
+        let mut seen = Vec::new();
+        let observed = walk_repo_dirs_observed(&base, &mut |d, n, found| {
+            seen.push((d.to_path_buf(), n, found));
+            true
+        });
+        assert_eq!(plain, observed, "same folders, same order");
+        assert_eq!(seen.first().map(|s| (s.0.clone(), s.1, s.2)), Some((base.clone(), 1, 0)));
+        assert!(seen.windows(2).all(|w| w[1].1 == w[0].1 + 1), "folders counted one by one");
+        assert_eq!(seen.last().unwrap().2 + usize::from(seen.last().unwrap().0.join(".git").exists()), plain.len());
+        // Stopped after three folders: what was found until then, no more.
+        let stopped = walk_repo_dirs_observed(&base, &mut |_, n, _| n <= 3);
+        assert!(stopped.len() <= plain.len() && plain.starts_with(&stopped), "{stopped:?} is a prefix of {plain:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_tracked_scan_reports_where_it_is_and_stops_with_nothing() {
+        let base = std::env::temp_dir().join(format!("gitswitch_scan_tracked_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["one/.git", "two/.git", "deeper/three/.git"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        let root = base.to_string_lossy().to_string();
+        let state = crate::find_clones::ScanState::new();
+        let out = scan_tracked_sync(&root, &state).unwrap();
+        let names: Vec<String> = out.repos.iter().map(|r| crate::paths::base_name(&r.path)).collect();
+        assert_eq!(names, vec!["three", "one", "two"], "sorted by path");
+        assert!(!out.cancelled && out.root == root && out.folders >= 5, "{} folders", out.folders);
+        let p = state.snapshot();
+        assert_eq!((p.phase.as_str(), p.found, p.checked, p.total), ("reading", 3, 3, 3));
+
+        let stopped = crate::find_clones::ScanState::new();
+        stopped.stop();
+        let out = scan_tracked_sync(&root, &stopped).unwrap();
+        assert!(out.cancelled && out.repos.is_empty());
+        assert!(scan_tracked_sync(&base.join("missing").to_string_lossy(), &crate::find_clones::ScanState::new()).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn scan_finds_repositories_whatever_their_folder_is_called() {
+        let base = std::env::temp_dir().join(format!("gitswitch-scan-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["build", "dist", "node_modules/dep", "plain"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+            let ok = crate::spawn::command("git").args(["init", "-q"]).arg(base.join(d)).status().map(|s| s.success()).unwrap_or(false);
+            if !ok {
+                return; // no git here: nothing to prove
+            }
+        }
+        let _ = crate::spawn::command("git").arg("-C").arg(base.join("plain")).args(["remote", "add", "upstream", "git@github.com:acme/x.git"]).status();
+        let found = scan_sync(&base.to_string_lossy()).unwrap();
+        let names: Vec<String> = found.iter().map(|r| crate::paths::base_name(&r.path)).collect();
+        assert!(names.contains(&"build".to_string()) && names.contains(&"dist".to_string()), "{names:?}");
+        assert!(!names.contains(&"dep".to_string()), "a repository inside node_modules is not walked into: {names:?}");
+        let plain = found.iter().find(|r| r.path.ends_with("plain")).unwrap();
+        assert_eq!((plain.owner.as_str(), plain.name.as_str()), ("acme", "x"));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

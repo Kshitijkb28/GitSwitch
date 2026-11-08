@@ -4,12 +4,15 @@ version = "0.1.0"
 description = "Switch git identities automatically per folder — multiple GitHub accounts, zero manual switching"
 authors = ["Kshitij Bhardwaj"]
 edition = "2021"
+# The workspace's default members bring the helper and the shim's binaries
+# too; `cargo run` (what `tauri dev` calls) must still know which is the app.
+default-run = "gitswitch"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace]
-members = ["lock-core", "lock-helper"]
-default-members = [".", "lock-core", "lock-helper"]
+members = ["lock-core", "lock-helper", "git-shim", "sidecars"]
+default-members = [".", "lock-core", "lock-helper", "git-shim"]
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
@@ -30,27 +33,55 @@ dirs = "6.0.0"
 chrono = { version = "0.4.44", features = ["serde"] }
 uuid = { version = "1.23.1", features = ["v4"] }
 thiserror = "2.0.18"
-keyring = "3"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-deep-link = "2"
 gitswitch-lock-core = { path = "lock-core" }
 
 # A real terminal needs a real pty: wezterm's crate wraps unix ptys and
 # Windows ConPTY behind one API.
 portable-pty = "0.9"
+# The Uninstall tab: Info.plist and launchd plists; leftovers go to the Trash.
+plist = "1"
+trash = "5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# A second launch (a gitswitch:// link opened while the app runs) hands its
+# link to the running app instead of starting another.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_NetworkManagement_WiFi",
+  "Win32_Networking_WinSock",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
   "Win32_System_Registry",
+  "Win32_System_RestartManager",
+  "Win32_System_SystemInformation",
+  "Win32_System_LibraryLoader",
   "Win32_System_Threading",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
+# The speed bar on the taskbar asks UI Automation where the taskbar's buttons
+# are (COM interfaces, which windows-sys does not have). The same version
+# tauri and tao already build, so nothing new is compiled but this module.
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Accessibility"] }
+# The Uninstall tab: the installed programs' uninstall entries, both registry views.
+winreg = "0.55"
 

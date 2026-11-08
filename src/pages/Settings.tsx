@@ -8,8 +8,13 @@ import { useToast } from "../components/Toast";
 import { getCustomClientId, setOAuthClientId } from "../lib/oauth";
 import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
-import { check } from "@tauri-apps/plugin-updater";
+import { notePushChanged } from "../lib/console";
+import { RefreshButton } from "../components/RefreshButton";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { getVersion } from "@tauri-apps/api/app";
+import { useAnyJobRunning } from "../lib/gitJobs";
+import { UninstallDialog } from "../components/UninstallDialog";
+import { checkForUpdate, useUpdates } from "../lib/updates";
 
 export function Settings() {
   const toast = useToast();
@@ -17,18 +22,36 @@ export function Settings() {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<string | null>(null);
-  const [checking, setChecking] = useState(false);
+  // Shared with the sidebar: an update the background check found is ready here.
+  const { update: pendingUpdate, checking } = useUpdates();
+  const [installing, setInstalling] = useState(false);
+  const [version, setVersion] = useState<string | null>(null);
+  // Installing restarts the app, which would kill a pull or sync mid-way.
+  const jobRunning = useAnyJobRunning();
   const [clientId, setClientId] = useState("");
   const [locks, setLocks] = useState<api.HelperStatus | null>(null);
   const [lockBusy, setLockBusy] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState(false);
   const [lockMessage, setLockMessage] = useState<string | null>(null);
+  const [uninstalling, setUninstalling] = useState(false);
+
+  function loadVersion() {
+    return getVersion().then((v) => setVersion(typeof v === "string" ? v : null), () => {});
+  }
 
   useEffect(() => {
     loadConfig();
     loadLocks();
     setClientId(getCustomClientId() ?? "");
+    loadVersion();
   }, []);
+
+  const [reloading, setReloading] = useState(false);
+  async function reloadAll() {
+    setReloading(true);
+    await Promise.all([loadConfig(), loadLocks(), loadVersion()]);
+    setReloading(false);
+  }
 
   async function loadLocks() {
     try {
@@ -43,6 +66,7 @@ export function Settings() {
     setLockMessage(null);
     try {
       const r = await job();
+      if (r.outcome === "applied") notePushChanged();
       setLockMessage(
         r.outcome === "applied"
           ? r.message
@@ -110,56 +134,57 @@ export function Settings() {
   }
 
   async function handleCheckUpdate() {
-    setChecking(true);
     setUpdateStatus(null);
     try {
-      const update = await check();
-      if (update) {
-        setUpdateStatus(`Update available: v${update.version}`);
-        let downloaded = 0;
-        let contentLength = 0;
-        await update.downloadAndInstall((event) => {
-          switch (event.event) {
-            case "Started":
-              contentLength = event.data.contentLength ?? 0;
-              setUpdateStatus(`Downloading... 0%`);
-              break;
-            case "Progress":
-              downloaded += event.data.chunkLength;
-              const pct = contentLength
-                ? Math.round((downloaded / contentLength) * 100)
-                : 0;
-              setUpdateStatus(`Downloading... ${pct}%`);
-              break;
-            case "Finished":
-              setUpdateStatus("Update installed! Restarting...");
-              break;
-          }
-        });
-        await relaunch();
-      } else {
-        setUpdateStatus("You're on the latest version!");
-        setTimeout(() => setUpdateStatus(null), 3000);
-      }
+      // Found, not installed: installing restarts the app, so that is a
+      // separate, deliberate click below.
+      const update = await checkForUpdate();
+      setUpdateStatus(update ? `Version ${update.version} is available.` : "You're on the latest version.");
     } catch (e) {
-      const msg = String(e);
-      if (msg.includes("__TAURI") || msg.includes("not a function") || msg.includes("undefined")) {
-        setUpdateStatus("Update check requires the desktop app.");
-      } else {
-        setUpdateStatus(`Update check failed: ${e}`);
-      }
-    } finally {
-      setChecking(false);
+      setUpdateStatus(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function handleInstallUpdate() {
+    if (!pendingUpdate || jobRunning) return;
+    setInstalling(true);
+    try {
+      let downloaded = 0;
+      let contentLength = 0;
+      await pendingUpdate.downloadAndInstall((event) => {
+        switch (event.event) {
+          case "Started":
+            contentLength = event.data.contentLength ?? 0;
+            setUpdateStatus("Downloading... 0%");
+            break;
+          case "Progress": {
+            downloaded += event.data.chunkLength;
+            const pct = contentLength ? Math.round((downloaded / contentLength) * 100) : 0;
+            setUpdateStatus(`Downloading... ${pct}%`);
+            break;
+          }
+          case "Finished":
+            setUpdateStatus("Update installed! Restarting...");
+            break;
+        }
+      });
+      await relaunch();
+    } catch (e) {
+      setUpdateStatus(`The update didn't install: ${e}`);
+      setInstalling(false);
     }
   }
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-zinc-100">Settings</h1>
-        <p className="text-sm text-zinc-400 mt-1">
-          View and manage your git configuration
-        </p>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-zinc-100">Settings</h1>
+          <p className="text-sm text-zinc-400 mt-1">
+            View and manage your git configuration
+          </p>
+        </div>
+        <RefreshButton onClick={reloadAll} busy={reloading} title="Re-read the git config and the push locks" />
       </div>
 
       {message && (
@@ -371,7 +396,7 @@ export function Settings() {
           <div className="space-y-1 text-sm text-zinc-400">
             <p>
               <span className="text-zinc-500">Version:</span>{" "}
-              <span className="text-zinc-300">0.1.0</span>
+              <span className="text-zinc-300">{version ?? "—"}</span>
             </p>
             <p>
               <span className="text-zinc-500">Built with:</span>{" "}
@@ -383,17 +408,47 @@ export function Settings() {
               variant="secondary"
               size="sm"
               onClick={handleCheckUpdate}
-              disabled={checking}
+              disabled={checking || installing}
             >
               <Download size={14} className={checking ? "animate-bounce" : ""} />
               Check for Updates
             </Button>
+            {pendingUpdate && (
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={handleInstallUpdate}
+                disabled={installing || jobRunning}
+                title={jobRunning ? "A git operation is still running; installing would restart the app and cut it off." : undefined}
+              >
+                Install v{pendingUpdate.version} and restart
+              </Button>
+            )}
             {updateStatus && (
               <span className="text-xs text-zinc-400">{updateStatus}</span>
+            )}
+            {pendingUpdate && jobRunning && (
+              <span className="text-xs text-amber-300/90">Wait for the running git operation to finish first.</span>
             )}
           </div>
         </div>
       </Card>
+
+      <Card>
+        <div className="flex items-center gap-2 mb-2">
+          <Trash2 size={16} className="text-zinc-300" />
+          <h2 className="text-sm font-semibold text-zinc-300 uppercase tracking-wider">Uninstall</h2>
+        </div>
+        <p className="text-xs text-zinc-500 mb-3 leading-relaxed">
+          Removes GitSwitch from this computer: first what it set up in git, your repositories and the push
+          locks, then — once it has quit — its data and the app itself. Your SSH keys and repositories stay.
+        </p>
+        <Button variant="danger" size="sm" onClick={() => setUninstalling(true)} data-uninstall-open>
+          <Trash2 size={14} />
+          Uninstall GitSwitch…
+        </Button>
+      </Card>
+      <UninstallDialog open={uninstalling} onClose={() => setUninstalling(false)} />
     </div>
   );
 }

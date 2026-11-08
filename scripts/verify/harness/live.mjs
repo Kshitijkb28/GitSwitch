@@ -87,6 +87,8 @@ function probeInvoke(cmd, args) {
         ...process.env,
         HOME: ENV.home,
         GIT_CONFIG_NOSYSTEM: "1",
+        // Never the real keychain: the debug build keeps tokens here instead.
+        GITSWITCH_TOKEN_DIR: `${ENV.home}/tokens`,
         PROBE_OP: "invoke",
         PROBE_CMD: cmd,
         PROBE_JSON: JSON.stringify(args ?? {}),
@@ -127,11 +129,23 @@ function serialised(fn) {
 /** Everything the page asks for. Two shims (see the header); the rest is the real backend. */
 async function onInvoke(cmd, args) {
   if (cmd === "history_list_repos") return { ok: true, value: [REPO_REF] };
+  // Who would push depends on this machine's keys and on github.com answering;
+  // the sandbox remote is a local path anyway, which is what the real backend says.
+  if (cmd === "changes_push_identity") {
+    return { ok: true, value: { remote: "origin", url: WORK, via: "local", login: null, key_path: null, host: null, account: null, expected_login: null, detail: "The remote is a local path; no account is involved." } };
+  }
   if (cmd === "get_profiles") {
     const r = await serialised(() => probeInvoke(cmd, args));
     return r.ok ? r : { ok: true, value: [] };
   }
-  return serialised(() => probeInvoke(cmd, args));
+  const r = await serialised(() => probeInvoke(cmd, args));
+  // A command the probe does not forward comes back as an ordinary error and
+  // the page shows its fallback — which would pass every assertion about the
+  // fallback. Name it instead.
+  if (r && r.ok === false && /unknown command/.test(String(r.error))) {
+    ok(`the probe forwards ${cmd} (src-tauri/src/probe.rs)`, false, r.error);
+  }
+  return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +211,19 @@ async function waitGone(page, needle, timeout = WAIT) {
   } catch {
     return false;
   }
+}
+/** Poll an asynchronous predicate until true or the timeout. */
+async function waitUntilAsync(fn, timeout = WAIT) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    try {
+      if (await fn()) return true;
+    } catch {
+      // keep polling
+    }
+    await sleep(150);
+  }
+  return false;
 }
 /** Poll a synchronous predicate (usually a git fact) until true or the timeout. */
 async function waitUntil(fn, timeout = WAIT) {
@@ -276,6 +303,15 @@ async function clickInRow(page, rowText, pick) {
     pick
   );
 }
+/** Like clickInRow, but waits for the row and its button to appear (a card that re-reads after a scope change). */
+async function clickInRowWhen(page, rowText, pick, timeout = WAIT) {
+  const end = Date.now() + timeout;
+  while (Date.now() < end) {
+    if (await clickInRow(page, rowText, pick)) return true;
+    await sleep(150);
+  }
+  return false;
+}
 /** The open dialog titled `title` (Modal renders an <h2>), or null. */
 const modalPanel = (title) => {
   const h = [...document.querySelectorAll("h2")].find((x) => x.innerText.trim() === title);
@@ -292,7 +328,7 @@ async function clickInDialogRow(page, title, rowText, pick, timeout = WAIT) {
     if (!panel) return false;
     // Prefer the row that NAMES rowText exactly (a leaf element whose text is
     // just that), then fall back to a substring match: a branch such as
-    // "gitswitch-before-sync-…" whose row mentions "main" must not be picked
+    // "gitswitch-before-update-…" whose row mentions "main" must not be picked
     // for "main".
     const all = [...panel.querySelectorAll("li")];
     const exact = all.filter((r) => [...r.querySelectorAll("*")].some((el) => el.children.length === 0 && el.innerText.trim() === rowText));
@@ -385,6 +421,7 @@ await page.evaluateOnNewDocument((repo) => {
   // The remembered repository, as the app would have persisted it.
   localStorage.setItem("gitswitch:changes.repo", JSON.stringify(repo));
   localStorage.setItem("gitswitch:history.repo", JSON.stringify(repo));
+  localStorage.setItem("gitswitch:repo.path", JSON.stringify(repo));
   window.__TAURI_INTERNALS__ = {
     invoke: (cmd, args) => {
       window.__CALLS__.push({ cmd, args });
@@ -401,11 +438,11 @@ await page.evaluateOnNewDocument((repo) => {
 }, WORK);
 
 async function openChanges() {
-  await page.goto(`${server.url}/changes`, { waitUntil: "networkidle0", timeout: WAIT });
+  await page.goto(`${server.url}/repo/changes`, { waitUntil: "networkidle0", timeout: WAIT });
   if (!(await waitText(page, "Committing as"))) throw new Error("the Changes page never showed the repository: " + (await text(page)).slice(0, 400));
 }
 async function openHistory() {
-  await page.goto(`${server.url}/history`, { waitUntil: "networkidle0", timeout: WAIT });
+  await page.goto(`${server.url}/repo/history`, { waitUntil: "networkidle0", timeout: WAIT });
   await page.waitForFunction(() => /showing \d/.test(document.body.innerText), { timeout: WAIT });
 }
 /** "Go to commit" → the detail panel for `hash`. */
@@ -683,7 +720,7 @@ try {
   });
 
   // -----------------------------------------------------------------------
-  await scenario("j. Sync card: Assess (fetches) then Sync now", async () => {
+  await scenario("j. Update drawer: Preview update (fetches) then Update now", async () => {
     git(OTHER, "pull", "-q", "--ff-only");
     write(`${OTHER}/more.txt`, "more\n");
     git(OTHER, "add", "-A");
@@ -691,24 +728,26 @@ try {
     git(OTHER, "push", "-q", "origin", "main");
     const incoming = git(OTHER, "rev-parse", "HEAD");
     await openChanges();
-    ok("Sync now is not offered before a plan exists", (await button(page, "Sync now")) === null);
-    ok("Assess (fetches)", await click(page, "Assess (fetches)"));
+    ok("Update now is not offered before a plan exists", (await button(page, "Update now")) === null);
+    ok("Preview update", await click(page, "Preview update"));
+    ok("  opens the Update drawer", await waitUntilAsync(async () => (await page.$('[role="dialog"][aria-label="Update"]')) !== null));
     ok("  the plan is a sentence", await waitText(page, "replayed on top of 1 new commit from origin/main"));
     let s = await text(page);
     ok("  main is 0 ahead and 1 behind", s.includes("main is 0 ahead and 1 behind origin/main"));
     ok("  the submodule table says vendor/sub has nothing to do", s.includes("vendor/sub") && s.includes("nothing to do"));
     ok("  Assess fetched: git sees the incoming commit", git(WORK, "rev-parse", "origin/main") === incoming);
     ok("  nothing moved yet", git(WORK, "rev-parse", "HEAD") !== incoming);
-    const st = await buttonState(page, "Sync now");
-    ok("  Sync now is enabled", st?.disabled === false, JSON.stringify(st));
-    ok("Sync now", await click(page, "Sync now"));
-    ok("  the page says Synced: fast-forwarded", await waitText(page, "Synced: fast-forwarded to 1 new commit from origin/main."));
+    const st = await buttonState(page, "Update now");
+    ok("  Update now is enabled", st?.disabled === false, JSON.stringify(st));
+    ok("Update now", await click(page, "Update now"));
+    ok("  the page says Updated: fast-forwarded", await waitText(page, "Updated: fast-forwarded to 1 new commit from origin/main."));
+    ok("  and the drawer closed", (await page.$('[role="dialog"][aria-label="Update"]')) === null);
     ok("  git: HEAD equals origin/main at other's commit", git(WORK, "rev-parse", "HEAD") === incoming && subjectOf(WORK, "HEAD") === "other 2 (live)");
     ok("  the tree is clean and no stash is left", git(WORK, "status", "--porcelain") === "" && git(WORK, "stash", "list") === "");
     s = await text(page);
     ok("  the result table shows the new HEAD", s.includes(`→ ${short(incoming)}`));
     ok("  every check passed", s.includes("All 6 checks passed"));
-    ok("  the page reflects the new HEAD: level with origin/main, plan cleared", s.includes("Nothing to pull — you're level with origin/main") && (await button(page, "Assess (fetches)")) !== null);
+    ok("  the page reflects the new HEAD: level with origin/main, the preview offered again", s.includes("Nothing to pull — you're level with origin/main") && (await button(page, "Preview update")) !== null);
   });
 
   // -----------------------------------------------------------------------
@@ -761,6 +800,93 @@ try {
     ok("  the branch is 1 ahead of upstream", git(WORK, "rev-list", "--count", "origin/main..HEAD") === "1");
     ok("  the History page lists the revert", await waitText(page, 'Revert "other 2 (live)"'));
     ok("  and says 1 to push (after the sync status was re-read)", await waitText(page, "Up to date with origin/main · 1 to push"));
+  });
+
+  // -----------------------------------------------------------------------
+  await scenario("k. A dot-named submodule: the folder icon scopes the page to it; Pull inside and Update to act on it alone", async () => {
+    // Argos's shape: submodule folders whose names start with a dot.
+    git(WORK, "submodule", "add", "-q", `${ENV.sb}/sub.git`, ".audit");
+    git(WORK, "commit", "-qm", "add .audit (live)");
+    git(WORK, "push", "-q", "origin", "main");
+    const AUDIT = `${WORK}/.audit`;
+    const subIs = async (v) => {
+      try {
+        await page.waitForFunction((x) => localStorage.getItem("gitswitch:repo.sub") === JSON.stringify(x), { timeout: WAIT }, v);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    await openChanges();
+    let s = await text(page);
+    const at = s.indexOf(".audit");
+    ok("the card lists .audit with its own branch and upstream", /\.audit[\s\S]{0,300}?main → origin\/main/.test(s), s.slice(at, at + 200));
+    ok("Open on the .audit row (the folder icon)", await clickInRowWhen(page, ".audit", { title: "Work in this submodule as its own repository" }));
+    ok("  the scope is .audit", await subIs(".audit"));
+    ok("  and the page reads the submodule itself: level with origin/main", await waitText(page, "Nothing to pull"));
+    ok("  git: it is on main", git(AUDIT, "symbolic-ref", "--short", "HEAD") === "main");
+    ok("Back to the repository", await click(page, "Back to the repository"));
+    ok("  the scope is the repository again", await subIs(""));
+    ok("  which lists its submodules", await waitText(page, "Submodules:"));
+
+    // Someone pushes to the submodule's own upstream: Pull inside brings it in; the parent then sees the move.
+    const SEED = `${ENV.sb}/seed/sub`;
+    git(SEED, "pull", "-q", "--ff-only");
+    write(`${SEED}/more.txt`, "more\n");
+    git(SEED, "add", "-A");
+    git(SEED, "commit", "-qm", "sub more (live)");
+    git(SEED, "push", "-q", "origin", "main");
+    ok("Pull inside on the .audit row", await clickInRowWhen(page, ".audit", { text: "Pull inside" }));
+    ok("  the page says Pulled 1 commit(s)", await waitText(page, "Pulled 1 commit(s)"));
+    ok("  git: .audit is at its upstream's tip, still on main", git(AUDIT, "rev-parse", "HEAD") === git(SEED, "rev-parse", "HEAD") && git(AUDIT, "symbolic-ref", "--short", "HEAD") === "main");
+    ok("  the parent still records the old commit", git(WORK, "rev-parse", "HEAD:.audit") !== git(AUDIT, "rev-parse", "HEAD"));
+    ok("  and the card says so", await waitText(page, "moved 1 commit ahead"));
+    ok("  vendor/sub was not touched", git(SUB, "rev-parse", "HEAD") === git(WORK, "rev-parse", "HEAD:vendor/sub"));
+
+    // The record moves past the checkout (a pull of the superproject does this): Update to <recorded> checks it out.
+    git(WORK, "add", ".audit");
+    git(WORK, "commit", "-qm", "bump .audit (live)");
+    git(AUDIT, "reset", "-q", "--hard", "HEAD~1");
+    const recorded = git(WORK, "rev-parse", "HEAD:.audit");
+    await openChanges();
+    ok("the row offers Update to <recorded>", await waitText(page, `Update to ${short(recorded)}`));
+    ok("Update to <recorded>", await clickInRowWhen(page, ".audit", { title: "git submodule update -- .audit" }));
+    ok("  the page says 1 of 1 submodule(s) up to date.", await waitText(page, "1 of 1 submodule(s) up to date."));
+    ok("  git: .audit is at the recorded commit", await waitUntil(() => git(AUDIT, "rev-parse", "HEAD") === recorded));
+    ok("  vendor/sub still was not touched", git(SUB, "rev-parse", "HEAD") === git(WORK, "rev-parse", "HEAD:vendor/sub"));
+    ok("  and the card calls it clean again", await waitText(page, "up to date with what this repo records"));
+  });
+
+  // -----------------------------------------------------------------------
+  await scenario("l. A conflict pauses the update; Keep mine resolves it; Continue update finishes with every check passed", async () => {
+    git(OTHER, "pull", "-q", "--ff-only");
+    write(`${OTHER}/c.txt`, "theirs again\n");
+    git(OTHER, "commit", "-qam", "theirs c again (live)");
+    git(OTHER, "push", "-q", "origin", "main");
+    write(`${WORK}/c.txt`, "mine again\n");
+    git(WORK, "commit", "-qam", "mine c again (live)");
+    const ownBefore = git(WORK, "rev-list", "--count", "origin/main..HEAD");
+    await openChanges();
+    ok("Preview update", await click(page, "Preview update"));
+    ok("  the plan warns that both sides changed c.txt", await waitText(page, "Both sides changed c.txt"));
+    const author = git(WORK, "log", "-1", "--format=%an", "HEAD");
+    const drawerTxt = await page.evaluate(() => document.querySelector('[role="dialog"][aria-label="Update"]')?.innerText ?? "");
+    ok("  and names who did what, in the drawer", drawerTxt.includes("theirs c again (live)") && drawerTxt.includes("mine c again (live)") && author.length > 0 && drawerTxt.includes(author), `author "${author}"`);
+    ok("Update now", await click(page, "Update now"));
+    ok("  the update pauses on the conflict", await waitText(page, "Update paused: conflicts to resolve."));
+    ok("  git: the rebase is stopped on c.txt", exists(`${WORK}/.git/rebase-merge`) && git(WORK, "diff", "--name-only", "--diff-filter=U") === "c.txt");
+    ok("  the conflict list names it with the sides", await waitText(page, "both modified"));
+    ok("  Continue update waits", (await buttonState(page, "Continue update"))?.disabled === true);
+    ok("Keep mine", await clickInRowWhen(page, "c.txt", { text: "Keep mine" }));
+    ok("  the page reports the file resolved", await waitText(page, "1 file(s) resolved."));
+    ok("  c.txt holds my content", fs.readFileSync(`${WORK}/c.txt`, "utf8") === "mine again\n");
+    ok("  Continue update is enabled once nothing is unmerged", await waitUntilAsync(async () => (await buttonState(page, "Continue update"))?.disabled === false));
+    ok("Continue update", await click(page, "Continue update"));
+    const said = await waitText(page, "Updated: ");
+    ok("  the page says Updated", said, said ? "" : (await text(page)).replace(/\s+/g, " ").slice(0, 900));
+    ok("  with every check passed — the resolved commit counts as on top", await waitText(page, "All 6 checks passed"));
+    ok("  git: my commits are on top of upstream's, nothing in progress, the state file gone", git(WORK, "rev-list", "--count", "origin/main..HEAD") === ownBefore && !exists(`${WORK}/.git/rebase-merge`) && !exists(`${WORK}/.git/gitswitch-sync.json`));
+    ok("  and c.txt is mine", git(WORK, "show", "HEAD:c.txt") === "mine again");
   });
 } finally {
   await browser.close();

@@ -26,7 +26,7 @@ for folders that still use HTTPS.
 
 ## Features
 
-- **A terminal, in a drawer, on every page.** `Ctrl`/`Cmd` + `` ` `` opens a
+- **A terminal, and a record of what the app ran, in a drawer on every page.** `Ctrl`/`Cmd` + `` ` `` opens a
   real shell in the repository you have selected, and it stays open while you
   move between pages. It is the same shell you would open yourself, with the
   same account, SSH key and push block, because those live in your git config
@@ -35,12 +35,56 @@ for folders that still use HTTPS.
   force push, `--no-verify`, and a push that would skip the system config where
   a push lock lives. Those three are guard-rails against a slip, not a barrier:
   an absolute path to git or a changed `PATH` steps around them, and the drawer
-  says so rather than pretending otherwise.
+  says so rather than pretending otherwise. The header shows whether *this*
+  repository can be pushed at all, so a block is known before a push is typed.
+  Beside the shell is **Activity**: every git command GitSwitch itself ran, with
+  the exact command, its exit code, how long it took and what git said. Routine
+  reads are hidden by default because they are most of it. Anything that looks
+  like a credential — a token in a pasted clone URL, the same URL quoted back in
+  an error, an `Authorization` header — is replaced with `***` before it is
+  stored, not before it is shown.
 - **Every dropdown searches.** A list longer than three entries gets a filter
   box of its own: type to narrow it, arrow keys to move, Enter to choose. It
   matches the hidden value as well as the label, so two clones with the same
   name are told apart by their path. Long lists are rendered fifty rows at a
   time and grow as you scroll, so a few hundred repositories open instantly.
+- **Ports** — every port something is listening on, with the process that holds
+  it, the folder it runs from, and the repository and profile that folder belongs
+  to. Two copies of one project collide through what one of them left running —
+  a dev server, a database, a Compose project — and an AI agent in the other copy
+  then finds "something already on this port"; here the person sees which copy it
+  was and stops the right one. **Stop** asks first and sends the polite signal to
+  the whole process group (a dev server's children go with it); a process that
+  ignores it gets **Force stop**. A port published by Docker is stopped through
+  Docker (its container, or its whole Compose project), never by ending Docker
+  Desktop's own process, which is what holds the socket. What may not be stopped
+  from here is named with the reason: root's processes (with the `sudo kill` to
+  run), the system's own, GitSwitch itself and the drawer's shell. On macOS the
+  listing is `lsof` + `netstat` + `ps`; on Linux `ss` + `/proc`; on Windows one
+  PowerShell query — the Linux and Windows listings are unit-tested against their
+  documented formats and have not yet been seen by a person.
+- **Workspaces** — a repository cloned twice (to work in both with AI agents,
+  say) gets a separate identity per copy: an eight-character id kept in the
+  copy's own `.git/config` (a rename or move keeps it; nothing is pushed), a
+  port offset (the older copy keeps 0, the next takes 100, and so on — or change
+  it on the Repository page, where the workspace line also counts what listens
+  from this copy and links to those ports), and — for every copy but the first
+  — a Compose project name of its own,
+  so the first copy's containers and volumes keep their names. The terminal
+  drawer exports them (`GITSWITCH_WORKSPACE`, `GITSWITCH_WORKSPACE_PATH`,
+  `GITSWITCH_WORKSPACE_NAME`, `GITSWITCH_PORT_OFFSET`, and `COMPOSE_PROJECT_NAME`
+  only for a later copy) and prints one dim line saying what the shell got, so
+  a dev server or agent started there can take `$GITSWITCH_PORT_OFFSET` into
+  account and `docker compose up` lands in this copy's own project. The
+  Repository page names the other copies with their branch and changes, and
+  warns when two copies have the same branch checked out with uncommitted
+  changes in both — commits made in both diverge, and the second push is
+  refused. GitSwitch only tells you about the other copy — it never switches a
+  branch, edits a port in your project, or renames containers that are already
+  running. Those are your decisions. A `docker compose up` from your own
+  Terminal in a later copy still uses Compose's default name: the page shows
+  the `export COMPOSE_PROJECT_NAME=…` to paste. A linked worktree is a
+  workspace of its own; a submodule belongs to its superproject's.
 - **Doctor** — one click finds the things that silently send commits to the
   wrong account: an `~/.ssh/config` block pinning one key for github.com, SSH
   keys not registered on any account, hand-written `includeIf` rules fighting
@@ -50,7 +94,55 @@ for folders that still use HTTPS.
 - **Profiles** — create/edit identities, assign folders with a native folder
   picker. A folder can belong to only one profile (auto-deduplicated).
 - **Auto Assign** — scan a folder tree, check which of your GitHub accounts
-  actually has access to each repo, and map them to the right profile.
+  actually has access to each repo, and map them to the right profile. While
+  it searches it shows the folder it is in (with Stop); each repository shows
+  its path, and one a profile already holds says so — "Already in Work
+  (work-me)", or where Apply would move it.
+- **Find repositories** (on the Repository page) — finds the clones on this
+  computer that no profile's folders hold, which the page therefore does not
+  list: under your home folder, the Clone page's and Auto Assign's folders, the
+  folders beside your profile folders and any place you add. It passes over
+  hidden, media and package folders and network drives, and does not follow
+  links. It asks GitHub which of your accounts can reach each clone and
+  proposes the profile whose account can. Tick the ones to add (select all,
+  only the clear matches, filter, search, one profile for all the ticked ones,
+  hide the ones you never want offered) and add them in one click, or let the
+  clear matches be added straight away. Undo takes them off again. The clones
+  it finds that a profile already holds are listed too, with that profile and
+  its account.
+- **Pull requests** (a sidebar page, and the **GitHub** tab on the Repository
+  page) — your account's repositories, each with how many pull requests are
+  open, ask you for a review or are yours; pick one to see its pull requests:
+  everyone's, or created by you, asking your review, assigned to you or
+  involving you — open, merged, closed or all, with Refresh. Open one to read its files with their diffs, its
+  commits, checks and reviews; approve, ask for changes or comment; and merge
+  it (merge commit, squash or rebase) with the commit you reviewed — if someone
+  pushed since, GitHub refuses and nothing unreviewed is merged — optionally
+  deleting its branch. The GitHub tab also lists the repository's
+  collaborators and pending invitations, invites someone by username with a
+  role, and removes access. You act as one of your accounts (the profile's own
+  by default); its token never leaves the app's Rust side.
+- **Uninstall** (a sidebar page) — the apps on this computer: `.app` bundles
+  on macOS (App Store and Homebrew ones marked), the programs in "Installed
+  apps" and the Store apps on Windows, and on Ubuntu the apps in the menu
+  (.deb, Snap, Flatpak, AppImage) or every package. Uninstalling one goes step
+  by step: what will happen (the exact command on Windows and Ubuntu, and on
+  Ubuntu every other package apt would remove with it), then the app goes —
+  to the Trash on macOS, by its own uninstaller on Windows, by dpkg / snap /
+  flatpak on Ubuntu. Only once it is really gone does GitSwitch look for what
+  it left behind, and only in the places apps keep their data, only by its
+  exact id or name — never another app's folder, a sibling product's
+  (`…Chrome.canary`), a shared vendor folder, a generic name or anything
+  reached through a link. Sure ones are ticked, maybes are not; ticked ones go
+  to the Trash / Recycle Bin, each checked again first. What needs the
+  administrator is listed with its command, never deleted by GitSwitch. On
+  Windows the registry (your own HKCU settings) is an option, with a `.reg`
+  backup. GitSwitch itself and what it needs (git, its web view) are not
+  removed from here — **Settings › Uninstall GitSwitch** takes back
+  everything GitSwitch set up (its `~/.gitconfig` block, the guards and push
+  blocks in your repositories, the push locks behind the administrator prompt,
+  its sign-ins) and then removes the app, keeping your SSH keys and
+  repositories.
 - **Clone** — clone over SSH as the right account. The destination folder's
   profile decides the key, or pick one with **Clone as** (the new folder is then
   added to that profile). Downloads submodules with the same result as
@@ -230,6 +322,9 @@ for folders that still use HTTPS.
   in one click (via `gh`), test the connection, delete old keys.
 - **GitHub sign-in** — device-flow OAuth *and* instant sign-in via your
   existing GitHub CLI (`gh`) logins; autofill profile name/email from an account.
+  The page shows which login `gh` itself uses (the one git's HTTPS credential
+  helper acts as) and can make another one active — `gh auth switch`, without a
+  terminal. GitSwitch's own reads always name their account.
 - **Tray icon**, toast feedback, and a Settings view of the managed gitconfig.
   Pages remember where you were (selected repo, branch, filters) between visits.
 
@@ -243,13 +338,31 @@ incoming" check.
 It reads the same `profiles.json` this app writes rather than reimplementing
 anything, so the two can't drift apart.
 
+Install it from the `.vsix` attached to each GitHub release (also kept as the
+`gitswitch-vscode` artifact of every CI run):
+
 ```bash
-cd vscode-extension && npm install && npm run package
-code --install-extension gitswitch-0.1.0.vsix
+code --install-extension gitswitch-<version>.vsix   # or Extensions → ⋯ → Install from VSIX…
 ```
+
+Or build it from source — `npm run package` compiles it first:
+
+```bash
+cd vscode-extension && npm ci && npm run package
+```
+
+## Install
+
+Download the installer for your OS from the GitHub **Releases** page. The
+builds are not notarized by Apple or signed for Microsoft, so the first open
+needs one extra step on macOS and Windows — see
+[First open on macOS](BUILD.md#first-open-on-macos) and
+[Installing on Windows](BUILD.md#installing).
 
 ## Requirements
 
+- **macOS:** the first time, macOS asks to confirm opening an app that is not
+  notarized — see [First open on macOS](BUILD.md#first-open-on-macos).
 - **git** (required)
 - **ssh / ssh-keygen** (preinstalled on macOS, Linux, Windows 10+)
 - **gh** — the [GitHub CLI](https://cli.github.com) (optional; powers the
@@ -270,6 +383,7 @@ and the CI workflow that produces macOS/Windows/Linux installers from a git tag.
 ```bash
 npm run tauri build                    # installer for this machine's OS
 docker compose run --rm builder        # Linux .deb/.AppImage/.rpm from any machine
+docker compose up app                  # the app in Docker, shown at http://localhost:6080/vnc.html
 ```
 
 ## Testing

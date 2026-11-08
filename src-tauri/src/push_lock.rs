@@ -91,7 +91,8 @@ pub struct MirrorFacts {
 
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct JobOutcome {
-    /// applied | cancelled | denied | no-agent | manual-required | busy | failed | refused | unsupported
+    /// applied | incomplete | cancelled | denied | no-agent | manual-required | busy | failed | refused | unsupported
+    /// (`incomplete`: what could be done was done, and something is still not covered.)
     pub outcome: String,
     pub message: String,
     /// For `manual-required`: the exact command to run as an administrator.
@@ -216,10 +217,22 @@ pub fn layout() -> Option<Layout> {
 /// Homebrew put first on PATH is deliberately not it.
 pub fn system_git() -> PathBuf {
     if cfg!(target_os = "macos") {
-        let p = PathBuf::from("/usr/bin/git");
-        if p.exists() {
-            return p;
-        }
+        // /usr/bin/git is Apple's forwarding stub: every call asks xcrun where
+        // the real git lives (tens of milliseconds, and the "install the
+        // developer tools" dialog when there is none). Resolve it once.
+        static REAL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        return REAL
+            .get_or_init(|| {
+                let found = crate::spawn::command("/usr/bin/xcrun")
+                    .args(["--find", "git"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+                    .filter(|p| p.is_absolute() && p.is_file());
+                found.unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+            })
+            .clone();
     }
     if cfg!(windows) {
         if let Some(install) = windows_install_path() {
@@ -301,10 +314,15 @@ fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// Owned by the administrator and not group- or world-writable — or, under a
-/// test root, owned by the user running the suite.
-fn trusted_owner(m: &fs::Metadata) -> bool {
+/// test root, owned by the user running the suite. On Windows this is the
+/// helper's own check (lock-core's `win`): Administrators, SYSTEM or
+/// TrustedInstaller as owner, and no write right for a low-privilege group in
+/// the DACL. It used to answer `true` unconditionally there, which made every
+/// lock measurement on Windows a statement of faith.
+fn trusted_owner(path: &Path, m: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
+        let _ = path;
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no preconditions.
         let me = unsafe { libc::geteuid() };
@@ -314,9 +332,17 @@ fn trusted_owner(m: &fs::Metadata) -> bool {
         };
         owner_ok && m.mode() & 0o022 == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         let _ = m;
+        match test_root() {
+            Some(_) => true,
+            None => lc::win::admin_owned(path) && !lc::win::loosely_writable(path),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, m);
         true
     }
 }
@@ -360,7 +386,13 @@ fn sha256_of_file(p: &Path) -> Option<String> {
 /// The sidecar shipped next to the app executable (one level up for the test
 /// binaries, which live in `target/debug/deps`).
 pub fn bundled_helper_path() -> Option<PathBuf> {
-    let name = if cfg!(windows) { format!("{}.exe", lc::HELPER_BIN_NAME) } else { lc::HELPER_BIN_NAME.to_string() };
+    bundled_sidecar_path(lc::HELPER_BIN_NAME)
+}
+
+/// A sidecar Tauri placed beside the app's executable — or one level up, in a
+/// development tree.
+pub fn bundled_sidecar_path(name: &str) -> Option<PathBuf> {
+    let name = if cfg!(windows) { format!("{}.exe", name) } else { name.to_string() };
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let direct = dir.join(&name);
@@ -375,7 +407,7 @@ pub fn bundled_helper_path() -> Option<PathBuf> {
 }
 
 fn app_dir() -> Option<PathBuf> {
-    Some(dirs::data_dir()?.join("com.gitswitch.app"))
+    Some(crate::paths::data_dir()?.join("com.gitswitch.app"))
 }
 
 fn jobs_dir() -> Option<PathBuf> {
@@ -424,11 +456,11 @@ pub fn read_registry(layout: &Layout) -> RegistryRead {
     if meta.file_type().is_symlink() || !meta.is_file() {
         return RegistryRead::Untrusted(format!("{} is not a regular file", path.display()));
     }
-    if !trusted_owner(&meta) {
+    if !trusted_owner(path, &meta) {
         return RegistryRead::Untrusted(format!("{} is not owned by the administrator", path.display()));
     }
     if let Ok(dm) = fs::symlink_metadata(&layout.registry_dir) {
-        if dm.file_type().is_symlink() || !trusted_owner(&dm) {
+        if dm.file_type().is_symlink() || !trusted_owner(&layout.registry_dir, &dm) {
             return RegistryRead::Untrusted(format!("{} is not an administrator-only directory", layout.registry_dir.display()));
         }
     }
@@ -459,7 +491,7 @@ fn measure_helper(layout: &Layout, reg: Option<&Registry>) -> HelperMeasure {
         Ok(m) => m,
         Err(_) => return HelperMeasure { state: "missing".into(), installed_sha: None, bundled_sha },
     };
-    if m.file_type().is_symlink() || !m.is_file() || !trusted_owner(&m) {
+    if m.file_type().is_symlink() || !m.is_file() || !trusted_owner(&layout.helper_path, &m) {
         return HelperMeasure { state: "untrusted".into(), installed_sha: None, bundled_sha };
     }
     let installed_sha = sha256_of_file(&layout.helper_path);
@@ -485,8 +517,7 @@ fn measure_remote_helper(layout: &Layout, installed_sha: Option<&str>, vouched_s
     let link = &layout.remote_helper_path;
     let dir_ok = link
         .parent()
-        .and_then(|d| fs::symlink_metadata(d).ok())
-        .map(|m| trusted_owner(&m))
+        .and_then(|d| fs::symlink_metadata(d).ok().map(|m| trusted_owner(d, &m)))
         .unwrap_or(false);
     match fs::symlink_metadata(link) {
         Err(_) => "missing".into(),
@@ -636,6 +667,9 @@ pub async fn measure(repo: &Path, facts: &MirrorFacts) -> LockState {
             RegistryRead::Unreadable(why) => state.drift.push(format!("registry-unreadable:{}", why)),
             _ => {}
         }
+        // Not locked (or not any more): its history still says what happened
+        // to it — an unlock, a lock through its superproject.
+        state.recent_events = recent_events(&repo_c);
         return state;
     };
 
@@ -791,12 +825,26 @@ async fn job_system_gitconfig(platform: Platform) -> String {
     }
     // Ask the system git where its system scope lives; the answer may be a
     // distribution-specific path.
-    let out = tokio::process::Command::new(system_git())
+    let started = std::time::Instant::now();
+    let out = crate::spawn::async_command(system_git())
         .args(["config", "--system", "--show-origin", "--list"])
         .env_remove("GIT_CONFIG_NOSYSTEM")
         .output()
         .await;
     let Ok(o) = out else { return default };
+    // This one prints whatever the user's system config holds, which is exactly
+    // where an `http.extraheader` credential would be — hence the redaction.
+    crate::cmdlog::record(
+        Path::new("."),
+        ["git", "config", "--system", "--show-origin", "--list"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect(),
+        o.status.code().unwrap_or(-1),
+        started.elapsed(),
+        &String::from_utf8_lossy(&o.stdout),
+        &String::from_utf8_lossy(&o.stderr),
+    );
     let stdout = String::from_utf8_lossy(&o.stdout);
     let stderr = String::from_utf8_lossy(&o.stderr);
     let found = stdout
@@ -1031,6 +1079,9 @@ pub async fn finish_manual(nonce: &str) -> JobOutcome {
     let job_path = dir.join(format!("{}.json", nonce));
     match read_result_file(&job_path, nonce) {
         Some(r) => {
+            if r.ok {
+                settle_manual_job(&job_path).await;
+            }
             let _ = fs::remove_file(&job_path);
             let _ = fs::remove_file(result_path_for(&job_path));
             JobOutcome {
@@ -1067,6 +1118,189 @@ async fn lock_op_for(repo_path: &str) -> Result<Op, AppError> {
     })
 }
 
+/// A lock op for every populated submodule of the repository that is not
+/// locked yet — the lock reaches the repositories the code lives in. One
+/// whose path the helper cannot carry is left out (coverage names it).
+async fn submodule_lock_ops(repo_path: &str) -> Vec<Op> {
+    submodule_lock_ops_in(repo_path, None).await
+}
+
+/// The lock ops for the populated submodules — all of them, or only the
+/// named ones and what is nested under them.
+async fn submodule_lock_ops_in(repo_path: &str, only: Option<&[String]>) -> Vec<Op> {
+    let repo = Path::new(repo_path);
+    let mut ops = Vec::new();
+    for rel in push_guard::populated_submodules(repo).await {
+        if let Some(only) = only {
+            if !only.iter().any(|p| rel == *p || rel.starts_with(&format!("{}/", p))) {
+                continue;
+            }
+        }
+        let dir = repo.join(&rel);
+        let dir_s = dir.to_string_lossy().to_string();
+        if lc::validate_path(&canonical(&dir)).is_err() {
+            continue;
+        }
+        if let Ok(s) = Box::pin(crate::git_status::push_state_for(&dir_s)).await {
+            if s.lock.locked && !s.lock.needs_elevation {
+                continue;
+            }
+        }
+        if let Ok(op) = lock_op_for(&dir_s).await {
+            ops.push(op);
+        }
+    }
+    ops
+}
+
+/// Every populated submodule among `only` (and those nested in them) already
+/// locked, with nothing for the helper to repair — and at least one of them.
+async fn every_lock_kept(repo_path: &str, only: &[String]) -> bool {
+    let repo = Path::new(repo_path);
+    let mut seen = 0;
+    for rel in push_guard::populated_submodules(repo).await {
+        if !only.iter().any(|p| rel == *p || rel.starts_with(&format!("{}/", p))) {
+            continue;
+        }
+        seen += 1;
+        match Box::pin(crate::git_status::push_state_for(&repo.join(&rel).to_string_lossy())).await {
+            Ok(s) if s.lock.locked && !s.lock.needs_elevation => {}
+            _ => return false,
+        }
+    }
+    seen > 0
+}
+
+/// A submodule downloaded under a locked repository gets the lock itself —
+/// one job, one administrator prompt, nested ones included — so it cannot be
+/// unblocked from a terminal without the password either. Its guard-rail and
+/// the superproject's mark come first (cover_submodules); this adds the lock.
+pub async fn lock_downloaded_submodules(repo_path: &str, fresh: &[String]) -> JobOutcome {
+    let ops = submodule_lock_ops_in(repo_path, Some(fresh)).await;
+    if ops.is_empty() {
+        // Nothing to do because each of them already carries the lock (its
+        // module directory kept it from an earlier download): they are locked.
+        if every_lock_kept(repo_path, fresh).await {
+            return JobOutcome::simple("applied", "already locked");
+        }
+        return JobOutcome::simple("skipped", "the lock cannot carry these paths");
+    }
+    let repos = op_repos(&ops);
+    let out = run_job(ops).await;
+    if out.applied() {
+        log_submodule_events(&repos, &canonical(Path::new(repo_path)), "locked", "locked when downloaded");
+    } else if out.outcome == "manual-required" {
+        // Nothing on this path can say "I ran it": the job is dropped, and
+        // Repair hands over its own command.
+        if let (Some(dir), Some(nonce)) = (jobs_dir(), out.job_nonce.as_deref()) {
+            let job = dir.join(format!("{}.json", nonce));
+            let _ = fs::remove_file(result_path_for(&job));
+            let _ = fs::remove_file(&job);
+        }
+    }
+    out
+}
+
+/// The repositories of a job's lock ops — the submodules a superproject's job
+/// reached — so each gets its own line in its own event log.
+fn op_repos(ops: &[Op]) -> Vec<String> {
+    ops.iter().filter_map(|o| o.repo().map(str::to_string)).collect()
+}
+
+/// Record, in each submodule's own log, what its superproject's job did to it.
+fn log_submodule_events(sub_repos: &[String], superproject: &str, code: &str, how: &str) {
+    let name = crate::paths::base_name(superproject);
+    for r in sub_repos {
+        log_event(r, code, &format!("{} with its superproject {}", how, name), false);
+    }
+}
+
+/// The populated submodules that carry a lock the repository's lock brought
+/// along — marked as its doing; one the person locked on their own is not listed.
+async fn locked_submodules(repo_path: &str) -> Vec<std::path::PathBuf> {
+    let repo = Path::new(repo_path);
+    let mut out = Vec::new();
+    for rel in push_guard::populated_submodules(repo).await {
+        let dir = repo.join(&rel);
+        let by = sys_git(&dir).args(["config", "--local", "--get", "gitswitch.pushBlockedBy"]).ok_text().await.map(|v| !v.trim().is_empty()).unwrap_or(false);
+        if !by {
+            continue;
+        }
+        if let Ok(s) = crate::git_status::push_state_for(&dir.to_string_lossy()).await {
+            if s.lock.locked {
+                out.push(dir);
+            }
+        }
+    }
+    out
+}
+
+/// A job finished by hand still owes its user-level side: the mirrors (and
+/// the submodule markers) for what it locked, their removal for what it
+/// unlocked. Read from the job file before it is dropped.
+async fn settle_manual_job(job_path: &Path) {
+    let Ok(text) = fs::read_to_string(job_path) else { return };
+    let Ok(job) = serde_json::from_str::<lc::Job>(&text) else { return };
+    let repos: Vec<String> = job.ops.iter().filter_map(|o| o.repo().map(|r| r.to_string())).collect();
+    // The repository of the same job that holds this one: its superproject.
+    let superproject_of = |repo: &str| repos.iter().filter(|r| r.as_str() != repo && repo.starts_with(&format!("{}/", r))).max_by_key(|r| r.len()).cloned();
+    let mut covered_by: Vec<String> = Vec::new();
+    let mut uncovered_by: Vec<String> = Vec::new();
+    for op in &job.ops {
+        match op {
+            Op::Lock { repo, .. } => {
+                let dir = Path::new(repo);
+                let Ok(paths) = crate::git_status::git_paths(dir).await else { continue };
+                match superproject_of(repo) {
+                    Some(sup) => {
+                        // Read before the mirrors go on: a submodule the person
+                        // blocked on its own stays theirs, as on the prompt path.
+                        let own = push_guard::read_flag(dir).await && !push_guard::marked(dir).await;
+                        let _ = push_guard::apply_mirrors(dir, &paths.hooks).await;
+                        if !own {
+                            let _ = sys_git(dir).args(["config", "--local", "gitswitch.pushBlockedBy", "superproject"]).run().await;
+                        }
+                        log_submodule_events(std::slice::from_ref(repo), &sup, "locked", "locked (finished by hand)");
+                    }
+                    None => {
+                        let _ = push_guard::apply_mirrors(dir, &paths.hooks).await;
+                        log_event(repo, "locked", "finished by hand", false);
+                        covered_by.push(repo.clone());
+                    }
+                }
+            }
+            Op::Unlock { repo } => {
+                let dir = Path::new(repo);
+                let Ok(paths) = crate::git_status::git_paths(dir).await else { continue };
+                let _ = push_guard::remove_mirrors(dir, &paths.hooks).await;
+                let _ = sys_git(dir).args(["config", "--local", "--unset", "gitswitch.pushBlockedBy"]).run().await;
+                match superproject_of(repo) {
+                    Some(sup) => log_submodule_events(std::slice::from_ref(repo), &sup, "unlocked", "unlocked (finished by hand)"),
+                    None => {
+                        log_event(repo, "unlocked", "finished by hand", false);
+                        uncovered_by.push(repo.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // As the prompt path does: the submodules the lock could not carry get the
+    // guard-rail; an unlock takes the repository's guard-rail off the rest.
+    for r in &covered_by {
+        push_guard::cover_submodules(r, None).await;
+    }
+    for r in &uncovered_by {
+        push_guard::uncover_submodules(r).await;
+    }
+}
+
+/// The person acted on this repository itself: its block (or its freedom) is
+/// theirs from now on — a superproject's "Allowed" leaves it alone.
+async fn claim(repo_path: &str) {
+    let _ = sys_git(Path::new(repo_path)).args(["config", "--local", "--unset", "gitswitch.pushBlockedBy"]).run().await;
+}
+
 fn result_with_state(out: JobOutcome, state: Option<push_guard::PushState>) -> PushModeResult {
     PushModeResult { outcome: out.outcome, message: out.message, command: out.command, job_nonce: out.job_nonce, state }
 }
@@ -1079,37 +1313,74 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
     let profile = crate::git_status::owning_profile_id(repo_path);
     match mode {
         "locked" => {
-            if before.lock.locked && !before.lock.needs_elevation {
-                let state = push_guard::repair(repo_path, &hooks, profile.as_deref()).await?;
-                return Ok(result_with_state(JobOutcome::simple("applied", "Already locked."), Some(state)));
+            // The submodules too — the repositories the code lives in — in
+            // the same job, so one prompt covers them all.
+            let sub_ops = submodule_lock_ops(repo_path).await;
+            let sub_repos = op_repos(&sub_ops);
+            if before.lock.locked && !before.lock.needs_elevation && sub_ops.is_empty() {
+                let (state, notes) = push_guard::repair_noting(repo_path, &hooks, profile.as_deref()).await?;
+                claim(repo_path).await;
+                let out = as_measured(repo_path, &state, JobOutcome::simple("applied", "Already locked."), &notes).await;
+                return Ok(result_with_state(out, Some(state)));
             }
-            let op = lock_op_for(repo_path).await?;
-            let mut ops = vec![op];
+            let mut ops = Vec::new();
+            if !before.lock.locked {
+                ops.push(lock_op_for(repo_path).await?);
+            }
+            ops.extend(sub_ops);
             if before.lock.locked {
                 ops.push(Op::RepairSystem);
                 ops.push(Op::InstallRemoteHelper);
             }
             let out = run_job(ops).await;
             if out.applied() {
-                push_guard::apply_mirrors(Path::new(repo_path), &hooks).await?;
-                log_event(&canonical(Path::new(repo_path)), "locked", &out.message, false);
+                claim(repo_path).await;
+                // The submodules first: their marks are the only record that this
+                // job reached them, so a failure on the repository's own step
+                // below must not leave them locked and unmarked.
+                push_guard::cover_submodules(repo_path, None).await;
+                let me = canonical(Path::new(repo_path));
+                log_submodule_events(&sub_repos, &me, "locked", "locked");
+                let mirrors = push_guard::apply_mirrors(Path::new(repo_path), &hooks).await;
+                log_event(&me, "locked", &out.message, false);
+                mirrors?;
             }
             let state = if out.outcome == "manual-required" { None } else { Some(crate::git_status::push_state_for(repo_path).await?) };
             Ok(result_with_state(out, state))
         }
         "allowed" => {
-            if before.lock.locked {
-                let out = run_job(vec![Op::Unlock { repo: canonical(Path::new(repo_path)) }]).await;
+            // Every lock the repository's lock brought along (marked as its
+            // doing) goes in the same job; one the person locked on their own
+            // is theirs to unlock.
+            let locked_subs = locked_submodules(repo_path).await;
+            if before.lock.locked || !locked_subs.is_empty() {
+                let mut ops = Vec::new();
+                if before.lock.locked {
+                    ops.push(Op::Unlock { repo: canonical(Path::new(repo_path)) });
+                }
+                for dir in &locked_subs {
+                    ops.push(Op::Unlock { repo: canonical(dir) });
+                }
+                let out = run_job(ops).await;
                 if !out.applied() {
                     let state = if out.outcome == "manual-required" { None } else { Some(before) };
                     return Ok(result_with_state(out, state));
                 }
-                log_event(&canonical(Path::new(repo_path)), "unlocked", &out.message, false);
+                let me = canonical(Path::new(repo_path));
+                // Only the repository the lock was on says it was unlocked.
+                if before.lock.locked {
+                    log_event(&me, "unlocked", &out.message, false);
+                }
+                let freed: Vec<String> = locked_subs.iter().map(|d| canonical(d)).collect();
+                log_submodule_events(&freed, &me, "unlocked", "unlocked");
+                push_guard::uncover_submodules(repo_path).await;
                 push_guard::remove_mirrors(Path::new(repo_path), &hooks).await?;
+                claim(repo_path).await;
                 let state = crate::git_status::push_state_for(repo_path).await?;
                 return Ok(result_with_state(out, Some(state)));
             }
             let state = push_guard::set_repo_blocked(repo_path, &hooks, false, profile.as_deref()).await?;
+            claim(repo_path).await;
             Ok(result_with_state(JobOutcome::simple("applied", "Pushes are allowed again."), Some(state)))
         }
         "guardrail" => {
@@ -1119,6 +1390,7 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
                 ));
             }
             let state = push_guard::set_repo_blocked(repo_path, &hooks, true, profile.as_deref()).await?;
+            claim(repo_path).await;
             Ok(result_with_state(JobOutcome::simple("applied", "Pushes are blocked (guard-rail)."), Some(state)))
         }
         other => Err(AppError::Config(format!("Unknown push mode '{}'", other))),
@@ -1130,14 +1402,20 @@ pub async fn set_push_mode(repo_path: &str, mode: &str) -> Result<PushModeResult
 pub async fn repair_lock(repo_path: &str) -> Result<PushModeResult, AppError> {
     let hooks = crate::git_status::git_paths(Path::new(repo_path)).await?.hooks;
     let profile = crate::git_status::owning_profile_id(repo_path);
-    let state = push_guard::repair(repo_path, &hooks, profile.as_deref()).await?;
+    let (state, mut notes) = push_guard::repair_noting(repo_path, &hooks, profile.as_deref()).await?;
     if !state.lock.locked {
         return Ok(result_with_state(JobOutcome::simple("applied", "This repository is not locked; the guard-rail was re-applied."), Some(state)));
     }
-    if !state.lock.needs_elevation && state.lock.helper != "outdated" {
-        return Ok(result_with_state(JobOutcome::simple("applied", "Everything is in place."), Some(state)));
+    let sub_ops = submodule_lock_ops(repo_path).await;
+    if !state.lock.needs_elevation && state.lock.helper != "outdated" && sub_ops.is_empty() {
+        // Nothing for the administrator: what needed no password was put back
+        // above. Said as measured — never "in place" while a submodule is not.
+        let out = as_measured(repo_path, &state, JobOutcome::simple("applied", "Everything is in place."), &notes).await;
+        return Ok(result_with_state(out, Some(state)));
     }
+    let sub_repos = op_repos(&sub_ops);
     let mut ops = vec![lock_op_for(repo_path).await?, Op::RepairSystem, Op::InstallRemoteHelper];
+    ops.extend(sub_ops);
     if state.lock.helper == "outdated" {
         if let Some(op) = upgrade_op() {
             ops.push(op);
@@ -1145,10 +1423,40 @@ pub async fn repair_lock(repo_path: &str) -> Result<PushModeResult, AppError> {
     }
     let out = run_job(ops).await;
     if out.applied() {
-        log_event(&canonical(Path::new(repo_path)), "repaired", &out.message, true);
+        notes = push_guard::cover_submodules(repo_path, None).await;
+        let me = canonical(Path::new(repo_path));
+        log_event(&me, "repaired", &out.message, true);
+        log_submodule_events(&sub_repos, &me, "locked", "locked by Repair");
     }
     let state = if out.outcome == "manual-required" { None } else { Some(crate::git_status::push_state_for(repo_path).await?) };
+    let out = match &state {
+        Some(s) => as_measured(repo_path, s, out, &notes).await,
+        None => out,
+    };
     Ok(result_with_state(out, state))
+}
+
+/// An outcome that says "applied", checked against the submodules afterwards:
+/// it stays "applied" only when every one is covered; otherwise it is
+/// "incomplete" and names what is still not, and why.
+async fn as_measured(repo_path: &str, state: &push_guard::PushState, out: JobOutcome, notes: &[String]) -> JobOutcome {
+    if !out.applied() {
+        return out;
+    }
+    let cov = push_guard::coverage(repo_path, state).await;
+    if cov.uncovered.is_empty() {
+        return out;
+    }
+    let lead = if out.message == "Everything is in place." || out.message == "Already locked." {
+        "This repository is locked; nothing else needed the administrator password, so there was no prompt.".to_string()
+    } else {
+        out.message.clone()
+    };
+    let mut message = format!("{} {}", lead, cov.summary);
+    if !notes.is_empty() {
+        message.push_str(&format!(" Could not write: {}.", notes.join("; ")));
+    }
+    JobOutcome { outcome: "incomplete".into(), message, ..out }
 }
 
 /// An upgrade from the bundled sidecar: signed when a `.sig` ships next to it,
@@ -1166,7 +1474,7 @@ fn upgrade_op() -> Option<Op> {
 }
 
 fn bundled_version() -> Option<String> {
-    let out = std::process::Command::new(bundled_helper_path()?).arg("--version").output().ok()?;
+    let out = crate::spawn::command(bundled_helper_path()?).arg("--version").output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     s.split_whitespace().nth(1).map(|v| v.to_string())
 }
@@ -1342,6 +1650,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert_eq!(v["plugins"]["updater"]["pubkey"].as_str().unwrap(), lc::RELEASE_PUBKEY_B64);
         assert_eq!(v["bundle"]["externalBin"][0].as_str().unwrap(), "binaries/gitswitch-lock-helper");
+    }
+
+    /// Without a signature an Apple Silicon Mac calls a downloaded copy
+    /// "damaged" and offers only the Trash; sealed ad hoc (no paid Developer
+    /// ID), it says the developer cannot be verified and offers Open Anyway.
+    /// The bundler seals the app and its sidecars before the .dmg is made.
+    #[test]
+    fn the_macos_bundle_is_sealed_ad_hoc() {
+        let conf = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        assert_eq!(v["bundle"]["macOS"]["signingIdentity"].as_str(), Some("-"));
     }
 
     #[test]

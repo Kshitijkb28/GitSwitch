@@ -23,10 +23,12 @@ import { Badge } from "../components/Badge";
 import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import { baseName, isWithin, normPath } from "../lib/paths";
-import { usePersistedState, writePersisted } from "../lib/persist";
+import { usePersistedState, handOff, useSessionState } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
+import { arrivedLabel, formatKb, timeLeftLabel } from "../lib/gitJobs";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 /** Longest matching folder wins — the same rule the generated gitconfig uses. */
 function profileForFolder(dir: string, profiles: Profile[]): Profile | null {
@@ -85,22 +87,27 @@ export function SparseClone() {
   const toast = useToast();
   const [url, setUrl] = usePersistedState("sparse.url", "");
   const [parentDir, setParentDir] = usePersistedState("sparse.parentDir", "");
-  const [folderName, setFolderName] = useState("");
+  const [folderName, setFolderName] = useSessionState("clone.folderName", "");
   const [mode, setMode] = usePersistedState<"full" | "sparse">("clone.mode", "full");
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [cloned, setCloned] = useState<api.CloneResult | null>(null);
   // "" = automatic: the destination folder's profile decides, like a terminal clone.
-  const [cloneAs, setCloneAs] = useState("");
+  const [cloneAs, setCloneAs] = useSessionState("clone.as", "");
   const [withSubmodules, setWithSubmodules] = usePersistedState("clone.submodules", true);
   // On by default: a clone of an LFS repository without this looks complete
   // but every large file is a pointer stub, and git status never says so.
   const [withLfs, setWithLfs] = usePersistedState("clone.lfs", true);
   const [lfsTool, setLfsTool] = useState<api.LfsTool | null>(null);
+  // How big the repository is, from GitHub, once the URL names one of theirs.
+  const [sizeEstimate, setSizeEstimate] = useState<api.CloneSizeEstimate | null>(null);
+  const sizeSeq = useRef(0);
+  // What git is doing right now, while a clone runs.
+  const [progress, setProgress] = useState<api.CloneProgress | null>(null);
   const [sparseLfs, setSparseLfs] = useState<api.LfsReport | null>(null);
   const navigate = useNavigate();
   const openInChanges = (path: string) => {
-    writePersisted("changes.repo", path);
-    navigate("/changes");
+    handOff("changes", path);
+    navigate("/repo/changes");
   };
 
   // Arriving from Repositories: take the link (and suggested profile) it sent,
@@ -151,10 +158,24 @@ export function SparseClone() {
   // GitHub shows org-<ID>@github.com links for orgs with an SSH certificate authority.
   const certOrgUrl = /^(?:ssh:\/\/)?org-[^@\s]+@github\.com[:/]/i.test(url.trim());
   const keyInUse = effective?.ssh_key_path ?? null;
-  // Bumped when the user returns to the app: the destination folder may have
-  // been created or deleted, and a certificate may have appeared, meanwhile.
+  // Bumped when the user returns to the app, and by Refresh: the destination
+  // folder may have been created or deleted, a certificate may have
+  // appeared, git-lfs may have been installed, GitHub may answer about the
+  // size now. Every reading this page takes on its own re-runs on it.
   const [recheck, setRecheck] = useState(0);
   useRefreshOnFocus(() => setRecheck((n) => n + 1));
+  // What a fresh visit does, in one go: every reading taken again, and the
+  // last clone's result card gone — a fresh visit starts without one, and
+  // Refresh must not keep what leaving the page would have dropped.
+  function reloadAll() {
+    reloadProfiles();
+    // What leaving and coming back drops: the last result, and its error.
+    setCloned(null);
+    setError(null);
+    setSparseLfs(null);
+    setFromRepo(null);
+    setRecheck((n) => n + 1);
+  }
   // git-lfs can be installed while the app is open, so ask again on focus.
   useEffect(() => {
     let stale = false;
@@ -190,6 +211,39 @@ export function SparseClone() {
   }, []);
   const job = cloneJob;
   const cloning = !!job && !job.done;
+
+  // The size is asked for once per URL, a little after typing stops.
+  const sizeUrl = useRef<string | null>(null);
+  useEffect(() => {
+    const mine = ++sizeSeq.current;
+    // A new URL blanks the old answer; a re-ask for the same URL (Refresh,
+    // the window regaining focus) keeps what the page has until GitHub
+    // answers again — an answer that fails does not take away one it gave.
+    const urlChanged = sizeUrl.current !== url;
+    sizeUrl.current = url;
+    if (urlChanged) setSizeEstimate(null);
+    // Any address: the backend answers at once when it cannot ask (not GitHub,
+    // and not an SSH alias that stands for it).
+    if (!url.trim()) return;
+    const id = window.setTimeout(() => {
+      api
+        .cloneSizeEstimate(url)
+        .then((s) => { if (mine === sizeSeq.current && (s || urlChanged)) setSizeEstimate(s); })
+        .catch(() => { /* GitHub would not say; the clone works all the same */ });
+    }, 600);
+    return () => window.clearTimeout(id);
+  }, [url, recheck]);
+
+  // Poll the clone's progress while it runs — the same shape as the LFS poll.
+  useEffect(() => {
+    if (!cloning || !job) { setProgress(null); return; }
+    let stop = false;
+    const read = () =>
+      api.cloneProgress(job.key).then((p) => { if (!stop) setProgress(p); }).catch(() => {});
+    read();
+    const id = window.setInterval(read, 500);
+    return () => { stop = true; window.clearInterval(id); };
+  }, [cloning, job]);
   const elapsedSecs = job ? Math.max(0, Math.round((Date.now() - job.startedAt) / 1000)) : 0;
   const elapsedLabel =
     elapsedSecs < 60
@@ -374,13 +428,16 @@ export function SparseClone() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-zinc-100">Clone</h1>
-        <p className="text-sm text-zinc-400 mt-1">
-          Clone over SSH as the right account — the destination folder's profile
-          decides which key is used. Choose a full clone, or a sparse one to
-          download only the folders you need.
-        </p>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-zinc-100">Clone</h1>
+          <p className="text-sm text-zinc-400 mt-1">
+            Clone over SSH as the right account — the destination folder's profile
+            decides which key is used. Choose a full clone, or a sparse one to
+            download only the folders you need.
+          </p>
+        </div>
+        <RefreshButton onClick={reloadAll} title="Re-read the profiles, the destination and what git-lfs and GitHub say" />
       </div>
 
       {fromRepo && (
@@ -408,6 +465,37 @@ export function SparseClone() {
               {job.mode === "sparse" && " (metadata only)"}…
             </span>
             <span className="block text-xs text-zinc-500 font-mono truncate">{job.key}</span>
+            {progress && (
+              <span className="block mt-1.5" aria-label="Clone progress">
+                <span className="flex items-center justify-between gap-3 text-xs text-zinc-300">
+                  <span>
+                    {progress.phase}
+                    {progress.percent !== null && ` ${progress.percent}%`}
+                    {progress.done !== null && progress.total !== null && (
+                      <span className="text-zinc-500"> · {progress.done.toLocaleString()} of {progress.total.toLocaleString()}</span>
+                    )}
+                    {progress.detail && <span className="text-zinc-500"> · {progress.detail}</span>}
+                  </span>
+                  <span className="text-zinc-500 tabular-nums">
+                    {arrivedLabel(progress)}
+                    {progress.rate && ` · ${progress.rate}`}
+                    {(() => {
+                      // The backend says how long is left: against the host's
+                      // size when it is known, the objects otherwise — for the
+                      // main download and for each submodule alike.
+                      const left = typeof progress.eta_secs === "number" ? timeLeftLabel(progress.eta_secs) : null;
+                      return left ? ` · ${left}` : "";
+                    })()}
+                  </span>
+                </span>
+                <span className="block h-1.5 mt-1 rounded bg-zinc-700/70 overflow-hidden">
+                  <span
+                    className={`block h-full rounded bg-emerald-500 transition-[width] duration-300 ${progress.percent === null ? "w-1/4 animate-pulse" : ""}`}
+                    style={progress.percent !== null ? { width: `${progress.percent}%` } : undefined}
+                  />
+                </span>
+              </span>
+            )}
             <span className="block text-xs text-zinc-500 mt-0.5">
               Running for {elapsedLabel} — you can use other pages, it keeps going and the result
               appears here.
@@ -461,6 +549,13 @@ export function SparseClone() {
             value={url}
             onChange={(e) => setUrl(e.target.value)}
           />
+          {sizeEstimate && (
+            <p className="text-xs text-zinc-500" aria-label="Repository size">
+              About <span className="text-zinc-300">{formatKb(sizeEstimate.kb)}</span> on GitHub for this
+              repository — {mode === "full" && withSubmodules ? "its submodules download on top, and " : ""}large
+              files kept in LFS are extra.
+            </p>
+          )}
           {isHttps && (
             <div className="flex items-start gap-2.5 px-3 py-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-xs text-amber-300">
               <AlertTriangle size={14} className="mt-0.5 shrink-0" />
@@ -785,6 +880,20 @@ export function SparseClone() {
                   Git LFS: {cloned.lfs.note}
                 </p>
               )}
+              {(cloned.submodule_lfs ?? []).map((s) => (
+                <p
+                  key={s.path}
+                  className={`text-xs mt-0.5 break-words ${
+                    s.report.error || (s.report.pointers_left > 0 && !s.report.installed)
+                      ? "text-amber-300/90"
+                      : s.report.pointers_left > 0
+                        ? "text-zinc-400"
+                        : "text-emerald-400/90"
+                  }`}
+                >
+                  Git LFS in {s.path}: {s.report.note}
+                </p>
+              ))}
               {cloned.lfs && cloned.lfs.pointers_left > 0 && cloned.lfs.installed && (
                 <Button size="sm" variant="secondary" className="mt-2" onClick={() => openInChanges(cloned.path)}>
                   <Download size={12} />

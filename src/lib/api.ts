@@ -12,6 +12,155 @@ export async function getProfiles(): Promise<Profile[]> {
   return invoke("get_profiles");
 }
 
+/** The page a gitswitch:// link asked for before the page listened (the link that started the app). */
+export async function deepLinkTake(): Promise<string | null> {
+  return invoke("deep_link_take");
+}
+
+// --- Ports: every listening port, who holds it, and stopping it --------------
+
+/** The repository in a profile folder a process runs inside. */
+export interface CloneRef {
+  path: string;
+  name: string;
+  profile_name: string;
+}
+
+/** The container a port is published by, and its Compose project when it has one. */
+export interface ContainerRef {
+  id: string;
+  name: string;
+  project: string | null;
+  service: string | null;
+  working_dir: string | null;
+  container_port: number | null;
+}
+
+/** "copy 2 of 2": which copy of its project a clone is, and the others' names. */
+export interface CopyRef {
+  rank: number;
+  of: number;
+  others: string[];
+}
+
+/** One listening port with everything the OS says about its holder. */
+export interface Listener {
+  key: string;
+  proto: "tcp" | "udp";
+  port: number;
+  addresses: string[];
+  scope: "loopback" | "all" | "lan";
+  pid: number | null;
+  name: string | null;
+  exe: string | null;
+  cwd: string | null;
+  started_at: string | null;
+  user: string | null;
+  /** Started from a GitSwitch terminal. */
+  ours: boolean;
+  workspace: string | null;
+  clone: CloneRef | null;
+  copy: CopyRef | null;
+  container: ContainerRef | null;
+  killable: boolean;
+  /** When not killable: why, in plain words. */
+  why_not: string | null;
+}
+
+export interface PortsReport {
+  os: "macos" | "linux" | "windows";
+  rows: Listener[];
+  /** What this listing could not see, one sentence each. */
+  notes: string[];
+  docker: "ok" | "missing" | "unavailable" | "timeout" | "skipped";
+  took_ms: number;
+}
+
+export interface KillOutcome {
+  pid: number;
+  ended: boolean;
+  how: "term" | "kill" | "taskkill" | "taskkill-force";
+  group: boolean;
+  message: string;
+}
+
+export interface ContainerStopOutcome {
+  stopped: string[];
+  message: string;
+}
+
+export async function portsList(): Promise<PortsReport> {
+  return invoke("ports_list");
+}
+
+/** `name` is what the page listed: a pid reused by another program is refused. */
+export async function portsKill(pid: number, force: boolean, name: string): Promise<KillOutcome> {
+  return invoke("ports_kill", { pid, force, name });
+}
+
+export async function portsContainerStop(id: string, project: string | null): Promise<ContainerStopOutcome> {
+  return invoke("ports_container_stop", { id, project });
+}
+
+/** One checkout of a project among the copies of it on this machine. */
+export interface WorkspaceCopy {
+  path: string;
+  /** The folder name, with a parent prepended while two copies share one. */
+  label: string;
+  id: string;
+  offset: number;
+  kind: "clone" | "worktree";
+  is_this: boolean;
+  profile_name: string | null;
+  branch: string | null;
+  detached: boolean;
+  unborn: boolean;
+  /** Tracked files changed (untracked left out); null when unreadable. */
+  changed: number | null;
+}
+
+export interface WorkspaceNote {
+  level: "amber";
+  text: string;
+}
+
+/**
+ * What tells this checkout apart from another copy of the same project: its
+ * id, port offset and Compose project name (the drawer exports them), the
+ * other copies, and the note when two copies share a branch with changes.
+ */
+export interface WorkspaceInfo {
+  /** The workspace's top folder (a submodule resolves to its superproject's). */
+  path: string;
+  name: string;
+  id: string;
+  kind: "clone" | "worktree";
+  asked_path: string;
+  offset: number;
+  /** Set for every copy but the first; the first keeps Compose's own name. */
+  compose_project: string | null;
+  /** "owner/name" for GitHub, else the remote's address; null without a remote. */
+  remote: string | null;
+  /** Every copy, this one included; by offset, then path. */
+  copies: WorkspaceCopy[];
+  note: WorkspaceNote | null;
+  /** What the drawer exports, as [name, value]. */
+  env: [string, string][];
+  banner: string;
+  warnings: string[];
+  /** The sentence about what is left to the person. */
+  not_automated: string;
+}
+
+export async function workspaceInfo(path: string): Promise<WorkspaceInfo> {
+  return invoke("workspace_info", { path });
+}
+
+/** The person chose this checkout's port offset (0..60000); one another copy uses is refused. */
+export async function workspaceSetOffset(path: string, offset: number): Promise<WorkspaceInfo> {
+  return invoke("workspace_set_offset", { path, offset });
+}
+
 export async function createProfile(params: {
   name: string;
   gitName: string;
@@ -20,6 +169,9 @@ export async function createProfile(params: {
   directories: string[];
   allowPush?: boolean | null;
   signingEnabled?: boolean | null;
+  remotePatterns?: string[] | null;
+  githubLogin?: string | null;
+  pushOverSsh?: boolean | null;
 }): Promise<Profile> {
   return invoke("create_profile", params);
 }
@@ -33,6 +185,9 @@ export async function updateProfile(params: {
   directories?: string[] | null;
   allowPush?: boolean | null;
   signingEnabled?: boolean | null;
+  remotePatterns?: string[] | null;
+  githubLogin?: string | null;
+  pushOverSsh?: boolean | null;
 }): Promise<Profile> {
   return invoke("update_profile", params);
 }
@@ -84,12 +239,49 @@ export async function ghLogout(account: string): Promise<string> {
   return invoke("gh_logout", { account });
 }
 
+/** One login of the GitHub CLI: its host, and whether gh itself uses it (null from a gh that does not say). */
+export interface GhAccount {
+  host: string;
+  login: string;
+  active: boolean | null;
+  scopes: string[] | null;
+}
+
+export async function ghAuthAccounts(): Promise<GhAccount[]> {
+  return invoke("gh_auth_accounts");
+}
+
+/** `gh auth switch --hostname <host> --user <login>`: the sentence gh's listing confirms. */
+export async function ghAuthSwitch(host: string, login: string): Promise<string> {
+  return invoke("gh_auth_switch", { host, login });
+}
+
+/** The one-time code `gh auth login --web` shows, and the page to enter it on. */
+export interface GhDevicePrompt {
+  code: string;
+  url: string;
+}
+
+/** Start gh's own browser sign-in (SSH as git's protocol, no key upload). */
+export async function ghAuthLoginStart(host?: string): Promise<GhDevicePrompt> {
+  return invoke("gh_auth_login_start", { host: host ?? null });
+}
+
+/** Wait for the sign-in started above: the account gh signed in. */
+export async function ghAuthLoginWait(): Promise<{ host: string; login: string }> {
+  return invoke("gh_auth_login_wait");
+}
+
+/** End the sign-in in progress, if any. */
+export async function ghAuthLoginCancel(): Promise<void> {
+  return invoke("gh_auth_login_cancel");
+}
+
 export async function ghRegisterSshKey(
   account: string,
-  keyPath: string,
-  title: string
+  keyPath: string
 ): Promise<string> {
-  return invoke("gh_register_ssh_key", { account, keyPath, title });
+  return invoke("gh_register_ssh_key", { account, keyPath });
 }
 
 export async function resolveKeyAccount(
@@ -150,6 +342,12 @@ export interface BranchInfo {
   last_author: string;
   last_date: string;
   last_subject: string;
+  /** One of GitSwitch's own backup branches (before an update, a reset, a rewrite). */
+  is_backup?: boolean;
+  /** The full ref: `refs/heads/x`, `refs/remotes/origin/x`. */
+  full_ref?: string;
+  /** A remote-tracking branch's name on its remote (`x` for `origin/x`); null for a local branch or an unknown remote. */
+  remote_branch?: string | null;
 }
 
 export interface HistoryCommit {
@@ -162,9 +360,19 @@ export interface HistoryCommit {
   subject: string;
   refs: string[];
   is_merge: boolean;
+  /** The author date, stable across rebases; `date` is the committer date. */
+  author_date: string;
+  /** Submodule pointers this commit moves. */
+  touches_submodules: string[];
+  /** Changes nothing but submodule pointers: a bump, not work. */
+  only_submodules: boolean;
+  /** No remote-tracking branch has it: it exists only here (meaningful when the page has `remote_refs`). */
+  unpushed: boolean;
   lane: number;
   parent_lanes: number[];
   active_lanes: number[];
+  /** A lane was waiting for it: its line comes from above (false for a tip). */
+  from_above?: boolean;
 }
 
 export interface HistoryPage {
@@ -174,6 +382,10 @@ export interface HistoryPage {
   limit: number;
   has_more: boolean;
   max_lane: number;
+  /** At least one remote-tracking branch exists; without one nothing here is known to be pushed. */
+  remote_refs: boolean;
+  /** The comparison with the remote-tracking branches failed: no row is marked, and this says why. */
+  marks_error?: string | null;
 }
 
 export interface FileChange {
@@ -228,6 +440,46 @@ export async function historyFetch(repoPath: string): Promise<FetchResult> {
   return invoke("history_fetch", { repoPath });
 }
 
+/** Who a push from this repository would authenticate as. */
+export interface PushIdentity {
+  remote: string | null;
+  url: string | null;
+  via: "ssh-key" | "ssh-agent" | "https-credential" | "blocked" | "local" | "none" | "unknown";
+  login: string | null;
+  key_path: string | null;
+  host: string | null;
+  account: string | null;
+  expected_login: string | null;
+  detail: string;
+}
+
+export async function changesPushIdentity(repoPath: string, refresh = false): Promise<PushIdentity> {
+  return invoke("changes_push_identity", { repoPath, refresh });
+}
+
+/** One person who committed on the viewed revision, with how often. */
+export interface AuthorCount {
+  name: string;
+  email: string;
+  commits: number;
+}
+
+export async function historyAuthors(repoPath: string, rev: string): Promise<AuthorCount[]> {
+  return invoke("history_authors", { repoPath, rev });
+}
+
+export interface HeadInfo {
+  branch: string | null;
+  detached: boolean;
+  unborn: boolean;
+}
+
+/** Which branch HEAD is on, or that it is detached or unborn: three git reads
+ *  where the full repository status is seventeen. */
+export async function historyHead(repoPath: string): Promise<HeadInfo> {
+  return invoke("history_head", { repoPath });
+}
+
 export async function historySyncStatus(
   repoPath: string,
   branch: string
@@ -238,6 +490,17 @@ export async function historySyncStatus(
 export interface MergeInfo {
   merged_into: string[];
   merges: HistoryCommit[];
+  /** How the branch got into the first few branches that contain it. */
+  merged_by?: MergedBy[];
+  merges_total?: number;
+  merges_truncated?: boolean;
+}
+
+export interface MergedBy {
+  branch: string;
+  /** merge | fast-forward | same-commit */
+  how: string;
+  commit: { hash: string; short: string; subject: string; author_name: string; date: string; parents: string[] } | null;
 }
 
 export async function historyListRepos(): Promise<RepoRef[]> {
@@ -254,7 +517,9 @@ export async function historyPage(
   offset: number,
   limit: number,
   search?: string | null,
-  author?: string | null
+  authors?: string[] | null,
+  hidePointerOnly = false,
+  unpushedOnly = false
 ): Promise<HistoryPage> {
   return invoke("history_page", {
     repoPath,
@@ -262,7 +527,9 @@ export async function historyPage(
     offset,
     limit,
     search: search ?? null,
-    author: author ?? null,
+    authors: authors ?? null,
+    hidePointerOnly,
+    unpushedOnly,
   });
 }
 
@@ -288,6 +555,10 @@ export interface CommitInfo {
   date: string;
   subject: string;
   pushed: boolean;
+  /** The local branches holding it, when no remote-tracking branch does. */
+  branches: string[];
+  /** On the checked-out branch: what Fix rewrites. */
+  on_head: boolean;
 }
 
 export interface RepoAudit {
@@ -302,6 +573,10 @@ export interface RepoAudit {
   has_upstream: boolean;
   dirty: boolean;
   guard: "none" | "gitswitch" | "foreign";
+  /** Wrong commits of yours on other local branches. */
+  other_branch_count: number;
+  /** Why Fix cannot run here now, when it cannot. */
+  fix_blocker: string | null;
 }
 
 export async function auditCommits(): Promise<RepoAudit[]> {
@@ -348,6 +623,21 @@ export async function doctorCheckRepos(): Promise<Finding[]> {
   return invoke("doctor_check_repos");
 }
 
+/** Doctor's repair for a repository-local identity override. */
+/** Doctor, on request: can the account each repository pushes as see it on GitHub? */
+export async function doctorCheckRepoAccess(): Promise<Finding[]> {
+  return invoke("doctor_check_repo_access");
+}
+
+/** One of Doctor's own repairs, by its finding's fix id. */
+export async function doctorApplyFix(fix: string): Promise<string> {
+  return invoke("doctor_apply_fix", { fix });
+}
+
+export async function doctorUnsetLocal(repoPath: string, key: string): Promise<string> {
+  return invoke("doctor_unset_local", { repoPath, key });
+}
+
 export async function doctorFixSshConfig(): Promise<string> {
   return invoke("doctor_fix_ssh_config");
 }
@@ -355,6 +645,8 @@ export async function doctorFixSshConfig(): Promise<string> {
 export interface ScannedRepo {
   path: string;
   remote_url: string;
+  /** origin's own push URL, when set and different from remote_url (masked). */
+  push_url?: string;
   owner: string;
   name: string;
 }
@@ -369,12 +661,148 @@ export async function scanRepos(root: string): Promise<ScannedRepo[]> {
   return invoke("scan_repos", { root });
 }
 
+/** A folder scan the page can watch (findReposProgress) and stop (findReposCancel) by its id. */
+export interface TrackedScan {
+  root: string;
+  repos: ScannedRepo[];
+  folders: number;
+  /** Stopped before it ended: repos is then empty. */
+  cancelled: boolean;
+}
+
+export async function scanReposTracked(scanId: string, root: string): Promise<TrackedScan> {
+  return invoke("scan_repos_tracked", { scanId, root });
+}
+
 export async function checkRepoAccess(
   token: string,
   owner: string,
   repo: string
 ): Promise<RepoPermissions | null> {
   return invoke("check_repo_access", { token, owner, repo });
+}
+
+// --- Find repositories: clones no profile folder holds ------------------------
+
+/** Where a repository's commits get their email from today. */
+export interface CommitsAs {
+  profile_id: string | null;
+  /**
+   * folder: a profile folder holds it, deeper than the page looks · rule: a
+   * profile's remote rule · gitdir: a worktree (or separate git folder), which
+   * follows where its git folder is · default: the default profile · local:
+   * the repository sets its own email · none: no email at all.
+   */
+  via: "folder" | "rule" | "gitdir" | "default" | "local" | "none";
+}
+
+/** A repository the Repository page does not list. */
+export interface FoundRepo extends ScannedRepo {
+  /** The GitHub repository pushes go to (the push URL's, else the origin's); empty when that is not GitHub. */
+  push_owner: string;
+  push_name: string;
+  /** `.git` is a file: a worktree or a separate git folder. */
+  gitdir_elsewhere: boolean;
+  commits_as: CommitsAs;
+}
+
+/** A repository found that a profile's folder already holds. */
+export interface ListedRepo {
+  path: string;
+  profile_id: string;
+  profile_name: string;
+  /** The GitHub account the profile names, when it names one. */
+  github_login: string | null;
+}
+
+export interface FoundClones {
+  /** The home folder, for showing paths under it as `~/…`. */
+  home: string | null;
+  /** The places searched, in order. */
+  roots: string[];
+  repos: FoundRepo[];
+  /** Repositories found that the Repository page lists already. */
+  already_listed: number;
+  /** Those repositories, each with the profile the Repository page shows it under. */
+  listed?: ListedRepo[];
+  truncated: { place: string; why: string }[];
+  /** Folders at the top of a place that could not be read (a macOS privacy refusal, say). */
+  unreadable: string[];
+  rejected: { place: string; why: string }[];
+  /** Linked folders near the home folder that lead somewhere not searched. */
+  linked: { from: string; to: string }[];
+  cancelled: boolean;
+}
+
+export interface FindProgress {
+  /** "looking" while folders are walked, "checking" while GitHub is asked. */
+  phase: string;
+  folders: number;
+  found: number;
+  checked: number;
+  total: number;
+  place: string;
+}
+
+/** One account and one repository. */
+export interface AccessCell {
+  state: "visible" | "invisible" | "unknown";
+  push: boolean;
+  admin: boolean;
+  /** Only the accounts it was shared with can read it. */
+  private: boolean | null;
+  why: string | null;
+}
+
+export interface AccessMatrix {
+  /** Every account asked, as GitHub spells its login. */
+  accounts: { login: string; source: string }[];
+  /** Accounts whose token could not be read or is not accepted. */
+  problems: { account: string; why: string }[];
+  /** "owner/name" (lowercase) -> login (lowercase) -> the answer. */
+  access: Record<string, Record<string, AccessCell>>;
+  cancelled: boolean;
+}
+
+export interface FolderChange {
+  profile_id: string;
+  path: string;
+}
+
+export interface FolderAdded extends FolderChange {
+  /** The email the repository's identity guard expected before, when it has one. */
+  guard_was: string | null;
+}
+
+export interface FoldersAdded {
+  added: FolderAdded[];
+  failed: (FolderChange & { why: string })[];
+}
+
+export async function findUnlistedRepos(scanId: string, extraRoots: string[]): Promise<FoundClones> {
+  return invoke("find_unlisted_repos", { scanId, extraRoots });
+}
+
+export async function findReposProgress(scanId: string): Promise<FindProgress | null> {
+  return invoke("find_repos_progress", { scanId });
+}
+
+export async function findReposCancel(scanId: string): Promise<void> {
+  return invoke("find_repos_cancel", { scanId });
+}
+
+/** What every signed-in account (GitHub CLI and GitSwitch sign-ins) may do with each "owner/name". */
+export async function repoAccessMatrix(scanId: string, repos: string[]): Promise<AccessMatrix> {
+  return invoke("repo_access_matrix", { scanId, repos });
+}
+
+export async function profileFoldersAdd(changes: FolderChange[]): Promise<FoldersAdded> {
+  return invoke("profile_folders_add", { changes });
+}
+
+/** Undo of profileFoldersAdd: hand back what it returned. */
+export async function profileFoldersRemove(changes: FolderAdded[]): Promise<FolderChange[]> {
+  return invoke("profile_folders_remove", { changes });
 }
 
 export interface SparseInfo {
@@ -395,6 +823,8 @@ export interface SubmoduleReport {
   /** the listed submodules whose update failed, by path */
   failed_paths: string[];
   error: string | null;
+  /** Submodules whose interrupted download was cleared before downloading again. */
+  cleared?: string[];
 }
 
 /** The large files after a checkout — present whenever the repo uses Git LFS. */
@@ -424,6 +854,8 @@ export interface CloneResult {
   mapped_to: string | null;
   submodules: SubmoduleReport | null;
   lfs: LfsReport | null;
+  /** The same for each populated submodule that uses Git LFS. */
+  submodule_lfs?: { path: string; report: LfsReport }[];
 }
 
 export interface SparseSetResult {
@@ -435,6 +867,36 @@ export async function lfsAvailable(): Promise<LfsTool> {
 }
 
 /** `cloneAs` = profile id to authenticate as; null lets the folder decide. */
+/** One line of `git clone --progress`, while a clone runs. */
+export interface CloneProgress {
+  phase: string;
+  percent: number | null;
+  done: number | null;
+  total: number | null;
+  bytes: string | null;
+  rate: string | null;
+  /** What is being worked on right now: the submodule being fetched, the large file being downloaded. */
+  detail?: string;
+  /** What the host says the repository being downloaded weighs, in kilobytes; absent when it does not say. */
+  estimate_kb?: number;
+  /** Seconds left at the current rate; absent when there is nothing to base it on yet. */
+  eta_secs?: number;
+}
+
+export async function cloneProgress(destPath: string): Promise<CloneProgress | null> {
+  return invoke("clone_progress", { destPath });
+}
+
+/** GitHub's size for a repository (kilobytes of git data; LFS content is extra). */
+export interface CloneSizeEstimate {
+  repo: string;
+  kb: number;
+}
+
+export async function cloneSizeEstimate(url: string): Promise<CloneSizeEstimate | null> {
+  return invoke("clone_size_estimate", { url });
+}
+
 export async function sparseClone(
   url: string,
   parentDir: string,
@@ -468,7 +930,7 @@ export async function fullClone(
 }
 
 export interface RepoAccount {
-  /** "gh:<account>" or "profile:<profile id>" */
+  /** "gh:<login>" (a GitHub CLI login) or "signin:<login>" (a sign-in kept here) */
   key: string;
   label: string;
   source: string;
@@ -507,6 +969,10 @@ export interface LocalClones {
   owner_profiles: Record<string, string>;
   /** owner (lowercase) -> "org-<id>" SSH user seen locally */
   org_ssh_users: Record<string, string>;
+  /** "owner/name" (lowercase) -> the folder a clone is still writing it into */
+  cloning?: Record<string, string>;
+  /** "owner/name" (lowercase) -> every local copy, for repositories cloned more than once */
+  copies?: Record<string, string[]>;
 }
 
 /** Which repos are on this machine right now — local disk only, no network. */
@@ -598,17 +1064,25 @@ export async function sparseAdd(
   return invoke("sparse_add", { repoPath, dirs });
 }
 
-export async function storeGithubToken(
-  profileId: string,
-  token: string
-): Promise<void> {
-  return invoke("store_github_token", { profileId, token });
+/** A login signed in with "Sign in with GitHub" and kept here; its token is in the system's credential store. */
+export interface KeptSignIn {
+  login: string;
+  id: number;
 }
 
-export async function getGithubToken(
-  profileId: string
-): Promise<string | null> {
-  return invoke("get_github_token", { profileId });
+/** Keep a "Sign in with GitHub": GitHub is asked whose token it is, and the token goes to the system's credential store. */
+export async function githubSigninKeep(token: string): Promise<GitHubUser> {
+  return invoke("github_signin_keep", { token });
+}
+
+/** Forget a kept sign-in: its token and its login. */
+export async function githubSigninForget(login: string): Promise<void> {
+  return invoke("github_signin_forget", { login });
+}
+
+/** The sign-ins kept here, newest first. */
+export async function githubSignins(): Promise<KeptSignIn[]> {
+  return invoke("github_signins");
 }
 
 export async function applyGitConfig(): Promise<void> {
@@ -623,8 +1097,14 @@ export interface GitHubUser {
   id: number;
   login: string;
   name: string | null;
+  /** The public address, if the account shows one. */
   email: string | null;
   avatar_url: string;
+  /** The account's verified addresses, primary first (needs the user:email scope). */
+  emails?: string[];
+  primary_email?: string | null;
+  /** The token could not read the account's addresses. */
+  email_scope_missing?: boolean;
 }
 
 export interface GitHubKey {
@@ -700,6 +1180,9 @@ export interface ChangeEntry {
   /** Conflicted entries only: modes and oids of index stages 1, 2, 3 (base, ours, theirs). */
   stage_modes?: string[];
   stage_oids?: string[];
+  /** A conflicted submodule pointer: the commit Keep mine / Take theirs records (sides already mapped). */
+  pointer_mine?: string;
+  pointer_theirs?: string;
   staged_added: number | null;
   staged_removed: number | null;
   unstaged_added: number | null;
@@ -733,9 +1216,23 @@ export interface SyncSummary {
   root: string;
   /** False when this repository is a submodule of the one being synced. */
   is_root: boolean;
+  /** Conflicted files still unmerged where the pause is: 0 means Continue update can be pressed. */
+  unresolved: number;
+  /** The superproject's upstream, what "theirs" means in every rebase the update runs. */
+  upstream: string;
+  /** For a submodule's own status: its path in the superproject and the commit it is rebased onto. */
+  sub_path: string | null;
+  sub_target: string | null;
+  /**
+   * The pause is a submodule pointer the update could not place itself, still
+   * unmerged here: stage it in this repository ("Mark resolved" on its row).
+   */
+  handed_over?: boolean;
 }
 
 export interface SyncNeedsUser {
+  /** The commit of yours being replayed when the superproject's rebase stopped. */
+  at_commit?: string | null;
   /** superproject | submodule:<path> | submodule-autostash:<path> | autostash-conflict */
   where_: string;
   paths: string[];
@@ -754,6 +1251,8 @@ export interface RepoIdentity {
   signing_on: boolean;
   signing_key: string | null;
   guard: "gitswitch" | "foreign" | "none";
+  /** The email GitSwitch's guard expects; it goes stale when the profile's email changes. */
+  guard_email: string | null;
 }
 
 export interface RemotePushState {
@@ -812,8 +1311,40 @@ export interface PushState {
 
 export type PushMode = "allowed" | "guardrail" | "locked";
 
+/** One submodule's share of the repository's push block or lock. */
+export interface SubCoverage {
+  path: string;
+  blocked: boolean;
+  locked: boolean;
+  needs_repair: boolean;
+  /** It has what the repository has: a lock under a locked repository, at least the guard-rail under a blocked one. */
+  covered: boolean;
+  /** When not covered: what it has instead, in plain words. */
+  why: string;
+  /** Its block is the repository's doing: the repository's "Allowed" takes it away (with the prompt when it is a lock). */
+  by_superproject?: boolean;
+  /** When its lock is not whole: what was measured, in the lock's own terms. */
+  drift?: string[];
+}
+
+/** How far the repository's push block or lock reaches into its submodules — where the code lives. */
+export interface PushCoverage {
+  mode: PushMode;
+  submodules: SubCoverage[];
+  /** Submodules with less than the repository has: a push from inside them is not stopped. */
+  uncovered: string[];
+  /** Repair can do something about what is uncovered. */
+  needs_repair: boolean;
+  /** ...and part of it is the administrator's: Repair shows the prompt. */
+  needs_elevation?: boolean;
+  /** One sentence for the card; empty when there is nothing to say. */
+  summary: string;
+}
+
 export type JobOutcomeKind =
   | "applied"
+  /** What could be done was done; something is still not covered (the message says what). */
+  | "incomplete"
   | "cancelled"
   | "denied"
   | "no-agent"
@@ -948,12 +1479,24 @@ export interface SubmoduleInfo {
     | "dirty"
     | "moved-and-dirty"
     | "not-initialised"
-    | "unmapped";
+    | "unmapped"
+    /** A `.git` entry but nothing checked out: a download that was interrupted. Downloadable again. */
+    | "incomplete";
   summary: string;
   gitdir_valid: boolean;
   operation: string | null;
   conflicted: number;
   upstream_remote: string | null;
+  /**
+   * The recorded commit is on one of the submodule's remote-tracking branches,
+   * so a clone of this repository can get it. `null` when that cannot be known
+   * here (not initialised, the commit missing, or no remote-tracking branch).
+   */
+  recorded_on_remote: boolean | null;
+  /** Commits at its checkout that no remote-tracking branch has; `null` without one to compare with. */
+  own_unpushed: number | null;
+  /** `<remote>/<branch>` a clone would follow, when that remote-tracking branch is here. */
+  latest_ref?: string | null;
 }
 
 export interface LfsStatus {
@@ -968,6 +1511,8 @@ export interface LfsStatus {
   pointer_paths: string[];
   more_pointers: number;
   summary: string;
+  /** How to install git-lfs on this platform, for when it is missing. */
+  install_hint: string;
 }
 
 export async function changesLfsStatus(repoPath: string): Promise<LfsStatus> {
@@ -1116,6 +1661,8 @@ export interface PullOutcome {
   /** A rebase with autostash finished but the stash could not be re-applied cleanly. */
   autostash_conflict?: boolean;
   autostash_left?: string | null;
+  /** Submodule pointers the pull moved: the repository now records other commits than are checked out. */
+  submodules_moved?: number;
 }
 
 /** What every git operation returns: the outcome plus the re-read repo state. */
@@ -1134,6 +1681,29 @@ export interface OpResult {
   sync?: SyncOutcome;
   tree?: TreeOutcome;
   stash?: StashOutcome;
+  state?: StateOutcome;
+  /** Submodules a push would leave a clone unable to check out, or could not check. */
+  unpushed_submodules?: SubmodulePush[];
+  /**
+   * Set by the page on a result that belongs to a submodule it ran an operation
+   * in (its path), not to the repository on screen: actions keyed on the
+   * result's codes are not offered for it.
+   */
+  inside?: string;
+}
+
+/**
+ * A submodule whose recorded commit a push advertises while none of the
+ * submodule's remotes has it (`not-on-remote`), or where that could not be
+ * checked (`not-here`: the commit is not in its checkout; `not-populated`).
+ */
+export interface SubmodulePush {
+  path: string;
+  recorded: string;
+  recorded_short: string;
+  state: "not-on-remote" | "not-here" | "not-populated";
+  /** Its checked-out branch; null when detached, where a push from it needs a branch first. */
+  branch: string | null;
 }
 
 // --- Tree management: branches, undo, reset, revert, cherry-pick, conflicts ----
@@ -1151,7 +1721,7 @@ export interface StashRef {
 }
 
 export interface TreeOutcome {
-  /** switch | create-branch | delete-branch | rename-branch | undo-commit | reset | detach | revert | cherry-pick | resolve-side | discard-all */
+  /** switch | create-branch | delete-branch | rename-branch | undo-commit | reset | detach | revert | cherry-pick | resolve-side | discard-all | align-submodules */
   op: string;
   head_before: string | null;
   head_after: string | null;
@@ -1237,6 +1807,97 @@ export interface StashOutcome {
   kept: boolean;
   recovery: string | null;
   not_stashed_submodules: string[];
+}
+
+/** A repository inside a saved state (a submodule or a nested repository). */
+export interface StateSub {
+  path: string;
+  /** Checked out now: its part can come back. */
+  downloaded: boolean;
+  changed: number;
+  branch: string | null;
+  /** Commits on its saved branch since that are already pushed (that branch is kept). */
+  pushed_since: number;
+}
+
+/** A saved state: where the repository was — commit, branch, staged and every changed file. */
+export interface RepoState {
+  /** "1".."4" or "before". */
+  slot: string;
+  oid: string;
+  name: string;
+  /** null: HEAD was detached. */
+  branch: string | null;
+  head: string;
+  head_short: string;
+  head_subject: string;
+  /** Seconds since 1970. */
+  saved: number;
+  changed: number;
+  staged: number;
+  new_files: number;
+  branch_gone: boolean;
+  /** Commits the branch gained since (they leave it on Go back, kept on a backup branch). */
+  commits_since: number;
+  /** Of those, already pushed. */
+  pushed_since: number;
+  upstream: string | null;
+  /** For "Before going back": the state that was gone back to. */
+  before_of: string | null;
+  subs: StateSub[];
+}
+
+export interface StatesList {
+  /** The saved states, by slot. */
+  states: RepoState[];
+  before: RepoState | null;
+  /** How many this repository keeps (its own setting; 4 until changed). */
+  max: number;
+  /** The slot a new state goes into; null when every slot is in use. */
+  next_free: string | null;
+  /** The most it can be set to. */
+  limit: number;
+}
+
+export interface StateOutcome {
+  /** save | restore | delete */
+  action: string;
+  slot: string;
+  name: string;
+  oid: string | null;
+  branch_before: string | null;
+  branch_after: string | null;
+  head_before: string | null;
+  head_after: string | null;
+  before_saved: string | null;
+  new_branch: string | null;
+  backup: string | null;
+  recovery: string | null;
+  notes: string[];
+}
+
+/** The four state slots and the automatic "Before going back". */
+export async function statesList(repoPath: string): Promise<StatesList> {
+  return invoke("states_list", { repoPath });
+}
+
+/** Save where the repository is now into a slot; `replace`: the state shown there, to replace it. */
+export async function statesSave(repoPath: string, slot: string, name: string | null, replace: string | null): Promise<OpResult> {
+  return invoke("states_save", { repoPath, slot, name, replace });
+}
+
+/** Go back to a state (named by the oid shown). `newBranch`: on a new branch; `allowPushed`: past pushed commits anyway. */
+export async function statesRestore(repoPath: string, slot: string, oid: string, newBranch: string | null, allowPushed: boolean): Promise<OpResult> {
+  return invoke("states_restore", { repoPath, slot, oid, newBranch, allowPushed });
+}
+
+export async function statesDelete(repoPath: string, slot: string, oid: string): Promise<OpResult> {
+  return invoke("states_delete", { repoPath, slot, oid });
+}
+
+/** Keep up to `max` states in this repository; refused below a slot that holds one. Answers with the list. */
+export async function statesSetMax(repoPath: string, max: number): Promise<StatesList> {
+  return invoke("states_set_max", { repoPath, max });
 }
 
 export async function changesSubmoduleStatuses(repoPath: string): Promise<SubmoduleStatus[]> {
@@ -1396,6 +2057,16 @@ export interface SyncCommitRef {
   subject: string;
   /** Submodule paths whose pointer this commit moves. */
   touches: string[];
+  author_name: string;
+  author_email: string;
+  /** The author date, ISO 8601 — stable across the rebases an update performs. */
+  date: string;
+  /** Changes nothing but submodule pointers (a CI bump). */
+  only_pointers: boolean;
+  /** Upstream already carries this change: the rebase drops it. */
+  already_upstream: boolean;
+  /** In an outcome: left out because nothing of it remained once its conflict was resolved. */
+  resolved_away?: boolean;
 }
 
 export interface SyncSubPlan {
@@ -1416,11 +2087,30 @@ export interface SyncSubPlan {
   untracked: number;
   fetch_error: string | null;
   notes: string[];
+  /**
+   * When blocked, a stable code for the remedy (also: untracked-inside |
+   * commit-first): reinit | finish-operation |
+   * resolve-conflicts | removed-upstream | fetch-failed | unreachable |
+   * record-pointers | squash-own | stash-inside. Buttons key on this, never
+   * on the sentence.
+   */
+  remedy: string | null;
+  /** What the update brings into this submodule, and what is its own (capped). */
+  incoming_commits: SyncCommitRef[];
+  own_commits: SyncCommitRef[];
+  /** It has submodules of its own; the update does not go inside them. */
+  has_nested: boolean;
+  /** Upstream moved it to another address; the update re-points it there (git submodule sync). */
+  url_change: { from: string; to: string } | null;
+  /** The remote its branch's upstream lives on. */
+  remote: string | null;
 }
 
 export interface SyncSuperPlan {
   branch: string;
   upstream: string;
+  /** The remote the update fetches from. */
+  remote?: string;
   head: string;
   upstream_oid: string;
   ahead: number;
@@ -1433,6 +2123,17 @@ export interface SyncSuperPlan {
   untracked: number;
   will_stash: boolean;
   notes: string[];
+  /** turn-on-stash | stash-collides | untracked-in-the-way | identity, in the blockers' order. */
+  remedies: string[];
+  /** Where you and upstream last agreed, shortened. */
+  base_short: string;
+  /** The first 30 files with uncommitted changes. */
+  dirty_paths: string[];
+  /** Commits beyond the 30 listed on each side. */
+  more_incoming: number;
+  more_own: number;
+  /** Of the commits beyond the listed ones, how many upstream already has (they are dropped too). */
+  more_own_dropped?: number;
 }
 
 export interface SyncSkipped {
@@ -1450,6 +2151,8 @@ export interface SyncPlan {
   submodules: SyncSubPlan[];
   skipped: SyncSkipped[];
   /** Oids the run re-checks: ["", upstream] then [path, target] per submodule. */
+  /** The superproject HEAD the plan was made for; a plan for another HEAD is stale. */
+  head_oid?: string | null;
   fingerprint: [string, string][];
   summary: string;
 }
@@ -1491,6 +2194,8 @@ export interface SyncOutcome {
   head_after: string;
   incoming: number;
   own_kept: SyncCommitRef[];
+  /** How many commits of yours are on top — all of them; `own_kept` lists the newest. */
+  own_kept_total?: number;
   own_dropped: SyncCommitRef[];
   stashed: boolean;
   /** An autostash entry git could not re-apply is still in `git stash list`. */
@@ -1511,22 +2216,64 @@ export async function changesSyncRun(
   repoPath: string,
   stash: boolean,
   bundles: boolean,
-  fingerprint: [string, string][]
+  fingerprint: [string, string][],
+  /** Download every large file still a pointer stub afterwards, in each repository that uses LFS. */
+  withLfs = false
 ): Promise<OpResult> {
-  return invoke("changes_sync_run", { repoPath, stash, bundles, fingerprint });
+  return invoke("changes_sync_run", { repoPath, stash, bundles, fingerprint, withLfs });
 }
 
-export async function changesSyncContinue(repoPath: string): Promise<OpResult> {
-  return invoke("changes_sync_continue", { repoPath });
+export async function changesSyncContinue(repoPath: string, allowMarkers = false): Promise<OpResult> {
+  return invoke("changes_sync_continue", { repoPath, allowMarkers });
 }
 
 export async function changesSyncAbort(repoPath: string): Promise<OpResult> {
   return invoke("changes_sync_abort", { repoPath });
 }
 
-/** One commit recording every submodule checked out ahead of what the branch records. */
-export async function changesRecordPointers(repoPath: string): Promise<OpResult> {
-  return invoke("changes_record_pointers", { repoPath });
+/**
+ * Opens a file of the repository in the system's default application, or
+ * reveals it in the file manager. The backend checks the path is inside the
+ * repository first.
+ */
+export async function changesOpenPath(repoPath: string, path: string, reveal: boolean): Promise<void> {
+  return invoke("changes_open_path", { repoPath, path, reveal });
+}
+
+export interface ConflictHunk {
+  /** 1-based line of the `<<<<<<<` marker. */
+  line: number;
+  mine: string[];
+  /** The common ancestor's lines, when the file carries diff3 markers. */
+  base: string[];
+  theirs: string[];
+}
+
+export interface ConflictView {
+  path: string;
+  /** No hunks to show: Keep mine or Take theirs decides it. */
+  binary: boolean;
+  marker_count: number;
+  hunks: ConflictHunk[];
+  truncated: boolean;
+  sides: Sides;
+  total_lines: number;
+  /** The file is larger than what was read: a count of zero does not mean resolved. */
+  partial?: boolean;
+}
+
+/** A conflicted file split into what each side wants, for the resolution view. */
+export async function changesConflictView(repoPath: string, path: string): Promise<ConflictView> {
+  return invoke("changes_conflict_view", { repoPath, path });
+}
+
+/**
+ * One commit recording submodule pointers checked out ahead of what the branch
+ * records. `paths`: exactly these submodules — each is refused when it is not
+ * a populated, listed submodule or not strictly ahead; null = every such one.
+ */
+export async function changesRecordPointers(repoPath: string, paths: string[] | null = null): Promise<OpResult> {
+  return invoke("changes_record_pointers", { repoPath, paths });
 }
 
 export type PullMode = "ff-only" | "merge" | "rebase";
@@ -1544,8 +2291,9 @@ export async function changesFileDiff(
   return invoke("changes_file_diff", { repoPath, path, staged, untracked });
 }
 
-export async function changesStage(repoPath: string, paths: string[]): Promise<OpResult> {
-  return invoke("changes_stage", { repoPath, paths });
+/** `allowMarkers`: stage a conflicted file even though conflict markers are still in it (the "anyway" button). */
+export async function changesStage(repoPath: string, paths: string[], allowMarkers = false): Promise<OpResult> {
+  return invoke("changes_stage", { repoPath, paths, allowMarkers });
 }
 
 export async function changesStageAll(repoPath: string): Promise<OpResult> {
@@ -1568,8 +2316,9 @@ export async function changesCommit(
   return invoke("changes_commit", { repoPath, message, amend });
 }
 
-export async function changesPush(repoPath: string, setUpstream: boolean): Promise<OpResult> {
-  return invoke("changes_push", { repoPath, setUpstream });
+/** `allowUnpushedSubmodules`: push although a submodule's recorded commit is on none of that submodule's remotes. */
+export async function changesPush(repoPath: string, setUpstream: boolean, allowUnpushedSubmodules = false): Promise<OpResult> {
+  return invoke("changes_push", { repoPath, setUpstream, allowUnpushedSubmodules });
 }
 
 /** `withLfs` also downloads LFS content — a plain pull leaves pointer stubs. `autostash` lets a rebase pull run on a dirty tree. */
@@ -1577,17 +2326,25 @@ export async function changesPull(
   repoPath: string,
   mode: PullMode,
   withLfs: boolean,
-  autostash: boolean
+  autostash: boolean,
+  /** A remote-tracking branch to integrate instead of the upstream ("origin/main"). */
+  source: string | null = null
 ): Promise<OpResult> {
-  return invoke("changes_pull", { repoPath, mode, withLfs, autostash });
+  return invoke("changes_pull", { repoPath, mode, withLfs, autostash, source });
 }
 
-export async function changesSubmoduleUpdate(repoPath: string): Promise<OpResult> {
-  return invoke("changes_submodule_update", { repoPath });
+/** `paths`: only these submodules (the never-initialised ones); null = every listed one. */
+export async function changesSubmoduleUpdate(repoPath: string, paths: string[] | null = null): Promise<OpResult> {
+  return invoke("changes_submodule_update", { repoPath, paths });
 }
 
-export async function changesContinue(repoPath: string): Promise<OpResult> {
-  return invoke("changes_continue", { repoPath });
+/** Checks out, in these submodules, the commit the repository records for each. Local only. */
+export async function changesSubmoduleAlign(repoPath: string, paths: string[]): Promise<OpResult> {
+  return invoke("changes_submodule_align", { repoPath, paths });
+}
+
+export async function changesContinue(repoPath: string, allowMarkers = false): Promise<OpResult> {
+  return invoke("changes_continue", { repoPath, allowMarkers });
 }
 
 export async function changesAbort(repoPath: string): Promise<OpResult> {
@@ -1627,8 +2384,40 @@ export async function doctorCheckPushLocks(): Promise<Finding[]> {
   return invoke("doctor_check_push_locks");
 }
 
+export async function changesPushCoverage(repoPath: string): Promise<PushCoverage> {
+  return invoke("changes_push_coverage", { repoPath });
+}
+
 export async function changesRepairPushBlock(repoPath: string): Promise<PushState> {
   return invoke("changes_repair_push_block", { repoPath });
+}
+
+// --- The command log -----------------------------------------------------
+
+/** One git command this app ran, already redacted. */
+export interface ConsoleEntry {
+  id: number;
+  at: string;
+  repo: string;
+  /** Exactly what ran. `argv[0]` is the program. */
+  argv: string[];
+  /** -1 when git could not be started, -9 when it was killed on a timeout. */
+  exit_code: number;
+  duration_ms: number;
+  stdout: string;
+  stderr: string;
+  /** A read rather than a change; hidden by default because most are. */
+  is_read: boolean;
+  truncated: boolean;
+}
+
+/** Commands newer than `sinceId`. An empty `repoPath` means every repository. */
+export async function consoleEntries(sinceId: number, repoPath: string): Promise<ConsoleEntry[]> {
+  return invoke("console_entries", { sinceId, repoPath });
+}
+
+export async function consoleClear(): Promise<void> {
+  return invoke("console_clear", {});
 }
 
 // --- Terminal ------------------------------------------------------------
@@ -1658,4 +2447,595 @@ export async function terminalResize(id: string, cols: number, rows: number): Pr
 
 export async function terminalClose(id: string): Promise<void> {
   return invoke("terminal_close", { id });
+}
+
+// --- GitHub: pull requests, reviews, merging, collaborators ---
+// Each call names the account to act as (a RepoAccount key); the token stays in Rust.
+
+export interface AccountAccess {
+  account: string;
+  login: string;
+  source: string;
+  permission: "admin" | "push" | "read" | "none" | "unknown";
+  private: boolean | null;
+  why: string | null;
+}
+
+export interface RepoContext {
+  owner: string | null;
+  name: string | null;
+  not_github: string | null;
+  accounts: AccountAccess[];
+  suggested: string | null;
+  profile_login: string | null;
+}
+
+export type PullState = "open" | "merged" | "closed" | "all";
+export type PullScope = "created" | "review_requested" | "assigned" | "involves";
+
+export interface PullItem {
+  repo: string;
+  number: number;
+  title: string;
+  author: string;
+  draft: boolean;
+  state: "open" | "merged" | "closed";
+  created_at: string;
+  updated_at: string;
+  merged_at: string | null;
+  closed_at: string | null;
+  head_ref: string | null;
+  base_ref: string | null;
+  comments: number | null;
+  labels: string[];
+  html_url: string;
+}
+
+export interface PullPage {
+  items: PullItem[];
+  next_page: number | null;
+  total: number | null;
+}
+
+export interface PullReview {
+  login: string;
+  state: string;
+  submitted_at: string | null;
+}
+
+export interface PullCheck {
+  name: string;
+  state: "success" | "failure" | "pending" | "neutral" | "skipped";
+  url: string | null;
+}
+
+export interface PullDetail {
+  repo: string;
+  number: number;
+  title: string;
+  body: string;
+  author: string;
+  state: "open" | "merged" | "closed";
+  draft: boolean;
+  merged_by: string | null;
+  merged_at: string | null;
+  mergeable: boolean | null;
+  mergeable_state: string;
+  head_ref: string;
+  head_sha: string;
+  head_repo: string | null;
+  base_ref: string;
+  default_branch: string;
+  additions: number;
+  deletions: number;
+  changed_files: number;
+  commits: number;
+  comments: number;
+  created_at: string;
+  updated_at: string;
+  html_url: string;
+  merge_methods: ("merge" | "squash" | "rebase")[];
+  merge_methods_known: boolean;
+  can_push: boolean;
+  is_admin: boolean;
+  viewer: string;
+  reviews: PullReview[];
+  checks: PullCheck[];
+  notes: string[];
+  can_delete_branch: boolean;
+}
+
+export interface PullFile {
+  path: string;
+  previous_path: string | null;
+  status: string;
+  additions: number;
+  deletions: number;
+  diff: FileDiff;
+}
+
+export interface PullFiles {
+  files: PullFile[];
+  truncated: boolean;
+}
+
+export interface PullCommit {
+  sha: string;
+  title: string;
+  author: string;
+  date: string | null;
+}
+
+export interface MergeOutcome {
+  merged: boolean;
+  sha: string;
+  message: string;
+  branch_deleted: boolean | null;
+  branch_note: string | null;
+}
+
+export interface Collaborator {
+  login: string;
+  role: string;
+  is_owner: boolean;
+}
+
+export interface Invitation {
+  id: number;
+  login: string;
+  role: string;
+  created_at: string;
+  inviter: string | null;
+}
+
+export interface People {
+  collaborators: Collaborator[];
+  invitations: Invitation[] | null;
+  note: string | null;
+}
+
+export interface AddOutcome {
+  status: "invited" | "added";
+  message: string;
+  invitation_id: number | null;
+}
+
+export async function githubRepoContext(repoPath: string | null, repo: string | null = null): Promise<RepoContext> {
+  return invoke("github_repo_context", { repoPath, repo });
+}
+
+export async function githubPulls(account: string, owner: string, name: string, state: PullState, page = 1): Promise<PullPage> {
+  return invoke("github_pulls", { account, owner, name, state, page });
+}
+
+export async function githubPullsSearch(account: string, scope: PullScope, state: PullState, repo: string | null, page = 1): Promise<PullPage> {
+  return invoke("github_pulls_search", { account, scope, state, repo, page });
+}
+
+export async function githubPull(account: string, owner: string, name: string, number: number): Promise<PullDetail> {
+  return invoke("github_pull", { account, owner, name, number });
+}
+
+export async function githubPullFiles(account: string, owner: string, name: string, number: number): Promise<PullFiles> {
+  return invoke("github_pull_files", { account, owner, name, number });
+}
+
+export async function githubPullCommits(account: string, owner: string, name: string, number: number): Promise<PullCommit[]> {
+  return invoke("github_pull_commits", { account, owner, name, number });
+}
+
+export async function githubPullReview(account: string, owner: string, name: string, number: number, event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT", body: string): Promise<PullReview> {
+  return invoke("github_pull_review", { account, owner, name, number, event, body });
+}
+
+export async function githubPullMerge(
+  account: string,
+  owner: string,
+  name: string,
+  number: number,
+  method: "merge" | "squash" | "rebase",
+  sha: string,
+  title: string | null,
+  message: string | null,
+  deleteBranch: boolean
+): Promise<MergeOutcome> {
+  return invoke("github_pull_merge", { account, owner, name, number, method, sha, title, message, deleteBranch });
+}
+
+export async function githubCollaborators(account: string, owner: string, name: string): Promise<People> {
+  return invoke("github_collaborators", { account, owner, name });
+}
+
+export async function githubCollaboratorAdd(account: string, owner: string, name: string, username: string, permission: "pull" | "triage" | "push" | "maintain" | "admin"): Promise<AddOutcome> {
+  return invoke("github_collaborator_add", { account, owner, name, username, permission });
+}
+
+export async function githubCollaboratorRemove(account: string, owner: string, name: string, username: string): Promise<void> {
+  return invoke("github_collaborator_remove", { account, owner, name, username });
+}
+
+export async function githubInvitationCancel(account: string, owner: string, name: string, id: number): Promise<void> {
+  return invoke("github_invitation_cancel", { account, owner, name, id });
+}
+
+/** One of the account's repositories on the Pull requests page, with its counts. */
+export interface PullRepo {
+  /** "owner/name" */
+  repo: string;
+  private: boolean;
+  archived: boolean;
+  fork: boolean;
+  pushed_at: string | null;
+  /** admin | maintain | write | triage | read */
+  permission: string | null;
+  /** Open pull requests; null when they could not be counted. */
+  open: number | null;
+  /** Open pull requests asking this account for a review; null when the count failed. */
+  to_review: number | null;
+  /** Open pull requests this account opened; null when the count failed. */
+  mine: number | null;
+  /** False: someone else's repository, known through a pull request of yours or a review asked of you. */
+  affiliated: boolean;
+}
+
+export interface PullRepos {
+  login: string;
+  repos: PullRepo[];
+  truncated: boolean;
+  notes: string[];
+}
+
+export async function githubPullRepos(account: string): Promise<PullRepos> {
+  return invoke("github_pull_repos", { account });
+}
+
+// ---- Uninstalling GitSwitch ----
+
+export type AppRemoval =
+  | { kind: "trash"; bundle: string; trash: string }
+  | { kind: "nsis"; uninstaller: string }
+  | { kind: "deb"; package: string }
+  | { kind: "rpm"; package: string }
+  | { kind: "app-image"; file: string }
+  | { kind: "manual"; reason: string };
+
+export interface UninstallPlan {
+  platform: "macos" | "windows" | "linux";
+  app: AppRemoval;
+  how: string;
+  gitconfig: string | null;
+  signers: string | null;
+  repos: string[];
+  lock_helper: boolean;
+  locks: string[];
+  signins: string[];
+  data: string[];
+}
+
+export interface UninstallPrepare {
+  outcome: "done" | "stopped";
+  message: string;
+  command: string | null;
+  done: string[];
+  problems: string[];
+}
+
+export interface UninstallFinish {
+  how: string;
+  manual: string | null;
+  log: string;
+}
+
+export async function uninstallPlan(): Promise<UninstallPlan> {
+  return invoke("uninstall_plan");
+}
+
+export async function uninstallPrepare(keepData: boolean): Promise<UninstallPrepare> {
+  return invoke("uninstall_prepare", { keepData });
+}
+
+/** Starts the removal and quits GitSwitch about 1.5 s later. */
+export async function uninstallFinish(keepData: boolean): Promise<UninstallFinish> {
+  return invoke("uninstall_finish", { keepData });
+}
+
+// ---- The Uninstall tab: apps on this computer, and their leftovers ----
+
+export interface InstalledApp {
+  id: string;
+  name: string;
+  version: string | null;
+  publisher: string | null;
+  location: string | null;
+  /** app | app-store | homebrew | msi | exe | store | deb | snap | flatpak | appimage | package */
+  source: string;
+  size: number | null;
+  date: number | null;
+  notes: string[];
+  blocked: string | null;
+  is_self: boolean;
+  /** A system app, and why (came with Windows or the PC, runs its hardware, others use it). */
+  system?: string | null;
+}
+
+export interface AppList {
+  platform: "macos" | "windows" | "linux";
+  apps: InstalledApp[];
+  notes: string[];
+}
+
+export interface AppPrepared {
+  session: string;
+  app: InstalledApp;
+  method: string;
+  command: string | null;
+  facts: string[];
+  also_removed: string[];
+  blocked: string | null;
+  running: boolean;
+  warnings: string[];
+  vendor_uninstaller: string | null;
+  /** Windows: deleting its files directly instead of running its uninstaller. */
+  force?: ForcePlan | null;
+  /** Windows: why its files can't be deleted directly. */
+  force_unavailable?: string | null;
+}
+
+export interface ForcePlan {
+  folders: { path: string; size: number | null; size_complete: boolean; admin: boolean }[];
+  /** Its entry in Installed apps. */
+  entry: string;
+  entry_admin: boolean;
+  /** Its start-up entries, as "name (where)". */
+  startup: string[];
+  /** Windows asks for permission for some of it. */
+  admin: boolean;
+}
+
+export interface AppProgress {
+  /** uninstalling | gone | still-installed | failed */
+  state: string;
+  message: string | null;
+}
+
+export interface Leftover {
+  id: string;
+  path: string;
+  place: string;
+  /** file | folder | registry | launch-agent | package-settings | link */
+  kind: string;
+  size: number | null;
+  size_complete: boolean;
+  confidence: "high" | "medium";
+  reason: string;
+  admin: boolean;
+  command: string | null;
+  /** GitSwitch deletes it after Windows' permission prompt (Windows). */
+  elevate?: boolean;
+}
+
+export interface LeftoverScan {
+  scan: string;
+  items: Leftover[];
+  notes: string[];
+}
+
+export interface LeftoverDeleted {
+  id: string;
+  /** trashed | removed | gone | changed | refused | needs-admin | protected | in-use | at-restart | failed */
+  outcome: string;
+  message: string;
+}
+
+// ---- Net speed
+
+export type NetKind = "wifi" | "ethernet" | "cellular" | "other" | "virtual";
+
+/** An adapter, with its speed now (bytes per second). */
+export interface NetIface {
+  id: string;
+  name: string;
+  detail: string | null;
+  kind: NetKind;
+  up: boolean;
+  in_use: boolean;
+  /** Bits per second. */
+  link_bps: number | null;
+  down: number;
+  upload: number;
+}
+
+export interface NetWifi {
+  ssid: string | null;
+  signal: number | null;
+  rssi_dbm: number | null;
+  rx_mbps: number | null;
+  tx_mbps: number | null;
+  /** Why something isn't shown. */
+  note: string | null;
+  /** The setting that would show it: "location". */
+  fix: string | null;
+}
+
+export interface NetSettings {
+  /** Show the speed in the taskbar / menu bar / top bar. */
+  tray: boolean;
+  /** Windows: numbers in the tray icon, the speed bar, or both. */
+  style: "icon" | "bar" | "both";
+  /** macOS / Linux: also the floating speed bar. */
+  bar: boolean;
+  /** Windows: the speed bar docked on the taskbar, or floating anywhere on the screen. */
+  bar_place: "taskbar" | "anywhere";
+  bar_pos: [number, number] | null;
+  /** Windows: where on the taskbar the speed bar was dragged (kept by the bar itself). */
+  bar_dock?: { anchor: "left" | "tray"; px: number } | null;
+  show: "both" | "down" | "up";
+  unit: "bytes" | "bits";
+  interval_ms: number;
+  /** "auto", "all" or an adapter's id. */
+  source: string;
+}
+
+export interface NetSnapshot {
+  platform: "windows" | "macos" | "linux";
+  down: number;
+  up: number;
+  source_name: string;
+  connection: NetIface | null;
+  wifi: NetWifi | null;
+  /** [ms since 1970, down, up], oldest first. */
+  history: [number, number, number][];
+  interfaces: NetIface[];
+  usage: { today: [number, number]; month: [number, number]; session: [number, number]; since: number };
+  settings: NetSettings;
+}
+
+export interface NetBar {
+  down: string;
+  up: string;
+  show: string;
+  light: boolean;
+}
+
+export interface SpeedTest {
+  /** idle | latency | download | upload | done | cancelled | failed */
+  phase: string;
+  progress: number;
+  latency_ms: number | null;
+  /** Bytes per second. */
+  down_bps: number | null;
+  up_bps: number | null;
+  used_bytes: number;
+  error: string | null;
+  at: number | null;
+}
+
+export async function netspeedSnapshot(): Promise<NetSnapshot> {
+  return invoke("netspeed_snapshot");
+}
+
+export async function netspeedSetSettings(settings: NetSettings): Promise<NetSettings> {
+  return invoke("netspeed_set_settings", { settings });
+}
+
+export async function netspeedBar(): Promise<NetBar> {
+  return invoke("netspeed_bar");
+}
+
+/** Windows: the taskbar's speed bar back beside the clock. */
+export async function netspeedBarReset(): Promise<void> {
+  return invoke("netspeed_bar_reset");
+}
+
+/** The system's settings page: the taskbar's icons (Windows) or location access. */
+export async function netspeedOpenSettings(which: "taskbar" | "location"): Promise<void> {
+  return invoke("netspeed_open_settings", { which });
+}
+
+export async function netspeedShowTab(): Promise<void> {
+  return invoke("netspeed_show_tab");
+}
+
+export async function speedtestStart(): Promise<void> {
+  return invoke("netspeed_speedtest_start");
+}
+
+export async function speedtestStatus(): Promise<SpeedTest> {
+  return invoke("netspeed_speedtest_status");
+}
+
+export async function speedtestCancel(): Promise<void> {
+  return invoke("netspeed_speedtest_cancel");
+}
+
+/** An app uninstalled with GitSwitch before, no longer installed. */
+export interface PastUninstall {
+  /** The app's id: what appsRescan takes. */
+  key: string;
+  name: string;
+  /** When it was uninstalled, seconds since 1970. */
+  at: number;
+}
+
+export async function appsHistory(): Promise<PastUninstall[]> {
+  return invoke("apps_history");
+}
+
+/** Look for an app's leftovers again: the session to continue with. */
+export async function appsRescan(key: string): Promise<string> {
+  return invoke("apps_rescan", { key });
+}
+
+/** The app's own running processes, closed — and those that would not close. */
+export interface AppClosed {
+  closed: string[];
+  left: string[];
+}
+
+export interface UninstallSessionSummary {
+  session: string;
+  name: string;
+  state: string;
+  started: number;
+}
+
+export async function appsList(kind: "apps" | "packages"): Promise<AppList> {
+  return invoke("apps_list", { kind });
+}
+
+/** [bytes, counted completely] */
+export async function appsSize(id: string): Promise<[number, boolean]> {
+  return invoke("apps_size", { id });
+}
+
+export async function appsPrepare(id: string): Promise<AppPrepared> {
+  return invoke("apps_prepare", { id });
+}
+
+export async function appsUninstall(session: string): Promise<AppProgress> {
+  return invoke("apps_uninstall", { session });
+}
+
+export async function appsStatus(session: string): Promise<AppProgress> {
+  return invoke("apps_status", { session });
+}
+
+export async function appsCheckGone(session: string): Promise<AppProgress> {
+  return invoke("apps_check_gone", { session });
+}
+
+export async function appsScan(session: string, registry: boolean): Promise<LeftoverScan> {
+  return invoke("apps_scan", { session, registry });
+}
+
+/** Only the scan's ids travel — the backend knows what each one is. */
+export async function appsDelete(scan: string, ids: string[]): Promise<LeftoverDeleted[]> {
+  return invoke("apps_delete", { scan, ids });
+}
+
+export async function appsSessions(): Promise<UninstallSessionSummary[]> {
+  return invoke("apps_sessions");
+}
+
+export async function appsForget(session: string): Promise<void> {
+  return invoke("apps_forget", { session });
+}
+
+/** Close the app's own running processes, so its uninstall can go ahead. */
+export async function appsClose(session: string): Promise<AppClosed> {
+  return invoke("apps_close", { session });
+}
+
+/** Windows: leftovers in use, deleted when Windows next starts (after one permission prompt). */
+export async function appsDeleteAtRestart(scan: string, ids: string[]): Promise<LeftoverDeleted[]> {
+  return invoke("apps_delete_at_restart", { scan, ids });
+}
+
+/** Windows: delete a program's files directly (folders to the Recycle Bin, its entry and start-up values removed). */
+export async function appsForceRemove(session: string): Promise<AppProgress> {
+  return invoke("apps_force_remove", { session });
+}
+
+export async function appsOpenUninstaller(session: string): Promise<void> {
+  return invoke("apps_open_uninstaller", { session });
 }

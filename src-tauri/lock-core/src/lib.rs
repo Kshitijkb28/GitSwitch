@@ -7,7 +7,15 @@
 //! exactly what the helper *should* have written, which is how tampering is
 //! measured rather than guessed.
 
-#![forbid(unsafe_code)]
+// win.rs is the one exception: Win32's security API is unsafe by nature,
+// so on Windows the lint is `deny` and that module allows it for itself
+// (`forbid` could not be lifted). Everywhere else it stays forbidden.
+#![cfg_attr(not(windows), forbid(unsafe_code))]
+#![cfg_attr(windows, deny(unsafe_code))]
+
+/// Windows file ownership, shared with the privileged helper.
+#[cfg(windows)]
+pub mod win;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -109,6 +117,20 @@ pub struct Layout {
     pub polkit_policy: Option<PathBuf>,
 }
 
+/// Git for Windows keeps its programs under the toolchain it was built with:
+/// `ucrt64` (current releases), `clangarm64` (ARM), `mingw64` (older ones).
+/// The one whose `bin/git.exe` is there is the one git runs from, so its
+/// `libexec/git-core` is git's exec path — where a remote helper must be.
+pub fn windows_git_core(install: &str, exists: &dyn Fn(&str) -> bool) -> String {
+    let install = install.trim_end_matches('/');
+    for toolchain in ["ucrt64", "clangarm64", "mingw64", "mingw32"] {
+        if exists(&format!("{}/{}/bin/git.exe", install, toolchain)) {
+            return format!("{}/{}/libexec/git-core", install, toolchain);
+        }
+    }
+    format!("{}/mingw64/libexec/git-core", install)
+}
+
 /// Strip the leading `/` or `C:/` so a path can be re-rooted for tests.
 fn relative_form(p: &str) -> String {
     let n = norm(p);
@@ -142,10 +164,15 @@ impl Layout {
                 ),
                 Platform::Windows => {
                     let install = norm(windows_install_path.unwrap_or("C:/Program Files/Git"));
+                    let found = |p: &str| match root {
+                        Some(r) => r.join(relative_form(p)).is_file(),
+                        None => Path::new(p).is_file(),
+                    };
+                    let core = windows_git_core(&install, &found);
                     (
                         "C:/ProgramData/GitSwitch/lock".into(),
                         format!("C:/ProgramData/GitSwitch/lock/bin/{}.exe", HELPER_BIN_NAME),
-                        format!("{}/mingw64/libexec/git-core/{}.exe", install, REMOTE_HELPER_NAME),
+                        format!("{}/{}.exe", core, REMOTE_HELPER_NAME),
                         format!("{}/etc/gitconfig", install),
                         None,
                     )
@@ -986,7 +1013,15 @@ mod tests {
         assert_eq!(w.system_gitconfig, PathBuf::from("/tmp/root/D/Tools/Git/etc/gitconfig"));
         assert_eq!(w.registry_dir, PathBuf::from("/tmp/root/C/ProgramData/GitSwitch/lock"));
         let w2 = Layout::new(Platform::Windows, None, Some(r"C:\Program Files\Git"));
-        assert_eq!(w2.remote_helper_path, PathBuf::from("C:/Program Files/Git/mingw64/libexec/git-core/git-remote-gitswitch-push-blocked.exe"));
+        let w2s = w2.remote_helper_path.to_string_lossy().replace('\\', "/");
+        assert!(w2s.starts_with("C:/Program Files/Git/") && w2s.ends_with("/libexec/git-core/git-remote-gitswitch-push-blocked.exe"), "{w2s}");
+        // The toolchain git runs from: current Git for Windows is ucrt64, older mingw64.
+        let has = |files: &'static [&'static str]| move |p: &str| files.contains(&p);
+        assert_eq!(windows_git_core("C:/Program Files/Git", &has(&["C:/Program Files/Git/ucrt64/bin/git.exe"])), "C:/Program Files/Git/ucrt64/libexec/git-core");
+        assert_eq!(windows_git_core("C:/Program Files/Git/", &has(&["C:/Program Files/Git/mingw64/bin/git.exe"])), "C:/Program Files/Git/mingw64/libexec/git-core");
+        assert_eq!(windows_git_core("D:/Git", &has(&["D:/Git/clangarm64/bin/git.exe"])), "D:/Git/clangarm64/libexec/git-core");
+        assert_eq!(windows_git_core("C:/Git", &has(&[])), "C:/Git/mingw64/libexec/git-core", "nothing found: the long-standing place");
+        assert_eq!(windows_git_core("C:/Git", &has(&["C:/Git/mingw64/bin/git.exe", "C:/Git/ucrt64/bin/git.exe"])), "C:/Git/ucrt64/libexec/git-core", "the current one first");
         assert!(Layout::new(Platform::Linux, None, None).polkit_policy.is_some());
     }
 
@@ -1153,7 +1188,7 @@ mod tests {
             repo: "/Users/me/with space/argos".into(),
             gitdir: "/Users/me/with space/argos/.git".into(),
             patterns: vec!["/Users/me/with space/argos/".into()],
-            block_prefixes: vec!["git@github.com:".into(), "org-1@github.com:E/argos.git".into()],
+            block_prefixes: vec!["git@github.com:".into(), "org-1@github.com:AcmeOrg/widgets.git".into()],
             label: "argos".into(),
             locked_at: "2026-09-23T09:15:00Z".into(),
             locked_by_uid: Some(501),
@@ -1162,7 +1197,7 @@ mod tests {
         };
         let s = render_stanza(&entry);
         assert!(s.contains("[gitswitch]\n\tlocked = true\n\tlockId = abc\n\tlockedRepo = \"/Users/me/with space/argos\"\n"));
-        assert!(s.contains("[url \"gitswitch-push-blocked://\"]\n\tpushInsteadOf = \"git@github.com:\"\n\tpushInsteadOf = \"org-1@github.com:E/argos.git\"\n"));
+        assert!(s.contains("[url \"gitswitch-push-blocked://\"]\n\tpushInsteadOf = \"git@github.com:\"\n\tpushInsteadOf = \"org-1@github.com:AcmeOrg/widgets.git\"\n"));
         assert!(!s.contains("\tinsteadOf"), "a plain insteadOf would break fetch");
         assert!(!s.contains("git config"));
         assert!(!s.contains('\\'));

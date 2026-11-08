@@ -3,7 +3,6 @@ import { useNavigate } from "react-router-dom";
 import {
   BookMarked,
   Loader2,
-  RefreshCw,
   Search,
   Lock,
   Globe,
@@ -23,10 +22,11 @@ import { Select } from "../components/Select";
 import { Checkbox } from "../components/Checkbox";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { useToast } from "../components/Toast";
-import { usePersistedState } from "../lib/persist";
+import { handOff, usePersistedState } from "../lib/persist";
 import { useRefreshOnFocus } from "../lib/focus";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
+import { RefreshButton } from "../components/RefreshButton";
 
 const PAGE_SIZE = 25;
 
@@ -34,7 +34,17 @@ const PAGE_SIZE = 25;
 const listingCache = new Map<string, { listing: api.RepoListing; fetchedAt: number }>();
 // A listing can take a while for big accounts — never ask GitHub twice at once
 // for the same account (double mounts, quick account flips back and forth).
-const inflight = new Map<string, Promise<api.RepoListing>>();
+// A visit that joins a load already running is painted too: it gets what has
+// arrived so far at once, then every page as it lands. Without that, leaving
+// the page and coming back while the rest was still loading showed the
+// spinner until the very last page — the first repositories were in hand
+// all along.
+interface InflightLoad {
+  promise: Promise<api.RepoListing>;
+  partial: { listing: api.RepoListing; more: boolean } | null;
+  listeners: Set<(listing: api.RepoListing, moreComing: boolean) => void>;
+}
+const inflight = new Map<string, InflightLoad>();
 
 // The local scan is cheap but not free (it walks the profile folders), and
 // several things ask for it at once — mount, account change, window focus.
@@ -89,12 +99,20 @@ function fetchListing(
   onPartial: (listing: api.RepoListing, moreComing: boolean) => void
 ): Promise<api.RepoListing> {
   const running = inflight.get(key);
-  if (running && !force) return running;
-  const p = loadProgressively(key, onPartial).finally(() => {
-    if (inflight.get(key) === p) inflight.delete(key);
+  if (running && !force) {
+    running.listeners.add(onPartial);
+    if (running.partial) onPartial(running.partial.listing, running.partial.more);
+    return running.promise;
+  }
+  const entry: InflightLoad = { promise: Promise.resolve() as unknown as Promise<api.RepoListing>, partial: null, listeners: new Set([onPartial]) };
+  entry.promise = loadProgressively(key, (listing, more) => {
+    entry.partial = { listing, more };
+    for (const paint of entry.listeners) paint(listing, more);
+  }).finally(() => {
+    if (inflight.get(key) === entry) inflight.delete(key);
   });
-  inflight.set(key, p);
-  return p;
+  inflight.set(key, entry);
+  return entry.promise;
 }
 
 function timeAgo(iso: string | null): string {
@@ -151,13 +169,23 @@ export function Repositories() {
   /** Fresh local answers win over whatever the listing said when it was fetched. */
   const localPathOf = (r: api.RemoteRepo) =>
     local ? local.clones[r.full_name.toLowerCase()] ?? null : r.local_path;
+  /** The folder a clone of this repository is still being written into. */
+  const cloningPathOf = (r: api.RemoteRepo) => local?.cloning?.[r.full_name.toLowerCase()] ?? null;
+  /** Every local copy of this repository — two or more when it is cloned twice. */
+  const copiesOf = (r: api.RemoteRepo) => local?.copies?.[r.full_name.toLowerCase()] ?? [];
+  // While a clone runs, the list is read again until it is done.
+  const anyCloning = Object.keys(local?.cloning ?? {}).length > 0;
+  useEffect(() => {
+    if (!anyCloning) return;
+    const id = window.setInterval(refreshLocal, 5000);
+    return () => window.clearInterval(id);
+  }, [anyCloning, refreshLocal]);
   const cloneUrlOf = (r: api.RemoteRepo) => {
     const orgUser = local?.org_ssh_users[r.owner.toLowerCase()];
     return orgUser ? `${orgUser}@github.com:${r.owner}/${r.name}.git` : r.clone_url;
   };
 
-  useEffect(() => {
-    api.getProfiles().then(setProfiles).catch(() => setProfiles([]));
+  function reloadAccounts() {
     api.repoAccounts()
       .then((a) => {
         setAccounts(a);
@@ -165,6 +193,10 @@ export function Repositories() {
         setAccount((prev) => (a.some((x) => x.key === prev) ? prev : a[0]?.key ?? ""));
       })
       .catch(() => setAccounts([]));
+  }
+  useEffect(() => {
+    api.getProfiles().then(setProfiles).catch(() => setProfiles([]));
+    reloadAccounts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -172,6 +204,10 @@ export function Repositories() {
     if (!key) return;
     const cached = listingCache.get(key);
     if (cached && !force) {
+      // Taking the cached answer is a load too: a slower fetch for another
+      // account that is still in flight must not paint over it when it lands.
+      ++loadSeq.current;
+      setLoading(false);
       listingKey.current = key;
       setListing(cached.listing);
       setFetchedAt(cached.fetchedAt);
@@ -280,14 +316,8 @@ export function Repositories() {
       refreshLocal();
       return;
     }
-    try {
-      localStorage.setItem("gitswitch:history.repo", JSON.stringify(path));
-      localStorage.setItem("gitswitch:history.account", JSON.stringify(""));
-      localStorage.setItem("gitswitch:history.rev", JSON.stringify("--all"));
-    } catch {
-      /* storage unavailable — History will simply open on its default repo */
-    }
-    navigate("/history");
+    handOff("history", path);
+    navigate("/repo/history");
   }
 
   async function copyLink(url: string) {
@@ -311,8 +341,8 @@ export function Repositories() {
             Everything your GitHub accounts can reach — clone any of them as the right account.
           </p>
         </div>
-        {!noAccounts && (
-          <div className="flex items-center gap-2 flex-wrap min-w-0">
+        <div className="flex items-center gap-2 flex-wrap min-w-0">
+          {!noAccounts && (
             <div className="w-64 max-w-full">
               <Select
                 value={account}
@@ -322,17 +352,19 @@ export function Repositories() {
                 options={(accounts ?? []).map((a) => ({ value: a.key, label: a.label }))}
               />
             </div>
-            <Button
-              variant="secondary"
-              onClick={() => load(account, true)}
-              disabled={!account || loading}
-              className="min-w-[8rem]" // fits "Loading…" (≈120px) so the swap doesn't shift the picker
-            >
-              <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
-              {loading ? "Loading…" : "Refresh"}
-            </Button>
-          </div>
-        )}
+          )}
+          <RefreshButton
+            onClick={() => {
+              // Everything a fresh visit reads, again.
+              api.getProfiles().then(setProfiles).catch(() => setProfiles([]));
+              refreshLocal();
+              reloadAccounts();
+              if (account) load(account, true);
+            }}
+            busy={loading}
+            title="Re-check the signed-in accounts, re-read the local clones, and list the repositories again"
+          />
+        </div>
       </div>
 
       {noAccounts && (
@@ -340,8 +372,9 @@ export function Repositories() {
           <BookMarked size={32} className="mx-auto text-zinc-600 mb-3" />
           <h3 className="text-lg font-medium text-zinc-300">No GitHub accounts signed in</h3>
           <p className="text-sm text-zinc-500 mt-1 max-w-md mx-auto">
-            Sign in with the GitHub CLI (<span className="font-mono">gh auth login</span>) or on the
-            GitHub Auth page, and your repositories will show up here.
+            Sign in on the GitHub page — with GitHub itself, or the GitHub CLI's{" "}
+            <span className="font-mono">gh auth login</span> — then Refresh, and the repositories each account
+            can reach show up here.
           </p>
           <Button className="mt-4" variant="secondary" onClick={() => navigate("/github")}>
             <GitHubIcon size={16} />
@@ -491,6 +524,7 @@ export function Repositories() {
             {visible.map((r) => {
               const suggestion = profileName(suggestionFor(r));
               const localPath = localPathOf(r);
+              const cloningPath = localPath ? null : cloningPathOf(r);
               return (
                 <div key={r.full_name} className="flex items-start gap-3 py-3 min-w-0">
                   <span className="mt-0.5 shrink-0 text-zinc-500" title={r.private ? "Private" : "Public"}>
@@ -515,8 +549,13 @@ export function Repositories() {
                       {timeAgo(r.pushed_at)}
                       {r.default_branch && <> · {r.default_branch}</>}
                       {localPath ? (
-                        <span className="text-emerald-400/80" title={localPath}>
-                          {" "}· cloned at {shortPath(localPath)}
+                        <span className="text-emerald-400/80" title={copiesOf(r).length > 1 ? copiesOf(r).join("\n") : localPath}>
+                          {" "}· cloned {copiesOf(r).length > 1 ? `×${copiesOf(r).length} · ` : "at "}
+                          {shortPath(localPath)}
+                        </span>
+                      ) : cloningPath ? (
+                        <span className="text-sky-300/80" title={cloningPath}>
+                          {" "}· cloning into {shortPath(cloningPath)}…
                         </span>
                       ) : (
                         suggestion && <> · clones as {suggestion}</>
@@ -536,6 +575,11 @@ export function Repositories() {
                       <Button size="sm" variant="secondary" onClick={() => openInHistory(localPath)}>
                         <FolderOpen size={14} />
                         Open
+                      </Button>
+                    ) : cloningPath ? (
+                      <Button size="sm" variant="secondary" onClick={() => navigate("/sparse")} title="The Clone page shows its progress">
+                        <Loader2 size={14} className="animate-spin" />
+                        Cloning…
                       </Button>
                     ) : (
                       <Button size="sm" onClick={() => cloneRepo(r)}>

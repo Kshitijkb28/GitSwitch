@@ -37,11 +37,31 @@ fn short(oid: &str) -> String {
 /// `owner/repo` from a GitHub remote URL (ssh or https), else None.
 pub fn github_slug(url: &str) -> Option<(String, String)> {
     let u = url.trim().trim_end_matches('/');
-    let rest = u
-        .strip_prefix("git@github.com:")
-        .or_else(|| u.strip_prefix("ssh://git@github.com/"))
-        .or_else(|| u.strip_prefix("https://github.com/"))
-        .or_else(|| u.strip_prefix("http://github.com/"))?;
+    let rest = if let Some(web) = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")) {
+        // `https://github.com/o/r`, also with a user or token before the host.
+        let web = web.rsplit_once('@').map(|(_, host)| host).unwrap_or(web);
+        web.strip_prefix("github.com/")?
+    } else if let Some(ssh) = u.strip_prefix("ssh://") {
+        // `ssh://<user>@github.com[:port]/o/r`
+        let (user, at_host) = ssh.split_once('@')?;
+        if user.is_empty() || user.contains('/') {
+            return None;
+        }
+        let path = at_host.strip_prefix("github.com")?;
+        match path.split_once('/') {
+            Some(("", p)) => p,
+            Some((port, p)) if port.strip_prefix(':').is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) => p,
+            _ => return None,
+        }
+    } else {
+        // `<user>@github.com:o/r` — the user is `git`, or `org-<id>` where an
+        // organisation issues its own SSH certificates.
+        let (user, at_host) = u.split_once('@')?;
+        if user.is_empty() || user.contains('/') || user.contains(':') {
+            return None;
+        }
+        at_host.strip_prefix("github.com:")?
+    };
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
     let mut it = rest.splitn(2, '/');
     let owner = it.next()?.to_string();
@@ -52,9 +72,39 @@ pub fn github_slug(url: &str) -> Option<(String, String)> {
     Some((owner, repo))
 }
 
+/// `owner/repo` from the path of an SSH remote whose host stands for GitHub:
+/// after `ssh://<authority>/`, or after the colon of `[user@]host:path`, read
+/// by GitHub's own rules.
+fn slug_behind_alias(url: &str) -> Option<(String, String)> {
+    let u = url.trim();
+    let path = match u.strip_prefix("ssh://") {
+        Some(rest) => rest.split_once('/')?.1,
+        None => u.split_once(':')?.1,
+    };
+    github_slug(&format!("git@github.com:{}", path))
+}
+
+/// `owner/repo` like [`github_slug`], also through an SSH host alias for
+/// GitHub — `git@gh-work:o/r.git`, `git@github.com-work:o/r.git`,
+/// `ssh://git@ssh.github.com:443/o/r` — the usual way to keep two accounts'
+/// keys apart. ssh says what the alias stands for (`ssh -G`, on this
+/// computer); an alias for any other host gives None.
+pub async fn github_slug_resolved(url: &str) -> Option<(String, String)> {
+    if let Some(slug) = github_slug(url) {
+        return Some(slug);
+    }
+    let remote = crate::ssh_config::ssh_host_of_url(url)?;
+    let host = crate::ssh_config::resolve(&remote.host).await?;
+    let real = host.hostname.to_ascii_lowercase();
+    if real != "github.com" && real != "ssh.github.com" {
+        return None;
+    }
+    slug_behind_alias(url)
+}
+
 async fn github_compare(owner: &str, repo: &str, base: &str, head: &str) -> Option<usize> {
     let client = crate::github::http_client().ok()?;
-    let api = std::env::var("GITSWITCH_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into());
+    let api = crate::remote_repos::api_base();
     for account in crate::remote_repos::accounts().await {
         let Ok(token) = crate::remote_repos::token_for(&account.key).await else { continue };
         let resp = client
@@ -176,5 +226,27 @@ mod tests {
         assert_eq!(github_slug("ssh://git@github.com/o/r.git"), Some(("o".into(), "r".into())));
         assert_eq!(github_slug("/tmp/remote.git"), None);
         assert_eq!(github_slug("git@gitlab.com:o/r.git"), None);
+        // The user before the host is whatever the organisation hands out.
+        assert_eq!(github_slug("org-12345@github.com:acme/widgets.git"), Some(("acme".into(), "widgets".into())));
+        assert_eq!(github_slug("ssh://org-12345@github.com/acme/widgets"), Some(("acme".into(), "widgets".into())));
+        assert_eq!(github_slug("ssh://git@github.com:22/o/r.git"), Some(("o".into(), "r".into())));
+        assert_eq!(github_slug("https://x-access-token@github.com/o/r.git"), Some(("o".into(), "r".into())));
+        // A host that only starts like GitHub's is not GitHub.
+        assert_eq!(github_slug("git@github.com.example.test:o/r.git"), None);
+        assert_eq!(github_slug("https://github.com.example.test/o/r"), None);
+        assert_eq!(github_slug("ssh://git@github.community/o/r"), None);
+        assert_eq!(github_slug("org-1@gitlab.com:o/r.git"), None);
+        assert_eq!(github_slug("github.com:o/r"), None);
+        assert_eq!(github_slug("git@github.com:o/r/extra"), None);
+    }
+
+    #[test]
+    fn a_github_alias_path_is_read_like_githubs_own() {
+        assert_eq!(slug_behind_alias("git@gh-work:o/r.git"), Some(("o".into(), "r".into())));
+        assert_eq!(slug_behind_alias("gh-work:o/r"), Some(("o".into(), "r".into())));
+        assert_eq!(slug_behind_alias("ssh://git@gh-work:2222/o/r.git"), Some(("o".into(), "r".into())));
+        assert_eq!(slug_behind_alias("ssh://git@ssh.github.com:443/o/r"), Some(("o".into(), "r".into())));
+        assert_eq!(slug_behind_alias("git@gh-work:o/r/x"), None);
+        assert_eq!(slug_behind_alias("git@gh-work:"), None);
     }
 }

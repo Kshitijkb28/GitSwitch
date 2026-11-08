@@ -26,17 +26,21 @@ use crate::profiles;
 use crate::push_lock::{self, LockState, MirrorFacts};
 use gitswitch_lock_core as lc;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 /// The URL scheme pushes get rewritten to. git has no such remote helper, so
 /// the push fails before anything leaves the machine — unless GitSwitch's own
 /// helper of that name is installed, whose only job is to explain why.
 pub const BLOCK_SCHEME: &str = lc::BLOCK_SCHEME;
 const FLAG: &str = "gitswitch.pushBlocked";
-const HOOK_MARKER: &str = ">>> GitSwitch push guard >>>";
+pub(crate) const HOOK_MARKER: &str = ">>> GitSwitch push guard >>>";
 
 /// GitHub in every form git accepts, so a rewrite covers the common cases even
-/// before per-remote prefixes are added. Mirrors `git_config::push_block_section`.
+/// before per-remote prefixes are added. Mirrors `git_config::push_block_section`
+/// except for its empty catch-all prefix, which only a profile's block uses:
+/// these also go into lock jobs, whose validator refuses an empty prefix.
 const BASE_PREFIXES: &[&str] = &[
     "git@github.com:",
     "git@github.com/",
@@ -335,7 +339,7 @@ pub fn block_reason(
     }
 }
 
-async fn read_flag(repo: &Path) -> bool {
+pub(crate) async fn read_flag(repo: &Path) -> bool {
     GitCmd::at(repo)
         .args(["config", "--local", "--bool", "--get", FLAG])
         .ok_text()
@@ -366,10 +370,24 @@ async fn read_hooks_path(repo: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// One measurement or change of a repository's user-level pieces at a time.
+/// A measurement taken while another task rewrites the same config (a lock
+/// job's last step, the page's next reading healing it) saw half a block and
+/// called a sound lock broken; two writers tripped over git's config lock.
+async fn repo_turn(repo: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    static TURNS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let turn = {
+        let mut all = TURNS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+        all.entry(push_lock::canonical(repo)).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    };
+    turn.lock_owned().await
+}
+
 /// Measure, never assume: reads the flag, the rewrite, the hook, every
 /// remote's effective push URL, and the lock's admin-owned layers. Under a
 /// lock, user-level mirrors that drifted are put back and the state says so.
 pub async fn push_state(repo: &Path, hooks: &Path, profile_id: Option<&str>) -> PushState {
+    let _turn = repo_turn(repo).await;
     let store = profiles::load_profiles().unwrap_or_else(|_| profiles::ProfileStore::new());
     let profile = profile_id.and_then(|id| store.profiles.iter().find(|p| p.id == id));
     let profile_blocked = profile.map(|p| !p.allow_push).unwrap_or(false);
@@ -390,16 +408,19 @@ pub async fn push_state(repo: &Path, hooks: &Path, profile_id: Option<&str>) -> 
         uncovered_remotes: remotes.iter().filter(|r| !r.rewritten && !r.has_explicit_pushurl).map(|r| r.name.clone()).collect(),
         remote_urls: raw_urls.clone(),
     };
-    let mut lock = push_lock::measure(repo, &facts(repo_blocked, config_block_present, &hook, &remotes)).await;
+    // Boxed, here and below: this measurement sits deep inside an Update's
+    // Continue (status reads, submodules downloaded under a block), where a
+    // debug build's nested poll frames outgrew a 2 MiB thread stack.
+    let mut lock = Box::pin(push_lock::measure(repo, &facts(repo_blocked, config_block_present, &hook, &remotes))).await;
 
     if lock.locked && lock.mirrors == "drifted" && push_lock::heal_allowed(repo) {
         let before = lock.drift.iter().filter(|d| d.starts_with("mirror-")).cloned().collect::<Vec<_>>().join(", ");
-        let healed = apply_mirrors(repo, hooks).await.is_ok();
+        let healed = Box::pin(apply_mirrors_held(repo, hooks)).await.is_ok();
         repo_blocked = read_flag(repo).await;
         config_block_present = read_rewrite_present(repo).await;
         hook = hook_kind(hooks);
         remotes = read_remotes(repo).await;
-        let again = push_lock::measure(repo, &facts(repo_blocked, config_block_present, &hook, &remotes)).await;
+        let again = Box::pin(push_lock::measure(repo, &facts(repo_blocked, config_block_present, &hook, &remotes))).await;
         let ok = healed && again.mirrors != "drifted";
         lock = again;
         if ok {
@@ -445,18 +466,48 @@ pub async fn push_state(repo: &Path, hooks: &Path, profile_id: Option<&str>) -> 
 async fn write_config_block(repo: &Path) -> Result<(), AppError> {
     let urls = remote_urls(repo).await;
     let key = format!("url.{}.pushInsteadOf", BLOCK_SCHEME);
-    // Start clean so repeated applies can't pile up duplicates.
-    let _ = GitCmd::at(repo)
-        .args(["config", "--local", "--unset-all", &key])
-        .run()
-        .await;
-    for prefix in block_prefixes(&urls) {
+    let want = block_prefixes(&urls);
+    let have: Vec<String> = GitCmd::at(repo)
+        .args(["config", "--local", "--get-all", &key])
+        .ok_text()
+        .await
+        .map(|t| t.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    // What is missing goes in first, and nothing that stays is ever taken
+    // out: the block is never half gone — for a push from a terminal, or for
+    // this app's next measurement — and applying it again writes nothing.
+    for prefix in want.iter().filter(|p| !have.contains(p)) {
         GitCmd::at(repo)
-            .args(["config", "--local", "--add", &key, &prefix])
+            .args(["config", "--local", "--add", &key, prefix])
             .text()
             .await?;
     }
+    // Then what no remote needs any more, and copies an earlier apply left.
+    // Both only ever block more, so a failure here is not the block's.
+    let mut seen = std::collections::HashSet::new();
+    for h in &have {
+        if !want.contains(h) {
+            let _ = GitCmd::at(repo).args(["config", "--local", "--unset-all", &key, &value_pattern(h)]).run().await;
+        } else if !seen.insert(h.as_str()) {
+            // One write that leaves exactly one copy.
+            let _ = GitCmd::at(repo).args(["config", "--local", "--replace-all", &key, h, &value_pattern(h)]).run().await;
+        }
+    }
     Ok(())
+}
+
+/// A git config value pattern matching `value` exactly: git reads it as an
+/// extended regular expression, and these prefixes are full of dots.
+fn value_pattern(value: &str) -> String {
+    let mut s = String::from("^");
+    for c in value.chars() {
+        if "\\.[]()*+?{}|^$".contains(c) {
+            s.push('\\');
+        }
+        s.push(c);
+    }
+    s.push('$');
+    s
 }
 
 async fn remove_config_block(repo: &Path) -> Result<(), AppError> {
@@ -494,11 +545,25 @@ fn install_hook(hooks: &Path) -> Result<bool, AppError> {
             chained = hooks.join("pre-push.gitswitch-saved").exists();
         }
     }
-    std::fs::write(&hook, hook_body(chained))?;
+    // Written only when it differs, and whole: a push that runs the hook while
+    // it is being written must not find it empty.
+    let body = hook_body(chained);
+    if std::fs::read_to_string(&hook).ok().as_deref() != Some(body.as_str()) {
+        let tmp = hooks.join("pre-push.gitswitch-new");
+        std::fs::write(&tmp, &body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::fs::rename(&tmp, &hook)?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+        if std::fs::metadata(&hook).map(|m| m.permissions().mode() & 0o111 == 0).unwrap_or(false) {
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+        }
     }
     Ok(chained)
 }
@@ -525,11 +590,21 @@ fn remove_hook(hooks: &Path) -> Result<(), AppError> {
 /// `core.hooksPath` sends hooks elsewhere (writing there could drop a
 /// GitSwitch file into a tracked folder — husky — or a shared hooks dir).
 pub async fn apply_mirrors(repo: &Path, hooks: &Path) -> Result<(), AppError> {
-    GitCmd::at(repo)
-        .args(["config", "--local", "--bool", FLAG, "true"])
-        .text()
-        .await?;
-    write_config_block(repo).await?;
+    let _turn = repo_turn(repo).await;
+    Box::pin(apply_mirrors_held(repo, hooks)).await
+}
+
+/// `apply_mirrors` for a caller that already has the repository's turn.
+async fn apply_mirrors_held(repo: &Path, hooks: &Path) -> Result<(), AppError> {
+    // Each piece is written only when it is missing: re-applying a complete
+    // block leaves the config file alone.
+    if !read_flag(repo).await {
+        GitCmd::at(repo)
+            .args(["config", "--local", "--bool", FLAG, "true"])
+            .text()
+            .await?;
+    }
+    Box::pin(write_config_block(repo)).await?;
     if read_hooks_path(repo).await.is_none() {
         install_hook(hooks)?;
     }
@@ -538,6 +613,7 @@ pub async fn apply_mirrors(repo: &Path, hooks: &Path) -> Result<(), AppError> {
 
 /// Undo `apply_mirrors`, and put back any pushurl the lock stored.
 pub async fn remove_mirrors(repo: &Path, hooks: &Path) -> Result<(), AppError> {
+    let _turn = repo_turn(repo).await;
     let _ = GitCmd::at(repo)
         .args(["config", "--local", "--unset", FLAG])
         .run()
@@ -560,6 +636,8 @@ pub async fn set_repo_blocked(
     let repo = PathBuf::from(repo_path);
     if blocked {
         apply_mirrors(&repo, hooks).await?;
+        // The submodules too: the code lives there, and a push can start there.
+        cover_submodules(repo_path, None).await;
     } else {
         let current = push_state(&repo, hooks, profile_id).await;
         if current.lock.locked {
@@ -568,29 +646,323 @@ pub async fn set_repo_blocked(
             ));
         }
         remove_mirrors(&repo, hooks).await?;
+        uncover_submodules(repo_path).await;
     }
     Ok(push_state(&repo, hooks, profile_id).await)
 }
 
 /// Re-apply whatever is missing — the fix for `needs_repair`, and for a
-/// locked repository the mirrors.
+/// locked repository the mirrors — in the repository and its submodules.
 pub async fn repair(
     repo_path: &str,
     hooks: &Path,
     profile_id: Option<&str>,
 ) -> Result<PushState, AppError> {
+    Ok(repair_noting(repo_path, hooks, profile_id).await?.0)
+}
+
+/// `repair`, and what could not be written in the submodules, one line each.
+pub async fn repair_noting(
+    repo_path: &str,
+    hooks: &Path,
+    profile_id: Option<&str>,
+) -> Result<(PushState, Vec<String>), AppError> {
     let repo = PathBuf::from(repo_path);
-    let state = push_state(&repo, hooks, profile_id).await;
+    let state = Box::pin(push_state(&repo, hooks, profile_id)).await;
     if !state.repo_blocked && !state.lock.locked {
-        return Ok(state);
+        return Ok((state, Vec::new()));
     }
-    apply_mirrors(&repo, hooks).await?;
-    Ok(push_state(&repo, hooks, profile_id).await)
+    Box::pin(apply_mirrors(&repo, hooks)).await?;
+    let notes = Box::pin(cover_submodules(repo_path, None)).await;
+    Ok((Box::pin(push_state(&repo, hooks, profile_id)).await, notes))
+}
+
+/// Written into a submodule the repository's block or lock was extended to,
+/// so that only the repository's "allowed" takes it away again — a block the
+/// person put on the submodule itself stays. The value names no path: a
+/// submodule has exactly one superproject, and that may be moved.
+const BY: &str = "gitswitch.pushBlockedBy";
+const BY_VALUE: &str = "superproject";
+
+pub(crate) async fn marked(dir: &Path) -> bool {
+    GitCmd::at(dir).args(["config", "--local", "--get", BY]).ok_text().await.map(|v| !v.trim().is_empty()).unwrap_or(false)
+}
+
+/// Every populated submodule of the repository, nested ones included, as
+/// paths relative to it ("a/b" for one inside another).
+pub async fn populated_submodules(repo: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut queue: Vec<(PathBuf, String)> = vec![(repo.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = queue.pop() {
+        let Ok(list) = crate::submodules::list_submodules(&dir.to_string_lossy()).await else { continue };
+        for s in list.into_iter().filter(|s| s.initialised && s.gitdir_valid) {
+            let rel = if prefix.is_empty() { s.path.clone() } else { format!("{}/{}", prefix, s.path) };
+            queue.push((dir.join(&s.path), rel.clone()));
+            out.push(rel);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// One submodule's share of the repository's push block or lock.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct SubCoverage {
+    pub path: String,
+    pub blocked: bool,
+    pub locked: bool,
+    pub needs_repair: bool,
+    /// It has what the repository has: a lock under a locked repository, at
+    /// least the guard-rail under a blocked one, with nothing drifted.
+    pub covered: bool,
+    /// When not covered: what it has instead, in the person's words.
+    pub why: String,
+    /// Its block is the repository's doing (marked), not the person's own:
+    /// the repository's "Allowed" takes it away — with the administrator
+    /// prompt when it is a lock.
+    #[serde(default)]
+    pub by_superproject: bool,
+    /// When its lock is not whole: what was measured, in the lock's own
+    /// terms (`stanza-stale`, `mirror-rewrite`…), for whoever has to look.
+    #[serde(default)]
+    pub drift: Vec<String>,
+}
+
+/// How far the repository's push block or lock reaches into its submodules —
+/// the repositories the code actually lives in.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct PushCoverage {
+    /// allowed | guardrail | locked — the repository's own mode.
+    pub mode: String,
+    pub submodules: Vec<SubCoverage>,
+    /// Submodules with less than the repository has, or drifted: a push from
+    /// inside them is not stopped.
+    pub uncovered: Vec<String>,
+    /// Repair can do something about what is uncovered.
+    pub needs_repair: bool,
+    /// ...and part of that is the administrator's: Repair will show the prompt.
+    pub needs_elevation: bool,
+    /// One sentence for the card; empty when there is nothing to say.
+    pub summary: String,
+}
+
+/// What Repair can do for one uncovered submodule.
+#[derive(PartialEq)]
+enum Fix {
+    /// Nothing: a remote with its own push address, hooks sent elsewhere, a
+    /// path the lock cannot carry — said, not offered.
+    Nothing,
+    /// Its own settings, no password.
+    Plain,
+    /// The lock's administrator-owned part: the prompt.
+    Admin,
+}
+
+pub fn mode_of(state: &PushState) -> &'static str {
+    if state.lock.locked {
+        "locked"
+    } else if state.repo_blocked {
+        "guardrail"
+    } else {
+        "allowed"
+    }
+}
+
+fn some_submodules(n: usize) -> String {
+    format!("{} submodule{}", n, if n == 1 { "" } else { "s" })
+}
+
+/// Measure every populated submodule against the repository's own mode —
+/// four at a time, since each is several git calls.
+pub async fn coverage(repo_path: &str, state: &PushState) -> PushCoverage {
+    let repo = PathBuf::from(repo_path);
+    let mode = mode_of(state);
+    let rels = populated_submodules(&repo).await;
+    let mut measured: Vec<(String, PushState, bool)> = Vec::new();
+    for chunk in rels.chunks(4) {
+        let handles: Vec<_> = chunk
+            .iter()
+            .map(|rel| {
+                let dir = repo.join(rel);
+                let rel = rel.clone();
+                tokio::spawn(async move {
+                    let paths = crate::git_status::git_paths(&dir).await.ok()?;
+                    let profile = crate::git_status::owning_profile_id(&dir.to_string_lossy());
+                    let by = marked(&dir).await;
+                    Some((rel, push_state(&dir, &paths.hooks, profile.as_deref()).await, by))
+                })
+            })
+            .collect();
+        for h in handles {
+            if let Ok(Some(m)) = h.await {
+                measured.push(m);
+            }
+        }
+    }
+    // A submodule measured while something else was still writing its pieces
+    // could read as broken for that moment: one that measures as needing
+    // repair is measured once more, on its own, before the card says so.
+    let shaky = |s: &PushState| s.lock.locked && (s.lock.needs_elevation || s.lock.mirrors == "drifted");
+    for (rel, s, _) in measured.iter_mut() {
+        if !shaky(s) {
+            continue;
+        }
+        let dir = repo.join(&*rel);
+        if let Ok(paths) = crate::git_status::git_paths(&dir).await {
+            let profile = crate::git_status::owning_profile_id(&dir.to_string_lossy());
+            *s = Box::pin(push_state(&dir, &paths.hooks, profile.as_deref())).await;
+        }
+    }
+    let mut subs = Vec::new();
+    let mut uncovered: Vec<(String, String)> = Vec::new();
+    let mut fixes: Vec<Fix> = Vec::new();
+    for (rel, s, by_superproject) in measured {
+        // What the person wants to hear: whether a push from inside is really
+        // stopped, and by what — and whether Repair needs the password for it.
+        let nothing_stops = s.gaps.iter().any(|g| g.contains("Nothing local stops a push"));
+        let (why, fix) = match mode {
+            "locked" => {
+                if s.lock.locked && s.lock.needs_elevation {
+                    ("its lock needs repair".to_string(), Fix::Admin)
+                } else if s.lock.locked && s.lock.mirrors == "drifted" {
+                    ("it is locked, but its own settings lost part of the block; Repair puts it back without a password".to_string(), Fix::Plain)
+                } else if s.lock.locked {
+                    (String::new(), Fix::Nothing)
+                } else if lc::validate_path(&push_lock::canonical(&repo.join(&rel))).is_err() {
+                    // Said by what was measured: the guard-rail only when it is there.
+                    if s.repo_blocked && !nothing_stops {
+                        ("its path holds a character the lock cannot carry; the guard-rail stops a push there, anyone with a terminal can turn that off".to_string(), Fix::Nothing)
+                    } else {
+                        ("its path holds a character the lock cannot carry, and nothing stops a push from inside it".to_string(), Fix::Plain)
+                    }
+                } else if s.repo_blocked && !nothing_stops {
+                    ("has the guard-rail, not the lock — anyone with a terminal can turn it off; Repair adds the lock".to_string(), Fix::Admin)
+                } else {
+                    ("nothing stops a push from inside it".to_string(), Fix::Admin)
+                }
+            }
+            "guardrail" => {
+                if (s.repo_blocked || s.lock.locked) && !s.needs_repair && !nothing_stops {
+                    (String::new(), Fix::Nothing)
+                } else if s.repo_blocked && nothing_stops {
+                    ("its guard-rail is turned aside there (a remote with its own push address, hooks sent elsewhere): nothing stops a push from inside it".to_string(), Fix::Nothing)
+                } else if s.repo_blocked {
+                    ("its guard-rail has drifted; Repair re-applies it".to_string(), Fix::Plain)
+                } else if s.config_block_present && !s.remotes.iter().any(|r| !r.rewritten) {
+                    ("only its address rewrite still stops a push; Repair re-applies the rest".to_string(), Fix::Plain)
+                } else {
+                    ("nothing stops a push from inside it".to_string(), Fix::Plain)
+                }
+            }
+            _ => (String::new(), Fix::Nothing),
+        };
+        let covered = why.is_empty();
+        let drift = if covered { Vec::new() } else { s.lock.drift.clone() };
+        if !covered {
+            uncovered.push((rel.clone(), why.clone()));
+            fixes.push(fix);
+        }
+        subs.push(SubCoverage { path: rel, blocked: s.blocked, locked: s.lock.locked, needs_repair: s.needs_repair, covered, why, by_superproject, drift });
+    }
+    let summary = if subs.is_empty() {
+        String::new()
+    } else if mode == "allowed" {
+        let own: Vec<&str> = subs.iter().filter(|s| s.blocked).map(|s| s.path.as_str()).collect();
+        if own.is_empty() { String::new() } else { format!("Blocked on their own: {}.", own.join(", ")) }
+    } else if uncovered.is_empty() {
+        format!("Covers this repository and {}.", some_submodules(subs.len()))
+    } else {
+        format!(
+            "Not covering {} of {}: {}.",
+            uncovered.len(),
+            some_submodules(subs.len()),
+            uncovered.iter().map(|(p, w)| format!("{} ({})", p, w)).collect::<Vec<_>>().join("; ")
+        )
+    };
+    PushCoverage {
+        mode: mode.into(),
+        needs_repair: fixes.iter().any(|f| *f != Fix::Nothing),
+        needs_elevation: fixes.contains(&Fix::Admin),
+        submodules: subs,
+        uncovered: uncovered.into_iter().map(|(p, _)| p).collect(),
+        summary,
+    }
+}
+
+/// Give the populated submodules (or the named ones) the user-level pieces the
+/// repository has — the guard-rail everywhere a push could start. The lock's
+/// administrator-owned layer for a submodule is a job of its own (`push_lock`);
+/// until it runs, the guard-rail holds in the terminal too. Failures are
+/// returned, one line each; `coverage` reports what is still missing.
+pub async fn cover_submodules(repo_path: &str, only: Option<&[String]>) -> Vec<String> {
+    let mut notes = Vec::new();
+    let repo = PathBuf::from(repo_path);
+    for rel in populated_submodules(&repo).await {
+        // The named ones and the submodules inside them (a download is recursive).
+        if let Some(o) = only {
+            if !o.iter().any(|p| p == &rel || rel.starts_with(&format!("{}/", p))) {
+                continue;
+            }
+        }
+        let dir = repo.join(&rel);
+        let paths = match crate::git_status::git_paths(&dir).await {
+            Ok(p) => p,
+            Err(e) => {
+                notes.push(format!("{}: {}", rel, e));
+                continue;
+            }
+        };
+        // Blocked on its own already, by the person: the block stays theirs,
+        // so "allowed" on the repository will not take it away.
+        let own = read_flag(&dir).await && !marked(&dir).await;
+        if let Err(e) = Box::pin(apply_mirrors(&dir, &paths.hooks)).await {
+            notes.push(format!("{}: {}", rel, e));
+            continue;
+        }
+        // Marked once: writing the same mark again would rewrite its config
+        // for nothing, under whatever else is reading it.
+        if !own && !marked(&dir).await {
+            let _ = GitCmd::at(&dir).args(["config", "--local", BY, BY_VALUE]).run().await;
+        }
+    }
+    notes
+}
+
+/// Take the user-level pieces away from every populated submodule the
+/// repository's block was extended to. One blocked on its own, or locked, keeps them.
+pub async fn uncover_submodules(repo_path: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    let repo = PathBuf::from(repo_path);
+    for rel in populated_submodules(&repo).await {
+        let dir = repo.join(&rel);
+        let Ok(paths) = crate::git_status::git_paths(&dir).await else { continue };
+        if !marked(&dir).await {
+            continue;
+        }
+        let profile = crate::git_status::owning_profile_id(&dir.to_string_lossy());
+        if Box::pin(push_state(&dir, &paths.hooks, profile.as_deref())).await.lock.locked {
+            notes.push(format!("{} stays locked on its own", rel));
+            continue;
+        }
+        if let Err(e) = Box::pin(remove_mirrors(&dir, &paths.hooks)).await {
+            notes.push(format!("{}: {}", rel, e));
+            continue;
+        }
+        let _ = GitCmd::at(&dir).args(["config", "--local", "--unset", BY]).run().await;
+    }
+    notes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_value_pattern_matches_exactly_that_prefix() {
+        assert_eq!(value_pattern("org-1@github.com:Org/x.git"), "^org-1@github\\.com:Org/x\\.git$");
+        assert_eq!(value_pattern("a+b(c)[d]{e}|f^$\\"), "^a\\+b\\(c\\)\\[d\\]\\{e\\}\\|f\\^\\$\\\\$");
+        assert_eq!(value_pattern("ssh://git@github.com:22/"), "^ssh://git@github\\.com:22/$");
+    }
 
     #[test]
     fn prefixes_are_derived_from_every_url_shape() {
@@ -599,8 +971,8 @@ mod tests {
             Some("git@github.com:")
         );
         assert_eq!(
-            derive_push_prefix("org-302118749@github.com:EtharaOrion/argos.git").as_deref(),
-            Some("org-302118749@github.com:")
+            derive_push_prefix("org-1234567@github.com:AcmeOrg/widgets.git").as_deref(),
+            Some("org-1234567@github.com:")
         );
         assert_eq!(
             derive_push_prefix("ssh://git@github.com/o/r.git").as_deref(),

@@ -90,7 +90,7 @@ pub enum TreeIntent {
     Detach { target_valid: bool, detached_unique: usize },
     Revert { target_valid: bool, is_merge: bool, mainline_given: bool },
     CherryPick { target_valid: bool, is_merge: bool, already_contained: bool },
-    ResolveSide { has_paths: bool, submodule_selected: bool, not_conflicted_selected: bool },
+    ResolveSide { has_paths: bool, not_conflicted_selected: bool },
     DiscardAll { include_untracked: bool, stash_first: bool },
 }
 
@@ -188,15 +188,9 @@ pub fn check_tree(intent: &TreeIntent, f: &StatusFacts) -> Option<Refusal> {
     use TreeIntent::*;
 
     // Conflict resolution is exactly the work an operation in progress needs.
-    if let ResolveSide { has_paths, submodule_selected, not_conflicted_selected } = intent {
+    if let ResolveSide { has_paths, not_conflicted_selected } = intent {
         if !*has_paths {
             return Some(refuse("no-paths", "Nothing selected. Pick the conflicted files to resolve."));
-        }
-        if *submodule_selected {
-            return Some(refuse(
-                "submodule-conflict",
-                "Submodule pointer conflicts are resolved by bringing the submodule to the right commit — Sync does that, or do it inside the submodule.",
-            ));
         }
         if *not_conflicted_selected {
             return Some(refuse("not-conflicted", "That file isn't in conflict — the list may be out of date."));
@@ -714,16 +708,32 @@ fn submodule_note(paths: &[String]) -> String {
         String::new()
     } else {
         format!(
-            " {} submodule(s) are checked out at a different commit than this one records: {}. Update submodules to align them; their own changes are untouched.",
+            " {} submodule(s) are checked out at a different commit than this one records: {}. Align submodules checks out the commits it records; their own branches and changes are untouched.",
             paths.len(),
             paths.join(", ")
         )
     }
 }
 
+/// Gitlinks whose pointer change a soft or mixed reset kept: staged (soft) or
+/// checked out past the record (mixed).
+fn moved_pointers(s: &RepoStatus) -> Vec<String> {
+    s.entries.iter().filter(|e| e.is_submodule && (e.sub_commit_changed || e.is_staged())).map(|e| e.path.clone()).collect()
+}
+
+/// After a soft or mixed reset a moved pointer is one of the changes the
+/// reset keeps on purpose — not something to align away.
+fn kept_pointer_note(paths: &[String]) -> String {
+    if paths.is_empty() {
+        String::new()
+    } else {
+        format!(" The submodule pointer change for {} is kept with the other changes.", paths.join(", "))
+    }
+}
+
 /// A branch name nothing else uses yet: two resets within the same second
 /// must not fail the second one.
-async fn free_backup_name(repo: &str, prefix: &str) -> String {
+pub(crate) async fn free_backup_name(repo: &str, prefix: &str) -> String {
     let base = format!("{}{}", prefix, sync::stamp());
     let mut name = base.clone();
     let mut n = 1;
@@ -774,7 +784,9 @@ pub async fn switch_branch(repo_path: &str, name: &str) -> Result<OpResult, AppE
         return Ok(OpResult::refused(invalid_name(name), before));
     }
 
-    let out = g(repo_path)
+    let lfs = crate::git_ops::lfs_before(repo_path, &before).await;
+    let out = lfs
+        .apply(g(repo_path))
         .args(["switch", "--no-guess", "--", name])
         .timeout(NET_TIMEOUT)
         .run()
@@ -795,11 +807,12 @@ pub async fn switch_branch(repo_path: &str, name: &str) -> Result<OpResult, AppE
     }
     tree.submodule_mismatch = submodule_mismatch(&after);
     tree.recovery = switch_back(&before);
-    let detail = format!(
+    let mut detail = format!(
         "Was {}.{}",
         before.branch.as_ref().map(|b| format!("on {}", b)).unwrap_or_else(|| format!("detached at {}", sync::short(before.head_oid.as_deref().unwrap_or("")))),
         submodule_note(&tree.submodule_mismatch)
     );
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     Ok(OpResult { tree: Some(tree), ..OpResult::done(format!("Switched to {}.", name), detail, after) })
 }
 
@@ -839,7 +852,8 @@ pub async fn create_branch(repo_path: &str, name: &str, from: Option<&str>, swit
         None => None,
     };
     let start = tracking.clone().unwrap_or_else(|| from_oid.clone());
-    let cmd = g(repo_path).cfg("branch.autoSetupMerge", "true");
+    let lfs = if switch_to { crate::git_ops::lfs_before(repo_path, &before).await } else { crate::git_ops::LfsAround::none() };
+    let cmd = lfs.apply(g(repo_path)).cfg("branch.autoSetupMerge", "true");
     let out = if switch_to {
         cmd.args(["switch", "--no-guess", "-c", name, &start]).timeout(NET_TIMEOUT).run().await?
     } else {
@@ -868,12 +882,13 @@ pub async fn create_branch(repo_path: &str, name: &str, from: Option<&str>, swit
         _ => format!("git branch -D {}", name),
     });
     let headline = if switch_to { format!("Created and switched to {}.", name) } else { format!("Created {}.", name) };
-    let detail = format!(
+    let mut detail = format!(
         "Starts at {}{}.{}",
         tree.commit.as_ref().map(|c| c.label()).unwrap_or_default(),
         tracking.as_ref().map(|t| format!(", tracking {}", t.trim_start_matches("refs/remotes/"))).unwrap_or_default(),
         submodule_note(&tree.submodule_mismatch)
     );
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     Ok(OpResult { tree: Some(tree), ..OpResult::done(headline, detail, after) })
 }
 
@@ -888,7 +903,8 @@ pub async fn delete_branch(repo_path: &str, name: &str, force: bool) -> Result<O
     let valid = validate_branch_name(name).is_ok();
     let full = format!("refs/heads/{}", name);
     let tip = if valid { sync::oid(Path::new(repo_path), &full).await } else { None };
-    let unique = if tip.is_some() { count(repo_path, &[&full, "--not", &format!("--exclude={}", full), "--all"]).await } else { 0 };
+    // Saved states are no home for a branch's commits: they don't count.
+    let unique = if tip.is_some() { count(repo_path, &[&full, "--not", &format!("--exclude={}", full), "--exclude=refs/gitswitch/*", "--all"]).await } else { 0 };
     let intent = TreeIntent::DeleteBranch {
         is_current: before.branch.as_deref() == Some(name),
         exists: tip.is_some(),
@@ -1003,10 +1019,53 @@ pub async fn undo_commit(repo_path: &str) -> Result<OpResult, AppError> {
     })
 }
 
+/// Files `target` adds relative to HEAD that already exist on disk without
+/// being in the index — untracked or ignored. `git switch` refuses to clobber
+/// those itself; `git reset --hard` does not, so this is the check it lacks.
+/// A STAGED new file is in the index and is left out: the caller's dialog has
+/// already said staged changes are thrown away (or stashed first).
+async fn untracked_in_the_way(repo: &str, target: &str) -> Vec<String> {
+    let nul_list = |out: Result<crate::git_exec::GitOutput, AppError>| -> Vec<String> {
+        out.ok()
+            .filter(|o| o.ok())
+            .map(|o| o.text().split('\0').filter(|p| !p.is_empty()).map(String::from).collect())
+            .unwrap_or_default()
+    };
+    let added = nul_list(
+        g(repo)
+            .args(["diff", "--name-only", "-z", "--diff-filter=A", "HEAD", target, "--"])
+            .run()
+            .await,
+    );
+    let on_disk: Vec<String> = added
+        .into_iter()
+        .filter(|p| std::fs::symlink_metadata(Path::new(repo).join(p)).is_ok())
+        .collect();
+    if on_disk.is_empty() {
+        return on_disk;
+    }
+    let indexed: std::collections::HashSet<String> = nul_list(g(repo).args(["ls-files", "-z"]).run().await).into_iter().collect();
+    on_disk.into_iter().filter(|p| !indexed.contains(p)).collect()
+}
+
+fn untracked_in_the_way_message(files: &[String]) -> String {
+    let shown: Vec<&str> = files.iter().take(5).map(String::as_str).collect();
+    let more = files.len() - shown.len();
+    format!(
+        "A hard reset would overwrite {} file{} that git isn't tracking: {}{}. Move or delete {} first — nothing was changed.",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+        shown.join(", "),
+        if more > 0 { format!(" and {} more", more) } else { String::new() },
+        if files.len() == 1 { "it" } else { "them" }
+    )
+}
+
 /// Move the branch to `target`. Commits that would leave it are kept on a
 /// backup branch first; commits any remote branch already has are never
 /// dropped. `stash_first` stashes the staged and unstaged changes before the
-/// move (untracked files are left on disk: no reset touches them).
+/// move. Untracked files are left on disk — and when the target would
+/// overwrite one, the reset is refused rather than letting git delete it.
 pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_first: bool) -> Result<OpResult, AppError> {
     let before = snapshot(repo_path).await?;
     let target = target.trim();
@@ -1026,6 +1085,15 @@ pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_firs
         return Ok(OpResult::refused(r, before));
     }
     let oid = oid.unwrap_or_default();
+    // `git reset --hard` protects only what it knows about: a file the target
+    // has and HEAD does not, already on disk untracked, is overwritten without
+    // a word. The dialog promised untracked files are left alone, so keep it.
+    if mode == ResetMode::Hard {
+        let in_the_way = untracked_in_the_way(repo_path, &oid).await;
+        if !in_the_way.is_empty() {
+            return Ok(OpResult::refused(refuse("untracked-in-the-way", untracked_in_the_way_message(&in_the_way)), before));
+        }
+    }
     let head_before = before.head_oid.clone().unwrap_or_default();
     let target_ref = commit_ref(repo_path, &oid).await;
     let mut tree = outcome("reset", &before, &before);
@@ -1058,7 +1126,8 @@ pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_firs
         }
     }
 
-    let out = g(repo_path).args(["reset", mode.flag(), "--quiet", &oid]).timeout(LOCAL_TIMEOUT).run().await?;
+    let lfs = if mode == ResetMode::Hard { crate::git_ops::lfs_before(repo_path, &before).await } else { crate::git_ops::LfsAround::none() };
+    let out = lfs.apply(g(repo_path)).args(["reset", mode.flag(), "--quiet", &oid]).timeout(LOCAL_TIMEOUT).run().await?;
     let after = snapshot(repo_path).await?;
     tree.head_after = after.head_oid.clone();
     tree.branch_after = after.branch.clone();
@@ -1071,7 +1140,9 @@ pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_firs
     if mode == ResetMode::Hard && dirty_files(&after) > 0 {
         return Ok(failed_with(GitOp::Reset, &format!("git reset --hard exited 0 but {} file(s) still show changes", dirty_files(&after)), after, tree));
     }
-    tree.submodule_mismatch = submodule_mismatch(&after);
+    // Only a hard reset leaves a submodule elsewhere than what is recorded:
+    // a soft or mixed one keeps the moved pointer as one of its changes.
+    tree.submodule_mismatch = if mode == ResetMode::Hard { submodule_mismatch(&after) } else { Vec::new() };
     tree.recovery = Some(reset_recovery(mode, repo_path, tree.backup.as_ref().map(|b| b.branch.as_str()), &head_before));
 
     let mut detail = match mode {
@@ -1087,6 +1158,10 @@ pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_firs
     }
     detail.push_str(&format!(" Undo with `{}`.", tree.recovery.clone().unwrap_or_default()));
     detail.push_str(&submodule_note(&tree.submodule_mismatch));
+    if mode != ResetMode::Hard {
+        detail.push_str(&kept_pointer_note(&moved_pointers(&after)));
+    }
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     Ok(OpResult { tree: Some(tree), ..OpResult::done(format!("Reset to {} ({}).", target_ref.short, mode.label()), detail, after) })
 }
 
@@ -1106,7 +1181,8 @@ pub async fn detach(repo_path: &str, target: &str) -> Result<OpResult, AppError>
     }
     let oid = oid.unwrap_or_default();
 
-    let out = g(repo_path).args(["switch", "--detach", &oid]).timeout(NET_TIMEOUT).run().await?;
+    let lfs = crate::git_ops::lfs_before(repo_path, &before).await;
+    let out = lfs.apply(g(repo_path)).args(["switch", "--detach", &oid]).timeout(NET_TIMEOUT).run().await?;
     let after = snapshot(repo_path).await?;
     let mut tree = outcome("detach", &before, &after);
     tree.commit = Some(commit_ref(repo_path, &oid).await);
@@ -1119,11 +1195,12 @@ pub async fn detach(repo_path: &str, target: &str) -> Result<OpResult, AppError>
     }
     tree.submodule_mismatch = submodule_mismatch(&after);
     tree.recovery = switch_back(&before);
-    let detail = format!(
+    let mut detail = format!(
         "You're not on a branch: commits made here belong to no branch until you start one. Go back with `{}`.{}",
         tree.recovery.clone().unwrap_or_default(),
         submodule_note(&tree.submodule_mismatch)
     );
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     let headline = format!("Looking at {}.", tree.commit.as_ref().map(|c| c.label()).unwrap_or_default());
     Ok(OpResult { tree: Some(tree), ..OpResult::done(headline, detail, after) })
 }
@@ -1191,7 +1268,8 @@ pub async fn revert(repo_path: &str, target: &str, mainline: Option<u32>) -> Res
         args.push(m.to_string());
     }
     args.push(oid.clone());
-    let out = g(repo_path).args(args).timeout(LOCAL_TIMEOUT).run().await?;
+    let lfs = crate::git_ops::lfs_before(repo_path, &before).await;
+    let out = lfs.apply(g(repo_path)).args(args).timeout(LOCAL_TIMEOUT).run().await?;
     let after = snapshot(repo_path).await?;
     let mut tree = outcome("revert", &before, &after);
     tree.commit = Some(reverted.clone());
@@ -1215,11 +1293,13 @@ pub async fn revert(repo_path: &str, target: &str, mainline: Option<u32>) -> Res
     }
     let new = commit_ref(repo_path, after.head_oid.as_deref().unwrap_or_default()).await;
     tree.recovery = Some(format!("git reset --soft {}", head_before));
+    let mut detail = format!("New commit `{}` undoes `{}`. Undo the revert with `git reset --soft {}` (keeps its changes staged).", new.label(), reverted.label(), head_before);
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     Ok(OpResult {
         tree: Some(tree),
         ..OpResult::done(
             format!("Reverted {}.", reverted.short),
-            format!("New commit `{}` undoes `{}`. Undo the revert with `git reset --soft {}` (keeps its changes staged).", new.label(), reverted.label(), head_before),
+            detail,
             after,
         )
     })
@@ -1243,7 +1323,8 @@ pub async fn cherry_pick(repo_path: &str, target: &str) -> Result<OpResult, AppE
     let head_before = before.head_oid.clone().unwrap_or_default();
     let picked = commit_ref(repo_path, &oid).await;
 
-    let out = g(repo_path).args(["cherry-pick", &oid]).timeout(LOCAL_TIMEOUT).run().await?;
+    let lfs = crate::git_ops::lfs_before(repo_path, &before).await;
+    let out = lfs.apply(g(repo_path)).args(["cherry-pick", &oid]).timeout(LOCAL_TIMEOUT).run().await?;
     let mut after = snapshot(repo_path).await?;
     let mut tree = outcome("cherry-pick", &before, &after);
     tree.commit = Some(picked.clone());
@@ -1272,11 +1353,13 @@ pub async fn cherry_pick(repo_path: &str, target: &str) -> Result<OpResult, AppE
     }
     let new = commit_ref(repo_path, after.head_oid.as_deref().unwrap_or_default()).await;
     tree.recovery = Some(format!("git reset --soft {}", head_before));
+    let mut detail = format!("New commit `{}` carries `{}`. Undo with `git reset --soft {}` (keeps its changes staged).", new.label(), picked.label(), head_before);
+    detail.push_str(&crate::git_ops::lfs_after(repo_path, &lfs).await);
     Ok(OpResult {
         tree: Some(tree),
         ..OpResult::done(
             format!("Picked {}.", picked.short),
-            format!("New commit `{}` carries `{}`. Undo with `git reset --soft {}` (keeps its changes staged).", new.label(), picked.label(), head_before),
+            detail,
             after,
         )
     })
@@ -1292,11 +1375,7 @@ pub async fn resolve_side(repo_path: &str, paths: Vec<String>, side: Side) -> Re
     let before = snapshot(repo_path).await?;
     let selected: Vec<&crate::git_status::ChangeEntry> = before.entries.iter().filter(|e| e.kind == "conflicted" && paths.contains(&e.path)).collect();
     let not_conflicted = paths.iter().find(|p| !selected.iter().any(|e| &e.path == *p)).cloned();
-    let intent = TreeIntent::ResolveSide {
-        has_paths: !paths.is_empty(),
-        submodule_selected: selected.iter().any(|e| e.is_submodule || e.stage_modes.iter().any(|m| m == "160000")),
-        not_conflicted_selected: not_conflicted.is_some(),
-    };
+    let intent = TreeIntent::ResolveSide { has_paths: !paths.is_empty(), not_conflicted_selected: not_conflicted.is_some() };
     if let Some(r) = check(&Intent::Tree(intent), &StatusFacts::from(&before)) {
         let r = match (&r.code[..], &not_conflicted) {
             ("not-conflicted", Some(p)) => refuse("not-conflicted", format!("{} isn't in conflict — the list may be out of date.", p)),
@@ -1308,10 +1387,21 @@ pub async fn resolve_side(repo_path: &str, paths: Vec<String>, side: Side) -> Re
     let op_kind = before.operation.as_ref().map(|o| o.kind.clone());
     let flag = side_flag(op_kind.as_deref(), side);
     let stage = if flag == "--ours" { 1 } else { 2 };
+    // Submodule pointers: each submodule is brought to that side's commit and
+    // the pointer recorded — every one checked before anything moves.
+    let (pointers, files): (Vec<&crate::git_status::ChangeEntry>, Vec<&crate::git_status::ChangeEntry>) =
+        selected.iter().copied().partition(|e| e.is_submodule || e.stage_modes.iter().any(|m| m == "160000"));
+    let mut plans = Vec::new();
+    for e in &pointers {
+        match Box::pin(plan_pointer(repo_path, e, stage)).await? {
+            Ok(p) => plans.push(p),
+            Err(r) => return Ok(OpResult::refused(r, before)),
+        }
+    }
     let (keep, remove): (Vec<String>, Vec<String>) = {
         let mut keep = Vec::new();
         let mut remove = Vec::new();
-        for e in &selected {
+        for e in &files {
             let present = e.stage_modes.get(stage).map(|m| m != "000000").unwrap_or(false);
             if present {
                 keep.push(e.path.clone());
@@ -1323,6 +1413,16 @@ pub async fn resolve_side(repo_path: &str, paths: Vec<String>, side: Side) -> Re
     };
 
     let mut errors = Vec::new();
+    let (mut pointer_notes, mut pointer_undo) = (Vec::new(), Vec::new());
+    for p in &plans {
+        match Box::pin(move_pointer(repo_path, p)).await? {
+            Ok((note, undo)) => {
+                pointer_notes.push(note);
+                pointer_undo.extend(undo);
+            }
+            Err(said) => errors.push(said),
+        }
+    }
     if !keep.is_empty() {
         let out = g(repo_path)
             .args(["checkout", flag, "--pathspec-from-file=-", "--pathspec-file-nul"])
@@ -1368,17 +1468,153 @@ pub async fn resolve_side(repo_path: &str, paths: Vec<String>, side: Side) -> Re
         }
         return Ok(failed_with(GitOp::Merge, words.trim(), after, tree));
     }
-    let mut detail = format!(
-        "{} file(s) now hold {} side and are staged{}. {}",
-        keep.len(),
-        if side == Side::Mine { "your" } else { "the other" },
-        if remove.is_empty() { String::new() } else { format!("; {} removed because that side deleted {}", remove.len(), plural(remove.len(), "it", "them")) },
-        tree.mapping_note.clone().unwrap_or_default()
-    );
+    if !pointer_undo.is_empty() {
+        tree.recovery = Some(pointer_undo.join(" && "));
+    }
+    let mut detail = if files.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} file(s) now hold {} side and are staged{}. ",
+            keep.len(),
+            if side == Side::Mine { "your" } else { "the other" },
+            if remove.is_empty() { String::new() } else { format!("; {} removed because that side deleted {}", remove.len(), plural(remove.len(), "it", "them")) },
+        )
+    };
+    if !pointer_notes.is_empty() {
+        detail.push_str(&format!("{}. ", pointer_notes.join("; ")));
+    }
+    detail.push_str(&tree.mapping_note.clone().unwrap_or_default());
     if !tree.conflicts.is_empty() {
         detail.push_str(&format!(" {} other file(s) are still in conflict.", tree.conflicts.len()));
     }
-    Ok(OpResult { tree: Some(tree), ..OpResult::done(format!("{}: {} file(s) resolved.", side.label(), paths.len()), detail, after) })
+    let what = match (files.len(), pointers.len()) {
+        (f, 0) => format!("{} file(s)", f),
+        (0, p) => format!("{} submodule pointer(s)", p),
+        (f, p) => format!("{} file(s) and {} submodule pointer(s)", f, p),
+    };
+    Ok(OpResult { tree: Some(tree), ..OpResult::done(format!("{}: {} resolved.", side.label(), what), detail.trim().to_string(), after) })
+}
+
+/// What taking one side of a conflicted submodule pointer does.
+struct PointerPlan {
+    path: String,
+    target: String,
+    /// None: not downloaded here, so only the pointer is recorded.
+    mv: Option<PointerMove>,
+}
+
+enum PointerMove {
+    Already,
+    /// On this branch, which the target descends from.
+    FastForward { branch: String, from: String },
+    /// Everything else; a branch it was on keeps its commits.
+    Detach { from: String, branch: Option<String> },
+}
+
+/// Taking `stage`'s side of one conflicted pointer: what will move, or why it
+/// cannot — nothing changes here. Local only: a commit the submodule does not
+/// have is refused, never fetched.
+async fn plan_pointer(repo_path: &str, e: &crate::git_status::ChangeEntry, stage: usize) -> Result<Result<PointerPlan, Refusal>, AppError> {
+    let path = e.path.clone();
+    let target = (e.stage_modes.get(stage).map(String::as_str) == Some("160000"))
+        .then(|| e.stage_oids.get(stage).cloned())
+        .flatten()
+        .filter(|o| o.chars().any(|c| c != '0'));
+    let Some(target) = target else {
+        return Ok(Err(refuse(
+            "pointer-side-missing",
+            format!("That side has no submodule at {} (it was added or removed on one side) — decide by hand, then Mark resolved.", path),
+        )));
+    };
+    let sub = Path::new(repo_path).join(&path);
+    if !crate::sparse::own_repository(&sub).await {
+        return Ok(Ok(PointerPlan { path, target, mv: None }));
+    }
+    let sub_s = sub.to_string_lossy().to_string();
+    let st = Box::pin(snapshot(&sub_s)).await?;
+    if let Some(o) = &st.operation {
+        return Ok(Err(refuse(
+            "operation-in-progress",
+            format!("{} has a {} in progress inside — finish it there first (Continue update, when it is the update's own).", path, o.kind),
+        )));
+    }
+    if st.conflicted_count > 0 || dirty_files(&st) > 0 {
+        return Ok(Err(refuse("submodule-changes", format!("{} has changes inside — commit or stash them there first.", path))));
+    }
+    let head = sync::oid(&sub, "HEAD").await.unwrap_or_default();
+    if head == target {
+        return Ok(Ok(PointerPlan { path, target, mv: Some(PointerMove::Already) }));
+    }
+    if sync::oid(&sub, &format!("{}^{{commit}}", target)).await.is_none() {
+        return Ok(Err(refuse("commit-missing", format!("{} doesn't have {} — fetch inside it first.", path, sync::short(&target)))));
+    }
+    let descends = !head.is_empty() && sync::is_ancestor(&sub, &head, &target).await;
+    if let (Some(b), true) = (&st.branch, descends) {
+        return Ok(Ok(PointerPlan { path, target, mv: Some(PointerMove::FastForward { branch: b.clone(), from: head }) }));
+    }
+    if st.branch.is_none() && !descends {
+        match loose_commits(&sub_s, Some(target.as_str())).await {
+            Some(0) => {}
+            Some(n) => {
+                return Ok(Err(refuse(
+                    "submodule-detached-commits",
+                    format!("{} commit(s) at {}'s checkout are on no branch, remote branch or tag and would be left behind — Start a branch there first.", n, path),
+                )))
+            }
+            None => return Ok(Err(refuse("submodule-detached-commits", format!("Couldn't tell whether {}'s checkout holds commits no branch has, so it was not moved.", path)))),
+        }
+    }
+    Ok(Ok(PointerPlan { path, target, mv: Some(PointerMove::Detach { from: head, branch: st.branch.clone() }) }))
+}
+
+/// Carry out one plan: move the submodule, check it got there, record the
+/// pointer. Ok((what it did, the undo for the move)) or git's words.
+async fn move_pointer(repo_path: &str, p: &PointerPlan) -> Result<Result<(String, Option<String>), String>, AppError> {
+    let sub = Path::new(repo_path).join(&p.path);
+    let sub_s = sub.to_string_lossy().to_string();
+    let q = sync::shell_quote(&p.path);
+    let (how, undo) = match &p.mv {
+        None => ("not downloaded here, so only the pointer is recorded".to_string(), None),
+        Some(PointerMove::Already) => ("already checked out there".to_string(), None),
+        Some(mv) => {
+            let st = Box::pin(snapshot(&sub_s)).await?;
+            let lfs = crate::git_ops::lfs_before(&sub_s, &st).await;
+            let (args, how, undo): (Vec<&str>, String, String) = match mv {
+                PointerMove::FastForward { branch, from } => (
+                    vec!["merge", "--ff-only", "--no-edit", "--no-stat", "--", p.target.as_str()],
+                    format!("{} fast-forwarded there", branch),
+                    format!("git -C {} reset --keep {}", q, from),
+                ),
+                PointerMove::Detach { from, branch } => (
+                    vec!["switch", "--detach", p.target.as_str()],
+                    match branch {
+                        Some(b) => format!("checked out there, detached; {} still holds {}", b, sync::short(from)),
+                        None => format!("checked out there, detached (was {})", sync::short(from)),
+                    },
+                    match branch {
+                        Some(b) => format!("git -C {} switch {}", q, b),
+                        None => format!("git -C {} switch --detach {}", q, from),
+                    },
+                ),
+                PointerMove::Already => unreachable!(),
+            };
+            let out = lfs.apply(g(&sub_s)).args(args).timeout(LOCAL_TIMEOUT).run().await?;
+            if !out.ok() {
+                return Ok(Err(format!("{}: {}", p.path, said(&out))));
+            }
+            if sync::oid(&sub, "HEAD").await.as_deref() != Some(p.target.as_str()) {
+                return Ok(Err(format!("{}: git exited 0 but its HEAD is not {}", p.path, p.target)));
+            }
+            (format!("{}{}", how, crate::git_ops::lfs_after(&sub_s, &lfs).await), Some(undo))
+        }
+    };
+    // A stage-0 entry replaces the conflict's three.
+    let out = g(repo_path).args(["update-index", "--cacheinfo", &format!("160000,{},{}", p.target, p.path)]).timeout(LOCAL_TIMEOUT).run().await?;
+    if !out.ok() {
+        return Ok(Err(format!("Could not record {}: {}", p.path, said(&out))));
+    }
+    Ok(Ok((format!("{} now records {} — {}", p.path, sync::short(&p.target), how), undo)))
 }
 
 /// Everything back to HEAD: tracked changes restored, new files left untracked
@@ -1507,6 +1743,228 @@ pub async fn resolve_commit(repo_path: &str, text: &str) -> Result<Option<Commit
 }
 
 // ---------------------------------------------------------------------------
+// Submodules left elsewhere
+// ---------------------------------------------------------------------------
+
+/// The commit `repo`'s index records at `path`, when that is a gitlink.
+pub(crate) async fn recorded_gitlink(repo: &str, path: &str) -> Option<String> {
+    let out = g(repo).args(["ls-files", "-s", "-z", "--", path]).ok_text().await?;
+    out.split('\0')
+        .filter_map(|rec| rec.split_once('\t'))
+        .find(|(meta, p)| *p == path && meta.starts_with("160000 "))
+        .and_then(|(meta, _)| meta.split_whitespace().nth(1))
+        .map(str::to_string)
+}
+
+/// Commits reachable from `dir`'s HEAD that no branch, remote-tracking ref or
+/// tag holds, nor `keep` (the commit a superproject records, which holds its
+/// ancestors) — what moving its HEAD elsewhere would leave on nothing. None
+/// when git cannot say; callers then move nothing.
+async fn loose_commits(dir: &str, keep: Option<&str>) -> Option<usize> {
+    let mut args = vec!["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes", "--tags"];
+    if let Some(k) = keep {
+        args.push(k);
+    }
+    g(dir).args(args).ok_text().await.and_then(|s| s.trim().parse().ok())
+}
+
+/// The commit the repository that holds `dir` as a submodule records for it.
+async fn recorded_by_parent(dir: &Path) -> Option<String> {
+    let parent = g(&dir.to_string_lossy()).args(["rev-parse", "--show-superproject-working-tree"]).ok_text().await?;
+    let parent = std::fs::canonicalize(parent.trim()).ok()?;
+    let me = std::fs::canonicalize(dir).ok()?;
+    let rel = me.strip_prefix(&parent).ok()?.to_string_lossy().replace('\\', "/");
+    recorded_gitlink(&parent.to_string_lossy(), &rel).await
+}
+
+/// What moving the populated submodule at `path` to another commit would
+/// lose, as a refusal — None when nothing would: changes, an operation or
+/// conflicts inside it, or commits only its detached HEAD holds. `keep` is
+/// the commit it moves to (what is below it is kept by it); `nested` also
+/// asks the submodules populated inside it, which `--recursive` moves too.
+pub(crate) async fn submodule_move_blocker(repo: &str, path: &str, keep: Option<&str>, nested: bool) -> Result<Option<Refusal>, AppError> {
+    let sub = Path::new(repo).join(path);
+    let sub_s = sub.to_string_lossy().to_string();
+    let st = Box::pin(snapshot(&sub_s)).await?;
+    if let Some(o) = &st.operation {
+        return Ok(Some(refuse("submodule-changes", format!("{} has a {} in progress inside — finish or abort it there first.", path, o.kind))));
+    }
+    if st.conflicted_count > 0 {
+        return Ok(Some(refuse("submodule-changes", format!("{} has {} conflicted file(s) inside — resolve them there first.", path, st.conflicted_count))));
+    }
+    let dirty = dirty_files(&st);
+    if dirty > 0 {
+        return Ok(Some(refuse("submodule-changes", format!("{} has {} changed file(s) inside — commit or stash them there first.", path, dirty))));
+    }
+    let keep = match keep {
+        Some(k) if sync::oid(&sub, &format!("{}^{{commit}}", k)).await.is_some() => Some(k),
+        _ => None,
+    };
+    let loose = |n: Option<usize>, at: &str| -> Option<Refusal> {
+        match n {
+            Some(0) => None,
+            Some(n) => Some(refuse(
+                "submodule-detached-commits",
+                format!("{} commit(s) at {}'s checkout are on no branch, remote branch or tag and would be left behind — Start a branch there first (Submodules tab).", n, at),
+            )),
+            None => Some(refuse("submodule-detached-commits", format!("Couldn't tell whether {}'s checkout holds commits no branch has, so it was not moved.", at))),
+        }
+    };
+    if let Some(r) = loose(loose_commits(&sub_s, keep).await, path) {
+        return Ok(Some(r));
+    }
+    if nested {
+        for rel in crate::push_guard::populated_submodules(&sub).await {
+            let dir = sub.join(&rel);
+            // Nothing checked out (an interrupted download): nothing to lose.
+            if sync::oid(&dir, "HEAD").await.is_none() {
+                continue;
+            }
+            let at = format!("{}/{}", path, rel);
+            // What its parent records holds what is below it — when it is
+            // here: a commit the nested one has not fetched names nothing.
+            let keep = match recorded_by_parent(&dir).await {
+                Some(k) if sync::oid(&dir, &format!("{}^{{commit}}", k)).await.is_some() => Some(k),
+                _ => None,
+            };
+            if let Some(r) = loose(loose_commits(&dir.to_string_lossy(), keep.as_deref()).await, &at) {
+                return Ok(Some(r));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Check out, in each named submodule, the commit this repository records for
+/// it — what a go-back, a switch or a discard left pointing elsewhere. Its
+/// branches keep their commits; only its HEAD moves, detached, as `git
+/// submodule update` leaves it, whatever `submodule.<name>.update` says. Local
+/// only: a recorded commit it does not have is refused, never fetched. A
+/// submodule with no address in .gitmodules is aligned the same way. The ones
+/// nested inside are not gone into: the result names any left elsewhere.
+pub async fn align_submodules(repo_path: &str, paths: Vec<String>) -> Result<OpResult, AppError> {
+    let before = snapshot(repo_path).await?;
+    if let Some(r) = check(&Intent::Submodule, &StatusFacts::from(&before)) {
+        return Ok(OpResult::refused(r, before));
+    }
+    if paths.is_empty() {
+        return Ok(OpResult::refused(refuse("nothing-to-align", "No submodule was named."), before));
+    }
+    for p in &paths {
+        crate::git_ops::validate_repo_path(p)?;
+    }
+    let mut tree = outcome("align-submodules", &before, &before);
+    let (mut moved, mut already, mut refused, mut failed) = (Vec::new(), Vec::new(), Vec::<Refusal>::new(), Vec::new());
+    let (mut notes, mut recoveries, mut extra) = (Vec::new(), Vec::new(), String::new());
+    for path in &paths {
+        let Some(recorded) = recorded_gitlink(repo_path, path).await else {
+            refused.push(refuse("not-a-submodule", format!("{} isn't a submodule of this repository.", path)));
+            continue;
+        };
+        let sub = Path::new(repo_path).join(path);
+        let sub_s = sub.to_string_lossy().to_string();
+        let head = if crate::sparse::own_repository(&sub).await { sync::oid(&sub, "HEAD").await } else { None };
+        let Some(head) = head else {
+            refused.push(refuse("not-downloaded", format!("{} isn't downloaded — Download on the Submodules tab fetches it at the recorded commit.", path)));
+            continue;
+        };
+        if head == recorded {
+            already.push(path.clone());
+            continue;
+        }
+        if sync::oid(&sub, &format!("{}^{{commit}}", recorded)).await.is_none() {
+            refused.push(refuse(
+                "recorded-missing",
+                format!("{} doesn't have {}, the commit this repository records — fetch inside it first (aligning never downloads).", path, sync::short(&recorded)),
+            ));
+            continue;
+        }
+        if let Some(r) = Box::pin(submodule_move_blocker(repo_path, path, Some(&recorded), false)).await? {
+            refused.push(r);
+            continue;
+        }
+        let st = Box::pin(snapshot(&sub_s)).await?;
+        let lfs = crate::git_ops::lfs_before(&sub_s, &st).await;
+        let out = lfs.apply(g(&sub_s)).args(["checkout", "--quiet", "--detach", &recorded]).timeout(LOCAL_TIMEOUT).run().await?;
+        let now = sync::oid(&sub, "HEAD").await;
+        if !out.ok() {
+            failed.push(format!("{}: {}", path, said(&out)));
+            continue;
+        }
+        if now.as_deref() != Some(recorded.as_str()) {
+            failed.push(format!("{}: git checkout exited 0 but HEAD is {} (expected {})", path, now.unwrap_or_default(), recorded));
+            continue;
+        }
+        let q = sync::shell_quote(path);
+        match &st.branch {
+            Some(b) => {
+                recoveries.push(format!("git -C {} switch {}", q, b));
+                notes.push(format!("{} is at {}; {} still holds {}", path, sync::short(&recorded), b, sync::short(&head)));
+            }
+            None => {
+                recoveries.push(format!("git -C {} checkout --detach {}", q, head));
+                notes.push(format!("{} is at {} (was {})", path, sync::short(&recorded), sync::short(&head)));
+            }
+        }
+        extra.push_str(&crate::git_ops::lfs_after(&sub_s, &lfs).await);
+        let inner = Box::pin(snapshot(&sub_s)).await.map(|s| submodule_mismatch(&s)).unwrap_or_default();
+        if !inner.is_empty() {
+            extra.push_str(&format!(" Inside {}, {} now sit elsewhere than it records — open {} and align there.", path, inner.join(", "), path));
+        }
+        moved.push(path.clone());
+    }
+    let after = snapshot(repo_path).await?;
+    tree.head_after = after.head_oid.clone();
+    tree.branch_after = after.branch.clone();
+    tree.submodule_mismatch = submodule_mismatch(&after);
+    if !recoveries.is_empty() {
+        tree.recovery = Some(recoveries.join(" && "));
+    }
+    // Nothing moved and something was refused: a refusal, saying which were
+    // already where they belong — never a green "every one is aligned".
+    if moved.is_empty() && failed.is_empty() {
+        if let Some(first) = refused.first() {
+            let mut message = refused.iter().map(|r| r.message.as_str()).collect::<Vec<_>>().join(" ");
+            if !already.is_empty() {
+                message.push_str(&format!(" Already at the recorded commit: {}.", already.join(", ")));
+            }
+            return Ok(refused_with(refuse(&first.code, message), after, tree));
+        }
+    }
+    let mut detail = String::new();
+    if !notes.is_empty() {
+        detail.push_str(&format!("{}.", notes.join("; ")));
+    }
+    if !already.is_empty() {
+        detail.push_str(&format!(" Already at the recorded commit: {}.", already.join(", ")));
+    }
+    for r in &refused {
+        detail.push_str(&format!(" Not moved: {}", r.message));
+    }
+    if let Some(rc) = &tree.recovery {
+        detail.push_str(&format!(" Undo with `{}`.", rc));
+    }
+    detail.push_str(&extra);
+    let detail = detail.trim().to_string();
+    if !failed.is_empty() {
+        let mut a = git_advice::explain(GitOp::Checkout, &failed.join("\n"), &advice_ctx(&after));
+        a.headline = "Not every submodule could be aligned.".to_string();
+        if !detail.is_empty() {
+            a.guidance = format!("{} {}", a.guidance, detail).trim().to_string();
+        }
+        return Ok(OpResult { tree: Some(tree), ..OpResult::failed(a, after) });
+    }
+    let headline = if moved.is_empty() {
+        "Every submodule named is already at the commit this repository records.".to_string()
+    } else if moved.len() == paths.len() {
+        format!("Aligned {} submodule(s) with the commits this repository records.", moved.len())
+    } else {
+        format!("Aligned {} of {} submodule(s) with the commits this repository records.", moved.len(), paths.len())
+    };
+    Ok(OpResult { tree: Some(tree), ..OpResult::done(headline, detail, after) })
+}
+
+// ---------------------------------------------------------------------------
 // Probe driver
 // ---------------------------------------------------------------------------
 
@@ -1551,6 +2009,8 @@ pub(crate) async fn probe(op: &str, repo: &str, args: &[String]) {
             Ok(t) => emit(&t),
             Err(e) => emit_err(e),
         },
+        // <path>[,<path>…]
+        "tree_sub_align" => show(align_submodules(repo, args.to_vec()).await),
         other => emit_err(format!("unknown tree op {}", other)),
     }
 }
@@ -1721,17 +2181,16 @@ mod tests {
         assert!(r.message.contains("Abort the merge instead"));
         // Creating a branch without switching only writes a ref.
         assert_eq!(code(CreateBranch { switch_to: false, from_valid: true, detached_unique: 0 }, &busy), "ok");
-        assert_eq!(code(ResolveSide { has_paths: true, submodule_selected: false, not_conflicted_selected: false }, &busy), "ok");
+        assert_eq!(code(ResolveSide { has_paths: true, not_conflicted_selected: false }, &busy), "ok");
     }
 
     #[test]
     fn resolving_a_side_refuses_nothing_submodules_and_stale_lists() {
         let f = StatusFacts { conflicted: 2, operation: Some("rebase".into()), ..clean() };
-        assert_eq!(code(ResolveSide { has_paths: false, submodule_selected: false, not_conflicted_selected: false }, &f), "no-paths");
-        assert_eq!(code(ResolveSide { has_paths: true, submodule_selected: true, not_conflicted_selected: false }, &f), "submodule-conflict");
-        assert_eq!(code(ResolveSide { has_paths: true, submodule_selected: false, not_conflicted_selected: true }, &f), "not-conflicted");
+        assert_eq!(code(ResolveSide { has_paths: false, not_conflicted_selected: false }, &f), "no-paths");
+        assert_eq!(code(ResolveSide { has_paths: true, not_conflicted_selected: true }, &f), "not-conflicted");
         // Allowed while a sync is paused — that is exactly when it is needed.
-        assert_eq!(code(ResolveSide { has_paths: true, submodule_selected: false, not_conflicted_selected: false }, &StatusFacts { sync_in_progress: true, ..f }), "ok");
+        assert_eq!(code(ResolveSide { has_paths: true, not_conflicted_selected: false }, &StatusFacts { sync_in_progress: true, ..f }), "ok");
     }
 
     #[test]

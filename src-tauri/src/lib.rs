@@ -4,13 +4,18 @@ mod credentials;
 mod doctor;
 mod elevate;
 mod error;
+mod find_clones;
+mod gh_api;
 mod gh_cli;
+mod gh_repo;
+mod pulls;
 mod git_advice;
 mod git_config;
 mod git_exec;
 mod git_history;
 mod git_ops;
 mod git_status;
+mod cmdlog;
 mod lfs;
 mod terminal;
 mod git_remote;
@@ -27,13 +32,28 @@ mod push_lock;
 mod remote_repos;
 mod repo_scan;
 mod sparse;
+mod spawn;
+mod ssh_config;
+mod push_identity;
+
+/// sha256 hex of a secret, for cache keys that must not hold the secret itself.
+pub(crate) fn lfs_sha(secret: &str) -> String {
+    gitswitch_lock_core::sha256_hex(secret.as_bytes())
+}
 mod submodules;
 mod stash;
+mod states;
 mod sync;
 mod tree;
 mod signing;
 mod ssh_keys;
+mod deep_link;
+mod ports;
+mod workspace;
 mod tray;
+mod uninstall;
+mod apps;
+mod netspeed;
 
 /// macOS/Linux GUI apps launched from Finder/the dock inherit a minimal PATH that
 /// omits Homebrew (`/opt/homebrew/bin`, `/usr/local/bin`). Tools like `gh` live
@@ -52,7 +72,13 @@ fn fix_path_env() {
     let current = std::env::var("PATH").unwrap_or_default();
     let mut parts: Vec<String> = Vec::new();
     for p in extra {
-        parts.push(p.to_string());
+        // Only folders that exist: on macOS `/home` is an automounter trigger,
+        // so a PATH entry under it made every child process the app started
+        // (thousands of git runs per page) wake automountd and query Open
+        // Directory for the Linuxbrew home that is not there.
+        if std::path::Path::new(p).is_dir() {
+            parts.push(p.to_string());
+        }
     }
     for p in current.split(':') {
         if !p.is_empty() && !parts.iter().any(|x| x == p) {
@@ -67,13 +93,26 @@ fn fix_path_env() {}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Started elevated by the Uninstall tab to delete what needs the
+    // administrator: do only that, then exit — never the app itself.
+    if let Some(code) = apps::elevated_cleanup_from_args() {
+        std::process::exit(code);
+    }
     fix_path_env();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // First of all: a second launch — a gitswitch:// link opened while the
+    // app runs — hands its link over (the deep-link plugin routes it) and
+    // brings this window forward instead of starting another app.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| tray::show_main(app)));
+    builder
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(deep_link::Pending::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_profiles,
             commands::create_profile,
@@ -89,6 +128,11 @@ pub fn run() {
             commands::gh_list_accounts,
             commands::gh_get_token,
             commands::gh_logout,
+            commands::gh_auth_accounts,
+            commands::gh_auth_switch,
+            commands::gh_auth_login_start,
+            commands::gh_auth_login_wait,
+            commands::gh_auth_login_cancel,
             commands::gh_register_ssh_key,
             commands::resolve_key_account,
             commands::convert_repos_to_ssh,
@@ -105,11 +149,14 @@ pub fn run() {
             commands::changes_pull,
             commands::changes_submodules,
             commands::changes_submodule_update,
+            commands::changes_submodule_align,
             commands::changes_lfs_status,
             commands::changes_lfs_pull,
             commands::changes_lfs_files,
             commands::changes_lfs_pull_paths,
             commands::changes_lfs_progress,
+            commands::console_entries,
+            commands::console_clear,
             commands::terminal_open,
             commands::terminal_write,
             commands::terminal_resize,
@@ -121,6 +168,8 @@ pub fn run() {
             commands::changes_sync_run,
             commands::changes_sync_continue,
             commands::changes_sync_abort,
+            commands::changes_open_path,
+            commands::changes_conflict_view,
             commands::changes_record_pointers,
             commands::changes_submodule_statuses,
             commands::changes_switch_branch,
@@ -137,6 +186,11 @@ pub fn run() {
             commands::changes_stash_list,
             commands::changes_stash_show,
             commands::changes_stash_file_diff,
+            commands::states_list,
+            commands::states_save,
+            commands::states_restore,
+            commands::states_delete,
+            commands::states_set_max,
             commands::changes_stash_push,
             commands::changes_stash_apply,
             commands::changes_stash_drop,
@@ -148,14 +202,47 @@ pub fn run() {
             commands::changes_push_state,
             commands::changes_set_push_mode,
             commands::changes_repair_push_block,
+            commands::changes_push_coverage,
             commands::changes_repair_push_lock,
             commands::push_lock_helper_status,
             commands::push_lock_uninstall,
+            commands::uninstall_plan,
+            commands::uninstall_prepare,
+            commands::uninstall_finish,
+            commands::apps_list,
+            commands::apps_size,
+            commands::apps_prepare,
+            commands::apps_uninstall,
+            commands::apps_status,
+            commands::apps_check_gone,
+            commands::apps_scan,
+            commands::apps_delete,
+            commands::apps_sessions,
+            commands::apps_forget,
+            commands::apps_open_uninstaller,
+            commands::apps_force_remove,
+            commands::netspeed_snapshot,
+            commands::netspeed_set_settings,
+            commands::netspeed_bar,
+            commands::netspeed_bar_reset,
+            commands::netspeed_open_settings,
+            commands::netspeed_show_tab,
+            commands::netspeed_speedtest_start,
+            commands::netspeed_speedtest_status,
+            commands::netspeed_speedtest_cancel,
+            commands::apps_close,
+            commands::apps_history,
+            commands::apps_rescan,
+            commands::apps_delete_at_restart,
             commands::push_lock_fix,
             commands::push_lock_finish_manual,
             commands::doctor_check_push_locks,
             commands::history_fetch,
             commands::history_sync_status,
+            commands::history_head,
+            commands::history_authors,
+            commands::clone_progress,
+            commands::clone_size_estimate,
             commands::history_list_repos,
             commands::history_branches,
             commands::history_page,
@@ -170,8 +257,32 @@ pub fn run() {
             commands::doctor_check_keys,
             commands::doctor_check_repos,
             commands::doctor_fix_ssh_config,
+            commands::doctor_unset_local,
+            commands::doctor_apply_fix,
+            commands::doctor_check_repo_access,
+            commands::changes_push_identity,
             commands::scan_repos,
+            commands::scan_repos_tracked,
             commands::check_repo_access,
+            commands::find_unlisted_repos,
+            commands::find_repos_progress,
+            commands::find_repos_cancel,
+            commands::repo_access_matrix,
+            commands::github_repo_context,
+            commands::github_pulls,
+            commands::github_pulls_search,
+            commands::github_pull_repos,
+            commands::github_pull,
+            commands::github_pull_files,
+            commands::github_pull_commits,
+            commands::github_pull_review,
+            commands::github_pull_merge,
+            commands::github_collaborators,
+            commands::github_collaborator_add,
+            commands::github_collaborator_remove,
+            commands::github_invitation_cancel,
+            commands::profile_folders_add,
+            commands::profile_folders_remove,
             commands::sparse_clone,
             commands::full_clone,
             commands::repo_accounts,
@@ -185,8 +296,9 @@ pub fn run() {
             commands::sparse_repo_info,
             commands::sparse_set,
             commands::sparse_add,
-            commands::store_github_token,
-            commands::get_github_token,
+            commands::github_signin_keep,
+            commands::github_signin_forget,
+            commands::github_signins,
             commands::apply_git_config,
             commands::get_current_git_config,
             commands::verify_github_token,
@@ -194,9 +306,49 @@ pub fn run() {
             commands::list_github_ssh_keys,
             commands::github_device_code,
             commands::github_poll_token,
+            commands::deep_link_take,
+            commands::ports_list,
+            commands::ports_kill,
+            commands::ports_container_stop,
+            commands::workspace_info,
+            commands::workspace_set_offset,
         ])
+        // While the net speed is shown outside the window, closing the
+        // window keeps GitSwitch running in the tray (Quit is in its menu).
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" && netspeed::keeps_running() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             tray::setup_tray(app.handle())?;
+            netspeed::start(app.handle());
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        deep_link::open(&handle, url.as_str());
+                    }
+                });
+                // Started by a link: the page it names.
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    for url in urls {
+                        deep_link::open(app.handle(), url.as_str());
+                    }
+                }
+                // An AppImage is not installed: it registers the scheme itself.
+                #[cfg(target_os = "linux")]
+                if std::env::var_os("APPIMAGE").is_some() {
+                    let _ = app.deep_link().register_all();
+                }
+            }
+            if let Err(e) = git_config::refresh_profile_includes() {
+                eprintln!("GitSwitch: the profiles' git config files could not be refreshed: {}", e);
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -206,6 +358,12 @@ pub fn run() {
             // window that opened it.
             if let tauri::RunEvent::Exit = event {
                 terminal::close_all();
+                netspeed::save();
+            }
+            // macOS: the Dock icon brings back a window that was closed to the menu bar.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                tray::show_main(_app);
             }
         });
 }

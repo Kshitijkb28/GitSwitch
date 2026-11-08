@@ -9,6 +9,7 @@ import {
   Trash2,
   Pencil,
   RefreshCw,
+  Globe,
 } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import type { Profile } from "../types/profile";
@@ -143,7 +144,7 @@ export function Dashboard() {
                       <Badge variant="success">signed</Badge>
                     )}
                   </div>
-                  <p className="text-sm text-zinc-400 mt-0.5">
+                  <p className="text-sm text-zinc-400 mt-0.5 break-all">
                     {profile.git_name} &lt;{profile.git_email}&gt;
                   </p>
                   <div className="flex items-center gap-4 mt-2">
@@ -160,6 +161,16 @@ export function Dashboard() {
                       {profile.directories.length} director
                       {profile.directories.length === 1 ? "y" : "ies"}
                     </span>
+                    {(profile.remote_patterns ?? []).length > 0 && (
+                      <span
+                        className="inline-flex items-center gap-1 text-xs text-zinc-500"
+                        title={profile.remote_patterns.join(", ")}
+                      >
+                        <Globe size={12} />
+                        {profile.remote_patterns.length} remote rule
+                        {profile.remote_patterns.length === 1 ? "" : "s"}
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div className="flex items-center gap-1 ml-3">
