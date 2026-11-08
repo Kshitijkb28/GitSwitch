@@ -114,14 +114,26 @@ pub(crate) mod tests {
 
     /// `forward!(c::changes_stage, args, repo_path, paths)`: read each named
     /// parameter from the JSON object, call the command, print the outcome.
-    // Boxed: `invoke` holds every command's state machine in one future, and
-    // the larger ones (an update's continue reads the status a dozen times)
-    // overflowed the test thread's 2 MiB stack when inlined.
+    // The command runs in a future of its own (`boxed`), made there: `invoke`
+    // keeps only a pointer per command. Built in `invoke` itself, every
+    // command's state machine and answer took a stack slot in its debug frame
+    // (722 KB, under every live call), and an update's Continue overflowed the
+    // test thread's 2 MiB stack.
     macro_rules! forward {
         ($f:path, $args:expr $(, $p:ident)*) => {{
             $( let $p = match arg(&$args, stringify!($p)) { Ok(v) => v, Err(e) => return reply_err(e) }; )*
-            reply(Box::pin($f($($p),*)).await)
+            boxed(move || $f($($p),*)).await
         }};
+    }
+
+    /// Make the command's future, await it and print its answer, all inside a
+    /// boxed future: what `make` builds never lies in the caller's frame.
+    fn boxed<T, Fut>(make: impl FnOnce() -> Fut + 'static) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
+    where
+        T: serde::Serialize,
+        Fut: std::future::Future<Output = Result<T, crate::error::AppError>> + 'static,
+    {
+        Box::pin(async move { reply(make().await) })
     }
 
     /// Commands that return a plain value rather than a `Result`.
@@ -408,11 +420,35 @@ pub(crate) mod tests {
     #[ignore]
     async fn probe() {
         let op = std::env::var("PROBE_OP").expect("PROBE_OP");
+        // Each in a boxed future of its own. Written in this function, every
+        // op's temporaries sat in its debug frame (some 700 KB), which then lay
+        // under every live `invoke` call too.
+        if op == "invoke" {
+            // --- the UI's IPC, forwarded (scripts/verify/harness/live.mjs) ---
+            Box::pin(invoke()).await;
+        } else {
+            Box::pin(ops(op)).await;
+        }
+        // Every clone-progress entry the op set, in order, for the suites to
+        // read back: against a local remote a phase lasts milliseconds, so
+        // sampling `clone_progress` from outside could miss it.
+        if let Ok(path) = std::env::var("PROBE_TRACE_FILE") {
+            let trace = crate::sparse::progress_trace().lock().map(|t| t.clone()).unwrap_or_default();
+            let _ = std::fs::write(path, serde_json::to_string(&trace).unwrap_or_else(|_| "[]".into()));
+        }
+        // What a poll for this path would read now that the op is over: an
+        // entry left behind would open the next download on this one's line.
+        if let (Ok(file), Ok(path)) = (std::env::var("PROBE_LEFT_FILE"), std::env::var("PROBE_LEFT_FOR")) {
+            let left = crate::sparse::clone_progress(&path);
+            let _ = std::fs::write(file, serde_json::to_string(&left).unwrap_or_else(|_| "null".into()));
+        }
+    }
+
+    /// Every `PROBE_OP` but `invoke`.
+    async fn ops(op: String) {
         let a = args();
         let first = a.first().map(|s| s.as_str()).unwrap_or("");
         match op.as_str() {
-            // --- the UI's IPC, forwarded (scripts/verify/harness/live.mjs) ---
-            "invoke" => invoke().await,
             // --- identity: a profile written into the sandbox HOME's gitconfig ---
             // first = a JSON file {name, git_name, git_email, ssh_key_path?, directories[]}
             // PROBE_ARGS = "<script>": what is on this Mac, read once, then the
@@ -768,19 +804,6 @@ pub(crate) mod tests {
                 Err(e) => emit_err(e),
             },
             other => panic!("unknown op {}", other),
-        }
-        // Every clone-progress entry the op set, in order, for the suites to
-        // read back: against a local remote a phase lasts milliseconds, so
-        // sampling `clone_progress` from outside could miss it.
-        if let Ok(path) = std::env::var("PROBE_TRACE_FILE") {
-            let trace = crate::sparse::progress_trace().lock().map(|t| t.clone()).unwrap_or_default();
-            let _ = std::fs::write(path, serde_json::to_string(&trace).unwrap_or_else(|_| "[]".into()));
-        }
-        // What a poll for this path would read now that the op is over: an
-        // entry left behind would open the next download on this one's line.
-        if let (Ok(file), Ok(path)) = (std::env::var("PROBE_LEFT_FILE"), std::env::var("PROBE_LEFT_FOR")) {
-            let left = crate::sparse::clone_progress(&path);
-            let _ = std::fs::write(file, serde_json::to_string(&left).unwrap_or_else(|_| "null".into()));
         }
     }
 }
