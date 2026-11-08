@@ -35,15 +35,18 @@ export function profilesPath(
   platform: string = process.platform,
   env: NodeJS.ProcessEnv = process.env
 ): string {
+  // The paths of the platform asked about, not of the one this runs on: the
+  // tests ask about all three from any of them.
+  const p = platform === "win32" ? path.win32 : path.posix;
   // dirs ignores XDG_DATA_HOME unless it is absolute; so does this.
-  const xdg = env.XDG_DATA_HOME && path.isAbsolute(env.XDG_DATA_HOME) ? env.XDG_DATA_HOME : undefined;
+  const xdg = env.XDG_DATA_HOME && p.isAbsolute(env.XDG_DATA_HOME) ? env.XDG_DATA_HOME : undefined;
   const dir =
     platform === "darwin"
-      ? path.join(home, "Library", "Application Support")
+      ? p.join(home, "Library", "Application Support")
       : platform === "win32"
-        ? env.APPDATA ?? path.join(home, "AppData", "Roaming")
-        : xdg ?? path.join(home, ".local", "share");
-  return path.join(dir, "com.gitswitch.app", "profiles.json");
+        ? env.APPDATA ?? p.join(home, "AppData", "Roaming")
+        : xdg ?? p.join(home, ".local", "share");
+  return p.join(dir, "com.gitswitch.app", "profiles.json");
 }
 
 export function loadProfiles(file: string = profilesPath()): Profile[] {

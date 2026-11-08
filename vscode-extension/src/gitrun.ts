@@ -20,9 +20,13 @@ export function hardenedEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Proce
 }
 
 /** A read: the app's READ_TIMEOUT. */
-export function git(cwd: string, args: string[], { timeoutMs = 30_000, program = "git" } = {}): Promise<string> {
+export function git(
+  cwd: string,
+  args: string[],
+  { timeoutMs = 30_000, program = "git", programArgs = [] as string[] } = {}
+): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(program, args, { cwd, timeout: timeoutMs, env: hardenedEnv(), maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(program, [...programArgs, ...args], { cwd, timeout: timeoutMs, env: hardenedEnv(), maxBuffer: 16 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) reject(new Error(String(stderr).trim() || err.message));
       else resolve(String(stdout).trim());
     });
@@ -33,6 +37,8 @@ export interface FetchOptions {
   /** Stop after this long without a byte of output. */
   stallMs?: number;
   program?: string;
+  /** Put before git's own arguments: a stand-in run by an interpreter (the tests' fake gits). */
+  programArgs?: string[];
   signal?: AbortSignal;
 }
 
@@ -43,7 +49,7 @@ export interface FetchOptions {
  * housekeeping is left out of the fetch and run afterwards, best effort, so
  * a long `gc` is not mistaken for a stuck download.
  */
-export function fetchWatched(cwd: string, { stallMs = 180_000, program = "git", signal }: FetchOptions = {}): Promise<void> {
+export function fetchWatched(cwd: string, { stallMs = 180_000, program = "git", programArgs = [], signal }: FetchOptions = {}): Promise<void> {
   return new Promise((resolve, reject) => {
     // Its own process group (unix): git runs ssh or git-remote-https as
     // children that hold its pipes, so stopping git alone would leave them
@@ -51,7 +57,7 @@ export function fetchWatched(cwd: string, { stallMs = 180_000, program = "git", 
     const windows = process.platform === "win32";
     const child = spawn(
       program,
-      ["-c", "fetch.unpackLimit=1", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "fetch", "--all", "--progress"],
+      [...programArgs, "-c", "fetch.unpackLimit=1", "-c", "maintenance.auto=false", "-c", "gc.auto=0", "fetch", "--all", "--progress"],
       { cwd, env: hardenedEnv(), detached: !windows }
     );
     let lastErr = "";
@@ -98,7 +104,7 @@ export function fetchWatched(cwd: string, { stallMs = 180_000, program = "git", 
       if (stopped) {
         reject(new Error(stopped));
       } else if (code === 0) {
-        housekeeping(cwd, program);
+        housekeeping(cwd, program, programArgs);
         resolve();
       } else {
         reject(new Error(lastErr || `git fetch exited with ${code}`));
@@ -108,8 +114,8 @@ export function fetchWatched(cwd: string, { stallMs = 180_000, program = "git", 
 }
 
 /** What the fetch left out: `git maintenance run --auto`, else `gc --auto`. Nobody waits on it. */
-function housekeeping(cwd: string, program: string) {
-  execFile(program, ["maintenance", "run", "--auto", "--quiet"], { cwd, env: hardenedEnv() }, (err) => {
-    if (err) execFile(program, ["gc", "--auto", "--quiet"], { cwd, env: hardenedEnv() }, () => {});
+function housekeeping(cwd: string, program: string, programArgs: string[]) {
+  execFile(program, [...programArgs, "maintenance", "run", "--auto", "--quiet"], { cwd, env: hardenedEnv() }, (err) => {
+    if (err) execFile(program, [...programArgs, "gc", "--auto", "--quiet"], { cwd, env: hardenedEnv() }, () => {});
   });
 }
