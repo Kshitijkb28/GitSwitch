@@ -1027,29 +1027,38 @@ pub async fn undo_commit(repo_path: &str) -> Result<OpResult, AppError> {
 /// being in the index — untracked or ignored. `git switch` refuses to clobber
 /// those itself; `git reset --hard` does not, so this is the check it lacks.
 /// A STAGED new file is in the index and is left out: the caller's dialog has
-/// already said staged changes are thrown away (or stashed first).
-async fn untracked_in_the_way(repo: &str, target: &str) -> Vec<String> {
-    let nul_list = |out: Result<crate::git_exec::GitOutput, AppError>| -> Vec<String> {
-        out.ok()
-            .filter(|o| o.ok())
-            .map(|o| o.text().split('\0').filter(|p| !p.is_empty()).map(String::from).collect())
-            .unwrap_or_default()
+/// already said staged changes are thrown away (or stashed first). `Err` when
+/// git could not answer: then nobody knows what the reset would overwrite.
+pub(crate) async fn untracked_in_the_way(repo: &str, target: &str) -> Result<Vec<String>, String> {
+    let nul_list = |out: Result<crate::git_exec::GitOutput, AppError>| -> Result<Vec<String>, String> {
+        match out {
+            Ok(o) if o.ok() => Ok(o.text().split('\0').filter(|p| !p.is_empty()).map(String::from).collect()),
+            Ok(o) => Err(o.stderr.trim().to_string()),
+            Err(e) => Err(e.to_string()),
+        }
     };
+    // `--no-renames`: a path the target reaches by renaming a file HEAD has is
+    // a new path on disk all the same, and diff.renames (on by default) would
+    // report it as a rename and hide it from the filter.
     let added = nul_list(
         g(repo)
-            .args(["diff", "--name-only", "-z", "--diff-filter=A", "HEAD", target, "--"])
+            .args(["diff", "--no-renames", "--name-only", "-z", "--diff-filter=A", "HEAD", target, "--"])
             .run()
             .await,
-    );
+    )?;
     let on_disk: Vec<String> = added
         .into_iter()
         .filter(|p| std::fs::symlink_metadata(Path::new(repo).join(p)).is_ok())
         .collect();
     if on_disk.is_empty() {
-        return on_disk;
+        return Ok(on_disk);
     }
-    let indexed: std::collections::HashSet<String> = nul_list(g(repo).args(["ls-files", "-z"]).run().await).into_iter().collect();
-    on_disk.into_iter().filter(|p| !indexed.contains(p)).collect()
+    // Where the disk ignores case, a rename that changes only the case finds
+    // the tracked file itself at the new name: that is not a file in the way.
+    let ignore_case = g(repo).args(["config", "--bool", "--get", "core.ignorecase"]).ok_text().await.is_some_and(|s| s.trim() == "true");
+    let fold = |p: &str| if ignore_case { p.to_lowercase() } else { p.to_string() };
+    let indexed: std::collections::HashSet<String> = nul_list(g(repo).args(["ls-files", "-z"]).run().await)?.iter().map(|p| fold(p)).collect();
+    Ok(on_disk.into_iter().filter(|p| !indexed.contains(&fold(p))).collect())
 }
 
 fn untracked_in_the_way_message(files: &[String]) -> String {
@@ -1093,7 +1102,15 @@ pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_firs
     // has and HEAD does not, already on disk untracked, is overwritten without
     // a word. The dialog promised untracked files are left alone, so keep it.
     if mode == ResetMode::Hard {
-        let in_the_way = untracked_in_the_way(repo_path, &oid).await;
+        let in_the_way = match untracked_in_the_way(repo_path, &oid).await {
+            Ok(files) => files,
+            Err(said) => {
+                return Ok(OpResult::refused(
+                    refuse("untracked-unknown", format!("GitSwitch could not check which untracked files a hard reset would overwrite (git said: {}), so nothing was changed.", said)),
+                    before,
+                ))
+            }
+        };
         if !in_the_way.is_empty() {
             return Ok(OpResult::refused(refuse("untracked-in-the-way", untracked_in_the_way_message(&in_the_way)), before));
         }

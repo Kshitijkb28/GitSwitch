@@ -430,6 +430,20 @@ pub fn pathspec_stdin(paths: &[String]) -> Result<Vec<u8>, AppError> {
     Ok(out)
 }
 
+/// The old names of the staged renames among `paths`: status reports a rename
+/// as one entry under its new name, but the index holds it as two changes, and
+/// an action on the entry has to act on both. A copy is left out: its source
+/// was not changed by it, and may carry edits of its own nobody selected.
+fn renamed_from(entries: &[git_status::ChangeEntry], paths: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in entries.iter().filter(|e| e.staged == "R" && paths.contains(&e.path)) {
+        if let Some(o) = e.orig_path.as_ref().filter(|o| !out.contains(o)) {
+            out.push(o.clone());
+        }
+    }
+    out
+}
+
 /// A path must stay inside the worktree. Paths come from our own status output,
 /// so this is a guard against a malformed request, not a user typo.
 /// The absolute, canonical path of `path` inside `repo_path` — or an error
@@ -1077,7 +1091,11 @@ pub async fn unstage(repo_path: &str, paths: Vec<String>) -> Result<OpResult, Ap
         return Ok(OpResult::refused(r, before));
     }
 
-    let stdin = pathspec_stdin(&paths)?;
+    // A staged rename is one entry under its new name, but two index entries:
+    // unstaging only the new name would leave the old one's deletion staged.
+    let mut pathspec = paths.clone();
+    pathspec.extend(renamed_from(&before.entries, &paths));
+    let stdin = pathspec_stdin(&pathspec)?;
     // With no commits yet there is no HEAD to reset against.
     let out = if before.unborn {
         GitCmd::at(repo_path)
@@ -1163,11 +1181,33 @@ pub async fn discard(repo_path: &str, paths: Vec<String>) -> Result<OpResult, Ap
         .filter(|e| e.kind == "untracked")
         .map(|e| e.path.clone())
         .collect();
-    // A staged-added file has no HEAD version: restoring it deletes it. The UI
-    // needs to word that differently, so it is counted separately.
+    // A staged rename is one entry under its new name. Restoring only that
+    // name deletes it (HEAD has no such file) and leaves the old name deleted
+    // too: the file would be gone under both. Its old name comes back from
+    // HEAD as well — in the index only when something else now sits at that
+    // path on disk, which a restore of the work tree would overwrite.
+    let (old_names, old_names_in_use): (Vec<String>, Vec<String>) = renamed_from(&before.entries, &paths)
+        .into_iter()
+        .partition(|p| std::fs::symlink_metadata(std::path::Path::new(repo_path).join(p)).is_err());
+    // A rename that changes only the case, on a disk that ignores case: the
+    // old name "exists" because it is the renamed file itself. Restoring the
+    // new name deletes that one physical file, so the old name has to come
+    // back after it, in a call of its own (in the same call git writes the
+    // old name first and then deletes it as the new one: measured on NTFS).
+    let ignore_case = !old_names_in_use.is_empty()
+        && GitCmd::at(repo_path).args(["config", "--bool", "--get", "core.ignorecase"]).ok_text().await.is_some_and(|s| s.trim() == "true");
+    let (case_only, old_names_in_use): (Vec<String>, Vec<String>) = old_names_in_use.into_iter().partition(|o| {
+        ignore_case
+            && before.entries.iter().any(|e| {
+                e.staged == "R" && e.orig_path.as_deref() == Some(o.as_str()) && paths.contains(&e.path) && e.path != *o && e.path.to_lowercase() == o.to_lowercase()
+            })
+    });
+    // A staged-added file has no HEAD version, nor has the new name of a
+    // rename or a copy: restoring one deletes it. The UI needs to word that
+    // differently, so it is counted separately.
     let will_be_deleted: Vec<String> = selected
         .iter()
-        .filter(|e| e.kind == "untracked" || e.staged == "A")
+        .filter(|e| e.kind == "untracked" || matches!(e.staged.as_str(), "A" | "R" | "C"))
         .map(|e| e.path.clone())
         .collect();
 
@@ -1184,6 +1224,8 @@ pub async fn discard(repo_path: &str, paths: Vec<String>) -> Result<OpResult, Ap
     let mut errors: Vec<String> = Vec::new();
 
     if !tracked.is_empty() {
+        let mut both = tracked.clone();
+        both.extend(old_names.iter().cloned());
         let out = GitCmd::at(repo_path)
             .args([
                 "restore",
@@ -1193,7 +1235,29 @@ pub async fn discard(repo_path: &str, paths: Vec<String>) -> Result<OpResult, Ap
                 "--pathspec-from-file=-",
                 "--pathspec-file-nul",
             ])
-            .stdin_bytes(pathspec_stdin(&tracked)?)
+            .stdin_bytes(pathspec_stdin(&both)?)
+            .timeout(LOCAL_TIMEOUT)
+            .run()
+            .await?;
+        if !out.ok() {
+            errors.push(out.stderr.clone());
+        }
+    }
+    if !old_names_in_use.is_empty() {
+        let out = GitCmd::at(repo_path)
+            .args(["restore", "--staged", "--source=HEAD", "--pathspec-from-file=-", "--pathspec-file-nul"])
+            .stdin_bytes(pathspec_stdin(&old_names_in_use)?)
+            .timeout(LOCAL_TIMEOUT)
+            .run()
+            .await?;
+        if !out.ok() {
+            errors.push(out.stderr.clone());
+        }
+    }
+    if !case_only.is_empty() {
+        let out = GitCmd::at(repo_path)
+            .args(["restore", "--staged", "--worktree", "--source=HEAD", "--pathspec-from-file=-", "--pathspec-file-nul"])
+            .stdin_bytes(pathspec_stdin(&case_only)?)
             .timeout(LOCAL_TIMEOUT)
             .run()
             .await?;
@@ -2787,6 +2851,23 @@ pub async fn continue_op(repo_path: &str, allow_markers: bool) -> Result<OpResul
         && git_file(std::path::Path::new(repo_path), "rebase-merge/stopped-sha").await.is_some()
         && !stop_is_open(std::path::Path::new(repo_path)).await;
     if picks && !committed_already && staged_is_empty(repo_path).await {
+        // `rebase --skip` resets the working tree hard (cherry-pick and revert
+        // skip with `reset --merge`, which keeps edits): unstaged edits to
+        // tracked files would go with it, where `rebase --continue` refuses
+        // over them. So a rebase skips only over a tree git calls clean, and
+        // a check git could not answer counts as edits.
+        if op.kind.starts_with("rebase") {
+            let unstaged = GitCmd::at(repo_path).pinned().args(["diff", "--quiet", "--ignore-submodules", "--"]).run().await.map(|o| o.code != 0).unwrap_or(true);
+            if unstaged {
+                return Ok(OpResult::refused(
+                    refuse(
+                        "skip-would-discard",
+                        "The stopped commit has nothing left to apply after the resolution, so the rebase can only skip it — and skipping resets the working tree, which would throw away your unstaged changes to tracked files. Nothing was changed. Set them aside first (in a terminal: `git stash`, then `git stash pop` once the rebase is finished), or discard them, then Continue.",
+                    ),
+                    before,
+                ));
+            }
+        }
         args = vec![args[0].clone(), "--skip".into()];
         skipped = true;
     } else if op.kind.starts_with("rebase") && !committed_already {
@@ -2897,6 +2978,21 @@ pub async fn init_repo(path: &str) -> Result<InitOutcome, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_staged_rename_is_acted_on_under_both_names_and_a_copy_under_one() {
+        let h = "a".repeat(40);
+        let raw = format!(
+            "2 R. N... 100644 100644 100644 {h} {h} R100 new.txt\0old.txt\x002 C. N... 100644 100644 100644 {h} {h} C75 copy.txt\0src.txt\x001 .M N... 100644 100644 100644 {h} {h} other.txt\0"
+        );
+        let entries = git_status::parse_porcelain_v2(raw.as_bytes()).entries;
+        let sel = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(renamed_from(&entries, &sel(&["new.txt"])), vec!["old.txt"]);
+        assert_eq!(renamed_from(&entries, &sel(&["new.txt", "old.txt"])), vec!["old.txt"], "named once");
+        assert!(renamed_from(&entries, &sel(&["copy.txt"])).is_empty(), "a copy's source was not changed by it");
+        assert!(renamed_from(&entries, &sel(&["other.txt"])).is_empty());
+        assert!(renamed_from(&entries, &sel(&["old.txt"])).is_empty(), "only a selected rename brings its old name");
+    }
 
     /// A throwaway folder with a project in it, no git anywhere above it.
     fn project(tag: &str) -> PathBuf {

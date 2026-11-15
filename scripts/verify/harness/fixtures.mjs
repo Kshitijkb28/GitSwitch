@@ -400,6 +400,18 @@ export const SCENARIOS = {
     untracked_count: 1,
   }),
 
+  // `git mv src/old.ts src/new.ts`, then an edit to src/new.ts: one entry under
+  // the new name, staged as a rename and listed as not staged too (where the
+  // Discard button is).
+  renamed: status({
+    entries: [
+      entry({ path: "src/new.ts", orig_path: "src/old.ts", staged: "R", unstaged: "M", rename_score: 100, staged_added: 0, staged_removed: 0 }),
+      entry({ path: "src/mod.ts" }),
+    ],
+    staged_count: 1,
+    unstaged_count: 2,
+  }),
+
   diverged: status({ ahead: 2, behind: 3 }),
   behindOnly: status({ behind: 4 }),
 

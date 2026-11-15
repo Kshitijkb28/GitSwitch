@@ -2322,6 +2322,23 @@ try {
     ok("discarding a new file warns it will be deleted from disk", (await text(page)).includes("deleted from disk"));
     await page.close();
   }
+  {
+    // Discarding goes back to the last commit, which has no file at a rename's new name.
+    const page = await open(SCENARIOS.renamed);
+    ok("(control: the rename's row is listed)", await clickInRow(page, "src/new.ts", { title: "Discard — this cannot be undone" }));
+    await page.waitForFunction(() => document.body.innerText.includes("Discard these changes?"), { timeout: 4000 });
+    const s = await text(page);
+    ok("discarding a staged rename warns its new name is deleted from disk", s.includes("1 of them is a new file and will be deleted from disk."));
+    ok("  and says the file goes back to its old name", s.includes("it goes back to its old name, as in the last commit"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.renamed);
+    await clickInRow(page, "src/mod.ts", { title: "Discard — this cannot be undone" });
+    await page.waitForFunction(() => document.body.innerText.includes("Discard these changes?"), { timeout: 4000 });
+    ok("(control: a plain modified file is not called deleted)", !(await text(page)).includes("deleted from disk"));
+    await page.close();
+  }
 
   // -----------------------------------------------------------------
   section("Staging");

@@ -307,6 +307,30 @@ git -C "$W" checkout -q -- .gitignore; rm -rf "$W/gen"
 OUT=$(probe tree_reset "$W" "$FWD,hard")
 ok "with nothing in the way the same reset runs" "$(printf '%s' "$OUT" | jqf ok)" "True"
 git -C "$W" reset -q --hard HEAD~1
+# A path the target reaches by renaming a file HEAD has is just as new on
+# disk; git's rename detection (on by default) reports it as a rename.
+START="$(head_of "$W")"
+printf 'tracked\n' > "$W/ren-old.txt"; git -C "$W" add ren-old.txt; git -C "$W" commit -qm "adds ren-old.txt"
+git -C "$W" mv ren-old.txt ren-new.txt; git -C "$W" commit -qm "renames it"
+REN="$(head_of "$W")"
+git -C "$W" reset -q --hard HEAD~1
+printf 'mine, unsaved\n' > "$W/ren-new.txt"
+ok "(control: git calls the change a rename)" "$(git -C "$W" diff --name-status HEAD "$REN" | cut -c1)" "R"
+OUT=$(probe tree_reset "$W" "$REN,hard")
+ok "an untracked file where the target renames a file to is refused too" "$(printf '%s' "$OUT" | jqf refusal.code)" "untracked-in-the-way"
+ok "  naming it" "$(printf '%s' "$OUT" | jqf refusal.message)" "ren-new.txt"
+ok "  and it is kept" "$(cat "$W/ren-new.txt")" "mine, unsaved"
+ok "  HEAD did not move" "$(head_of "$W")" "$(git -C "$W" rev-parse "$REN~1")"
+rm -f "$W/ren-new.txt"
+# Where the disk ignores case, a rename that changes only the case finds the
+# tracked file itself at the new name: that is no file in the way.
+git -C "$W" mv ren-old.txt case-tmp.txt; git -C "$W" mv case-tmp.txt REN-OLD.txt; git -C "$W" commit -qm "renames it by case"
+CASE="$(head_of "$W")"
+git -C "$W" reset -q --hard HEAD~1
+OUT=$(probe tree_reset "$W" "$CASE,hard")
+ok "a rename by case alone is not refused" "$(printf '%s' "$OUT" | jqf ok)$(printf '%s' "$OUT" | jqf refusal.code)" "True"
+ok "  and the index has the new name" "$(git -C "$W" ls-files -- REN-OLD.txt)" "REN-OLD.txt"
+git -C "$W" reset -q --hard "$START"
 
 section "Pushed means on any remote branch — for reset and undo alike"
 printf 'elsewhere\n' > "$W/else.txt"; git -C "$W" add -A >/dev/null; git -C "$W" commit -qm "pushed elsewhere"

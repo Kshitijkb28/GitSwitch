@@ -1,4 +1,4 @@
-import { useEffect, useState, type SubmitEvent } from "react";
+import { useEffect, useRef, useState, type SubmitEvent } from "react";
 import {
   X,
   FileText,
@@ -131,6 +131,9 @@ export function CommitDetailPanel({
   const [resolved, setResolved] = useState<CommitTarget | null>(target);
   const [resolving, setResolving] = useState(false);
   const [status, setStatus] = useState<RepoStatus | null>(null);
+  /** Whether `status` is a fresh answer: a read on its way, or one that failed, says nothing about the tree. */
+  const [statusRead, setStatusRead] = useState<"loading" | "ok" | "failed">("loading");
+  const statusSeq = useRef(0);
   const [stash, setStash] = useState(false);
   const [hardConfirm, setHardConfirm] = useState(false);
   /** The backend said a reset would drop pushed commits — same note as `would_drop_pushed`. */
@@ -169,7 +172,9 @@ export function CommitDetailPanel({
     return () => { cancelled = true; };
   }, [repoPath, detail.hash, openFile]);
 
-  const dirty = isDirty(status);
+  // A hard reset throws away what it is not told to stash, so a tree whose
+  // status has not arrived, or could not be read, may hold changes.
+  const dirty = statusRead !== "ok" || isDirty(status);
   const pushed = pushedNote || resolved?.would_drop_pushed === true;
   const notBehind = resolved !== null && !resolved.contained_in_head;
   const atHead = resolved?.is_head === true;
@@ -196,10 +201,35 @@ export function CommitDetailPanel({
       .then((t) => setResolved(t))
       .catch(() => setResolved(null))
       .finally(() => setResolving(false));
+  }
+
+  /**
+   * Read the working tree for the hard-reset dialog. Until the answer is in,
+   * and if it never comes, the tree counts as dirty and the stash is ticked.
+   * Only the latest read counts: an older one landing late says less.
+   */
+  function readStatus() {
+    const seq = ++statusSeq.current;
+    setStatusRead("loading");
+    setStatus(null);
+    setStash(true);
     api
       .changesRepoStatus(repoPath)
-      .then((s) => { setStatus(s); setStash(isDirty(s)); })
-      .catch(() => { setStatus(null); setStash(false); });
+      .then((s) => {
+        if (seq !== statusSeq.current) return;
+        setStatus(s);
+        setStatusRead("ok");
+        setStash(isDirty(s));
+      })
+      .catch(() => {
+        if (seq === statusSeq.current) setStatusRead("failed");
+      });
+  }
+
+  /** The confirmation re-reads the tree: edits made since "Go back" count too. */
+  function openHardConfirm() {
+    readStatus();
+    setHardConfirm(true);
   }
 
   function openBranch() {
@@ -422,7 +452,7 @@ export function CommitDetailPanel({
                 danger
                 disabled={moveBlock !== null}
                 disabledTitle={moveBlock ?? undefined}
-                onDo={() => setHardConfirm(true)}
+                onDo={openHardConfirm}
               />
             </ul>
           </div>
@@ -576,6 +606,14 @@ export function CommitDetailPanel({
           <p className="text-xs text-zinc-500">
             A backup branch ({"gitswitch-before-reset-<time>"}) keeps them; the undo command is shown afterwards.
           </p>
+          {statusRead === "loading" && (
+            <p className="text-xs text-zinc-400">Checking for uncommitted changes…</p>
+          )}
+          {statusRead === "failed" && (
+            <p className="text-xs text-amber-300">
+              GitSwitch could not read the working tree, so it may hold uncommitted changes.
+            </p>
+          )}
           {dirty && (
             <>
               <label className="flex items-start gap-2.5 cursor-pointer select-none">
@@ -589,7 +627,9 @@ export function CommitDetailPanel({
               </label>
               {!stash && (
                 <p className="text-xs text-red-400">
-                  Without stashing, your uncommitted changes are thrown away. That cannot be undone.
+                  {statusRead === "ok"
+                    ? "Without stashing, your uncommitted changes are thrown away. That cannot be undone."
+                    : "Without stashing, any uncommitted changes are thrown away. That cannot be undone."}
                 </p>
               )}
             </>
@@ -598,7 +638,7 @@ export function CommitDetailPanel({
             <Button variant="secondary" onClick={() => setHardConfirm(false)}>
               Keep things as they are
             </Button>
-            <Button variant="danger" disabled={locked} onClick={() => reset("hard")}>
+            <Button variant="danger" disabled={locked || statusRead === "loading"} onClick={() => reset("hard")}>
               Move {branch} back
             </Button>
           </div>
