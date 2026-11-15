@@ -1885,6 +1885,14 @@ pub fn validate_branch_name(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// A full object id (40 hex digits for SHA-1, 64 for SHA-256) and nothing
+/// else. An id read back from the repository (a commit's header lines, a
+/// saved state, a field of `git log` output) goes to git as a revision only
+/// when it passes: anything else could be read as an option (`--output=<file>`).
+pub fn is_object_id(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// For the other modules' tests: proof that a runner goes through `GitCmd`.
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -2227,6 +2235,26 @@ mod tests {
             "trailing/", "a//b", "ends.",
         ] {
             assert!(validate_branch_name(bad).is_err(), "{} should fail", bad);
+        }
+    }
+
+    #[test]
+    fn only_a_full_object_id_counts_as_one() {
+        assert!(is_object_id(&"a".repeat(40)) && is_object_id(&"0123456789abcdefABCDEF".repeat(3)[..64]));
+        for bad in [
+            String::new(),
+            "abc1234".into(),
+            "a".repeat(39),
+            "a".repeat(41),
+            "a".repeat(65),
+            "--output=canary.txt".into(),
+            format!("-{}", "a".repeat(39)),
+            format!("{} ", "a".repeat(39)),
+            "g".repeat(40),
+            // 40 bytes, but not 40 ASCII digits.
+            format!("é{}", "a".repeat(38)),
+        ] {
+            assert!(!is_object_id(&bad), "{bad:?} is not an object id");
         }
     }
 

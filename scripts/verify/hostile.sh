@@ -18,7 +18,10 @@
 #      names, and a plain fetch otherwise;
 #   4. legitimate settings still work: the person's own credential helper,
 #      the profile's ssh command, a git-crypt style clean filter on commit, a
-#      husky style hooks folder, submodule download with `update = !command`.
+#      husky style hooks folder, submodule download with `update = !command`;
+#   6. repository text never becomes a git option or a path outside the
+#      repository: a crafted saved state, a branch named `--output=…`, 0x1F in
+#      a commit subject, a submodule named `../../..`.
 #
 # Markers are scripts that only append a line to a file in the sandbox. No
 # network: remotes are local folders or example.invalid, and the ssh used is a
@@ -570,5 +573,90 @@ reset; profile LabAll "$SB"
 ok "profile saved over the parent folder: nothing ran" "ran:[$(fired)]" "ran:[]"
 passive_row "Repository picker, folder in a profile" history_list_repos  "{}" "$SB"
 passive_row "the page selected the repository"       changes_repo_status "{\"repoPath\":$P}" "$H"
+
+# =============================================================================
+section "6. Repository text that would become a git option or a path outside the repository"
+# Each case: plain git (or the old parsing) shows the text really does what
+# the row guards against — a canary overwritten, a folder outside deleted —
+# then the app refuses it and the canary and the folder stay.
+canary() { printf 'precious\n' > "$1"; }
+intact() { if [ "$(tr -d '\000' < "$1" 2>/dev/null)" = "precious" ]; then echo "canary unchanged"; else echo "canary OVERWRITTEN: $(head -c 60 "$1" 2>/dev/null | tr '\0\037\n' '0~ ')"; fi; }
+
+# GIT-B-04: a saved state's `parent` line, written by hand, reached `git log`
+# and `git diff-tree` as `--output=canary.txt` when the Changes tab listed the
+# states (lab 2's case).
+B4="$SB/states-hostile"; git init -q "$B4"; printf 'a\n' > "$B4/f.txt"; git -C "$B4" add f.txt
+git -C "$B4" -c user.name=x -c user.email=x@x.test commit -qm x
+B4C=$(git -C "$B4" rev-parse HEAD); B4T=$(git -C "$B4" rev-parse 'HEAD^{tree}')
+B4S=$(printf 'tree %s\nparent --output=canary.txt\nparent %s\nauthor x <x@x.test> 1700000000 +0000\ncommitter x <x@x.test> 1700000000 +0000\n\nGitSwitch state: x\n\n{"gitswitch-state":1,"name":"x","branch":null,"saved":0}\n' "$B4T" "$B4C" | git -C "$B4" hash-object -t commit -w --literally --stdin)
+# Written as a file, as an archive would carry it: `git update-ref` itself
+# refuses a commit whose parents are not ids.
+mkdir -p "$B4/.git/refs/gitswitch/states/main"; printf '%s\n' "$B4S" > "$B4/.git/refs/gitswitch/states/main/1"
+ok "(the crafted state is there for the app to find)" "$(git -C "$B4" for-each-ref --format='%(refname) %(objectname)' refs/gitswitch/states/main/)" "refs/gitswitch/states/main/1 $B4S"
+B4P="$(git -C "$B4" cat-file commit "$B4S" | sed -n 's/^parent //p' | head -1)"
+canary "$B4/canary.txt"; git -C "$B4" log -1 --format=%h%x00%s "$B4P" >/dev/null 2>&1
+ok "control: git prints the crafted parent as stored, and git log given it overwrites the canary" "$B4P / $(intact "$B4/canary.txt")" "--output=canary.txt / canary OVERWRITTEN"
+canary "$B4/canary.txt"
+out="$(pinvoke states_list "{\"repoPath\":$(jstr "$B4")}")"
+ok "states_list over a crafted state: the canary stays" "$(intact "$B4/canary.txt")" "canary unchanged"
+ok "  the list still answers, without the crafted state" "$(printf '%s' "$out" | jqf ok) $(printf '%s' "$out" | jqf value.states)" "True []"
+out="$(pinvoke states_restore "{\"repoPath\":$(jstr "$B4"),\"slot\":\"1\",\"oid\":\"$B4S\",\"newBranch\":null,\"allowPushed\":false}")"
+# git here cannot peel the crafted commit, so the slot reads as empty and the
+# page is told the state is gone; a git that reads it gets read_saved's own
+# refusal. Either way nothing is restored.
+said="$(printf '%s' "$out" | jqf error) $(printf '%s' "$out" | jqf value.refusal.code)"
+case "$said" in *"isn't a state GitSwitch saved"*|*no-state*) said="refused: $said" ;; esac
+ok "Go back to the crafted state: refused" "$said" "refused: "
+ok "  the canary stays, HEAD did not move, nothing was kept as 'Before going back'" "$(intact "$B4/canary.txt") $(git -C "$B4" rev-parse HEAD) $(git -C "$B4" for-each-ref refs/gitswitch/states/main/before | wc -l | tr -d ' ')" "canary unchanged $B4C 0"
+
+# GIT-A-07: HEAD on a branch named `--output=canary.txt` (git lets a ref be
+# called that); the History tab's sync line passed it to `git log`.
+A7="$SB/head-hostile"; newrepo "$A7"
+git -C "$A7" update-ref "refs/heads/--output=canary.txt" "$(git -C "$A7" rev-parse HEAD)"
+git -C "$A7" symbolic-ref HEAD "refs/heads/--output=canary.txt"
+canary "$A7/canary.txt"; git -C "$A7" log -1 --format=%h "$(git -C "$A7" rev-parse --abbrev-ref HEAD)" >/dev/null 2>&1
+ok "control: plain git log given HEAD's branch name overwrites the canary" "$(intact "$A7/canary.txt")" "canary OVERWRITTEN"
+canary "$A7/canary.txt"
+out="$(pinvoke history_sync_status "{\"repoPath\":$(jstr "$A7"),\"branch\":\"--all\"}")"
+ok "History sync line: the canary stays" "$(intact "$A7/canary.txt")" "canary unchanged"
+ok "  and it is refused as an invalid revision" "ok=$(printf '%s' "$out" | jqf ok): $(printf '%s' "$out" | jqf error)" "Invalid revision: --output=canary.txt"
+out="$(pinvoke history_branch_merges "{\"repoPath\":$(jstr "$A7"),\"branch\":\"--output=canary.txt\"}")"
+ok "Branch details for that branch: the canary stays" "$(intact "$A7/canary.txt")" "canary unchanged"
+
+# PARSE-R2-01: 0x1F in a commit subject moved its own words to where "Go back
+# to this commit" read the parents, and they reached `git log` as options.
+R1="$SB/subject-hostile"; newrepo "$R1"; R1P=$(git -C "$R1" rev-parse HEAD)
+printf 'a\037b\037c\037--output=canary.txt\n' > "$SB/subject-msg.txt"
+git -C "$R1" -c user.name=x -c user.email=x@x.test commit -q --allow-empty -F "$SB/subject-msg.txt"
+R1Y=$(git -C "$R1" rev-parse HEAD)
+OLDF="$(git -C "$R1" log -1 '--format=%H%x1f%h%x1f%s%x1f%an%x1f%cI%x1f%P' "$R1Y" | "$PY" -c 'import sys; print(sys.stdin.read().split("\x1f")[5].strip())')"
+canary "$R1/canary.txt"; git -C "$R1" log --no-walk=unsorted --format=%H "$OLDF" >/dev/null 2>&1
+ok "control: the old format read the subject's words as the parents, and git log given them overwrites the canary" "$OLDF / $(intact "$R1/canary.txt")" "--output=canary.txt / canary OVERWRITTEN"
+canary "$R1/canary.txt"
+out="$(pinvoke history_resolve "{\"repoPath\":$(jstr "$R1"),\"text\":\"$R1Y\"}")"
+ok "Go back to this commit: the canary stays" "$(intact "$R1/canary.txt")" "canary unchanged"
+ok "  its real parent is the one shown, and the subject is its subject" "$(printf '%s' "$out" | jqf value.parents | "$PY" -c 'import sys,json; print(",".join(p["oid"] for p in json.load(sys.stdin)))') $(printf '%s' "$out" | jqf value.is_merge)" "$R1P False"
+
+# DEST-B-01: a submodule name `../../..` in .gitmodules steered the clearing of
+# an interrupted download to the folder above the repository (lab 2's case).
+dest_case() {  # dest_case <label> <submodule name> -> the probe's answer
+  local D="$SB/dest-$1/a/b/c/outer"
+  case "$D" in "$SB"/*) ;; *) echo "refusing: $D is outside the sandbox"; exit 1;; esac
+  mkdir -p "$D"; printf 'keep me\n' > "$D/victim.txt"
+  local R="$D/repo"; newrepo "$R"
+  git -C "$R" update-index --add --cacheinfo 160000,1234567890123456789012345678901234567890,sub
+  printf '[submodule "%s"]\n\tpath = sub\n\turl = https://example.invalid/x\n' "$2" > "$R/.gitmodules"
+  git -C "$R" add .gitmodules; git -C "$R" -c user.name=x -c user.email=x@x.test commit -qm sub
+  mkdir -p "$R/sub"; git init -q "$R/sub"; mkdir -p "$R/.git/modules"
+  pinvoke changes_submodule_update "{\"repoPath\":$(jstr "$R"),\"paths\":[\"sub\"]}"
+}
+out="$(dest_case plain lib)"
+ok "control: with a plain name, the interrupted download's leftovers are cleared (the delete is reached)" "$(printf '%s' "$out" | jqf value.detail)" "An interrupted download of sub was cleared"
+out="$(dest_case planted "../../..")"
+DP="$SB/dest-planted/a/b/c/outer"
+ok "submodule name '../../..': the folder outside the repository stays" "$([ -f "$DP/victim.txt" ] && echo kept || echo DELETED)" "kept"
+ok "  nothing of the submodule was cleared either" "$([ -d "$DP/repo/sub/.git" ] && echo kept || echo cleared)" "kept"
+ok "  refused, saying why" "$(printf '%s' "$out" | jqf value.detail)" "not plain folder names"
+ok "  and named as not downloaded" "$(printf '%s' "$out" | jqf value.submodules.failed_paths)" '["sub"]'
 
 verify_result

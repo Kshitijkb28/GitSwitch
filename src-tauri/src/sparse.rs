@@ -1002,12 +1002,20 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
         Some(want) => listed.into_iter().filter(|(_, p)| want.iter().any(|w| crate::paths::norm(w) == crate::paths::norm(p))).collect(),
         None => listed,
     };
+    // The name and path are the repository author's text, and both are joined
+    // onto the repository below, to find a module directory and to clear an
+    // interrupted download's leftovers: a name like `../../..` put that delete
+    // outside the repository. Such an entry is refused, never downloaded
+    // (git itself ignores a submodule name with `..` in it), and the report
+    // says so.
+    let (listed, refused): (Vec<_>, Vec<_>) =
+        listed.into_iter().partition(|(n, p)| crate::paths::is_plain_relative(n) && crate::paths::is_plain_relative(p));
     let mut report = SubmoduleReport {
-        listed: listed.len(),
+        listed: listed.len() + refused.len(),
         downloaded: 0,
         unlisted,
-        failed_paths: Vec::new(),
-        error: None,
+        failed_paths: refused.iter().map(|(_, p)| p.clone()).collect(),
+        error: (!refused.is_empty()).then(|| refused_entries(&refused)),
         cleared: Vec::new(),
     };
     // Leave the repo exactly as `git clone --recurse-submodules` does: every
@@ -1191,14 +1199,19 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
     if let Some(dest) = progress_for {
         set_progress(dest, CloneProgress::submodules(listed.len(), listed.len(), None));
     }
-    report.failed_paths = failed.clone();
+    report.failed_paths.extend(failed.iter().cloned());
     if let Some(err) = first_error {
-        report.error = Some(format!(
+        let said = format!(
             "Couldn't download: {}.\n\n{}\n\nOnce that's sorted, Download on the repository's Submodules tab fetches {} — what already arrived is kept (in a terminal: `git submodule update --init --recursive`).",
             failed.join(", "),
             err,
             if failed.len() == 1 { "it" } else { "them" }
-        ));
+        );
+        // After the refusal of an entry that is not plain, when there was one.
+        report.error = Some(match report.error.take() {
+            Some(refusal) => format!("{}\n\n{}", refusal, said),
+            None => said,
+        });
     }
     let mut downloaded = 0;
     for (_, path) in &listed {
@@ -1210,6 +1223,19 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
     report
 }
 
+/// What the report says of `.gitmodules` entries whose name or path is not
+/// plain folder names: (name, path) each.
+fn refused_entries(refused: &[(String, String)]) -> String {
+    let each: Vec<String> = refused.iter().map(|(n, p)| if n == p { format!("`{}`", p) } else { format!("`{}` (named `{}`)", p, n) }).collect();
+    let (entry, is) = if refused.len() == 1 { ("Its name or path", "is") } else { ("Their names or paths", "are") };
+    format!(
+        "Not downloaded: {}. {} in .gitmodules {} not plain folder names (it has `..`, `.`, an empty part, a leading `/`, a drive or a backslash), so GitSwitch will not use it as a folder; git itself refuses a name with `..`. Ask whoever maintains the repository to fix .gitmodules.",
+        each.join(", "),
+        entry,
+        is
+    )
+}
+
 /// A submodule counts as downloaded only if its files are actually there:
 /// cloned-but-never-checked-out leaves `.git` with an empty folder.
 /// An interrupted download leaves a `.git` entry in the folder and a module
@@ -1217,9 +1243,20 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
 /// a folder. When nothing of it holds a commit — nothing to lose — the
 /// leftovers are removed so the download starts afresh. The path, when it did.
 async fn clear_incomplete(repo: &Path, name: &str, path: &str) -> Option<String> {
+    // Both from .gitmodules: update_submodules refuses an entry that is not
+    // plain names before it gets here; checked again because what follows
+    // deletes, and only ever inside the repository.
+    if !crate::paths::is_plain_relative(name) || !crate::paths::is_plain_relative(path) {
+        return None;
+    }
     let dir = repo.join(path);
     let gitfile = dir.join(".git");
     if !gitfile.exists() {
+        return None;
+    }
+    // A folder (or a `.git` in it) that is a link to somewhere else resolves
+    // outside the work tree: nothing there is ours to clear.
+    if !crate::paths::strictly_inside(&gitfile, repo) {
         return None;
     }
     if run_git(Some(&dir), &["rev-parse", "--verify", "--quiet", "HEAD"]).await.is_ok() {
@@ -1260,11 +1297,20 @@ async fn clear_incomplete(repo: &Path, name: &str, path: &str) -> Option<String>
                 .unwrap_or(false);
         !has_refs && !has_objects
     };
-    let modules = run_git(Some(repo), &["rev-parse", "--git-path", &format!("modules/{}", name)]).await.ok().map(|s| s.trim().to_string());
-    if let Some(m) = modules {
-        let mp = if Path::new(&m).is_absolute() { PathBuf::from(&m) } else { repo.join(&m) };
+    let git_path = |rel: String| async move {
+        let m = run_git(Some(repo), &["rev-parse", "--git-path", &rel]).await.ok()?.trim().to_string();
+        Some(if Path::new(&m).is_absolute() { PathBuf::from(&m) } else { repo.join(&m) })
+    };
+    if let Some(mp) = git_path(format!("modules/{}", name)).await {
         if mp.exists() {
-            if !commitless(mp.clone()).await {
+            // git prints `modules/<name>` as given, `..` and all: the module
+            // directory is cleared only when the disk puts it inside the
+            // repository's own modules folder.
+            let inside = match git_path("modules".to_string()).await {
+                Some(base) => crate::paths::strictly_inside(&mp, &base),
+                None => false,
+            };
+            if !inside || !commitless(mp.clone()).await {
                 return None;
             }
             let _ = std::fs::remove_dir_all(&mp);

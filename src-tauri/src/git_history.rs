@@ -183,8 +183,11 @@ pub struct SyncStatus {
     pub remote_tip: Option<CommitRef>,
 }
 
+/// `rev` is a branch name the repository supplies (HEAD's, its upstream's):
+/// after `--end-of-options` (git 2.24) it is never read as an option, even
+/// for a ref named `refs/heads/--output=<file>`.
 fn commit_ref(repo: &Path, rev: &str) -> Option<CommitRef> {
-    let raw = git(repo, &["log", "-1", &format!("--format=%h{US}%s{US}%an{US}%cI", US = US), rev]).ok()?;
+    let raw = git(repo, &["log", "-1", &format!("--format=%h{US}%s{US}%an{US}%cI", US = US), "--end-of-options", rev]).ok()?;
     let f: Vec<&str> = raw.splitn(4, US).collect();
     if f.len() < 4 {
         return None;
@@ -235,15 +238,15 @@ pub struct MergeCommit {
 /// being the tip means the commits sit on that line — a fast-forward; anything
 /// else is the merge that brought the tip in through another parent.
 fn merged_by(repo: &Path, tip: &str, target: &str) -> Option<(String, Option<MergeCommit>)> {
-    let fp = git(repo, &["rev-list", "--first-parent", &format!("{}..{}", tip, target)]).ok()?;
+    let fp = git(repo, &["rev-list", "--first-parent", "--end-of-options", &format!("{}..{}", tip, target)]).ok()?;
     let fp: Vec<&str> = fp.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if fp.is_empty() {
         return Some(("same-commit".into(), None));
     }
-    let anc = git(repo, &["rev-list", "--ancestry-path", &format!("{}..{}", tip, target)]).ok()?;
+    let anc = git(repo, &["rev-list", "--ancestry-path", "--end-of-options", &format!("{}..{}", tip, target)]).ok()?;
     let anc: std::collections::HashSet<&str> = anc.lines().map(str::trim).collect();
     let m = fp.iter().rev().find(|c| anc.contains(**c))?;
-    let raw = git(repo, &["log", "-n1", "--no-show-signature", &format!("--format=%H{US}%h{US}%P{US}%aN{US}%aI{US}%s", US = US), m]).ok()?;
+    let raw = git(repo, &["log", "-n1", "--no-show-signature", &format!("--format=%H{US}%h{US}%P{US}%aN{US}%aI{US}%s", US = US), "--end-of-options", m]).ok()?;
     let f: Vec<&str> = raw.trim_end_matches('\n').splitn(6, US).collect();
     if f.len() < 6 {
         return None;
@@ -1033,7 +1036,7 @@ pub fn commit_detail(repo_path: &str, hash: &str) -> Result<CommitDetail, AppErr
         "%H{US}%h{US}%an{US}%ae{US}%aI{US}%cn{US}%ce{US}%P{US}%D{US}%G?{US}%s{US}%b",
         US = US
     );
-    let raw = git(&repo, &["show", "-s", &format!("--format={}", fmt), hash])?;
+    let raw = git(&repo, &["show", "-s", &format!("--format={}", fmt), "--end-of-options", hash])?;
     let f: Vec<&str> = raw.splitn(12, US).collect();
     if f.len() < 12 {
         return Err(AppError::NotFound(format!("Commit {} not found", hash)));
@@ -1043,7 +1046,7 @@ pub fn commit_detail(repo_path: &str, hash: &str) -> Result<CommitDetail, AppErr
     // rename detection: a rename would otherwise print `dir/{old => new}`,
     // which is not a path the file diff can be asked for; as a deletion plus
     // an addition both rows carry real paths.
-    let stat = git(&repo, &["show", "--numstat", "--no-renames", "--format=", hash]).unwrap_or_default();
+    let stat = git(&repo, &["show", "--numstat", "--no-renames", "--format=", "--end-of-options", hash]).unwrap_or_default();
     let files = stat
         .lines()
         .filter_map(|l| {
@@ -1094,7 +1097,7 @@ pub fn commit_detail(repo_path: &str, hash: &str) -> Result<CommitDetail, AppErr
 /// merge commits along its own history.
 pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, AppError> {
     let repo = PathBuf::from(repo_path);
-    let tip = git(&repo, &["rev-parse", branch])?;
+    let tip = git(&repo, &["rev-parse", "--verify", "--end-of-options", branch])?;
 
     // Full ref names, so each remote's symbolic HEAD (short name: just
     // "origin") can be recognised and left out.
@@ -1314,6 +1317,12 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
     } else {
         branch.to_string()
     };
+    // Read from the repository (HEAD can point at `refs/heads/--output=<file>`,
+    // which git lets a ref be called) or sent by the page: it starts the
+    // arguments below, where a leading `-` would make it an option.
+    if branch.starts_with('-') {
+        return Err(AppError::Config(format!("Invalid revision: {}", branch)));
+    }
 
     let upstream = git(
         &repo,
@@ -1326,7 +1335,7 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
     if let Some(up) = upstream.as_ref() {
         if let Ok(counts) = git(
             &repo,
-            &["rev-list", "--left-right", "--count", &format!("{}...{}", branch, up)],
+            &["rev-list", "--left-right", "--count", "--end-of-options", &format!("{}...{}", branch, up)],
         ) {
             let mut it = counts.split_whitespace();
             ahead = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);

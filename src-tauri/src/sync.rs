@@ -943,7 +943,32 @@ async fn state_path(repo: &Path) -> Result<PathBuf, AppError> {
 pub async fn read_state(repo: &Path) -> Option<SyncState> {
     let p = state_path(repo).await.ok()?;
     let text = std::fs::read_to_string(p).ok()?;
-    serde_json::from_str(&text).ok()
+    serde_json::from_str(&text).ok().filter(state_is_plain)
+}
+
+/// The state file sits in the git directory, so whoever made the repository
+/// could have written it, and Continue and Abort pass what it holds to git
+/// (`reset --hard <head_before>`, `branch -f <branch> <at>`, `branch -D
+/// <backup>`): commits must be object ids, names must not read as options,
+/// the upstream must be a remote-tracking ref. A state that is not is not
+/// one this app wrote, and is not acted on.
+fn state_is_plain(st: &SyncState) -> bool {
+    let oid = |s: &str| s.is_empty() || crate::git_exec::is_object_id(s);
+    let name = |s: &str| !s.starts_with('-');
+    st.upstream_ref.starts_with("refs/remotes/")
+        && oid(&st.upstream_oid)
+        && oid(&st.head_before)
+        && st.backup.as_deref().is_none_or(name)
+        && st.subs.iter().all(|s| {
+            // Joined onto the repository by Continue and Abort: an absolute
+            // path or one with `..` would point them at another repository.
+            crate::paths::is_plain_relative(&s.path)
+                && oid(&s.head_before)
+                && oid(&s.target)
+                && s.head_after.as_deref().is_none_or(oid)
+                && [&s.backup, &s.branch_before, &s.reattach_to, &s.remote].iter().all(|n| n.as_deref().is_none_or(name))
+                && s.reattached.as_ref().is_none_or(|(b, at)| name(b) && oid(at))
+        })
 }
 
 fn write_state_at(path: &Path, st: &SyncState) -> Result<(), AppError> {
@@ -4092,6 +4117,50 @@ mod lfs_mode_tests {
         assert!(!all.downloads_inside());
         let none = state(false, None);
         assert_eq!(none.lfs_mode(""), LfsMode::Plain);
+    }
+
+    // (Here for the `state` helper.)
+    #[test]
+    fn a_state_file_that_names_options_is_not_acted_on() {
+        let (h, t) = ("a".repeat(40), "b".repeat(40));
+        let sub = SubState {
+            path: "lib".into(),
+            branch_before: Some("main".into()),
+            reattach_to: None,
+            head_before: h.clone(),
+            backup: Some("gitswitch-before-update-1".into()),
+            target: t.clone(),
+            rebased: false,
+            head_after: Some(t.clone()),
+            aligned: false,
+            note: String::new(),
+            stash_before: Some(String::new()),
+            reattached: Some(("main".into(), h.clone())),
+            url_change: None,
+            url_synced: false,
+            url_note: None,
+            remote: Some("origin".into()),
+        };
+        let good = SyncState { upstream_ref: "refs/remotes/origin/main".into(), upstream_oid: t.clone(), head_before: h.clone(), backup: Some("gitswitch-before-update-1".into()), subs: vec![sub.clone()], ..state(false, None) };
+        assert!(state_is_plain(&good));
+        assert!(state_is_plain(&SyncState { head_before: String::new(), subs: vec![SubState { head_before: String::new(), target: String::new(), ..sub.clone() }], ..good.clone() }), "not known yet");
+        let bad: Vec<SyncState> = vec![
+            SyncState { head_before: "--recurse-submodules".into(), ..good.clone() },
+            SyncState { head_before: "HEAD~3".into(), ..good.clone() },
+            SyncState { upstream_ref: "--output=x".into(), ..good.clone() },
+            SyncState { backup: Some("--list".into()), ..good.clone() },
+            SyncState { subs: vec![SubState { branch_before: Some("--orphan".into()), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { reattached: Some(("--delete".into(), h.clone())), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { reattached: Some(("main".into(), "--x".into())), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { head_before: "-x".into(), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { target: "--output=y".into(), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { path: "../other".into(), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { path: "/etc".into(), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { path: "C:/Windows".into(), ..sub.clone() }], ..good.clone() },
+        ];
+        for st in &bad {
+            assert!(!state_is_plain(st), "{:?} must not be acted on", (&st.head_before, &st.upstream_ref, &st.backup, &st.subs.first().map(|s| (&s.path, &s.head_before, &s.target, &s.branch_before, &s.reattached))));
+        }
     }
 }
 

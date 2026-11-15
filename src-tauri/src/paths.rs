@@ -22,6 +22,34 @@ pub fn is_within(child: &str, parent: &str) -> bool {
     c == p || c.starts_with(&format!("{}/", p))
 }
 
+/// A relative path the repository itself supplies (a submodule's name or
+/// path in `.gitmodules`) that can be joined onto one of our folders without
+/// leaving it: plain names separated by `/`. Refused: `..` and `.` (and any
+/// name of only dots and spaces, which Windows trims down to one of those),
+/// a leading `/`, a drive (`C:`), a backslash (a separator on Windows), an
+/// empty name (`a//b`) and NUL. One trailing `/` is allowed.
+pub fn is_plain_relative(p: &str) -> bool {
+    if p.is_empty() || p.starts_with('/') || p.contains(['\\', '\0']) {
+        return false;
+    }
+    let p = p.strip_suffix('/').unwrap_or(p);
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return false;
+    }
+    p.split('/').all(|name| !name.is_empty() && !name.chars().all(|c| c == '.' || c == ' '))
+}
+
+/// `target` lies inside `base` and is not `base` itself, as the disk resolves
+/// both (links, junctions and `..` followed). False when either cannot be
+/// resolved: a path that cannot be checked is not inside.
+pub fn strictly_inside(target: &std::path::Path, base: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(target), std::fs::canonicalize(base)) {
+        (Ok(t), Ok(b)) => t != b && t.starts_with(&b),
+        _ => false,
+    }
+}
+
 /// Last path component, whichever separator the platform used.
 pub fn base_name(path: &str) -> String {
     norm(path)
@@ -193,6 +221,30 @@ pub fn home_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_plain_names_pass_as_a_path_the_repository_supplies() {
+        for ok in ["lib", "libs/core", "vendor/x y", "lib/", "a.b/c..d", ".hidden/x"] {
+            assert!(is_plain_relative(ok), "{ok} is a plain path");
+        }
+        for bad in ["", "..", "../../..", "a/../b", ".", "./a", "a/.", "...", ".. ", "a/. ./b", "/etc", "//x", "a//b", "C:", "c:/x", "C:x", "x:y", r"a\b", r"..\x", "a\0b", "/"] {
+            assert!(!is_plain_relative(bad), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn inside_means_strictly_inside_as_the_disk_resolves_it() {
+        let root = std::env::temp_dir().join(format!("gs-inside-{}", std::process::id()));
+        let inner = root.join("repo").join(".git").join("modules").join("lib");
+        std::fs::create_dir_all(&inner).unwrap();
+        let repo = root.join("repo");
+        assert!(strictly_inside(&inner, &repo));
+        assert!(!strictly_inside(&repo, &repo), "the folder itself is not inside it");
+        assert!(!strictly_inside(&repo.join(".git").join("modules").join("..").join("..").join(".."), &repo), "`..` is followed");
+        assert!(!strictly_inside(&root, &repo));
+        assert!(!strictly_inside(&repo.join("missing"), &repo), "what cannot be resolved is not inside");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_config_value_is_quoted_and_escaped_so_git_reads_back_the_same_string() {
