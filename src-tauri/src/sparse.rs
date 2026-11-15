@@ -387,7 +387,11 @@ async fn run_git_streaming(
     for kv in cfg {
         git = git.cfg_raw(kv);
     }
-    let (mut cmd, argv) = git.args(args.iter().copied()).prepare();
+    let git = git.args(args.iter().copied()).settled().await?;
+    // As `run` does: what was read of this folder while a write ran (a
+    // half-downloaded submodule) is forgotten once it is over.
+    let _forget = git.forget_when_done();
+    let (mut cmd, argv) = git.prepare();
     let started = std::time::Instant::now();
     let mut child = cmd.spawn().map_err(|e| AppError::Command(format!("Failed to run git: {}", e)))?;
     #[cfg(windows)]
@@ -1126,14 +1130,15 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
                     Some(sha) => have_recorded(sha.clone()).await,
                     None => false,
                 };
-                // Already here: what is recorded is checked out whatever
-                // `submodule.<name>.update` says — merge, rebase or none
-                // would make "Update to" a merge commit inside it, a rebase,
-                // or nothing at all.
-                let mut update = vec!["submodule", "update", "--init", "--recursive", "--progress"];
+                // What is recorded is checked out whatever
+                // `submodule.<name>.update` says. Already here, merge, rebase
+                // or none would make "Update to" a merge commit inside it, a
+                // rebase, or nothing at all; on a first download git turns
+                // those into a checkout by itself but would still run an
+                // `update = !command` from the repository's own config.
+                let mut update = vec!["submodule", "update", "--init", "--recursive", "--progress", "--checkout"];
                 let mut update_cfg = cfg.clone();
                 if downloaded {
-                    update.push("--checkout");
                     // And a nested one set to `update = merge` can only
                     // fast-forward: one with commits of its own fails with
                     // git's words instead of getting a merge commit.

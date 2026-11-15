@@ -466,6 +466,13 @@ pub(crate) mod tests {
             let trace = crate::sparse::progress_trace().lock().map(|t| t.clone()).unwrap_or_default();
             let _ = std::fs::write(path, serde_json::to_string(&trace).unwrap_or_else(|_| "[]".into()));
         }
+        // Every git command the op ran, with the class the runner gave it
+        // (scripts/verify/hostile.sh: a passive entry point runs passive
+        // commands only).
+        if let Ok(path) = std::env::var("PROBE_CLASS_FILE") {
+            let ran = crate::git_exec::test_support::ran_all();
+            let _ = std::fs::write(path, serde_json::to_string(&ran).unwrap_or_else(|_| "[]".into()));
+        }
         // What a poll for this path would read now that the op is over: an
         // entry left behind would open the next download on this one's line.
         if let (Ok(file), Ok(path)) = (std::env::var("PROBE_LEFT_FILE"), std::env::var("PROBE_LEFT_FOR")) {

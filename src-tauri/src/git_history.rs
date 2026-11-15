@@ -1198,6 +1198,12 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
     if remotes.is_empty() {
         return Err(AppError::Config("This repo has no remote to fetch from.".into()));
     }
+    // This fetch runs on its own when "auto fetch" is on, so it is a passive
+    // command (`GitCmd::history_fetch`): refused, once and naming the keys,
+    // when the repository's own config names a program a fetch would run.
+    // Called from a blocking thread, hence `block_on`.
+    let rt = tokio::runtime::Handle::current();
+    rt.block_on(crate::git_exec::check_history_fetch(&repo))?;
 
     let head_before = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default();
     let worktree_before = git(&repo, &["status", "--porcelain"]).unwrap_or_default();
@@ -1213,7 +1219,6 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
     // downloads. The remotes `--all` would skip (`skipFetchAll`) are skipped.
     // No submodule recursion, as everywhere else in the app. Called from a
     // blocking thread, hence `block_on`.
-    let rt = tokio::runtime::Handle::current();
     let mut failures: Vec<String> = Vec::new();
     for remote in &remotes {
         if git(&repo, &["config", "--bool", "--get", &format!("remote.{}.skipFetchAll", remote)]).map(|v| v.trim() == "true").unwrap_or(false) {
@@ -1225,6 +1230,7 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
         }
         let fetched = rt.block_on(
             crate::git_exec::GitCmd::at(&repo)
+                .history_fetch()
                 .for_fetch()
                 .args(["fetch", "--progress", "--no-recurse-submodules", "--", remote])
                 .run(),
@@ -1243,7 +1249,7 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
             Err(e) => failures.push(format!("{}: {}", remote, e)),
         }
     }
-    rt.block_on(crate::git_exec::housekeeping(&repo));
+    rt.block_on(crate::git_exec::history_housekeeping(&repo));
     if !failures.is_empty() {
         return Err(AppError::Command(failures.join("\n\n")));
     }

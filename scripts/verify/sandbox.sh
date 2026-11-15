@@ -413,7 +413,9 @@ git -C "$SB/work" remote set-url --push origin https://github.com/acme/thing.git
 OUT=$(who)
 ok "an HTTPS remote with no stored credential says the push would fail" "$(printf '%s' "$OUT" | jqf value.via):$(printf '%s' "$OUT" | jqf value.login)" "https-credential:None"
 ok "  and why" "$(printf '%s' "$OUT" | jqf value.detail)" "No credential is stored"
-git -C "$SB/work" config credential.helper '!f() { echo username=hthelper; echo password=not-a-real-secret; }; f'
+# The helper is the person's own (global, in the sandbox's HOME): the push card
+# never runs a helper the repository's own config names (hostile.sh).
+git config --global credential.helper '!f() { echo username=hthelper; echo password=not-a-real-secret; }; f'
 OUT=$(who)
 # For github.com the account comes from GitHub's answer to the token, never from
 # the stored user name (a name is whatever was typed when it was saved). The
@@ -421,14 +423,14 @@ OUT=$(who)
 ok "a stored GitHub credential is named, but not trusted as the account" "$(printf '%s' "$OUT" | jqf value.account):$(printf '%s' "$OUT" | jqf value.login)" "hthelper:None"
 ok "  and says GitHub could not be asked" "$(printf '%s' "$OUT" | jqf value.detail)" "could not be reached"
 ok "  without the secret anywhere in the answer" "$(printf '%s' "$OUT" | grep -c "not-a-real-secret" || true)" "0"
-git -C "$SB/work" config credential.helper '!f() { echo username=ghp_000000000000000000000000000000000000; echo password=x-oauth-basic; }; f'
+git config --global credential.helper '!f() { echo username=ghp_000000000000000000000000000000000000; echo password=x-oauth-basic; }; f'
 OUT=$(who)
 ok "a token travelling as the user name is treated as the secret, not shown" "$(printf '%s' "$OUT" | grep -c "ghp_0000" || true)" "0"
 git -C "$SB/work" remote set-url --push origin https://gitlab.example.com/acme/thing.git
-git -C "$SB/work" config credential.helper '!f() { echo username=hthelper; echo password=not-a-real-secret; }; f'
+git config --global credential.helper '!f() { echo username=hthelper; echo password=not-a-real-secret; }; f'
 OUT=$(who)
 ok "for a host that is not GitHub, the stored user name is the best available answer" "$(printf '%s' "$OUT" | jqf value.login)" "hthelper"
-git -C "$SB/work" config --unset credential.helper
+git config --global --unset credential.helper
 # A block rewrites the remote's URL, never an explicit pushurl (git's rule, and
 # the guard's documented gap that the hook covers), so the URL itself moves here.
 git -C "$SB/work" config --unset remote.origin.pushurl

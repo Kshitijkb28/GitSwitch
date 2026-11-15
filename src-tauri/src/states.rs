@@ -1057,7 +1057,10 @@ fn restore_inner<'a>(
             if !dir.join(".git").exists() {
                 // A submodule removed or never downloaded here: checked out again
                 // from what this repository already has (never from the network).
-                let _ = run(g(repo).args(["submodule", "update", "--init", "--no-fetch", "--", &sub.path])).await;
+                // `--checkout`: the saved commit, whatever the repository's
+                // `submodule.<name>.update` says (an `!command` there would
+                // otherwise run).
+                let _ = run(g(repo).args(["submodule", "update", "--init", "--no-fetch", "--checkout", "--", &sub.path])).await;
             }
             if !dir.join(".git").exists() {
                 notes.push(format!("{} isn't downloaded, so its part couldn't come back. Download it (Submodules), then go back again.", shown));
