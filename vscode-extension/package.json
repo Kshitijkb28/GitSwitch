@@ -58,11 +58,12 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npx --yes @vscode/vsce@3 package --no-dependencies --skip-license"
+    "package": "vsce package --no-dependencies --skip-license"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "3.9.2",
     "typescript": "~5.8.3"
   },
   "repository": {
