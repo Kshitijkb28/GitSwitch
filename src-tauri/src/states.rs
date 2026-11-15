@@ -1086,6 +1086,13 @@ fn restore_inner<'a>(
                 notes.push(format!("{}: its part of the state names a folder outside the repository, so it was left alone.", shown));
                 continue;
             }
+            // Plain names can still lead out through a link (a junction on
+            // Windows) to another repository: no name of it that exists may
+            // be one (`paths::lies_inside`).
+            if !crate::paths::lies_inside(&repo.join(&sub.path), repo) {
+                notes.push(format!("{}: its folder leads outside the repository (a link), so it was left alone.", shown));
+                continue;
+            }
             let Some(oid) = &sub.oid else {
                 notes.push(format!("{} had no commit yet when the state was saved; it was left as it is.", shown));
                 continue;
@@ -1504,8 +1511,9 @@ pub async fn delete(repo_path: &str, slot: &str, oid: &str) -> Result<OpResult, 
 fn forget_inner<'a>(repo: &'a Path, subs: &'a [SubState], slot: &'a Slot) -> BoxFut<'a, ()> {
     Box::pin(async move {
         for sub in subs {
-            // Text from the state's message: never a folder outside the repository.
-            if !crate::paths::is_plain_relative(&sub.path) {
+            // Text from the state's message: never a folder outside the
+            // repository, by its names or through a link.
+            if !crate::paths::is_plain_relative(&sub.path) || !crate::paths::lies_inside(&repo.join(&sub.path), repo) {
                 continue;
             }
             let dir = repo.join(&sub.path);
@@ -1613,8 +1621,9 @@ async fn describe(repo: &Path, slot: &Slot, s: &Saved, upstream: Option<String>)
 fn describe_inner<'a>(repo: &'a Path, subs: &'a [SubState], prefix: &'a str, out: &'a mut Vec<StateSub>) -> BoxFut<'a, ()> {
     Box::pin(async move {
         for sub in subs {
-            // Text from the state's message: never a folder outside the repository.
-            if !crate::paths::is_plain_relative(&sub.path) {
+            // Text from the state's message: never a folder outside the
+            // repository, by its names or through a link.
+            if !crate::paths::is_plain_relative(&sub.path) || !crate::paths::lies_inside(&repo.join(&sub.path), repo) {
                 continue;
             }
             let path = format!("{}{}", prefix, sub.path);
@@ -1858,18 +1867,57 @@ mod tests {
         let repo = base.join("repo");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir_all(base.join("outside").join(".git")).unwrap();
-        let subs = vec![SubState { path: "../outside".into(), oid: None }, SubState { path: "lib".into(), oid: None }];
+        // Plain names, but a link (a junction on Windows) to `outside`.
+        crate::paths::test_link_dir(&base.join("outside"), &repo.join("linked"));
+        let subs = vec![SubState { path: "../outside".into(), oid: None }, SubState { path: "linked".into(), oid: None }, SubState { path: "lib".into(), oid: None }];
 
         let mut out = Vec::new();
         describe_inner(&repo, &subs, "", &mut out).await;
-        assert_eq!(out.iter().map(|s| s.path.as_str()).collect::<Vec<_>>(), vec!["lib"], "only the plain path is described");
+        assert_eq!(out.iter().map(|s| s.path.as_str()).collect::<Vec<_>>(), vec!["lib"], "only the plain path inside is described");
 
         let (mut notes, mut backups) = (Vec::new(), Vec::new());
         restore_inner(&repo, &subs, &HashMap::new(), "", false, &mut notes, &mut backups).await.unwrap();
-        assert_eq!(notes.len(), 2, "{:?}", notes);
+        assert_eq!(notes.len(), 3, "{:?}", notes);
         assert!(notes[0].starts_with("../outside: ") && notes[0].contains("outside the repository"), "{:?}", notes);
-        assert!(notes[1].starts_with("lib had no commit yet"), "{:?}", notes);
+        assert!(notes[1].starts_with("linked: ") && notes[1].contains("leads outside the repository"), "{:?}", notes);
+        assert!(notes[2].starts_with("lib had no commit yet"), "{:?}", notes);
         assert!(backups.is_empty());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Text a saved state carries (its HEAD, its trees) that reaches git as
+    /// a revision is never an option: each runner puts `--end-of-options`
+    /// (git 2.24) right before it, and the file `--output=` names is not
+    /// written. Reached here directly: `check_state_ids` refuses such a
+    /// state before any of them runs.
+    #[tokio::test]
+    async fn a_dash_led_revision_from_a_state_is_never_an_option() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-states-eoo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run(g(&dir).args(["init", "-q", "-b", "main"])).await.unwrap();
+        run(g(&dir).args(["-c", "user.name=x", "-c", "user.email=x@x.test", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "--no-verify", "-m", "one"])).await.unwrap();
+        std::fs::write(dir.join("canary.txt"), "precious\n").unwrap();
+        let rev = "--output=canary.txt";
+
+        assert_eq!(count(&dir, &[], &[rev]).await, 0);
+        assert_eq!(names(&dir, rev, "HEAD", None).await, 0);
+        assert!(lfs_missing(&dir, rev, "HEAD").await.is_empty());
+        let odd = Saved { oid: format!("eoo-{}", std::process::id()), head: rev.into(), index_tree: rev.into(), worktree_tree: rev.into(), meta: Meta::default() };
+        let _ = describe(&dir, &Slot::parse("1", false, 4).unwrap(), &odd, None).await;
+        // compare's diff-tree runs once HEAD and the index are as saved.
+        let at_head = Saved { head: head_commit(&dir).await.unwrap(), index_tree: run(g(&dir).args(["write-tree"])).await.unwrap(), ..odd.clone() };
+        assert!(compare(&dir, &at_head, Some("main"), "").await.is_err());
+
+        assert_eq!(std::fs::read_to_string(dir.join("canary.txt")).unwrap(), "precious\n", "nothing was written to the file the text names");
+        let ran: Vec<Vec<String>> = crate::git_exec::test_support::ran_under(&dir).into_iter().map(|r| r.args).filter(|a| a.iter().any(|x| x.starts_with(rev))).collect();
+        let subs: Vec<&str> = ran.iter().map(|a| a[0].as_str()).collect();
+        // count, names, lfs_missing; describe: its counts (three) and its log; compare.
+        assert_eq!(subs, vec!["rev-list", "diff-tree", "diff-tree", "diff-tree", "diff-tree", "diff-tree", "log", "diff-tree"], "{:?}", ran);
+        for a in &ran {
+            let at = a.iter().position(|x| x.starts_with(rev)).unwrap();
+            assert_eq!(a[at - 1], "--end-of-options", "{:?}", a);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

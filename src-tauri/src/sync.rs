@@ -978,6 +978,19 @@ fn state_is_plain(st: &SyncState) -> bool {
         })
 }
 
+/// A folder the state file names (a submodule's path, a repository of the
+/// large-file plan), joined onto the repository: only when it is plain names
+/// and none of its names that exist is a link — a link there (a junction on
+/// Windows) to another repository would point Continue and Abort at that
+/// one. A folder not made yet is still inside (`paths::lies_inside`).
+fn state_dir(repo: &Path, path: &str) -> Option<PathBuf> {
+    let dir = repo.join(path);
+    (crate::paths::is_plain_relative(path) && crate::paths::lies_inside(&dir, repo)).then_some(dir)
+}
+
+/// What the result says of such a folder, after its path.
+const LEADS_OUT: &str = "its folder leads outside the repository (a link), so it was left alone";
+
 fn write_state_at(path: &Path, st: &SyncState) -> Result<(), AppError> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(st)?)?;
@@ -1198,7 +1211,14 @@ async fn lfs_after_update(repo: &Path, st: &SyncState) -> String {
         }
     }
     for (path, complete_before) in &targets {
-        let dir = if path.is_empty() { repo.to_path_buf() } else { repo.join(path) };
+        let dir = if path.is_empty() {
+            repo.to_path_buf()
+        } else {
+            match state_dir(repo, path) {
+                Some(d) => d,
+                None => continue,
+            }
+        };
         if !dir.is_dir() {
             continue;
         }
@@ -2649,7 +2669,12 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
             continue;
         }
         let path = st.subs[i].path.clone();
-        let sub = repo.join(&path);
+        let Some(sub) = state_dir(repo, &path) else {
+            st.subs[i].note = LEADS_OUT.into();
+            st.subs[i].aligned = true;
+            write_state_at(state_file, st)?;
+            continue;
+        };
         if let Some(u) = st.subs[i].url_change.clone().filter(|_| st.subs[i].url_note.is_none()) {
             let to = crate::repo_scan::mask_token(&u.to);
             let remote = st.subs[i].remote.clone().unwrap_or_else(|| "origin".into());
@@ -2755,7 +2780,10 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
     // abort never undoes a download (there was nothing there before).
     let fresh: Vec<String> = st.plan.superproject.new_submodules.iter().filter(|p| !st.subs.iter().any(|s| &s.path == *p)).cloned().collect();
     for path in fresh {
-        let sub = repo.join(&path);
+        // The plan's list is the state file's text too: a path that is not
+        // plain names, or that leads out through a link, is not one upstream
+        // added here, and nothing is set up in it.
+        let Some(sub) = state_dir(repo, &path) else { continue };
         let recorded = gitlink_at(repo, "HEAD", &path).await.unwrap_or_default();
         let (ok, note) = if sub.join(".git").exists() {
             (true, "new upstream; already downloaded".to_string())
@@ -2832,7 +2860,8 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
 /// Where a sub's rebase is mid-flight.
 async fn sub_rebase_in_progress(repo: &Path, st: &SyncState) -> Option<String> {
     for s in &st.subs {
-        if rebase_in_progress(&repo.join(&s.path)).await {
+        let Some(dir) = state_dir(repo, &s.path) else { continue };
+        if rebase_in_progress(&dir).await {
             return Some(s.path.clone());
         }
     }
@@ -3375,7 +3404,19 @@ async fn build_outcome(repo: &Path, st: &SyncState) -> SyncOutcome {
     let mut aligned_all = true;
     let mut unrecorded = Vec::new();
     for s in &st.subs {
-        let sub = repo.join(&s.path);
+        let Some(sub) = state_dir(repo, &s.path) else {
+            aligned_all = false;
+            subs.push(SubOutcome {
+                path: s.path.clone(),
+                action: outcome_action(s, st.plan.submodules.iter().find(|p| p.path == s.path).map(|p| p.action.as_str()), &st.phase),
+                head_before: Some(s.head_before.clone()),
+                head_after: None,
+                recorded_after: None,
+                ok: false,
+                note: LEADS_OUT.into(),
+            });
+            continue;
+        };
         if let Some(b) = &s.backup {
             backups.push(BackupRef { repo: sub.to_string_lossy().to_string(), branch: b.clone(), oid: s.head_before.clone(), recovery: recovery(&sub, b) });
         }
@@ -3686,7 +3727,7 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
             return Ok(OpResult::refused(Refusal { code: "unmerged-paths".into(), message: format!("{} still has conflicted files. Resolve and stage them inside it first.", path) }, status));
         }
         // The stash entry it left is theirs to drop; the rebase itself is done.
-        if let Some(ss) = st.subs.iter_mut().find(|s| s.path == path) {
+        if let Some(ss) = st.subs.iter_mut().find(|s| s.path == path && state_dir(&repo, &s.path).is_some()) {
             let new_head = oid(&sub, "HEAD").await.unwrap_or_default();
             reattach(&sub, ss).await;
             ss.head_after = Some(new_head);
@@ -3764,9 +3805,12 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
         return Ok(r);
     }
     // Finished in a terminal: where the person finished it is where the
-    // update's rebase ended.
+    // update's rebase ended — but only while nothing came after the finish.
+    // A commit made in the terminal since would otherwise count as part of
+    // the update, and Abort would reset it away. Not adopted, Abort leaves
+    // the superproject rebased and names the backup.
     if st.head_after.is_none() {
-        st.head_after = oid(&repo, "HEAD").await;
+        st.head_after = finished_here(&repo, &st.plan.superproject.branch).await;
     }
     Box::pin(align_submodules(&repo, &mut st, &state_file)).await?;
     Box::pin(finish(repo_path, &st, &state_file)).await
@@ -3849,7 +3893,12 @@ async fn put_back_urls(repo: &Path, st: &mut SyncState) -> Vec<String> {
     let mut notes = Vec::new();
     for s in st.subs.iter_mut() {
         let Some(u) = s.url_change.clone().filter(|_| s.url_synced) else { continue };
-        let sub = repo.join(&s.path);
+        // `submodule sync` writes the address into the submodule's own config.
+        let Some(sub) = state_dir(repo, &s.path) else {
+            s.url_note = Some(LEADS_OUT.into());
+            notes.push(format!("{}: {}", s.path, LEADS_OUT));
+            continue;
+        };
         let remote = s.remote.clone().unwrap_or_else(|| "origin".into());
         let ok = g(repo).args(["submodule", "sync", "--", &s.path]).timeout(LOCAL_TIMEOUT).run().await.map(|o| o.ok()).unwrap_or(false);
         clear_parked(&sub, &remote).await;
@@ -3872,12 +3921,16 @@ async fn put_back_submodules(repo: &Path, st: &mut SyncState) -> Vec<String> {
     let mut notes: Vec<String> = Vec::new();
     let handed_over = st.handed_over.clone();
     for s in st.subs.iter_mut() {
-        let sub = repo.join(&s.path);
         // Downloaded by the update because upstream added it: there was nothing
         // there before, and nothing is taken away.
         if s.head_before.is_empty() {
             continue;
         }
+        let Some(sub) = state_dir(repo, &s.path) else {
+            s.note = LEADS_OUT.into();
+            notes.push(format!("{}: {}", s.path, s.note));
+            continue;
+        };
         if rebase_in_progress(&sub).await {
             let _ = rewrite_cmd(&sub, repo, modes.get(&s.path).copied().unwrap_or_default(), LOCAL_TIMEOUT).args(["rebase", "--abort"]).run().await;
         }
@@ -3954,6 +4007,22 @@ async fn put_back_submodules(repo: &Path, st: &mut SyncState) -> Vec<String> {
         notes.push(format!("{}: {}", s.path, s.note));
     }
     notes
+}
+
+/// HEAD, when it is where a rebase of `branch` was finished outside the app
+/// and nothing has happened to the branch since: the branch's newest reflog
+/// entry is that finish, and HEAD is its commit. git words the entry
+/// `rebase (finish): refs/heads/<branch> onto <oid>` (2.26 and later, 2.34
+/// included; checked on 2.52), `rebase -i (finish): …` before 2.26, when the
+/// machinery the merge backend runs on was called that. A commit made after
+/// the finish, another branch, or no reflog at all: `None`.
+async fn finished_here(repo: &Path, branch: &str) -> Option<String> {
+    crate::git_exec::validate_branch_name(branch).ok()?;
+    let line = g(repo).args(["log", "-g", "-1", "--format=%H%x1f%gs", "--end-of-options", &format!("refs/heads/{}", branch)]).ok_text().await?;
+    let (at, subject) = line.trim().split_once('\x1f')?;
+    let finish = subject.starts_with("rebase (finish): ") || subject.starts_with("rebase -i (finish): ");
+    let head = oid(repo, "HEAD").await?;
+    (finish && same_oid(at, &head)).then_some(head)
 }
 
 /// Why Abort must leave the superproject where it is instead of moving it
@@ -4252,6 +4321,25 @@ mod lfs_mode_tests {
         for st in &bad {
             assert!(!state_is_plain(st), "{:?} must not be acted on", (&st.head_before, &st.head_after, &st.upstream_ref, &st.backup, &st.subs.first().map(|s| (&s.path, &s.head_before, &s.target, &s.branch_before, &s.reattached))));
         }
+    }
+
+    /// A folder the state file names is acted in only when the disk puts it
+    /// inside the repository: a link (a junction on Windows) to another
+    /// repository is not, nor anything below one; a folder not made yet is.
+    #[test]
+    fn a_folder_the_state_names_through_a_link_is_left_alone() {
+        let base = std::env::temp_dir().join(format!("gitswitch-sync-statedir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("lib")).unwrap();
+        std::fs::create_dir_all(base.join("other").join(".git")).unwrap();
+        crate::paths::test_link_dir(&base.join("other"), &repo.join("linked"));
+        assert_eq!(state_dir(&repo, "lib"), Some(repo.join("lib")));
+        assert_eq!(state_dir(&repo, "new/sub"), Some(repo.join("new/sub")), "not there yet: the repository holds it");
+        assert_eq!(state_dir(&repo, "linked"), None);
+        assert_eq!(state_dir(&repo, "linked/x"), None);
+        assert_eq!(state_dir(&repo, "../other"), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

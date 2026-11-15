@@ -71,6 +71,8 @@ async function openHistoryPage(browser, server, opts = {}) {
     submodulesByPath: opts.submodulesByPath ?? null,
     /** What a clone made from the Clone page returns, for a hand-off test. */
     cloneResult: opts.cloneResult ?? null,
+    /** history_page rejects with this text (a refusal of the backend's), when set. */
+    historyPageError: opts.historyPageError ?? null,
     /** The Repositories page's listing: { repos, clones, pathExists }. */
     remote: opts.remote ?? null,
     peek: opts.peek ?? { branch: "main", upstream: "origin/main", remote: "origin", remote_tip: "440d0af1234567890abcdef1234567890abcdef12", known_tip: "e81d1c51234567890abcdef1234567890abcdef12", changed: true, branch_gone: false, new_commits: 3, counted_by: "github", message: "3 new commits on origin/main since your last fetch (440d0af). Nothing was downloaded — Fetch to see them." },
@@ -142,6 +144,7 @@ async function openHistoryPage(browser, server, opts = {}) {
             case "history_branches":
               return Promise.resolve(cfg.branches);
             case "history_page":
+              if (cfg.historyPageError) return Promise.reject(cfg.historyPageError);
               // A test changes what a given page holds by setting window.__PAGES__[offset].
               return Promise.resolve(window.__PAGES__?.[args.offset] ?? cfg.historyPage ?? fx.historyPage);
             case "history_authors":
@@ -1184,6 +1187,17 @@ try {
       state.where === "/repo/history" && state.path === "/repos/argos" && state.account === "", JSON.stringify(state));
     ok("  and reads it on all branches, not on a branch remembered from another repository",
       state.pages.length > 0 && state.pages.every((p) => p === "/repos/argos --all"), JSON.stringify(state.pages));
+    await page.close();
+  }
+
+  section("A page the backend refused to read says why, never an empty history");
+  {
+    const refusal = "GitSwitch did not run git rev-list: this repository is a partial clone whose own settings name core.sshCommand, which git would run to fetch a missing object on its own, and a command the app makes on its own never runs a program a repository names. Run it from a terminal, or move the setting into your profile.";
+    const page = await open({ historyPageError: refusal });
+    await page.waitForFunction(() => document.body.innerText.includes("core.sshCommand"), { timeout: 4000 }).catch(() => {});
+    const s = await text(page);
+    ok("the refusal is on the page, naming the setting", s.includes("partial clone whose own settings name core.sshCommand"), s.slice(0, 400));
+    ok("  and the page does not claim there are no commits", !s.includes("No commits"), s.slice(0, 400));
     await page.close();
   }
 

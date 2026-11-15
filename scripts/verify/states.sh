@@ -278,4 +278,30 @@ ok "  a repository with no commit yet is left as it is, said so" "$(printf '%s' 
 OUT=$(back "$W" before "$(oid_of "$W" before)")
 ok "“Before going back” returns every one of them" "$(printf '%s' "$OUT" | jqf value.ok) $(head_of "$W") $(head_of "$W/lib") $(cat "$W/lib/new.txt") $(cat "$W/tools/extra.txt")" "True $S2 $L3 lib new gone soon"
 
+section "A part of a state whose folder is now a link out of the repository is left alone"
+# A repository inside is saved with the state; then its folder is replaced by
+# a link (a junction on Windows) to that repository moved elsewhere. Going
+# back must not move it: it is not inside any more. (On Windows git sees a
+# junction as the folder, so the restore reaches the part; on macOS and Linux
+# git sees a link, which going back removes like any file made since.)
+link_dir() {  # link_dir <target folder> <link>
+  if command -v cygpath >/dev/null 2>&1; then MSYS2_ARG_CONV_EXCL='*' cmd /c mklink /J "$(cygpath -w "$2")" "$(cygpath -w "$1")" >/dev/null; else ln -s "$1" "$2"; fi
+}
+fresh lk; W="$SB/lk"
+git init -q "$W/inner"; printf 'i1\n' > "$W/inner/i.txt"; git -C "$W/inner" add -A >/dev/null; git -C "$W/inner" commit -qm "inner 1"
+OUT=$(save "$W" 1 "with inner")
+ok "(saved with the repository inside)" "$(printf '%s' "$OUT" | jqf value.ok) $(list "$W" | "$PY" -c 'import sys,json
+print([s["path"] for s in json.load(sys.stdin)["value"]["states"][0]["subs"]])')" "True ['inner']"
+printf 'i2\n' > "$W/inner/i.txt"; git -C "$W/inner" commit -qam "inner 2"; I2=$(head_of "$W/inner")
+printf 'marker\n' > "$W/inner/marker.txt"
+mkdir -p "$SB/elsewhere"; mv "$W/inner" "$SB/elsewhere/inner"
+link_dir "$SB/elsewhere/inner" "$W/inner"
+ok "(inner is now a link to the repository elsewhere)" "$(head_of "$W/inner")" "$I2"
+OUT=$(back "$W" 1 "$(oid_of "$W" 1)")
+ok "going back: the repository the link leads to is untouched" "$(head_of "$SB/elsewhere/inner") $(cat "$SB/elsewhere/inner/i.txt") $(cat "$SB/elsewhere/inner/marker.txt" 2>&1)" "$I2 i2 marker"
+if command -v cygpath >/dev/null 2>&1; then
+  ok "  the rest came back, and the result says why that part did not" "$(printf '%s' "$OUT" | jqf value.ok) $(printf '%s' "$OUT" | jqf value.detail)" "True"
+  ok "  (naming it)" "$(printf '%s' "$OUT" | jqf value.detail)" "inner: its folder leads outside the repository (a link)"
+fi
+
 verify_result

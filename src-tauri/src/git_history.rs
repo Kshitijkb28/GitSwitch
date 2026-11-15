@@ -899,9 +899,11 @@ pub fn history_page(
     // A count that fails is read as nothing (a repository without commits),
     // but a count stopped on its clock is not "no commits": reading it as 0
     // emptied the graph's members and ended paging after the first page.
+    // Nor is one the safety prelude refused (a partial clone whose own
+    // settings name a transport program): the page says why instead.
     let counted = match git_with(&repo, &count_ref, walk_clock()) {
         Ok(s) => s,
-        Err(e) if crate::git_exec::was_stopped(&e) => return Err(e),
+        Err(e) if crate::git_exec::was_stopped(&e) || crate::git_exec::was_refused(&e) => return Err(e),
         Err(_) => String::new(),
     };
     let is_oid = |l: &str| (l.len() == 40 || l.len() == 64) && l.chars().all(|c| c.is_ascii_hexdigit());
@@ -916,10 +918,11 @@ pub fn history_page(
     // history, not an error worth showing the user.
     // (With the unpushed filter a failure is a failure: an empty list would
     // claim everything is pushed.)
-    // (Nor is a walk stopped on its clock: that is "this took too long".)
+    // (Nor is a walk stopped on its clock: that is "this took too long".
+    // Nor a refusal of the prelude's.)
     let raw = match git_with(&repo, &log_ref, walk_clock()) {
         Ok(r) => r,
-        Err(e) if crate::git_exec::was_stopped(&e) => return Err(e),
+        Err(e) if crate::git_exec::was_stopped(&e) || crate::git_exec::was_refused(&e) => return Err(e),
         Err(_) if total == 0 && !unpushed_only => String::new(),
         Err(e) => return Err(e),
     };
@@ -1134,10 +1137,10 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
 
     // The merges in the branch's history, newest first: fifty, and how many there are.
     let fmt = format!("%H{US}%h{US}%P{US}%aN{US}%aE{US}%cI{US}%D{US}%s{US}%aI", US = US);
-    // A walk stopped on its clock is an error, not "no merges".
+    // A walk stopped on its clock, or refused, is an error, not "no merges".
     let raw = match git_with(&repo, &["log", "--merges", "--no-show-signature", "--date-order", "-n51", &format!("--format={}", fmt), "--end-of-options", branch], walk_clock()) {
         Ok(r) => r,
-        Err(e) if crate::git_exec::was_stopped(&e) => return Err(e),
+        Err(e) if crate::git_exec::was_stopped(&e) || crate::git_exec::was_refused(&e) => return Err(e),
         Err(_) => String::new(),
     };
     let mut merges: Vec<HistoryCommit> = parse_log(&raw)
@@ -1166,7 +1169,7 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
     merges.truncate(50);
     let merges_total = match git_with(&repo, &["rev-list", "--count", "--merges", "--end-of-options", branch], walk_clock()) {
         Ok(s) => s.trim().parse().unwrap_or(merges.len()),
-        Err(e) if crate::git_exec::was_stopped(&e) => return Err(e),
+        Err(e) if crate::git_exec::was_stopped(&e) || crate::git_exec::was_refused(&e) => return Err(e),
         Err(_) => merges.len(),
     };
 
@@ -1367,6 +1370,39 @@ mod tests {
     fn the_history_runner_goes_through_gitcmd() {
         let env = git(&std::env::temp_dir(), &crate::git_exec::test_support::SHOW_ENV).expect("git runs");
         crate::git_exec::test_support::assert_hardened(&env);
+    }
+
+    /// Text that reaches these runners as a revision (a branch named
+    /// `--output=<file>`, which git allows, or a hash the page sends) is
+    /// never an option: each puts `--end-of-options` (git 2.24) right before
+    /// it, and the file it names is not written. hostile.sh shows plain git
+    /// writing it.
+    #[test]
+    fn a_dash_led_revision_is_never_an_option() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-history-eoo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a folder");
+        git(&dir, &["init", "-q", "-b", "main"]).expect("init");
+        git(&dir, &["-c", "user.name=x", "-c", "user.email=x@x.test", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "--no-verify", "-m", "one"]).expect("commit");
+        let rev = "--output=canary.txt";
+        // A ref of that name, so each walk gets past its first command.
+        git(&dir, &["update-ref", &format!("refs/heads/{}", rev), "HEAD"]).expect("a branch named like an option");
+        std::fs::write(dir.join("canary.txt"), "precious\n").unwrap();
+        let path = dir.to_string_lossy().to_string();
+
+        assert!(commit_ref(&dir, rev).is_some(), "the branch is read as a branch");
+        assert_eq!(merged_by(&dir, rev, "HEAD").map(|(how, _)| how).as_deref(), Some("same-commit"));
+        assert_eq!(commit_detail(&path, rev).expect("the commit, by that name").subject, "one");
+
+        assert_eq!(std::fs::read_to_string(dir.join("canary.txt")).unwrap(), "precious\n", "nothing was written to the file the name names");
+        let ran: Vec<Vec<String>> = crate::git_exec::test_support::ran_under(&dir).into_iter().map(|r| r.args).filter(|a| a.iter().any(|x| x.starts_with(rev))).collect();
+        let subs: Vec<&str> = ran.iter().map(|a| a[0].as_str()).collect();
+        assert_eq!(subs, vec!["log", "rev-list", "show", "show"], "commit_ref, merged_by, and both reads of commit_detail: {:?}", ran);
+        for a in &ran {
+            let at = a.iter().position(|x| x.starts_with(rev)).unwrap();
+            assert_eq!(a[at - 1], "--end-of-options", "{:?}", a);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A walk stopped on its clock comes back as an error: never as a page

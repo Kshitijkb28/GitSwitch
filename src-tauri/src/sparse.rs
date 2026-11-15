@@ -1026,6 +1026,27 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
     if listed.is_empty() {
         return report;
     }
+    // A modules folder that is there but leads out of the repository's git
+    // directory (`.git/modules` a link or a junction; an archive can carry
+    // one): git's own `submodule update` would write through it — it removes
+    // `index` and writes `core.worktree` into a module directory it finds
+    // there — and clear_incomplete clears nothing below it. Nothing is
+    // downloaded, and the report says why. One not made yet is git's to make.
+    if let Some((base, false)) = modules_folder(repo).await {
+        if std::fs::symlink_metadata(&base).is_ok() {
+            let paths: Vec<String> = listed.iter().map(|(_, p)| p.clone()).collect();
+            let said = format!(
+                "Not downloaded: {}. This repository's .git/modules leads outside its git folder (a link or a junction), so GitSwitch will not let git write there. Replace the link with a folder of its own, then Download again.",
+                paths.join(", ")
+            );
+            report.failed_paths.extend(paths);
+            report.error = Some(match report.error.take() {
+                Some(refusal) => format!("{}\n\n{}", refusal, said),
+                None => said,
+            });
+            return report;
+        }
+    }
 
     // One submodule per git call. In a single batch, one refused submodule
     // makes git stop before checking out the ones it DID clone — and a retry
@@ -1236,6 +1257,27 @@ fn refused_entries(refused: &[(String, String)]) -> String {
     )
 }
 
+/// The repository's modules folder as git names it (`rev-parse --git-path
+/// modules`), and whether it lies strictly inside the repository's common git
+/// directory (`rev-parse --git-common-dir`, git 2.5; resolved against the
+/// repository when relative), as the disk resolves both. False when either
+/// cannot be resolved (a folder not made yet, a link that leads nowhere).
+/// `None` when git cannot say.
+async fn modules_folder(repo: &Path) -> Option<(PathBuf, bool)> {
+    let resolve = |m: String| {
+        let m = m.trim().to_string();
+        if Path::new(&m).is_absolute() {
+            PathBuf::from(m)
+        } else {
+            repo.join(m)
+        }
+    };
+    let base = resolve(run_git(Some(repo), &["rev-parse", "--git-path", "modules"]).await.ok()?);
+    let common = resolve(run_git(Some(repo), &["rev-parse", "--git-common-dir"]).await.ok()?);
+    let inside = crate::paths::strictly_inside(&base, &common);
+    Some((base, inside))
+}
+
 /// A submodule counts as downloaded only if its files are actually there:
 /// cloned-but-never-checked-out leaves `.git` with an empty folder.
 /// An interrupted download leaves a `.git` entry in the folder and a module
@@ -1305,10 +1347,17 @@ async fn clear_incomplete(repo: &Path, name: &str, path: &str) -> Option<String>
         if mp.exists() {
             // git prints `modules/<name>` as given, `..` and all: the module
             // directory is cleared only when the disk puts it inside the
-            // repository's own modules folder.
-            let inside = match git_path("modules".to_string()).await {
-                Some(base) => crate::paths::strictly_inside(&mp, &base),
-                None => false,
+            // repository's own modules folder, and that folder inside the
+            // repository's git directory. The repository decides what
+            // `.git/modules` is: a link there resolves both paths through the
+            // same link, so the first check alone holds wherever it points.
+            // The common git directory (`--git-common-dir`, git 2.5) holds the
+            // modules folder of a linked worktree, of a superproject that is
+            // itself a submodule (under its parent's `.git/modules`) and of a
+            // `.git` file naming a separate git directory alike.
+            let inside = match modules_folder(repo).await {
+                Some((base, true)) => crate::paths::strictly_inside(&mp, &base),
+                _ => false,
             };
             if !inside || !commitless(mp.clone()).await {
                 return None;

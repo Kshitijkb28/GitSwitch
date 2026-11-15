@@ -1371,7 +1371,12 @@ pub async fn file_diff(repo_path: &str, path: &str, staged: bool, untracked: boo
         if staged {
             cmd = cmd.arg("--cached");
         }
-        cmd.args(["--", path]).run().await?
+        // The path is the repository's text (a file or submodule may be
+        // named `--cached` or `*`): `:(literal)`, as the History and stash
+        // diffs pass theirs, so it matches only itself. An inherited
+        // `GIT_LITERAL_PATHSPECS=1` would take the magic as part of the name.
+        let literal = format!(":(literal){}", path);
+        cmd.env("GIT_LITERAL_PATHSPECS", "0").args(["--", &literal]).run().await?
     };
 
     if !out.ok() && out.stdout.is_empty() && !out.stderr.is_empty() {

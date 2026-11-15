@@ -21,7 +21,9 @@
 #      husky style hooks folder, submodule download with `update = !command`;
 #   6. repository text never becomes a git option or a path outside the
 #      repository: a crafted saved state, a branch named `--output=…`, 0x1F in
-#      a commit subject, a submodule named `../../..`.
+#      a commit subject, a submodule named `../../..`, a `.git/modules` that
+#      is a link out of the repository. (Section 2 has a submodule at the
+#      path `--cached`.)
 #
 # Markers are scripts that only append a line to a file in the sandbox. No
 # network: remotes are local folders or example.invalid, and the ssh used is a
@@ -213,6 +215,16 @@ reset; git -C "$G" -c core.fsmonitor= update-ref refs/heads/probe HEAD >/dev/nul
 ok "control: a ref update runs reference-transaction" "$(fired)" "hook-reference-transaction"
 reset; git -C "$G" -c core.fsmonitor= -c core.hooksPath="$EMPTY" update-ref -d refs/heads/probe >/dev/null 2>&1
 ok "core.hooksPath=<an empty folder>: no reference-transaction" "ran:[$(fired)]" "ran:[]"
+# Without a data folder the app names /dev/null on macOS and Linux (never a
+# shared folder someone else could fill): git finds no hook below it.
+if ! command -v cygpath >/dev/null 2>&1; then
+  dirty "$G/.gitattributes"
+  reset; git -C "$G" $N -c core.hooksPath=/dev/null diff --quiet >/dev/null 2>&1
+  ok "core.hooksPath=/dev/null: no post-index-change" "ran:[$(fired)]" "ran:[]"
+  reset; git -C "$G" -c core.fsmonitor= -c core.hooksPath=/dev/null update-ref refs/heads/probe HEAD >/dev/null 2>&1; rc=$?
+  ok "core.hooksPath=/dev/null: no reference-transaction, and the ref is written" "ran:[$(fired)] rc=$rc $(git -C "$G" rev-parse -q --verify refs/heads/probe >/dev/null && echo written)" "ran:[] rc=0 written"
+  git -C "$G" -c core.hooksPath="$EMPTY" update-ref -d refs/heads/probe
+fi
 ok "rev-parse --git-path hooks follows the pin (why rev-parse never gets it)" "$(git -C "$G" -c core.hooksPath="$EMPTY" rev-parse --git-path hooks)" "empty-hooks"
 rm -f "$G/.git/hooks/post-index-change" "$G/.git/hooks/reference-transaction"
 
@@ -346,6 +358,33 @@ subdirty; reset; GIT_OPTIONAL_LOCKS=0 git -C "$T" status --porcelain >/dev/null 
 for m in subclean nestclean plantedclean subfsmonitor; do
   ok "control: plain status in the superproject runs the submodules' own $m" "$(fired)" "$m"
 done
+# A submodule at the path `--cached` (or `--staged`, `--no-index`,
+# `--ignore-submodules`): read as an option, the path would have switched off
+# the check of the submodules for the diff of that very row.
+git clone -q "$SB/sub-src" "$T/--cached"
+git -C "$T" update-index --add --cacheinfo "160000,$(git -C "$T/--cached" rev-parse HEAD),--cached"
+git -C "$T/--cached" config filter.subevil.clean "$(mk dashclean filter)"
+dashdirty() { sleep 1.1; cp "$T/--cached/f.dat" "$T/--cached/f.dat.tmp" && mv "$T/--cached/f.dat.tmp" "$T/--cached/f.dat"; }
+dashdirty; passive_row "Submodules: the Changes diff of a submodule at the path --cached" changes_file_diff "{\"repoPath\":$PT,\"path\":\"--cached\",\"staged\":false,\"untracked\":false}" "$T"
+ok "  (the diff answered)" "$(pcall changes_file_diff "{\"repoPath\":$PT,\"path\":\"--cached\",\"staged\":false,\"untracked\":false}" | jqf ok)" "True"
+dashdirty; reset; GIT_OPTIONAL_LOCKS=0 git -C "$T" diff --ignore-submodules=none -- --cached >/dev/null 2>&1
+ok "control: plain git diff --ignore-submodules=none -- --cached runs that submodule's own clean filter" "$(fired)" "dashclean"
+# The Changes diff names its path as `:(literal)<path>`: a file named `x[y]`
+# is a pattern to git that matches `xy` too, and an inherited
+# GIT_LITERAL_PATHSPECS=1 would read the magic as part of the name (an empty
+# diff). Each row fails with its half of the fix taken out.
+G="$SB/globname"; newrepo "$G"
+printf 'one\n' > "$G/x[y]"; printf 'one\n' > "$G/xy"; printf 'one\n' > "$G/a.txt"
+git -C "$G" add -A; git -C "$G" -c user.name=x -c user.email=x@x.test commit -qm files
+printf 'bracket-change\n' >> "$G/x[y]"; printf 'plain-change\n' >> "$G/xy"; printf 'a-change\n' >> "$G/a.txt"
+PG="$(jstr "$G")"
+out="$(pcall changes_file_diff "{\"repoPath\":$PG,\"path\":\"x[y]\",\"staged\":false,\"untracked\":false}")"
+ok "a file named x[y]: its Changes diff shows that file" "$out" "bracket-change"
+ok "  and not xy, which the name matches as a pattern" "$(printf '%s' "$out" | grep -q plain-change && echo SHOWN || echo absent)" "absent"
+ok "control: plain git diff -- 'x[y]' shows xy too" "$(git -C "$G" diff -- 'x[y]')" "plain-change"
+out="$(GIT_LITERAL_PATHSPECS=1 pcall changes_file_diff "{\"repoPath\":$PG,\"path\":\"a.txt\",\"staged\":false,\"untracked\":false}")"
+ok "GIT_LITERAL_PATHSPECS=1 inherited: the Changes diff of a changed file still shows the change" "$out" "a-change"
+ok "control: GIT_LITERAL_PATHSPECS=1 git diff -- ':(literal)a.txt' is empty" "$([ -z "$(GIT_LITERAL_PATHSPECS=1 git -C "$G" diff -- ':(literal)a.txt')" ] && echo empty || echo shown)" "empty"
 
 # A submodule folder git cannot open as a repository of its own (an empty
 # .git folder): git's own status says so, and the check of the submodules
@@ -423,6 +462,12 @@ passive_row "Partial clone: the Changes status"              changes_repo_status
 passive_row "Partial clone: the Changes diff"                changes_file_diff        "{\"repoPath\":$PP,\"path\":\"f.txt\",\"staged\":false,\"untracked\":false}" "$PC"
 passive_row "Partial clone: the History file diff"           history_commit_file_diff "{\"repoPath\":$PP,\"hash\":\"$PCOLD\",\"path\":\"f.txt\"}" "$PC"
 ok "  (refused, naming the key)" "$(pcall changes_file_diff "{\"repoPath\":$PP,\"path\":\"f.txt\",\"staged\":false,\"untracked\":false}")" "partial clone whose own settings name core.sshCommand"
+# The History page passes such a refusal on: an error saying why, never an
+# empty history with no word.
+reset; out="$(pcall history_page "{\"repoPath\":$PP,\"rev\":\"HEAD\",\"offset\":0,\"limit\":50}")"
+ok "Partial clone: the History page is an error, not an empty history" "ok=$(printf '%s' "$out" | jqf ok)" "ok=False"
+ok "  naming the key" "$(printf '%s' "$out" | jqf error)" "partial clone whose own settings name core.sshCommand"
+ok "  nothing ran" "ran:[$(fired)]" "ran:[]"
 reset; GIT_OPTIONAL_LOCKS=0 git -C "$PC" diff --numstat >/dev/null 2>&1
 ok "control: plain git diff --numstat fetches the missing object with the repository's core.sshCommand" "$(fired)" "partialssh"
 # The app's own partial clones (no transport program of the repository's)
@@ -482,18 +527,32 @@ ok "  and saying what to do instead" "$out" "Fetch from a terminal, or move the 
 ok "  nothing ran" "ran:[$(fired)]" "ran:[]"
 ok "  every git it started is passive" "$(classes "$H")" "writes=[]"
 FR="$SB/fetchremote"; newrepo "$FR"
-F="$SB/fetcher"; git clone -q "$FR" "$F"
+# Over git's transport (`--no-local`), so the clone starts as one pack.
+F="$SB/fetcher"; git clone -q --no-local "$FR" "$F"
 git -C "$F" config credential.helper "!$(mk fetchhelper)"
 git -C "$F" config core.askPass "$(mk fetchaskpass)"
+# The housekeeping after the fetch asks pre-auto-gc only once there is
+# something to tidy: more packs than gc.autoPackLimit allows. The fetch keeps
+# what arrives as a pack, so one fetch crosses a limit of 1; no detaching, so
+# what housekeeping did is on disk when it returns.
+git -C "$F" config gc.autoPackLimit 1; git -C "$F" config fetch.unpackLimit 1; git -C "$F" config gc.autoDetach false
 for h in reference-transaction pre-auto-gc post-index-change; do
   printf '#!/bin/sh\necho "hook-fetch-%s" >> "%s"\nexit 0\n' "$h" "$MARK" > "$F/.git/hooks/$h"; chmod +x "$F/.git/hooks/$h"
 done
+packs() { git -C "$F" count-objects -v | grep -E '^(count|packs):' | tr '\n' ' ' | sed 's/ $//'; }
+ok "(the clone is one pack)" "$(packs)" "count: 0 packs: 1"
 git -C "$FR" -c user.name=x -c user.email=x@x.test commit -q --allow-empty -m second
 reset; out="$(pcall history_fetch "{\"repoPath\":$(jstr "$F")}")"
 ok "without such a key it fetches" "$out" "remote branch"
 ok "  nothing the repository names ran (hooks, helper, askpass)" "ran:[$(fired)]" "ran:[]"
 ok "  every git it started is passive" "$(classes "$F")" "writes=[]"
 ok "  the remote-tracking branch moved" "$(git -C "$F" rev-parse origin/main)" "$(git -C "$FR" rev-parse HEAD)"
+ok "  its housekeeping crossed gc.autoPackLimit and tidied (two packs back to one): pre-auto-gc was asked for, and not run" "$(packs)" "count: 0 packs: 1"
+git -C "$FR" -c user.name=x -c user.email=x@x.test commit -q --allow-empty -m second-b
+git -C "$F" -c core.hooksPath="$SB/empty-hooks" -c maintenance.auto=false -c gc.auto=0 fetch -q origin >/dev/null 2>&1
+ok "(a second pack again)" "$(packs)" "count: 0 packs: 2"
+reset; git -C "$F" maintenance run --auto --quiet >/dev/null 2>&1
+ok "control: plain housekeeping (maintenance run --auto) runs the repository's pre-auto-gc" "$(fired)" "hook-fetch-pre-auto-gc"
 git -C "$FR" -c user.name=x -c user.email=x@x.test commit -q --allow-empty -m third
 reset; git -C "$F" fetch -q origin >/dev/null 2>&1
 ok "control: a plain fetch runs the repository's reference-transaction hook" "$(fired)" "hook-fetch-reference-transaction"
@@ -566,6 +625,22 @@ ok "  and commits" "$(git -C "$U" log -1 --format=%s)" "with husky"
 reset; out="$(pcall changes_submodule_update "{\"repoPath\":$(jstr "$S"),\"paths\":[\"sub\"]}")"
 ok "Download submodule: submodule.<name>.update = !command does not run" "ran:[$(fired)]" "ran:[]"
 ok "  the recorded commit is checked out" "$(git -C "$S/sub" rev-parse HEAD 2>&1)" "$(git -C "$S0" rev-parse HEAD)"
+
+# Going back to a state checks a submodule that is not downloaded out again
+# from what the repository has: `--checkout`, so update = !command never runs.
+PS="$(jstr "$S")"
+out="$(pcall states_save "{\"repoPath\":$PS,\"slot\":\"1\",\"name\":\"with sub\",\"replace\":null}")"
+ok "(a state of the superproject, its submodule included)" "$(printf '%s' "$out" | jqf value.ok) $(printf '%s' "$out" | jqf value.detail)" "True"
+SOID="$(pcall states_list "{\"repoPath\":$PS}" | "$PY" -c 'import sys,json; print(json.load(sys.stdin)["value"]["states"][0]["oid"])')"
+undownload() { git -C "$S" submodule deinit -q -f sub >/dev/null 2>&1; git -C "$S" config submodule.sub.update "!$(mk updatecmd)"; }
+undownload
+ok "(the submodule is not downloaded, and its update is !command)" "$([ -e "$S/sub/.git" ] && echo downloaded || echo not) $(git -C "$S" config submodule.sub.update)" "not !"
+reset; out="$(pcall states_restore "{\"repoPath\":$PS,\"slot\":\"1\",\"oid\":\"$SOID\",\"newBranch\":null,\"allowPushed\":false}")"
+ok "Go back to a state over a submodule not downloaded: update = !command does not run" "ran:[$(fired)]" "ran:[]"
+ok "  the state came back, the submodule at its saved commit" "$(printf '%s' "$out" | jqf value.ok) $(git -C "$S/sub" rev-parse HEAD 2>&1)" "True $(git -C "$S0" rev-parse HEAD)"
+undownload
+reset; git -C "$S" submodule update --init --no-fetch -- sub >/dev/null 2>&1
+ok "control: plain git submodule update --init --no-fetch runs that command" "$(fired)" "updatecmd"
 
 # =============================================================================
 section "5. The same, with the hostile folder inside a profile (lab 1's last rows)"
@@ -658,5 +733,46 @@ ok "submodule name '../../..': the folder outside the repository stays" "$([ -f 
 ok "  nothing of the submodule was cleared either" "$([ -d "$DP/repo/sub/.git" ] && echo kept || echo cleared)" "kept"
 ok "  refused, saying why" "$(printf '%s' "$out" | jqf value.detail)" "not plain folder names"
 ok "  and named as not downloaded" "$(printf '%s' "$out" | jqf value.submodules.failed_paths)" '["sub"]'
+
+# DEST-B-01 again, with plain names: `.git/modules` itself is a link to the
+# folder that holds the repository (an archive can carry one). The module
+# folder `victim` resolves through it to an ordinary folder outside, which
+# holds no commit and so reads as an interrupted download.
+link_dir() {  # link_dir <target folder> <link>: a symbolic link; a junction on Windows (no developer mode needed)
+  if command -v cygpath >/dev/null 2>&1; then MSYS2_ARG_CONV_EXCL='*' cmd /c mklink /J "$(cygpath -w "$2")" "$(cygpath -w "$1")" >/dev/null; else ln -s "$1" "$2"; fi
+}
+modules_case() {  # modules_case <label> <link|real> [fresh]: the folder <sandbox>/modules-<label>/x, with `repo` and `victim` in it
+  local D="$SB/modules-$1/x"
+  case "$D" in "$SB"/*) ;; *) echo "refusing: $D is outside the sandbox"; exit 1;; esac
+  mkdir -p "$D/victim"; printf 'keep me\n' > "$D/victim/keep.txt"
+  local R="$D/repo"; newrepo "$R"
+  git -C "$R" update-index --add --cacheinfo 160000,1234567890123456789012345678901234567890,sub
+  printf '[submodule "victim"]\n\tpath = sub\n\turl = https://example.invalid/x\n' > "$R/.gitmodules"
+  git -C "$R" add .gitmodules; git -C "$R" -c user.name=x -c user.email=x@x.test commit -qm sub
+  # fresh: never downloaded, nothing in `sub`
+  [ "${3:-}" = fresh ] || { mkdir -p "$R/sub"; printf 'gitdir: ../.git/modules/victim\n' > "$R/sub/.git"; }
+  if [ "$2" = link ]; then link_dir "$D" "$R/.git/modules"; else mkdir -p "$R/.git/modules/victim"; fi
+}
+download() { pinvoke changes_submodule_update "{\"repoPath\":$(jstr "$1"),\"paths\":[\"sub\"]}"; }
+modules_case real real; DR="$SB/modules-real/x"
+out="$(download "$DR/repo")"
+ok "control: a real, commitless .git/modules/victim is cleared (the same row reaches the delete)" "$(printf '%s' "$out" | jqf value.detail)" "An interrupted download of sub was cleared"
+ok "  the module folder is gone" "$([ -d "$DR/repo/.git/modules/victim" ] && echo kept || echo cleared)" "cleared"
+modules_case link link; DL="$SB/modules-link/x"
+ok "(.git/modules is a link to the folder outside: victim is reached through it)" "$(cat "$DL/repo/.git/modules/victim/keep.txt" 2>&1)" "keep me"
+out="$(download "$DL/repo")"
+ok ".git/modules a link out of the repository: the folder outside and its file stay" "$([ -f "$DL/victim/keep.txt" ] && echo kept || echo DELETED)" "kept"
+ok "  nothing of the submodule was cleared either" "$([ -f "$DL/repo/sub/.git" ] && echo kept || echo cleared)" "kept"
+ok "  and it is named as not downloaded" "$(printf '%s' "$out" | jqf value.submodules.failed_paths)" '["sub"]'
+ok "  git wrote nothing through the link either: the folder outside holds only its file" "$([ "$(ls -A "$DL/victim")" = keep.txt ] && echo only-keep.txt || ls -A "$DL/victim" | tr '\n' ' ')" "only-keep.txt"
+ok "  saying why" "$(printf '%s' "$out" | jqf value.detail)" ".git/modules leads outside its git folder"
+# The same link with the submodule never downloaded: nothing to clear, but
+# git's own submodule update, finding a module folder there, removes its
+# `index` and writes `core.worktree` into its `config`. It is never started.
+modules_case fresh link fresh; DF="$SB/modules-fresh/x"
+out="$(download "$DF/repo")"
+ok ".git/modules a link out, the submodule never downloaded: git wrote nothing through the link" "$([ "$(ls -A "$DF/victim")" = keep.txt ] && echo only-keep.txt || ls -A "$DF/victim" | tr '\n' ' ')" "only-keep.txt"
+ok "  named as not downloaded" "$(printf '%s' "$out" | jqf value.submodules.failed_paths)" '["sub"]'
+ok "  saying why" "$(printf '%s' "$out" | jqf value.detail)" ".git/modules leads outside its git folder"
 
 verify_result

@@ -50,6 +50,51 @@ pub fn strictly_inside(target: &std::path::Path, base: &std::path::Path) -> bool
     }
 }
 
+/// A folder named by text the repository supplies (a saved state's part)
+/// lies inside `base`: below it by plain names (no `..`), none of which is a
+/// link or a junction as far as the folders exist. Below the first name not
+/// made yet (a submodule that is not downloaded) it is still inside: there
+/// is no link there to follow. Checked name by name, not by resolving the
+/// whole path: resolving needs the disk to report a folder's final path,
+/// which some Windows volumes (RAM disks, virtual drives) cannot do, and
+/// every part there would then read as a link out. A name that cannot be
+/// looked at for any other reason is not inside.
+pub fn lies_inside(target: &std::path::Path, base: &std::path::Path) -> bool {
+    use std::path::Component;
+    let Ok(rel) = target.strip_prefix(base) else { return false };
+    if rel.as_os_str().is_empty() || !base.is_dir() {
+        return false;
+    }
+    let mut at = base.to_path_buf();
+    for c in rel.components() {
+        let Component::Normal(name) = c else { return false };
+        at.push(name);
+        match std::fs::symlink_metadata(&at) {
+            // On Windows a junction is, like a symbolic link, a
+            // name-surrogate reparse point: `is_symlink` is true for both.
+            Ok(m) if m.file_type().is_symlink() => return false,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// For tests: `link` made a link to the folder `target` — a symbolic link on
+/// macOS and Linux, a junction on Windows (a symbolic link needs developer
+/// mode there; a junction does not).
+#[cfg(test)]
+pub(crate) fn test_link_dir(target: &std::path::Path, link: &std::path::Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("a symbolic link");
+    #[cfg(windows)]
+    {
+        let ok = std::process::Command::new("cmd").arg("/c").arg("mklink").arg("/J").arg(link).arg(target).output().map(|o| o.status.success()).unwrap_or(false);
+        assert!(ok, "a junction {:?} -> {:?}", link, target);
+    }
+}
+
 /// Last path component, whichever separator the platform used.
 pub fn base_name(path: &str) -> String {
     norm(path)
@@ -243,6 +288,30 @@ mod tests {
         assert!(!strictly_inside(&repo.join(".git").join("modules").join("..").join("..").join(".."), &repo), "`..` is followed");
         assert!(!strictly_inside(&root, &repo));
         assert!(!strictly_inside(&repo.join("missing"), &repo), "what cannot be resolved is not inside");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_lies_inside_when_it_or_its_nearest_existing_ancestor_does() {
+        let root = std::env::temp_dir().join(format!("gs-lies-inside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join("lib")).unwrap();
+        std::fs::create_dir_all(root.join("other").join("x")).unwrap();
+        assert!(lies_inside(&repo.join("lib"), &repo));
+        assert!(lies_inside(&repo.join("not-yet"), &repo), "a folder not made yet: the repository itself holds it");
+        assert!(lies_inside(&repo.join("lib").join("deep").join("er"), &repo));
+        assert!(!lies_inside(&repo, &repo), "the folder itself is not a part inside it");
+        test_link_dir(&root.join("other"), &repo.join("out"));
+        assert!(!lies_inside(&repo.join("out"), &repo), "a link (a junction on Windows) to a folder outside");
+        assert!(!lies_inside(&repo.join("out").join("x"), &repo));
+        assert!(!lies_inside(&repo.join("out").join("not-yet"), &repo), "a folder not made yet below such a link");
+        assert!(!lies_inside(&root.join("other"), &repo));
+        assert!(!lies_inside(&repo.join("lib").join("..").join("..").join("other"), &repo), "`..` is never inside");
+        assert!(!lies_inside(&repo.join("..").join("repo").join("lib"), &repo));
+        // A link that leads nowhere is still a link.
+        test_link_dir(&root.join("gone"), &repo.join("dangling"));
+        assert!(!lies_inside(&repo.join("dangling").join("x"), &repo));
         let _ = std::fs::remove_dir_all(&root);
     }
 

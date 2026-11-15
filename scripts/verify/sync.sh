@@ -1764,4 +1764,44 @@ OUT=$(probe sync_abort "$W/local")
 ok "an ignored file there is kept the same way" "$(printf '%s' "$OUT" | jqf detail):$(cat "$W/local/config.json")" "going back would overwrite config.json, which git isn't tracking"
 ok "  its content untouched" "$(cat "$W/local/config.json")" '{"local": true}'
 
+section "A commit made in a terminal after finishing the rebase there is not taken for the update's"
+# The update stops on a conflict in the superproject. In a terminal the
+# person finishes the rebase, then commits X; Continue goes on and pauses
+# inside C. Where the update's rebase ended is the rebase's own finish, so
+# Abort must not reset X away (it is in neither the backup nor upstream).
+mini tq B C
+W="$SB/tq"
+printf 'readme (upstream)\n' > "$W/upstream/README.md"; git -C "$W/upstream" commit -qam "super: upstream readme"
+printf 'C v1, rewritten\nline2\nline3\n' > "$W/upstream/C/C.txt"; git -C "$W/upstream/C" commit -q --amend -am "C: initial, rewritten"; git -C "$W/upstream/C" push -q -f origin main 2>/dev/null
+git -C "$W/upstream" add C >/dev/null; git -C "$W/upstream" commit -qm "super: rewrite C"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'readme (mine)\n' > "$W/local/README.md"; git -C "$W/local" commit -qam "super: my readme"
+S0="$(head_of "$W/local")"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "(control: the update pauses on README.md in the superproject)" "$(printf '%s' "$OUT" | jqf headline)" "Update paused: conflicts to resolve."
+rm -rf "$W/paused"; cp -R "$W/local" "$W/paused"
+replay() { rm -rf "$W/local"; cp -R "$W/paused" "$W/local"; }
+finish_in_terminal() {
+  printf 'readme (both)\n' > "$W/local/README.md"; git -C "$W/local" add README.md
+  GIT_EDITOR=true git -C "$W/local" rebase --continue >/dev/null 2>&1      # in a terminal
+}
+finish_in_terminal
+ok "(the branch's newest reflog entry is that rebase's finish)" "$(git -C "$W/local" log -g -1 --format=%gs refs/heads/main)" "rebase (finish): refs/heads/main onto "
+OUT=$(probe sync_continue "$W/local")
+ok "(control: Continue carries on and pauses inside C)" "$(printf '%s' "$OUT" | jqf headline)" "Update paused inside C."
+OUT=$(probe sync_abort "$W/local")
+ok "(control: with nothing made since the finish, Abort puts the superproject back)" "$(printf '%s' "$OUT" | jqf detail):$(head_of "$W/local")" ":$S0"
+
+replay
+finish_in_terminal
+printf 'x\n' > "$W/local/x.txt"; git -C "$W/local" add x.txt; git -C "$W/local" commit -qm "super: X, after the finish"      # in a terminal
+SX="$(head_of "$W/local")"
+OUT=$(probe sync_continue "$W/local")
+ok "X committed after the terminal finish: Continue still pauses inside C" "$(printf '%s' "$OUT" | jqf headline)" "Update paused inside C."
+OUT=$(probe sync_abort "$W/local")
+ok "  Abort leaves the superproject, saying why" "$(printf '%s' "$OUT" | jqf detail)" "the superproject was left as rebased: the update did not record where its rebase ended"
+ok "  and where its pre-update tip is" "$(printf '%s' "$OUT" | jqf detail)" "its pre-update tip is branch gitswitch-before-update-"
+ok "  X is still on main" "$(head_of "$W/local"):$(git -C "$W/local" rev-parse main)" "$SX:$SX"
+ok "  and C is put back" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "('C', 'put-back')"
+
 verify_result

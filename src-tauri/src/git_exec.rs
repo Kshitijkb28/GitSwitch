@@ -716,9 +716,12 @@ impl GitCmd {
         // unusual about the folder, and the config is read. (A promisor
         // remote named in the person's own config is not looked for here:
         // that setting is theirs.)
+        // Read off the async workers, like the gitlink check: a file read has
+        // no clock (only regular files are read, but a slow disk still waits).
         if shape.read == Read::Objects && !shape.recurse && lead.is_empty() {
             let folder = self.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-            if find_git_dirs(&folder).is_some_and(|dirs| !may_be_partial(&dirs)) {
+            let ordinary = tokio::task::spawn_blocking(move || find_git_dirs(&folder).is_some_and(|dirs| !may_be_partial(&dirs))).await.unwrap_or(false);
+            if ordinary {
                 return Ok(());
             }
         }
@@ -972,7 +975,13 @@ fn shape(args: &[String], history_fetch: bool) -> Shape {
         return passive(Read::HistoryFetch, None);
     }
     let rest: Vec<&str> = args[at + 1..].iter().map(String::as_str).collect();
-    let has = |f: &str| rest.contains(&f);
+    // The options git reads: nothing after `--` (paths) or `--end-of-options`
+    // (revisions) is one. A path or a revision can come from the repository
+    // (a submodule at the path `--cached`), and read as an option it would
+    // switch a protection off. `positionals`, `first` and `config_reads`
+    // keep the whole list.
+    let opts = &rest[..rest.iter().position(|a| *a == "--" || *a == "--end-of-options").unwrap_or(rest.len())];
+    let has = |f: &str| opts.contains(&f);
     let first = positionals(&rest, &[]).first().copied();
     let first_arg = rest.first().copied();
     // A command that reads objects but reaches no program-naming key still
@@ -981,15 +990,15 @@ fn shape(args: &[String], history_fetch: bool) -> Shape {
     // An explicit `--textconv` or `--ext-diff` would undo the flags this
     // runner puts in front of it: the drivers themselves are switched off.
     let live_drivers = has("--textconv") || has("--ext-diff");
-    let signature = rest.iter().any(|a| asks_signature(a));
+    let signature = opts.iter().any(|a| asks_signature(a));
     // With no format of its own, a log prints the repository's
     // `format.pretty`, which may ask for the signature.
-    let own_format = rest.iter().any(|a| a.starts_with("--format") || a.starts_with("--pretty") || *a == "--oneline");
+    let own_format = opts.iter().any(|a| a.starts_with("--format") || a.starts_with("--pretty") || *a == "--oneline");
     // Whether git may look inside the submodules' work trees (`recurse`):
     // unless told to ignore them, or to ignore their work trees, a status or
     // a diff against the work tree does. The repository's own
     // `diff.ignoreSubmodules` or `submodule.<name>.ignore` cannot be relied on.
-    let subs_ignored = rest.iter().any(|a| matches!(*a, "--ignore-submodules" | "--ignore-submodules=all" | "--ignore-submodules=dirty"));
+    let subs_ignored = opts.iter().any(|a| matches!(*a, "--ignore-submodules" | "--ignore-submodules=all" | "--ignore-submodules=dirty"));
     let recursing = |s: Shape, recurse: bool| Shape { recurse: recurse && !subs_ignored, ..s };
     match args[at].as_str() {
         "status" => recursing(passive(Read::Neutral, None), true),
@@ -1001,22 +1010,21 @@ fn shape(args: &[String], history_fetch: bool) -> Shape {
         "rev-list" | "for-each-ref" => passive(read_if(signature), None),
         // `--dirty` compares the work tree, through its clean filters.
         "describe" => {
-            let dirty = rest.iter().any(|a| a.starts_with("--dirty") || a.starts_with("--broken"));
+            let dirty = opts.iter().any(|a| a.starts_with("--dirty") || a.starts_with("--broken"));
             recursing(passive(read_if(dirty), None), dirty)
         }
         "cat-file" => passive(read_if(has("--filters") || has("--textconv")), None),
         "grep" => passive(read_if(has("--textconv")), None),
         // `--modified` hashes stat-dirty files through their clean filters.
-        // The plain listing reads the index alone; the ignore rules and
-        // `--with-tree` may read objects.
+        // Every other form may read objects: a sparse index is expanded
+        // first (its trees read), and so are the ignore rules and
+        // `--with-tree`; in a partial clone a missing tree is fetched.
         "ls-files" => {
-            let short = |c: char| rest.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(c));
+            let short = |c: char| opts.iter().any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains(c));
             if has("--modified") || short('m') {
                 passive(Read::Neutral, None)
-            } else if rest.iter().any(|a| matches!(*a, "--others" | "--ignored") || a.starts_with("--exclude") || a.starts_with("--with-tree")) || short('o') || short('i') {
-                passive(Read::Objects, None)
             } else {
-                passive(Read::None, None)
+                passive(Read::Objects, None)
             }
         }
         // They read commits, trees or blobs (`check-attr`/`check-ignore`: the
@@ -1064,13 +1072,30 @@ fn empty_hooks_dir() -> &'static str {
         // The test builds never touch the person's real data folder: the
         // suites name a sandbox one, cargo's own tests use the temp folder.
         #[cfg(test)]
-        let base = std::env::var_os("GITSWITCH_DATA_DIR").filter(|d| !d.is_empty()).map(|d| PathBuf::from(d).join("com.gitswitch.app")).unwrap_or_else(|| std::env::temp_dir().join("gitswitch-test"));
+        let base = Some(std::env::var_os("GITSWITCH_DATA_DIR").filter(|d| !d.is_empty()).map(|d| PathBuf::from(d).join("com.gitswitch.app")).unwrap_or_else(|| std::env::temp_dir().join("gitswitch-test")));
         #[cfg(not(test))]
-        let base = crate::paths::data_dir().map(|d| d.join("com.gitswitch.app")).unwrap_or_else(|| std::env::temp_dir().join("gitswitch"));
-        let dir = base.join("empty-hooks");
-        let _ = std::fs::create_dir_all(&dir);
-        dir.to_string_lossy().replace('\\', "/")
+        let base = crate::paths::data_dir().map(|d| d.join("com.gitswitch.app"));
+        hooks_dir_in(base)
     })
+}
+
+/// `empty_hooks_dir` for the app's own data folder, or for none (no HOME
+/// and no passwd entry). Never a shared folder then: anyone on the machine
+/// could create `/tmp/gitswitch/empty-hooks` first and put a hook in it,
+/// which every passive command would run as the person. On unix the name
+/// is `/dev/null`: git looks for `<hooksPath>/<hook>` (`find_hook`, an
+/// `access(X_OK)` that fails with ENOTDIR below something that is not a
+/// folder) and runs nothing. Windows has a per-user temp folder.
+fn hooks_dir_in(base: Option<PathBuf>) -> String {
+    let dir = match base {
+        Some(b) => b.join("empty-hooks"),
+        #[cfg(unix)]
+        None => return "/dev/null".to_string(),
+        #[cfg(not(unix))]
+        None => std::env::temp_dir().join("gitswitch").join("empty-hooks"),
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    dir.to_string_lossy().replace('\\', "/")
 }
 
 /// One entry of `git config --list --show-scope -z`.
@@ -1287,11 +1312,25 @@ pub(crate) struct GitDirs {
     pub common_dir: PathBuf,
 }
 
+/// A file's text, read only when it is a regular file: opening a FIFO (an
+/// archive can carry one in `.git`) waits for a writer that never comes,
+/// with no clock to stop it — git, asked instead, runs on one. `Ok(None)`:
+/// there is nothing at that path.
+fn regular_file(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => std::fs::read(path).map(Some),
+        Ok(_) => Err(std::io::Error::other("not a regular file")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// The repository git finds from `folder`, by the same walk up to the first
 /// `.git` (a folder, or a file saying `gitdir: …`). `None` when anything is
 /// out of the ordinary — that `.git` is not a repository git would accept
-/// (git would walk on past an empty `.git` folder), or cannot be read — so
-/// the callers ask git instead of guessing.
+/// (git would walk on past an empty `.git` folder), cannot be read, or is
+/// neither a folder nor a regular file, nor is its `commondir` — so the
+/// callers ask git instead of guessing.
 pub(crate) fn find_git_dirs(folder: &Path) -> Option<GitDirs> {
     let start = if folder.is_absolute() { folder.to_path_buf() } else { std::env::current_dir().ok()?.join(folder) };
     let mut at: &Path = &start;
@@ -1301,16 +1340,16 @@ pub(crate) fn find_git_dirs(folder: &Path) -> Option<GitDirs> {
             let git_dir = if meta.is_dir() {
                 dot
             } else {
-                let text = std::fs::read_to_string(&dot).ok()?;
+                let text = String::from_utf8(regular_file(&dot).ok()??).ok()?;
                 let rel = text.lines().next()?.strip_prefix("gitdir:")?.trim();
                 if rel.is_empty() {
                     return None;
                 }
                 at.join(rel)
             };
-            let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
-                Ok(text) => git_dir.join(text.lines().next()?.trim()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
+            let common_dir = match regular_file(&git_dir.join("commondir")) {
+                Ok(Some(bytes)) => git_dir.join(String::from_utf8(bytes).ok()?.lines().next()?.trim()),
+                Ok(None) => git_dir.clone(),
                 Err(_) => return None,
             };
             let accepted = git_dir.join("HEAD").is_file() && common_dir.join("objects").is_dir() && common_dir.join("refs").is_dir();
@@ -1325,17 +1364,18 @@ pub(crate) fn find_git_dirs(folder: &Path) -> Option<GitDirs> {
 /// `promisor`, `partialclone` and `include` in `config` and
 /// `config.worktree` (the local and worktree scopes). Config names are ASCII
 /// and never broken across lines, so a file without those words sets none of
-/// those keys. A file that cannot be read counts as "could".
+/// those keys. A file that cannot be read, or is not a regular file, counts
+/// as "could".
 pub(crate) fn may_be_partial(dirs: &GitDirs) -> bool {
     for file in [dirs.common_dir.join("config"), dirs.git_dir.join("config.worktree"), dirs.common_dir.join("config.worktree")] {
-        match std::fs::read(&file) {
-            Ok(bytes) => {
+        match regular_file(&file) {
+            Ok(Some(bytes)) => {
                 let low = bytes.to_ascii_lowercase();
                 if [&b"promisor"[..], b"partialclone", b"include"].iter().any(|w| low.windows(w.len()).any(|x| x == *w)) {
                     return true;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(None) => {}
             Err(_) => return true,
         }
     }
@@ -1346,11 +1386,15 @@ pub(crate) fn may_be_partial(dirs: &GitDirs) -> bool {
 /// four bytes, and a gitlink's (0160000) is `00 00 E0 00`. Not found in the
 /// index (nor in a split index's shared part), there is none; found, the
 /// index is listed to be sure. Read in pieces, as an index can be large. A
-/// file that cannot be read counts as "may".
+/// file that cannot be read, or is not a regular file (opening a FIFO would
+/// wait for good), counts as "may".
 pub(crate) fn index_may_hold_gitlinks(dirs: &GitDirs) -> bool {
     const GITLINK: [u8; 4] = [0, 0, 0xE0, 0];
     let holds = |path: &Path| -> std::io::Result<bool> {
         use std::io::Read;
+        if !std::fs::metadata(path)?.is_file() {
+            return Ok(true);
+        }
         let mut f = std::fs::File::open(path)?;
         let mut buf = vec![0u8; 1 << 16];
         let mut carry: Vec<u8> = Vec::new();
@@ -1838,6 +1882,16 @@ pub fn was_stopped(e: &AppError) -> bool {
         || m.starts_with("The large-file download was stopped after ")
 }
 
+/// Whether an error is the safety prelude declining to run a command (a
+/// partial clone whose own settings name a transport program, a setting
+/// that cannot be switched off, a read of the settings that failed), not
+/// git answering. Like a stop on the clock, it is not "nothing there": a
+/// History page that was refused is not a repository without commits.
+pub fn was_refused(e: &AppError) -> bool {
+    let AppError::Command(m) = e else { return false };
+    m.starts_with("GitSwitch did not run git ") || m.starts_with("GitSwitch did not fetch")
+}
+
 /// A git remote name we are willing to pass to git. Rejects anything that could
 /// be read as an option or a path.
 pub fn validate_remote_name(name: &str) -> Result<(), AppError> {
@@ -2132,6 +2186,21 @@ mod tests {
         assert!(!stopped("fatal: your current branch 'main' does not have any commits yet".into()));
         assert!(!stopped("git log failed: fatal: bad revision 'x'".into()));
         assert!(!super::was_stopped(&crate::error::AppError::Config("git rev-list was stopped after 60s".into())));
+    }
+
+    /// The prelude's own refusals are told apart from git's answer too, each
+    /// of the ways it words one.
+    #[test]
+    fn a_refusal_of_the_prelude_is_told_apart_from_a_failure() {
+        let keys = vec!["core.sshCommand".to_string()];
+        let why = super::ReadFailed { why: "git config was stopped after 30s".into(), refused: false };
+        for e in [super::partial_refusal("rev-list", &keys), super::unswitchable("status", "filter.\u{fffd}.clean"), super::fetch_refusal(&keys), super::fetch_read_failed(&why)] {
+            assert!(super::was_refused(&e), "{}", e);
+            assert!(!super::was_stopped(&e), "{}", e);
+        }
+        assert!(!super::was_refused(&crate::error::AppError::Command("fatal: your current branch 'main' does not have any commits yet".into())));
+        assert!(!super::was_refused(&crate::error::AppError::Command(super::timeout_message("rev-list", super::LOCAL_TIMEOUT, ""))));
+        assert!(!super::was_refused(&crate::error::AppError::Config("GitSwitch did not run git log".into())));
     }
 
     /// A blocking helper called from an async command: no panic (as
@@ -2440,10 +2509,20 @@ mod tests {
         assert_eq!(sh(&["log", "-1", "--show-signature"]).read, Read::Neutral);
         assert_eq!(sh(&["rev-list", "-1", "--format=%GK", "HEAD"]).read, Read::Neutral);
         assert_eq!(sh(&["show", "--textconv", "HEAD"]).read, Read::Neutral);
-        assert_eq!(sh(&["ls-files", "-s"]).read, Read::None);
-        assert_eq!(sh(&["ls-files", "-s", "-z", ":/"]).read, Read::None);
+        // Every listing may read trees: a sparse index is expanded first.
+        for a in [&["ls-files", "-s"][..], &["ls-files", "-s", "-z", ":/"], &["ls-files", "-z"], &["ls-files", "-z", "-t"], &["ls-files", "-u", "-z"], &["ls-files", "-s", "--", "x"], &["ls-files", "-o", "--exclude-standard"]] {
+            assert_eq!(sh(a).read, Read::Objects, "{:?}", a);
+        }
         assert_eq!(sh(&["ls-files", "-zm"]).read, Read::Neutral);
-        assert_eq!(sh(&["ls-files", "-o", "--exclude-standard"]).read, Read::Objects);
+        // A path named like an option is a path.
+        assert_eq!(sh(&["ls-files", "-s", "--", "-m"]).read, Read::Objects);
+        // Text after `--` or `--end-of-options` is never an option to git:
+        // a path or revision from the repository switches nothing off.
+        assert_eq!(sh(&["log", "--end-of-options", "--oneline"]).read, Read::Neutral);
+        assert_eq!(sh(&["log", "-1", "--", "--format=%H"]).read, Read::Neutral);
+        assert_eq!(sh(&["log", "--oneline", "--end-of-options", "HEAD"]).read, Read::Objects);
+        assert_eq!(sh(&["cat-file", "-p", "--", "--filters"]).read, Read::Objects);
+        assert_eq!(sh(&["describe", "--end-of-options", "--dirty"]).read, Read::Objects);
         // Objects read, no program-naming key reached.
         for a in [&["rev-list", "--count", "HEAD"][..], &["for-each-ref", "--format=%(refname)"], &["cat-file", "--batch"], &["ls-tree", "HEAD"], &["merge-base", "a", "b"], &["describe", "--tags"], &["stash", "list"], &["shortlog", "-s"], &["branch", "--list"], &["submodule", "status"], &["rev-parse", "HEAD~1"], &["rev-parse", "--verify", "HEAD^{commit}"], &["rev-parse", "HEAD:a.txt"], &["check-attr", "-a", "x"]] {
             assert_eq!(sh(a).read, Read::Objects, "{:?}", a);
@@ -2466,6 +2545,10 @@ mod tests {
         // Looking inside the submodules' work trees: a status or a diff
         // against the work tree, unless told to ignore them.
         for a in [&["status", "--porcelain"][..], &["status", "--ignore-submodules=untracked"], &["status", "--ignore-submodules=none"], &["diff", "--numstat"], &["diff", "HEAD", "--", "x"], &["diff-files", "-q"], &["diff-index", "HEAD"], &["describe", "--dirty"], &["lfs", "status"]] {
+            assert!(sh(a).recurse, "{:?} looks inside submodules", a);
+        }
+        // A submodule at the path `--cached` (or any option's name) is a path.
+        for a in [&["diff", "--no-color", "--ignore-submodules=none", "--", "--cached"][..], &["diff", "--", "--ignore-submodules"], &["diff", "--", "--staged", "--no-index"], &["diff-index", "HEAD", "--", "--cached"], &["status", "--porcelain", "--", "--ignore-submodules=all"]] {
             assert!(sh(a).recurse, "{:?} looks inside submodules", a);
         }
         for a in [&["status", "--ignore-submodules=all"][..], &["status", "--ignore-submodules"], &["status", "--ignore-submodules=dirty"], &["diff", "--cached"], &["diff", "--staged", "--numstat"], &["diff", "--no-index", "--", "a", "b"], &["diff-index", "--cached", "HEAD"], &["diff-tree", "-r", "a", "b"], &["stash", "show", "-p"], &["log", "-1"], &["describe"], &["commit", "-m", "x"]] {
@@ -2641,6 +2724,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The folder shortcuts read a file only when it is a regular one;
+    /// anything else gets the cautious answer, so git (on its clock) decides.
+    #[test]
+    fn the_folder_shortcuts_read_only_regular_files() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-prelude-odd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // What git takes for a repository: HEAD, objects and refs.
+        let gd = dir.join("r").join(".git");
+        std::fs::create_dir_all(gd.join("objects")).unwrap();
+        std::fs::create_dir_all(gd.join("refs")).unwrap();
+        std::fs::write(gd.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let dirs = find_git_dirs(&dir.join("r")).expect("a repository");
+        assert!(!may_be_partial(&dirs) && !index_may_hold_gitlinks(&dirs), "no config, no index: nothing to find");
+        // A folder where the file should be.
+        for name in ["config", "index", "commondir"] {
+            std::fs::create_dir_all(gd.join(name)).unwrap();
+            match name {
+                "config" => assert!(may_be_partial(&dirs), "a folder named config"),
+                "index" => assert!(index_may_hold_gitlinks(&dirs), "a folder named index"),
+                _ => assert_eq!(find_git_dirs(&dir.join("r")), None, "a folder named commondir"),
+            }
+            std::fs::remove_dir_all(gd.join(name)).unwrap();
+        }
+        // A FIFO (a tar archive can carry one): opening it would wait for a
+        // writer for good. Each answer must come back at once.
+        #[cfg(unix)]
+        {
+            let fifo = |p: &Path| {
+                let c = std::ffi::CString::new(p.to_string_lossy().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo {:?}", p);
+            };
+            let within = |what: &'static str, f: Box<dyn FnOnce() -> bool + Send>| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(f());
+                });
+                rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap_or_else(|_| panic!("{} waited on a FIFO", what))
+            };
+            let r = dir.join("r");
+            for (name, cautious) in [("config", true), ("index", true), ("commondir", false)] {
+                fifo(&gd.join(name));
+                let (gd2, r2) = (GitDirs { git_dir: gd.clone(), common_dir: gd.clone() }, r.clone());
+                let answer = match name {
+                    "config" => within("may_be_partial", Box::new(move || may_be_partial(&gd2))),
+                    "index" => within("index_may_hold_gitlinks", Box::new(move || index_may_hold_gitlinks(&gd2))),
+                    _ => within("find_git_dirs", Box::new(move || find_git_dirs(&r2).is_some())),
+                };
+                assert_eq!(answer, cautious, "a FIFO named {}", name);
+                std::fs::remove_file(gd.join(name)).unwrap();
+            }
+            // A `.git` that is a FIFO: no repository is guessed.
+            let w = dir.join("w");
+            std::fs::create_dir_all(&w).unwrap();
+            fifo(&w.join(".git"));
+            assert!(!within("find_git_dirs on a .git FIFO", Box::new(move || find_git_dirs(&w).is_some())));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn only_the_persons_own_credential_helpers_are_put_back_in_their_order() {
         let entries = vec![
@@ -2746,6 +2888,49 @@ mod tests {
 
     fn fired(mark: &Path) -> String {
         std::fs::read_to_string(mark).unwrap_or_default()
+    }
+
+    /// The empty hooks folder: the app's own data folder; without one, never
+    /// a folder another user could create first (unix: `/dev/null`, below
+    /// which git finds no hook; Windows: the per-user temp folder).
+    #[test]
+    fn without_a_data_folder_the_hooks_pin_names_no_shared_folder() {
+        let base = std::env::temp_dir().join(format!("gitswitch-hooks-in-{}", std::process::id()));
+        let got = hooks_dir_in(Some(base.clone()));
+        assert_eq!(got, base.join("empty-hooks").to_string_lossy().replace('\\', "/"));
+        assert!(base.join("empty-hooks").is_dir());
+        let _ = std::fs::remove_dir_all(&base);
+        #[cfg(unix)]
+        assert_eq!(hooks_dir_in(None), "/dev/null");
+        #[cfg(windows)]
+        assert!(Path::new(&hooks_dir_in(None)).starts_with(std::env::temp_dir()), "{}", hooks_dir_in(None));
+    }
+
+    /// git finds no hook below `/dev/null`, and still does its work.
+    #[cfg(unix)]
+    #[test]
+    fn git_runs_no_hook_below_dev_null() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-hooks-devnull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a folder");
+        assert!(fixture_git(&dir, &["init", "-q"]).status.success());
+        let mark = dir.join("MARK");
+        let hook = dir.join(".git").join("hooks").join("reference-transaction");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, format!("#!/bin/sh\necho hook >> '{}'\n", mark.to_string_lossy())).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let with = |pin: &str| {
+            let _ = std::fs::remove_file(&mark);
+            let out = plain_git(&dir, &["-c", pin, "-c", "user.name=x", "-c", "user.email=x@x.test", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "x"]);
+            (out.status.success(), fired(&mark))
+        };
+        let hooks = format!("core.hooksPath={}", hook.parent().unwrap().to_string_lossy());
+        assert_eq!(with(&hooks), (true, "hook\n".to_string()), "control: the hook runs from its own folder");
+        assert_eq!(with("core.hooksPath=/dev/null"), (true, String::new()), "no hook below /dev/null, and the commit is made");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Includes keep the scope of the file that pulled them in: a filter a
