@@ -76,4 +76,22 @@ ok "  and nothing was made around them" "$([ -e "$P/holder/.git" ] && echo MADE 
 ok "a folder that is gone: refused" "$(pinvoke repo_init "{\"path\":$(jstr "$P/gone")}" | err)" "not on this computer"
 ok "  and it was not created" "$([ -e "$P/gone" ] && echo CREATED || echo none)" "none"
 
+section "Publish a repository made here: no remote, then its address added"
+PUB="$SB/publish"; mkdir -p "$PUB"
+git init -q -b main "$PUB" && printf 'x\n' > "$PUB/a.txt" && git -C "$PUB" add -A && git -C "$PUB" commit -qm "first" >/dev/null
+BARE="$SB/publish-remote.git"; git init -q --bare "$BARE"
+OUT=$(pinvoke changes_push "{\"repoPath\":$(jstr "$PUB"),\"setUpstream\":true}")
+ok "Publish with no remote is refused as no-remote" "$(printf '%s' "$OUT" | v "(v.get('refusal') or {}).get('code')")" "no-remote"
+ok "  saying it is on no server yet, not sending you to the terminal" "$(printf '%s' "$OUT" | v "'terminal' not in v['refusal']['message'] and 'no remote to push to' in v['refusal']['message']")" "True"
+ok "a transport-helper address is refused" "$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":$(jstr "ext::sh -c touch% $SB/pwned")}" | err)" "transport helpers"
+ok "  nothing ran and no remote was added" "ran=$([ -e "$SB/pwned" ] && echo yes || echo no) remotes=$(git -C "$PUB" remote | wc -l | tr -d ' ')" "ran=no remotes=0"
+ok "an address git could read as an option is refused" "$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":\"--upload-pack=touch x\"}" | err)" "isn't a repository address"
+ok "a token written into an https address is refused" "$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":\"https://me:ghp_x@github.com/me/app.git\"}" | err)" "token out of the address"
+OUT=$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":$(jstr "$BARE")}")
+ok "the address of an empty repository is added as origin" "$(printf '%s' "$OUT" | v "v") | $(git -C "$PUB" remote get-url origin)" "as origin. | $BARE"
+OUT=$(pinvoke changes_push "{\"repoPath\":$(jstr "$PUB"),\"setUpstream\":true}")
+ok "  then Publish lands there" "$(printf '%s' "$OUT" | v "v['ok']") $(git -C "$BARE" rev-parse main 2>/dev/null)" "True $(git -C "$PUB" rev-parse HEAD)"
+ok "  and main tracks origin/main from now on" "upstream=$(git -C "$PUB" rev-parse --abbrev-ref 'main@{upstream}')" "upstream=origin/main"
+ok "a repository that has a remote is never changed here" "$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":\"git@github.com:me/other.git\"}" | err | grep -c 'already has a remote') | $(git -C "$PUB" remote get-url origin)" "1 | $BARE"
+
 verify_result

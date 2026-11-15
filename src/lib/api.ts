@@ -2344,6 +2344,11 @@ export async function changesCommit(
   return invoke("changes_commit", { repoPath, message, amend });
 }
 
+/** Connect a repository that has no remote yet to `url`, as origin (Publish's "Add a remote…"). */
+export async function changesAddRemote(repoPath: string, url: string): Promise<string> {
+  return invoke("changes_add_remote", { repoPath, url });
+}
+
 /** `allowUnpushedSubmodules`: push although a submodule's recorded commit is on none of that submodule's remotes. */
 export async function changesPush(repoPath: string, setUpstream: boolean, allowUnpushedSubmodules = false): Promise<OpResult> {
   return invoke("changes_push", { repoPath, setUpstream, allowUnpushedSubmodules });

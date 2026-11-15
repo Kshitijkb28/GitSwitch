@@ -17,6 +17,7 @@ import { GitHubIcon } from "../components/GitHubIcon";
 import { baseName } from "../lib/paths";
 import { useRefreshOnFocus } from "../lib/focus";
 import { copyText } from "../lib/clipboard";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import * as api from "../lib/api";
 import { SIGNIN_PREFIX } from "../lib/signins";
 import { RefreshButton } from "../components/RefreshButton";
@@ -61,6 +62,23 @@ function RegisterKey({ keyPath, accounts }: { keyPath: string; accounts: string[
     }
   }
 
+  // A key added by hand on github.com belongs to no app, so no organization's
+  // third-party app restriction can hide its private repositories from it.
+  async function addByHand() {
+    setMessage(null);
+    try {
+      const copied = await copyText(await api.getPublicKey(keyPath));
+      await openUrl("https://github.com/settings/ssh/new");
+      setMessage(
+        copied
+          ? { ok: true, text: "The public key is copied. On GitHub, paste it into Key (any title), then click Add SSH key." }
+          : { ok: false, text: "GitHub's page is open, but the key couldn't be copied: paste the contents of the .pub file by hand." }
+      );
+    } catch (e) {
+      setMessage({ ok: false, text: String(e) });
+    }
+  }
+
   if (accounts.length === 0) {
     return (
       <p className="text-xs text-zinc-500">
@@ -91,6 +109,14 @@ function RegisterKey({ keyPath, accounts }: { keyPath: string; accounts: string[
           )}
         </Button>
       </div>
+      <p className="mt-2 text-xs text-zinc-500 leading-relaxed">
+        GitHub marks a key that an app registers as added by that app, and an organization that restricts
+        third-party apps (GitHub's default for new organizations) hides its private repositories from such keys.
+        For those, add the key by hand instead; it works everywhere.{" "}
+        <button type="button" onClick={() => void addByHand()} className="text-emerald-400 hover:underline cursor-pointer">
+          Add it by hand on GitHub
+        </button>
+      </p>
       {message && (
         <div className={`mt-3 flex items-start gap-2 text-sm break-words ${message.ok ? "text-emerald-400" : "text-red-400"}`}>
           {message.ok ? <CheckCircle2 size={16} className="shrink-0 mt-0.5" /> : <XCircle size={16} className="shrink-0 mt-0.5" />}

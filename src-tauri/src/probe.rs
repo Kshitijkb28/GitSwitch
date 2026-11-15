@@ -223,6 +223,7 @@ pub(crate) mod tests {
             "changes_discard" => forward!(c::changes_discard, args, repo_path, paths),
             "changes_commit" => forward!(c::changes_commit, args, repo_path, message, amend),
             "changes_push" => forward!(c::changes_push, args, repo_path, set_upstream, allow_unpushed_submodules),
+            "changes_add_remote" => forward!(c::changes_add_remote, args, repo_path, url),
             "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash, source),
             "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path, paths),
             "changes_submodule_align" => forward!(c::changes_submodule_align, args, repo_path, paths),

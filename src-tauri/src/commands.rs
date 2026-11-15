@@ -1263,6 +1263,14 @@ pub async fn changes_push(repo_path: String, set_upstream: bool, allow_unpushed_
     git_ops::push(&repo_path, set_upstream, allow_unpushed_submodules.unwrap_or(false)).await
 }
 
+/// Connect a repository that has no remote yet to an address, as origin:
+/// Publish's "Add a remote…", so a repository made here can be published
+/// without the terminal.
+#[tauri::command]
+pub async fn changes_add_remote(repo_path: String, url: String) -> Result<String, AppError> {
+    git_ops::add_origin(&repo_path, &url).await
+}
+
 /// `mode` is one of "ff-only", "merge", "rebase" — chosen by the user, never
 /// inferred from their git settings. `with_lfs` additionally downloads the
 /// content behind any LFS pointer stub, which a plain pull does not do unless

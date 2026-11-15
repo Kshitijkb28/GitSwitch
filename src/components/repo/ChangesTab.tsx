@@ -23,6 +23,8 @@ import { ResultCard } from "../changes/ResultCard";
 import { DiscardConfirmModal } from "../changes/DiscardConfirmModal";
 import { ResetConfirmModal } from "../changes/ResetConfirmModal";
 import { DiscardAllModal } from "../changes/DiscardAllModal";
+import { AddRemoteModal } from "../changes/AddRemoteModal";
+import { cleanError } from "../github/shared";
 import { usePersistedState } from "../../lib/persist";
 import { canonicalJoin } from "../../lib/paths";
 import { useRefreshOnFocus } from "../../lib/focus";
@@ -103,6 +105,8 @@ export function ChangesTab({
   const [stashOpen, setStashOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const [discardAllOpen, setDiscardAllOpen] = useState(false);
+  /** Publish was refused for want of any remote: the address to add as origin. */
+  const [addRemoteOpen, setAddRemoteOpen] = useState(false);
   const [tick, setTick] = useState(0);
   const [subRefresh, setSubRefresh] = useState(0);
   // Bumped by Refresh only: the pushing identity may ask github.com, which
@@ -621,6 +625,11 @@ export function ChangesTab({
           onClick: () => runLong("push", "Publishing…", () => api.changesPush(repoPath, true)),
         }
       : undefined;
+  // No remote at all (a repository made here, say): the address to publish to.
+  const addRemoteAction =
+    refusalCode === "no-remote" && status?.branch
+      ? { label: "Add a remote…", primary: true, onClick: () => setAddRemoteOpen(true) }
+      : undefined;
 
   return (
     <>
@@ -747,7 +756,7 @@ export function ChangesTab({
                 if (inside) void apply("align", () => api.changesSubmoduleAlign(inside, paths), inside);
                 else void runLong("submodules", `Checking out the recorded commit${paths.length === 1 ? "" : "s"}…`, () => api.changesSubmoduleAlign(repoPath, paths));
               }}
-              extraAction={markersAction ?? syncHandOff ?? movedAction ?? historyAction ?? publishAction}
+              extraAction={markersAction ?? syncHandOff ?? movedAction ?? historyAction ?? publishAction ?? addRemoteAction}
               extraActions={subPushActions}
             />
           )}
@@ -928,6 +937,20 @@ export function ChangesTab({
             onDownloadAll={() =>
               runLong("lfs", "Downloading LFS files…", () => api.changesLfsPull(repoPath))
             }
+          />
+          <AddRemoteModal
+            open={addRemoteOpen}
+            onCancel={() => setAddRemoteOpen(false)}
+            onConfirm={async (url) => {
+              try {
+                await api.changesAddRemote(repoPath, url);
+              } catch (e) {
+                return cleanError(e);
+              }
+              setAddRemoteOpen(false);
+              void runLong("push", "Publishing…", () => api.changesPush(repoPath, true));
+              return null;
+            }}
           />
           <DiscardAllModal
             open={discardAllOpen}

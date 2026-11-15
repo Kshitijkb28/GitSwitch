@@ -222,6 +222,13 @@ async fn probe_key_account(key_path: &str) -> Result<Option<String>, AppError> {
     })
 }
 
+/// The GitHub account `key_path` signs in as (`ssh -T git@github.com`), or
+/// None when GitHub did not say within 15 seconds (refused, unreachable).
+pub(crate) async fn github_login_of_key(key_path: &str) -> Option<String> {
+    let said = tokio::time::timeout(std::time::Duration::from_secs(15), test_ssh_connection_with_key(key_path)).await.ok()?.ok()?;
+    interpret_ssh_probe(&said).flatten()
+}
+
 /// Interpret `ssh -T git@github.com` output.
 /// `Some(Some(login))` authenticated · `Some(None)` definitively rejected ·
 /// `None` indeterminate (timeout, throttling, DNS…) — must NOT be read as

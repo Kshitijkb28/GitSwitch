@@ -1441,6 +1441,95 @@ pub struct PushTarget {
     pub set_upstream: bool,
 }
 
+/// Why `url` is not an address to publish to, or None when it is: https,
+/// ssh (`ssh://…` or the scp form `git@github.com:owner/repo.git`), or the
+/// full path of a folder. Nothing git could read as an option, no transport
+/// helper (`ext::…`, any `<x>::`), no plain http, and no user name, password
+/// or token written into an https address.
+pub(crate) fn remote_url_problem(url: &str) -> Option<String> {
+    let u = url.trim();
+    if u.is_empty() {
+        return Some("Paste the repository's address.".into());
+    }
+    if u.len() > 4096 || u.chars().any(char::is_control) {
+        return Some("The address has an invisible character in it. Copy it again from GitHub (the green Code button).".into());
+    }
+    if u.starts_with('-') {
+        return Some("That isn't a repository address.".into());
+    }
+    if u.contains("::") {
+        return Some("GitSwitch doesn't publish through git transport helpers (an address with \"::\"). Use the HTTPS or SSH address.".into());
+    }
+    // The full path of a folder: C:\…, C:/…, \\server\share\…, /…
+    let b = u.as_bytes();
+    let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+    if drive || u.starts_with("\\\\") || u.starts_with('/') {
+        return None;
+    }
+    if u.chars().any(char::is_whitespace) {
+        return Some("The address has a space in it. Copy it again from GitHub (the green Code button).".into());
+    }
+    let lower = u.to_ascii_lowercase();
+    if lower.starts_with("http://") {
+        return Some("Use the https:// address: plain http sends everything unencrypted.".into());
+    }
+    for scheme in ["https://", "ssh://"] {
+        if let Some(rest) = lower.strip_prefix(scheme) {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            if scheme == "https://" && authority.contains('@') {
+                return Some("Leave the user name, password or token out of the address: GitSwitch signs in with this folder's profile key, or with the sign-in git already has.".into());
+            }
+            let host = authority.rsplit('@').next().unwrap_or("");
+            if host.is_empty() || host.starts_with('-') || path.trim_matches('/').is_empty() || path.starts_with('-') {
+                return Some(format!(
+                    "The address needs a server and a repository, like {}github.com/you/repo.git.",
+                    if scheme == "ssh://" { "ssh://git@" } else { "https://" }
+                ));
+            }
+            return None;
+        }
+    }
+    if let Some(path) = lower.strip_prefix("file://") {
+        return (path.trim_matches('/').is_empty()).then(|| "The address needs the path of a folder after file://.".to_string());
+    }
+    // The scp form: [user@]host:path. One letter before the colon is a drive
+    // to git on Windows, not a host.
+    if let Some((left, path)) = u.split_once(':') {
+        let host = left.rsplit('@').next().unwrap_or("");
+        if host.len() > 1 && !host.starts_with('-') && !left.contains('/') && !left.contains('\\') && !path.is_empty() && !path.starts_with('-') {
+            return None;
+        }
+    }
+    Some("That doesn't look like a repository address. Use the HTTPS or SSH address from GitHub's green Code button, like git@github.com:you/repo.git.".into())
+}
+
+/// Connect a repository that has no remote yet to `url`, as `origin`: what
+/// Publish needs, without the terminal. Only for a repository with no remote
+/// at all; one that has some is never changed here.
+pub async fn add_origin(repo_path: &str, url: &str) -> Result<String, AppError> {
+    if let Some(problem) = remote_url_problem(url) {
+        return Err(AppError::Command(problem));
+    }
+    let url = url.trim();
+    let listed = GitCmd::at(repo_path).args(["remote"]).timeout(LOCAL_TIMEOUT).run().await?;
+    if !listed.ok() {
+        return Err(AppError::Command(format!("GitSwitch couldn't read this repository's remotes: {}", listed.stderr.trim())));
+    }
+    let remotes: Vec<String> = listed.text().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    if let Some(first) = remotes.first() {
+        return Err(AppError::Command(format!(
+            "This repository already has a remote ({}), so Publish uses it. If its address is wrong, change it in the terminal: `git remote set-url {} <url>`.",
+            remotes.join(", "),
+            first
+        )));
+    }
+    let out = GitCmd::at(repo_path).args(["remote", "add", "--", "origin", url]).timeout(LOCAL_TIMEOUT).run().await?;
+    if !out.ok() {
+        return Err(AppError::Command(format!("git remote add failed: {}", out.stderr.trim())));
+    }
+    Ok(format!("Connected to {} as origin.", url))
+}
+
 /// Where a push goes, by the same rules as git's default (`push.default =
 /// simple`). An upstream of the SAME name is pushed to. One of a different
 /// name is refused: a branch started from `origin/main` with tracking would
@@ -1469,7 +1558,7 @@ pub fn resolve_push_target(i: &PushInputs) -> Result<PushTarget, Refusal> {
         None if i.remotes.is_empty() => {
             return Err(refuse(
                 "no-remote",
-                "This repository has no remote to push to. Add one first — `git remote add origin <url>` in the terminal.",
+                "This repository isn't on a server yet: it has no remote to push to. Add one (the address of an empty repository on GitHub or your own server) and publish there.",
             ))
         }
         None => {
@@ -3833,5 +3922,51 @@ mod tests {
         assert_eq!(signature_label("B"), "bad");
         assert_eq!(signature_label("N"), "unsigned");
         assert_eq!(signature_label(""), "unsigned");
+    }
+}
+
+#[cfg(test)]
+mod remote_url_tests {
+    use super::remote_url_problem;
+
+    #[test]
+    fn a_publish_address_is_https_ssh_or_a_full_path_and_nothing_git_could_misread() {
+        for ok in [
+            "git@github.com:you/subtitlemaker.git",
+            "https://github.com/you/subtitlemaker.git",
+            "https://github.com/you/subtitlemaker",
+            "ssh://git@github.com/you/subtitlemaker.git",
+            "ssh://git@example.com:2222/srv/repo.git",
+            "org-302118749@github.com:Acme/app.git",
+            "C:\\Users\\me\\remotes\\app.git",
+            "D:/Shared Repos/app.git",
+            "\\\\server\\share\\app.git",
+            "/srv/git/app.git",
+            "file:///srv/git/app.git",
+            "  git@github.com:you/app.git  ",
+        ] {
+            assert_eq!(remote_url_problem(ok), None, "{ok} should be accepted");
+        }
+        for (bad, says) in [
+            ("", "Paste"),
+            ("ext::sh -c touch% /tmp/pwned", "transport helpers"),
+            ("--upload-pack=touch x", "isn't a repository address"),
+            ("-oProxyCommand=calc:x", "isn't a repository address"),
+            ("git@-oProxyCommand=calc:x", "doesn't look like"),
+            ("ssh://-oProxyCommand=calc/x", "server and a repository"),
+            ("ssh://git@github.com/-x", "server and a repository"),
+            ("http://github.com/you/app.git", "https://"),
+            ("https://user:ghp_secret@github.com/you/app.git", "token"),
+            ("https://github.com", "server and a repository"),
+            ("file://", "path of a folder"),
+            ("github.com/you/app", "doesn't look like"),
+            ("app.git", "doesn't look like"),
+            ("C:app.git", "doesn't look like"),
+            ("git@github.com:you/app\n.git", "invisible"),
+            ("https://github.com/you/my app.git", "space"),
+        ] {
+            let p = remote_url_problem(bad).unwrap_or_else(|| panic!("{bad:?} should be refused"));
+            assert!(p.contains(says), "{bad:?}: {p}");
+        }
     }
 }

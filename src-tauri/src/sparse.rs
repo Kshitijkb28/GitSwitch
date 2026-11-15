@@ -1538,10 +1538,22 @@ pub(crate) fn explain_clone_error(stderr: &str, key: Option<&str>, url: &str) ->
     explain_transport_error(stderr, key, url, true)
 }
 
+/// `explain_clone_error`, naming the GitHub account the key signs in as.
+pub(crate) fn explain_clone_error_as(stderr: &str, key: Option<&str>, url: &str, login: Option<&str>) -> String {
+    explain_transport_error_as(stderr, key, url, true, login)
+}
+
 /// The same for any operation on the network. `for_clone`: the advice may
 /// point at the Clone page's "Clone as"; otherwise the folder's own profile
 /// decides the account, and the advice says so.
 pub(crate) fn explain_transport_error(stderr: &str, key: Option<&str>, url: &str, for_clone: bool) -> String {
+    explain_transport_error_as(stderr, key, url, for_clone, None)
+}
+
+/// `explain_transport_error`, naming the GitHub account the key signs in as
+/// (`login`, when known) where that is the point: an account that cannot see
+/// the repository.
+pub(crate) fn explain_transport_error_as(stderr: &str, key: Option<&str>, url: &str, for_clone: bool, login: Option<&str>) -> String {
     let key_name = key.map(crate::paths::base_name);
     let the_key = match &key_name {
         Some(k) => format!("the SSH key {}", k),
@@ -1575,10 +1587,21 @@ pub(crate) fn explain_transport_error(stderr: &str, key: Option<&str>, url: &str
             format!("GitHub refused {}. Either it isn't registered on the GitHub account, or the organization doesn't accept it (see below). Register it from SSH Keys, or check in Profiles which profile this folder belongs to — its key is the one used here.", the_key)
         }
     } else if stderr.contains("Repository not found") || stderr.contains("Could not read from remote repository") {
+        // Named, the account is most often the answer: the access is on
+        // another account of the person's, or an invitation to this one was
+        // never accepted.
+        let who = match login {
+            Some(l) => format!("GitHub accepted {}, which signs in as {}, but said this repository isn't there for it.", the_key, l),
+            None => format!("GitHub accepted {}, but said this repository isn't there for its account.", the_key),
+        };
+        let invited = match login {
+            Some(l) => format!("The usual reason: an app added this key to your GitHub account (GitSwitch does when it registers a key for you), and the repository's organization restricts third-party apps, which GitHub does by default for new organizations, so it hides its private repositories from such keys. Fix it on GitHub: in Settings → SSH and GPG keys, delete this key and add it again by hand (New SSH key, paste the .pub file), or ask the organization to approve GitSwitch. Otherwise {} has no access to it: the address is wrong, or an invitation was never accepted (accept it while signed in as {}).", l, l),
+            None => "The usual reason: an app added this key to your GitHub account (GitSwitch does when it registers a key for you), and the repository's organization restricts third-party apps, which GitHub does by default for new organizations, so it hides its private repositories from such keys. Fix it on GitHub: in Settings → SSH and GPG keys, delete this key and add it again by hand (New SSH key, paste the .pub file), or ask the organization to approve GitSwitch. Otherwise the account has no access to it: the address is wrong, or an invitation was never accepted.".to_string(),
+        };
         if for_clone {
-            format!("GitHub accepted {}, but that account can't see this repository. Check the URL, or under \"Clone as\" pick the profile whose account has access (e.g. your company profile for a company repo).", the_key)
+            format!("{} {} If your access is on another GitHub account, add a profile for that account (with an SSH key registered on it), then pick it under \"Clone as\".", who, invited)
         } else {
-            format!("GitHub accepted {}, but that account can't see this repository. Check the remote's address, or check in Profiles that this folder belongs to the profile whose account has access.", the_key)
+            format!("{} {} Or check in Profiles that this folder belongs to the profile whose account has access.", who, invited)
         }
     } else if stderr.contains("could not read Username") || stderr.contains("terminal prompts disabled") {
         "This HTTPS URL needs a username and password, which GitSwitch can't type in for you. Use the SSH URL (git@github.com:owner/repo.git) instead.".to_string()
@@ -1736,10 +1759,21 @@ async fn clone_as_profile(
     if let Some(t) = asking {
         t.abort();
     }
-    cloned.map_err(|e| match e {
-        AppError::Command(msg) => AppError::Command(explain_clone_error(&msg, key.as_deref(), url)),
-        other => other,
-    })?;
+    if let Err(e) = cloned {
+        return Err(match e {
+            AppError::Command(msg) => {
+                // An account that can't see the repository: which account it
+                // is, asked of GitHub with the same key (a few seconds, and
+                // only now that the clone has failed).
+                let login = match key.as_deref() {
+                    Some(k) if msg.contains("Repository not found") && url.contains("github.com") => Box::pin(crate::ssh_keys::github_login_of_key(k)).await,
+                    _ => None,
+                };
+                AppError::Command(explain_clone_error_as(&msg, key.as_deref(), url, login.as_deref()))
+            }
+            other => other,
+        });
+    }
 
     // The main clone succeeded; submodule trouble is reported, not fatal —
     // the repo is usable and `git submodule update` can be retried.
@@ -2104,6 +2138,19 @@ mod tests {
                 "{bad} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn an_account_that_cannot_see_the_repository_is_named_with_the_ways_out() {
+        let stderr = "ERROR: Repository not found.\nfatal: Could not read from remote repository.";
+        let key = Some("C:/Users/me/.ssh/id_ed25519_me");
+        let e = explain_clone_error_as(stderr, key, "git@github.com:Org/app.git", Some("me-on-github"));
+        assert!(e.contains("signs in as me-on-github") && e.contains("restricts third-party apps") && e.contains("add it again by hand") && e.contains("me-on-github has no access"), "{e}");
+        assert!(e.contains("invitation was never accepted") && e.contains("approve GitSwitch") && e.contains("add a profile for that account") && e.contains("Clone as"), "{e}");
+        let unknown = explain_clone_error(stderr, key, "git@github.com:Org/app.git");
+        assert!(unknown.contains("isn't there for its account") && unknown.contains("restricts third-party apps") && !unknown.contains("signs in as"), "{unknown}");
+        let push = explain_transport_error_as(stderr, key, "git@github.com:Org/app.git", false, Some("me-on-github"));
+        assert!(push.contains("signs in as me-on-github") && push.contains("Profiles") && !push.contains("Clone as"), "{push}");
     }
 
     #[test]
