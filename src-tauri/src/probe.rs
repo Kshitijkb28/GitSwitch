@@ -319,6 +319,10 @@ pub(crate) mod tests {
                 let light = arg::<bool>(&args, "light").unwrap_or(false);
                 reply(Ok::<_, crate::error::AppError>(crate::netspeed::taskbar_show_for(secs, "300 KB/s", "12.4 MB/s", light)))
             }
+            // The real taskbar speed bar, hidden and then moved from outside it
+            // (as Explorer or a display change might): whether it put itself right.
+            #[cfg(windows)]
+            "netspeed_taskbar_heal" => reply(Ok::<_, crate::error::AppError>(crate::netspeed::taskbar_heal_check())),
             "apps_users_of" => match arg::<String>(&args, "path") {
                 Ok(p) => reply(Ok::<_, crate::error::AppError>(crate::apps::users_of(std::path::Path::new(&p)))),
                 Err(e) => reply_err(e),

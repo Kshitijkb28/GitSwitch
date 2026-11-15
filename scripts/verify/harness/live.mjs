@@ -279,6 +279,10 @@ async function clickWhenEnabled(page, label, timeout = WAIT) {
   }
   return click(page, label);
 }
+/** `clickWhenEnabled`, or an error naming the button: what follows needs the click. */
+async function mustClick(label) {
+  if (!(await clickWhenEnabled(page, label))) throw new Error(`${label} never became enabled: ` + (await text(page)).slice(0, 300));
+}
 /** Click a button inside the first <li> whose text mentions `rowText` and that has the button. */
 async function clickInRow(page, rowText, pick) {
   return page.evaluate(
@@ -448,12 +452,31 @@ async function openHistory() {
 /** "Go to commit" → the detail panel for `hash`. */
 async function openPanel(hash) {
   await typeInto(page, 'input[aria-label="Go to commit"]', hash);
-  await click(page, "Go");
+  await mustClick("Go");
   await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Copy hash"), { timeout: WAIT });
+}
+/**
+ * Open the Branches dialog. The page disables Branches while it re-reads the
+ * repository (after navigating, after an action), and a click on a disabled
+ * button does nothing: once that cost a whole run, when scenario c's dialog
+ * never opened and every later scenario started on the wrong branch. So it is
+ * clicked once it is enabled, and again if the dialog's title has not appeared
+ * a moment later (never while the dialog is open: a click there would land on
+ * its backdrop).
+ */
+async function openBranchesDialog() {
+  const isOpen = () => page.evaluate((src) => !!eval(src)("Branches"), modalPanel.toString());
+  const end = Date.now() + WAIT;
+  while (Date.now() < end) {
+    if (await isOpen()) return;
+    await clickWhenEnabled(page, "Branches", Math.max(1000, end - Date.now()));
+    if (await waitUntilAsync(isOpen, 3000)) return;
+  }
+  throw new Error("the Branches dialog never opened: " + (await text(page)).slice(0, 300));
 }
 /** Open the Branches dialog and wait until it lists the branch `rowNeedle`. */
 async function openBranches(rowNeedle) {
-  await click(page, "Branches");
+  await openBranchesDialog();
   await page.waitForFunction(
     (n, modalPanelSrc) => {
       const panel = eval(modalPanelSrc)("Branches");
@@ -526,7 +549,7 @@ try {
   await scenario("d. Undo last commit takes the commit apart", async () => {
     await openChanges();
     write(`${WORK}/d.txt`, "d\n");
-    await click(page, "Refresh");
+    await mustClick("Refresh");
     ok("a new file appears under Untracked after Refresh", await waitListed(page, "Untracked", "d.txt"));
     ok("Stage on its row", await clickInRow(page, "d.txt", { title: "Stage" }));
     ok("  stages it", await waitUntil(() => git(WORK, "diff", "--cached", "--name-only") === "d.txt"));
@@ -555,7 +578,7 @@ try {
     await openChanges();
     const st = await buttonState(page, "Stash changes…");
     ok("Stash changes… is offered on a dirty tree", st?.disabled === false, JSON.stringify(st));
-    await click(page, "Stash changes…");
+    await mustClick("Stash changes…");
     await page.waitForSelector('input[aria-label="Stash message"]', { timeout: WAIT });
     ok("the dialog counts the change", (await text(page)).includes("1 uncommitted change (0 staged, 1 not staged, 0 new)"));
     await page.type('input[aria-label="Stash message"]', "wip live");
@@ -579,7 +602,7 @@ try {
   // -----------------------------------------------------------------------
   await scenario("c. Branches: create, switch, rename, delete", async () => {
     await openChanges();
-    await click(page, "Branches");
+    await openBranchesDialog();
     await page.waitForSelector('input[aria-label="New branch name"]', { timeout: WAIT });
     await page.type('input[aria-label="New branch name"]', "feature/live");
     ok("the switch checkbox is on by default", await page.$eval('input[aria-label="Switch to the new branch"]', (el) => el.checked));
@@ -760,7 +783,7 @@ try {
     await openPanel(target);
     let s = await text(page);
     ok("Go to commit opens the panel with the real subject and hash", s.includes(subjectOf(WORK, target)) && s.includes(target));
-    await click(page, "Go back to this commit…");
+    await mustClick("Go back to this commit…");
     await page.waitForSelector('[role="radiogroup"][aria-label="Go back mode"]', { timeout: WAIT });
     await waitGone(page, "Checking where this commit sits");
     s = await text(page);
@@ -790,7 +813,7 @@ try {
     ok("the tip is a plain commit on main", git(WORK, "branch", "--show-current") === "main" && git(WORK, "rev-list", "--parents", "-1", "HEAD").split(" ").length === 2);
     await openHistory();
     await openPanel(head);
-    await click(page, "Undo this commit (revert)");
+    await mustClick("Undo this commit (revert)");
     ok(`it asks "Revert ${short(head)}?"`, await waitText(page, `Revert ${short(head)}?`));
     ok("  with no mainline question for a plain commit", (await page.$('[role="radiogroup"][aria-label="Mainline"]')) === null);
     ok("  Revert", await click(page, "Revert"));

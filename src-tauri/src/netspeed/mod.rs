@@ -551,7 +551,29 @@ fn show(app: &AppHandle) {
         taskbar::View { up: format::full(up, s.bits()), down: format::full(down, s.bits()), show: s.show.clone(), light: light_taskbar(), bits: s.bits() },
         s.bar_dock,
     );
+    #[cfg(windows)]
+    write_bar_log(taskbar::take_log());
     bar::sync(app, bar && !s.bar_on_taskbar(), s.bar_pos);
+}
+
+/// The taskbar bar's own account of what it did, appended to
+/// `netspeed-bar.log` in the data folder (begun afresh past 256 KB, the one
+/// before kept as `netspeed-bar.old.log`): why a bar went missing, afterwards.
+#[cfg(windows)]
+fn write_bar_log(lines: Vec<String>) {
+    use std::io::Write;
+    if lines.is_empty() {
+        return;
+    }
+    let Some(dir) = data_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("netspeed-bar.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 256 * 1024) {
+        let _ = std::fs::rename(&path, dir.join("netspeed-bar.old.log"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all((lines.join("\n") + "\n").as_bytes());
+    }
 }
 
 #[cfg(windows)]
@@ -655,6 +677,13 @@ pub(crate) fn open_tab() {
 #[cfg(all(test, windows))]
 pub(crate) fn taskbar_probe() -> serde_json::Value {
     taskbar::probe()
+}
+
+/// The real taskbar bar, hidden and then moved from outside it: whether it
+/// put itself right each time.
+#[cfg(all(test, windows))]
+pub(crate) fn taskbar_heal_check() -> serde_json::Value {
+    taskbar::heal_check(taskbar::View { up: "300 KB/s".into(), down: "12.4 MB/s".into(), show: "both".into(), light: false, bits: false })
 }
 
 /// The real taskbar bar, shown for a few seconds with this text.

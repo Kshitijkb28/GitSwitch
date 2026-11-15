@@ -23,7 +23,7 @@ use std::ptr::{null, null_mut};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Foundation::{GetLastError, BOOL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, GdiFlush, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, MonitorFromWindow, ReleaseDC, SelectObject,
     SetBkMode, SetTextColor, TextOutW, AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
@@ -32,10 +32,10 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetCapture, ReleaseCapture, SetCapture, VK_LBUTTON, VK_RBUTTON};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW, FindWindowW, GetCursorPos, GetWindow, GetWindowLongW, GetWindowRect, IsWindow,
-    IsWindowVisible, LoadCursorW,
+    GetSystemMetrics, IsWindowVisible, LoadCursorW, SM_SWAPBUTTON, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOMPOSITIONCHANGED, WM_SETTINGCHANGE, WM_THEMECHANGED,
     MsgWaitForMultipleObjectsEx, PeekMessageW, PostThreadMessageW, RegisterClassExW, SetCursor, SetWindowLongW, SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow,
     CS_DBLCLKS, GWL_EXSTYLE, GW_OWNER, IDC_ARROW, MA_NOACTIVATE, MSG, MWMO_INPUTAVAILABLE, PM_NOREMOVE, PM_REMOVE, QS_ALLINPUT, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
     SW_SHOWNOACTIVATE, ULW_ALPHA, WM_APP, WM_CAPTURECHANGED, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_QUIT, WM_SETCURSOR, WM_USER,
@@ -89,6 +89,13 @@ struct Shared {
     uia_error: Option<String>,
     /// Where the bar is (x, y, w, h), and whether clicks pass through it.
     placed: Option<([i32; 4], bool)>,
+    /// The bar's window (0 none).
+    hwnd: usize,
+    /// What the bar did and why, not yet written to `netspeed-bar.log` ([`note`]).
+    log: Vec<String>,
+    /// The bar stopped on errors too often: no new thread until it is turned
+    /// off and on again (or GitSwitch restarts).
+    gave_up: bool,
 }
 
 const STARTING: u32 = u32::MAX;
@@ -106,6 +113,9 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     remeasure: false,
     uia_error: None,
     placed: None,
+    hwnd: 0,
+    log: Vec::new(),
+    gave_up: false,
 });
 static WAKE: Condvar = Condvar::new();
 
@@ -120,6 +130,81 @@ fn post(thread: u32, msg: u32) {
     }
 }
 
+/// A line for `netspeed-bar.log`: what the bar did and why, so a bar that went
+/// missing can be explained afterwards. Kept here until the sampler writes it
+/// out ([`take_log`]): the bar's thread never touches the disk, since it shares
+/// its input with the taskbar's and must never keep Explorer waiting. Never
+/// called with `shared()` held.
+fn note(what: impl Into<String>) {
+    // UTC: the local zone would be a registry read on the bar's thread, and
+    // chrono panics when Windows cannot say what the zone is.
+    let line = format!("{} {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3fZ"), what.into());
+    let mut sh = shared();
+    if sh.log.len() >= 200 {
+        sh.log.remove(0);
+    }
+    sh.log.push(line);
+}
+
+/// The lines noted since the last call, oldest first.
+pub fn take_log() -> Vec<String> {
+    std::mem::take(&mut shared().log)
+}
+
+/// One kind of event for the log: said at once the first time, then at most
+/// once a minute with how many there were since the last line, so a burst
+/// shows as a count and a rare event as itself.
+#[derive(Debug, Default)]
+struct Tally {
+    since: u32,
+    said: Option<Instant>,
+}
+
+impl Tally {
+    /// One more; how many since the last line, when it is time for one.
+    fn hit(&mut self) -> Option<u32> {
+        self.since += 1;
+        if self.said.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+            return None;
+        }
+        self.said = Some(Instant::now());
+        Some(std::mem::take(&mut self.since))
+    }
+}
+
+/// " (×n since the last line)" for a count above one.
+fn times(n: u32) -> String {
+    if n > 1 {
+        format!(" (×{} since the last line)", n)
+    } else {
+        String::new()
+    }
+}
+
+/// How DWM has cloaked `h` (0: not at all). A cloaked window is invisible
+/// though `IsWindowVisible` says it is shown: the shell cloaks the windows of
+/// other virtual desktops, for one.
+fn cloaked(h: HWND) -> u32 {
+    let mut v: u32 = 0;
+    // SAFETY: a valid out-pointer of the size given; a handle that is gone just fails.
+    let hr = unsafe { DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut v as *mut u32 as *mut c_void, std::mem::size_of::<u32>() as u32) };
+    if hr == 0 {
+        v
+    } else {
+        0
+    }
+}
+
+// The one DWM call the bar needs, declared here rather than through a
+// windows-sys feature (which would rebuild every crate that uses windows-sys).
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmGetWindowAttribute(hwnd: HWND, attribute: u32, value: *mut c_void, size: u32) -> i32;
+}
+/// `DWMWA_CLOAKED`, and its "by the shell" bit (dwmapi.h).
+const DWMWA_CLOAKED: u32 = 14;
+const DWM_CLOAKED_SHELL: u32 = 2;
+
 /// Show, update or take away the bar. Called by the sampler on every tick.
 pub fn sync(want: bool, view: View, dock: Option<Dock>) {
     let mut sh = shared();
@@ -130,7 +215,7 @@ pub fn sync(want: bool, view: View, dock: Option<Dock>) {
         sh.dock = dock;
     }
     if want {
-        if sh.thread == 0 {
+        if sh.thread == 0 && !sh.gave_up {
             sh.thread = STARTING;
             if std::thread::Builder::new().name("gitswitch-speed-bar".into()).spawn(bar_thread).is_err() {
                 sh.thread = 0;
@@ -144,6 +229,7 @@ pub fn sync(want: bool, view: View, dock: Option<Dock>) {
         }
         post(sh.thread, WM_LOOK);
     } else {
+        sh.gave_up = false;
         post(sh.thread, WM_QUIT);
         WAKE.notify_all();
     }
@@ -160,7 +246,32 @@ fn bar_thread() {
         PeekMessageW(&mut msg, null_mut(), WM_USER, WM_USER, PM_NOREMOVE);
         shared().thread = GetCurrentThreadId();
     }
+    // Should the thread end on a panic outside a look (none is expected), its
+    // slot is freed all the same: no message may go to a thread id Windows can
+    // hand to another program. No new thread follows until the bar is turned
+    // off and on (a loop of failing threads would be worse).
+    struct Ending;
+    impl Drop for Ending {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                {
+                    let mut sh = shared();
+                    sh.thread = 0;
+                    sh.placed = None;
+                    sh.hwnd = 0;
+                    sh.gave_up = true;
+                }
+                note("the bar's thread stopped on an error: off until it is turned off and on, or GitSwitch restarts");
+            }
+        }
+    }
+    let _ending = Ending;
+    note("bar started");
     let mut bar = Bar::new();
+    // Looks that ended on an error in the last 10 minutes. Each makes the bar
+    // afresh (before, the thread died and the bar was gone until GitSwitch
+    // restarted); a 4th within 10 minutes turns it off.
+    let mut errors: Vec<Instant> = Vec::new();
     loop {
         // SAFETY: this thread's own message loop.
         unsafe {
@@ -181,10 +292,29 @@ fn bar_thread() {
             if !sh.want {
                 sh.thread = 0;
                 sh.placed = None;
+                drop(sh);
+                note("bar taken away: turned off");
                 return;
             }
         }
-        bar.look();
+        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bar.look())) {
+            let what = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_else(|| "no message".into());
+            errors.retain(|t| t.elapsed() < Duration::from_secs(600));
+            errors.push(Instant::now());
+            // The old window goes with the old bar; the next look makes one.
+            bar = Bar::new();
+            if errors.len() > 3 {
+                {
+                    let mut sh = shared();
+                    sh.thread = 0;
+                    sh.placed = None;
+                    sh.gave_up = true;
+                }
+                note(format!("the bar stopped on an error a 4th time in 10 minutes ({}): off until it is turned off and on, or GitSwitch restarts", what));
+                return;
+            }
+            note(format!("the bar stopped on an error ({}): made afresh", what));
+        }
     }
 }
 
@@ -213,6 +343,8 @@ thread_local! {
     static DRAG: Cell<Option<Drag>> = const { Cell::new(None) };
     /// Moved by hand since it was last drawn: draw it again where it belongs.
     static MOVED: Cell<bool> = const { Cell::new(false) };
+    /// A display, scale or theme change since the last look: draw it afresh.
+    static REDRAW: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Sizes at one DPI.
@@ -251,6 +383,28 @@ struct Bar {
     stale_since: Option<Instant>,
     /// Its sizes for this DPI and text (measured only when they change).
     sized: Option<(u32, View, Metrics)>,
+    /// What the log is told, each kind at most once a minute: put right after
+    /// outside changes, hidden with the taskbar, made again, not made. The
+    /// last drawing error, while it lasts.
+    reshown: Tally,
+    moved_back: Tally,
+    uncloaked: Tally,
+    off_screen: Tally,
+    remade: Tally,
+    make_failed: Tally,
+    draw_failed: Option<u32>,
+    /// Draw at the next look even if nothing about it changed (a display,
+    /// scale or theme change; moved from outside). Where it was drawn stays
+    /// known: the layout goes by it.
+    force: bool,
+    /// When it was last asked whether it is cloaked (once a second), and
+    /// since when the shell has kept it cloaked.
+    cloak_checked: Option<Instant>,
+    cloaked_since: Option<Instant>,
+    /// No taskbar was found at the last look (said once, not at every look).
+    no_taskbar: bool,
+    /// When the bar last said where it is.
+    beat: Option<Instant>,
 }
 
 const UP: [u8; 3] = [0xd9, 0x59, 0x26];
@@ -359,7 +513,28 @@ fn extent(dc: HDC, s: &str) -> (i32, i32) {
 
 impl Bar {
     fn new() -> Bar {
-        Bar { hwnd: null_mut(), owner: null_mut(), shown: false, drawn: None, font: None, asked: None, stale_since: None, sized: None }
+        Bar {
+            hwnd: null_mut(),
+            owner: null_mut(),
+            shown: false,
+            drawn: None,
+            font: None,
+            asked: None,
+            stale_since: None,
+            sized: None,
+            reshown: Tally::default(),
+            moved_back: Tally::default(),
+            uncloaked: Tally::default(),
+            off_screen: Tally::default(),
+            remade: Tally::default(),
+            make_failed: Tally::default(),
+            draw_failed: None,
+            force: false,
+            cloak_checked: None,
+            cloaked_since: None,
+            no_taskbar: false,
+            beat: None,
+        }
     }
 
     fn font_for(&mut self, dpi: u32) -> HFONT {
@@ -419,7 +594,8 @@ impl Bar {
         }
     }
 
-    fn create(&mut self, tb: HWND) -> bool {
+    /// Make the window, owned by the taskbar `tb`; the Windows error if it could not be made.
+    fn create(&mut self, tb: HWND) -> Result<(), u32> {
         // SAFETY: plain window creation on this thread; strings outlive the calls.
         unsafe {
             let inst = GetModuleHandleW(null());
@@ -446,13 +622,14 @@ impl Bar {
             let title = wide("GitSwitch net speed");
             let h = CreateWindowExW(ex, class.as_ptr(), title.as_ptr(), WS_POPUP, 0, 0, 0, 0, tb, null_mut(), inst, null());
             if h.is_null() {
-                return false;
+                return Err(GetLastError());
             }
             self.hwnd = h;
             self.owner = tb;
             self.shown = false;
             self.drawn = None;
-            true
+            shared().hwnd = h as usize;
+            Ok(())
         }
     }
 
@@ -461,6 +638,13 @@ impl Bar {
         unsafe {
             if !self.hwnd.is_null() && IsWindow(self.hwnd) != 0 {
                 DestroyWindow(self.hwnd);
+            }
+        }
+        {
+            // Only its own: a bar of an older thread going away must not wipe a newer one's.
+            let mut sh = shared();
+            if sh.hwnd == self.hwnd as usize {
+                sh.hwnd = 0;
             }
         }
         self.hwnd = null_mut();
@@ -483,7 +667,20 @@ impl Bar {
     /// Put the bar where it belongs now, drawn as it should be.
     fn look(&mut self) {
         if DRAG.with(|d| d.get()).is_some() {
-            return;
+            // A drag whose button came up where this window never heard of it
+            // would stop every look for good: let go once neither the capture
+            // nor the button is held any more.
+            // SAFETY: state reads only.
+            let held = unsafe {
+                let button = if GetSystemMetrics(SM_SWAPBUTTON) != 0 { VK_RBUTTON } else { VK_LBUTTON };
+                GetCapture() == self.hwnd || (GetAsyncKeyState(button as i32) as u16) & 0x8000 != 0
+            };
+            if held {
+                return;
+            }
+            DRAG.with(|d| d.set(None));
+            MOVED.with(|c| c.set(true));
+            note("a drag ended without its button coming up on the bar: let go");
         }
         let (view, dock, measured) = {
             let sh = shared();
@@ -493,19 +690,44 @@ impl Bar {
             return;
         }
         let Some(tb) = taskbar() else {
+            if !self.no_taskbar {
+                self.no_taskbar = true;
+                note("no taskbar found (Explorer not running?): the bar waits for one");
+            }
             self.close();
             return;
         };
+        self.no_taskbar = false;
         // SAFETY: a handle check only.
         if self.hwnd.is_null() || unsafe { IsWindow(self.hwnd) } == 0 || self.owner != tb {
             // First time, or Explorer restarted (the old taskbar took the bar with it).
+            let why = if self.hwnd.is_null() {
+                "made"
+            } else if self.owner != tb {
+                "made again: the taskbar is a new one (Explorer restarted)"
+            } else {
+                "made again: its window was gone"
+            };
             self.close();
-            if !self.create(tb) {
+            if let Err(e) = self.create(tb) {
+                if let Some(n) = self.make_failed.hit() {
+                    note(format!("the bar's window could not be made (error {}){}", e, times(n)));
+                }
                 return;
+            }
+            if why == "made" {
+                note(format!("bar made for taskbar {:#x}", tb as usize));
+            } else if let Some(n) = self.remade.hit() {
+                note(format!("bar {} for taskbar {:#x}{}", why, tb as usize, times(n)));
             }
         }
         let Some(tr) = rect(tb) else { return };
         if !on_screen(tb, &tr) {
+            if self.shown {
+                if let Some(n) = self.off_screen.hit() {
+                    note(format!("hidden while the taskbar is off the screen or hidden{}", times(n)));
+                }
+            }
             self.hide();
             return;
         }
@@ -524,6 +746,59 @@ impl Bar {
         // bar dropped on icons goes to the free spot nearest the drop).
         if MOVED.with(|c| c.replace(false)) {
             self.drawn = None;
+        }
+        // A display, scale or theme change (see `wndproc`): drawn afresh, in place.
+        if REDRAW.with(|c| c.replace(false)) {
+            self.force = true;
+        }
+        // What was done to the window from outside GitSwitch. Explorer can hide
+        // the windows the taskbar owns, and Windows moves windows about when a
+        // display changes. Going by its own record, the bar then stayed hidden,
+        // or away from where it belongs, until the taskbar's icons next moved
+        // it (opening GitSwitch's window was enough: its button moves them).
+        // SAFETY: reads of our own window.
+        if self.shown && unsafe { IsWindowVisible(self.hwnd) } == 0 {
+            self.shown = false;
+            if let Some(n) = self.reshown.hit() {
+                note(format!("hidden from outside GitSwitch: shown again{}", times(n)));
+            }
+        }
+        if let (Some(d), Some(r)) = (self.drawn.as_ref(), rect(self.hwnd)) {
+            if (r.left, r.top, r.right - r.left, r.bottom - r.top) != (d.x, d.y, d.w, d.h) {
+                if let Some(n) = self.moved_back.hit() {
+                    note(format!(
+                        "moved from outside GitSwitch to {},{} ({}×{}): put back at {},{}{}",
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        d.x,
+                        d.y,
+                        times(n)
+                    ));
+                }
+                self.force = true;
+            }
+        }
+        // Cloaked by the shell while the taskbar is not (as a window of another
+        // virtual desktop is): invisible though Windows calls it shown. After a
+        // moment it is made afresh, which puts it on the desktop in front.
+        if self.cloak_checked.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            self.cloak_checked = Some(Instant::now());
+            if cloaked(self.hwnd) & DWM_CLOAKED_SHELL != 0 && cloaked(tb) == 0 {
+                let since = *self.cloaked_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(2) {
+                    self.cloaked_since = None;
+                    if let Some(n) = self.uncloaked.hit() {
+                        note(format!("cloaked by Windows (another virtual desktop?): made afresh{}", times(n)));
+                    }
+                    // Made again at the next look.
+                    self.close();
+                    return;
+                }
+            } else {
+                self.cloaked_since = None;
+            }
         }
         let margin = (4.0 * scale).round() as i32;
         let tray = tray_rect(tb);
@@ -574,19 +849,36 @@ impl Bar {
         };
         GEOM.with(|g| g.set(Some(Geom { left: tr.left, right: tr.right, tray_left, w: m.w, x, y, scale, horizontal })));
         let d = Drawn { x, y, w: m.w, h: m.h, dpi, view, through };
-        if self.drawn.as_ref() != Some(&d) {
-            self.draw(&d, &m);
+        if self.force || self.drawn.as_ref() != Some(&d) {
+            // Recorded as drawn only once Windows took it: else the next look tries again.
+            if let Err(e) = self.draw(&d, &m) {
+                if self.draw_failed != Some(e) {
+                    note(format!("could not be drawn (error {}): trying again", e));
+                }
+                self.draw_failed = Some(e);
+                return;
+            }
+            if let Some(e) = self.draw_failed.take() {
+                note(format!("drawn again after error {}", e));
+            }
             shared().placed = Some(([x, y, m.w, m.h], through));
             self.drawn = Some(d);
+            self.force = false;
         }
         if !self.shown {
             // SAFETY: our own window; shown without taking the focus.
             unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
             self.shown = true;
         }
+        // Where it is, now and then: a gap in these lines says the bar's thread stopped.
+        if self.beat.is_none_or(|t| t.elapsed() >= Duration::from_secs(600)) {
+            self.beat = Some(Instant::now());
+            note(format!("shown at {},{} ({}×{}) on taskbar {:#x}, {} dpi, cloaked {}", x, y, m.w, m.h, tb as usize, dpi, cloaked(self.hwnd)));
+        }
     }
 
-    fn draw(&mut self, d: &Drawn, m: &Metrics) {
+    /// Draw `d` into the window; the Windows error when it did not take it.
+    fn draw(&mut self, d: &Drawn, m: &Metrics) -> Result<(), u32> {
         let font = self.font_for(d.dpi);
         // SAFETY: GDI objects made, used and released here; the pixel buffer
         // is the DIB section's own, sized w × h × 4 bytes.
@@ -603,9 +895,10 @@ impl Bar {
             let mut bits: *mut c_void = null_mut();
             let dib = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
             if dib.is_null() || bits.is_null() {
+                let e = GetLastError();
                 DeleteDC(dc);
                 ReleaseDC(null_mut(), screen);
-                return;
+                return Err(e);
             }
             let old_bmp = SelectObject(dc, dib);
             let old_font = SelectObject(dc, font);
@@ -637,7 +930,8 @@ impl Bar {
             let size = SIZE { cx: d.w, cy: d.h };
             let src = POINT { x: 0, y: 0 };
             let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
-            UpdateLayeredWindow(self.hwnd, screen, &at, &size, dc, &src, 0, &blend, ULW_ALPHA);
+            let taken = UpdateLayeredWindow(self.hwnd, screen, &at, &size, dc, &src, 0, &blend, ULW_ALPHA) != 0;
+            let e = if taken { 0 } else { GetLastError() };
             SelectObject(dc, old_font);
             SelectObject(dc, old_bmp);
             DeleteObject(dib);
@@ -648,6 +942,11 @@ impl Bar {
             let want = if d.through { ex | WS_EX_TRANSPARENT } else { ex & !WS_EX_TRANSPARENT };
             if want != ex {
                 SetWindowLongW(self.hwnd, GWL_EXSTYLE, want as i32);
+            }
+            if taken {
+                Ok(())
+            } else {
+                Err(e)
             }
         }
     }
@@ -739,6 +1038,13 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         WM_LBUTTONDBLCLK => {
             open_the_tab();
             0
+        }
+        // The screen, its scale or the theme changed, or the compositor
+        // restarted: drawn afresh at the next look, from the bar's own
+        // measurements (never from what these messages suggest).
+        WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE | WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED => {
+            REDRAW.with(|c| c.set(true));
+            DefWindowProcW(h, msg, wp, lp)
         }
         _ => DefWindowProcW(h, msg, wp, lp),
     }
@@ -972,9 +1278,86 @@ pub fn show_for(secs: u64, view: View) -> serde_json::Value {
     })
 }
 
+/// The real bar, then hidden from outside it and then moved from outside it,
+/// as Explorer or a display change might do: whether it showed itself again
+/// and went back to its place, how long each took, and what it noted.
+#[cfg(test)]
+pub fn heal_check(view: View) -> serde_json::Value {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOOWNERZORDER;
+    // SAFETY: a call on this thread only (the bar's extent is in physical pixels).
+    unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let _ = take_log();
+    // Keeps the bar fed, as the sampler does, until `done` (or 5 s): how long it took.
+    let feed_until = |done: &dyn Fn() -> bool| -> Option<u128> {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(5) {
+            sync(true, view.clone(), None);
+            if done() {
+                return Some(t.elapsed().as_millis());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    };
+    let hwnd = || shared().hwnd as HWND;
+    // SAFETY: a read of a window handle that may be gone (then it says no).
+    let visible = || !hwnd().is_null() && unsafe { IsWindowVisible(hwnd()) } != 0;
+    let at_place = || {
+        let placed = shared().placed;
+        match (placed, rect(hwnd())) {
+            (Some(([x, y, w, h], _)), Some(r)) => (r.left, r.top, r.right - r.left, r.bottom - r.top) == (x, y, w, h),
+            _ => false,
+        }
+    };
+    let shown_ms = feed_until(&|| visible() && at_place());
+    let mut out = serde_json::json!({ "shown_ms": shown_ms });
+    let mut moved_to: Option<(i32, i32)> = None;
+    if shown_ms.is_some() {
+        // Hidden from outside, as ShowOwnedPopups(taskbar, FALSE) would.
+        // SAFETY: a window of this process; the bar's thread answers it.
+        unsafe { ShowWindow(hwnd(), SW_HIDE) };
+        out["shown_again_ms"] = serde_json::json!(feed_until(&|| visible()));
+        // Moved from outside, as a display change might.
+        let placed = shared().placed;
+        if let Some(([x, y, _, _], _)) = placed {
+            // SAFETY: as above.
+            unsafe { SetWindowPos(hwnd(), null_mut(), x + 40, y - 30, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER) };
+            moved_to = Some((x + 40, y - 30));
+            out["put_back_ms"] = serde_json::json!(feed_until(&|| at_place()));
+        }
+    }
+    sync(false, view, None);
+    let t = Instant::now();
+    while shared().thread != 0 && t.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    out["ended"] = serde_json::json!(shared().thread == 0);
+    // The bar puts itself right within its own turn, often before this thread
+    // looks again: what it noticed is in its log.
+    let log = take_log();
+    out["noticed_hidden"] = serde_json::json!(log.iter().any(|l| l.contains("hidden from outside GitSwitch")));
+    out["noticed_moved"] = serde_json::json!(moved_to.is_some_and(|(mx, my)| log.iter().any(|l| l.contains(&format!("moved from outside GitSwitch to {},{}", mx, my)))));
+    out["log"] = serde_json::json!(log);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_event_is_said_at_once_then_at_most_once_a_minute_with_its_count() {
+        let mut t = Tally::default();
+        assert_eq!(t.hit(), Some(1), "the first time, at once");
+        assert_eq!(t.hit(), None);
+        assert_eq!(t.hit(), None);
+        // A minute on, the next one carries the count since the last line (itself included).
+        t.said = Instant::now().checked_sub(Duration::from_secs(61));
+        assert_eq!(t.hit(), Some(3));
+        assert_eq!(t.hit(), None);
+        assert_eq!(times(1), "");
+        assert_eq!(times(3), " (×3 since the last line)");
+    }
 
     #[test]
     fn text_coverage_becomes_premultiplied_colour_and_the_rest_still_takes_the_mouse() {
