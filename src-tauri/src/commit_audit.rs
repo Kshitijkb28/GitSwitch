@@ -46,58 +46,49 @@ pub struct RepoAudit {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let started = std::time::Instant::now();
-    // Signature checks must never land in output that is parsed.
-    let safe: Vec<&str> = match args.first().and_then(|sub| crate::git_exec::parse_safe_cfg(sub)) {
-        Some(kv) => vec!["-c", kv],
-        None => Vec::new(),
-    };
-    let out = crate::spawn::command("git")
-        .arg("-C")
-        .arg(repo)
-        .args(&safe)
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to run git: {}", e))?;
-    crate::cmdlog::record(
-        repo,
-        ["git", "-C", &repo.to_string_lossy()]
-            .iter()
-            .map(|a| a.to_string())
-            .chain(safe.iter().map(|a| a.to_string()))
-            .chain(args.iter().map(|a| a.to_string()))
-            .collect(),
-        out.status.code().unwrap_or(-1),
-        started.elapsed(),
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-    );
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    // The one runner: its environment, its log, and the signature pin that
+    // keeps verification text out of parsed output. The local clock: this
+    // walks reflogs and history, and makes the backup branch.
+    let out = crate::git_exec::GitCmd::at(repo)
+        .args(args.iter().copied())
+        .timeout(crate::git_exec::LOCAL_TIMEOUT)
+        .run_blocking()
+        .map_err(|e| match e {
+            AppError::Command(said) => said,
+            other => other.to_string(),
+        })?;
+    if !out.ok() {
+        return Err(out.stderr);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(out.trimmed())
 }
 
 fn git_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
-    let started = std::time::Instant::now();
-    let mut cmd = crate::spawn::command("git");
-    cmd.arg("-C").arg(repo).args(args);
+    // Its one use is the rewrite: a rebase running a script on every commit,
+    // which may sign each one through the person's own passphrase prompt.
+    // A long clock, so only a command that is truly stuck is stopped.
+    const REWRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    let mut cmd = crate::git_exec::GitCmd::at(repo).timeout(REWRITE_TIMEOUT);
+    // The leading `-c` pairs go where GitCmd puts its own, so the command
+    // line is unchanged and the subcommand it names in a message is the
+    // rebase rather than the first setting.
+    let mut rest = args;
+    while let ["-c", kv, tail @ ..] = rest {
+        cmd = cmd.cfg_raw(kv);
+        rest = tail;
+    }
+    cmd = cmd.args(rest.iter().copied());
     for (k, v) in envs {
-        cmd.env(k, v);
+        cmd = cmd.env(*k, *v);
     }
-    let out = cmd.output().map_err(|e| format!("failed to run git: {}", e))?;
-    crate::cmdlog::record(
-        repo,
-        ["git", "-C", &repo.to_string_lossy()].iter().map(|a| a.to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
-        out.status.code().unwrap_or(-1),
-        started.elapsed(),
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-    );
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    let out = cmd.run_blocking().map_err(|e| match e {
+        AppError::Command(said) => said,
+        other => other.to_string(),
+    })?;
+    if !out.ok() {
+        return Err(out.stderr);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(out.trimmed())
 }
 
 /// One commit's facts, as `log --format=%H%x1f%h%x1f%an%x1f%ae%x1f%ce%x1f%cI%x1f%s` gives them.
@@ -708,6 +699,18 @@ pub fn uninstall_guard(repo_path: &str) -> Result<String, AppError> {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    /// Both of the audit's runners are the one runner; the rewrite's own
+    /// variables still reach the script on top of the hardening.
+    #[test]
+    fn the_audit_runners_go_through_gitcmd() {
+        use crate::git_exec::test_support::{assert_hardened, SHOW_ENV};
+        let dir = std::env::temp_dir();
+        assert_hardened(&git(&dir, &SHOW_ENV).expect("git runs"));
+        let env = git_env(&dir, &SHOW_ENV, &[("GITSWITCH_FIX_WRONG", "<a@example.com>")]).expect("git runs");
+        assert_hardened(&env);
+        assert!(env.lines().any(|l| l.trim() == "GITSWITCH_FIX_WRONG=<a@example.com>"));
+    }
 
     fn prof(name: &str, email: &str, dirs: &[&str]) -> profiles::Profile {
         profiles::Profile {

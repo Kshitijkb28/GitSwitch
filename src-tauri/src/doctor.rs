@@ -118,6 +118,11 @@ pub fn manual_includeif_rules(gitconfig: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 async fn command_exists(bin: &str) -> bool {
+    // git, like every git the app starts, goes through the one runner — still
+    // found the way a newly opened terminal would find it.
+    if bin == "git" {
+        return crate::git_exec::GitCmd::without_repo().with_program(crate::spawn::program(bin)).arg("--version").run().await.is_ok_and(|o| o.ok());
+    }
     crate::spawn::async_command(crate::spawn::program(bin))
         .arg("--version")
         .output()
@@ -933,7 +938,7 @@ pub async fn unset_local(repo_path: &str, key: &str) -> Result<String, AppError>
 
 /// "2.50.1" from `git --version` ("git version 2.50.1 (Apple Git-155)").
 async fn git_version() -> Option<String> {
-    let out = crate::spawn::async_command("git").arg("--version").output().await.ok()?;
+    let out = crate::git_exec::GitCmd::without_repo().arg("--version").run().await.ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.split_whitespace().nth(2).map(|v| v.to_string())
 }

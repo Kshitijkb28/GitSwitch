@@ -466,7 +466,7 @@ pub(crate) fn git_version_at_least(version_line: &str, major: u32, minor: u32) -
 fn status_names_stashes() -> bool {
     static NAMES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *NAMES.get_or_init(|| {
-        let line = crate::spawn::command("git").arg("--version").output().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        let line = crate::git_exec::GitCmd::without_repo().arg("--version").run_blocking().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
         git_version_at_least(&line, 2, 35).unwrap_or(true)
     })
 }

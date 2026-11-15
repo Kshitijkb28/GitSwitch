@@ -1,11 +1,13 @@
-//! One hardened way to run git, used by every Changes-page operation.
+//! One hardened way to run git, used by every git process the app starts.
 //!
-//! The existing runners in `sparse.rs` / `git_history.rs` stay as they are —
-//! this exists because the Changes page needs four things none of them offer:
-//! stdin (commit messages and NUL pathspecs never become arguments), per-command
-//! `-c` overrides, timeouts (a GUI must not hang forever on an unreachable
-//! remote), and the ability to inspect a non-zero exit instead of turning it
-//! straight into an error string.
+//! It offers stdin (commit messages and NUL pathspecs never become
+//! arguments), per-command `-c` overrides, timeouts (a GUI must not hang
+//! forever on an unreachable remote), and the ability to inspect a non-zero
+//! exit instead of turning it straight into an error string. The smaller
+//! runners other modules keep (`git_history::git`, `repo_scan::git_text`, …)
+//! are thin wrappers over `GitCmd`, blocking ones through `run_blocking`, so
+//! the environment, the clock and the command log are the same everywhere.
+//! A test below fails when a git process is started any other way.
 
 use crate::error::AppError;
 use std::path::{Path, PathBuf};
@@ -146,6 +148,9 @@ pub struct GitCmd {
     args: Vec<String>,
     stdin: Option<Vec<u8>>,
     env: Vec<(String, String)>,
+    /// Variables this one command must not inherit, beyond those every
+    /// command loses (`env_remove`).
+    unset: Vec<String>,
     timeout: Duration,
     /// Set for a transfer that reports progress: the command is stopped only
     /// when it has said nothing for this long, never for taking long.
@@ -166,10 +171,17 @@ impl GitCmd {
             args: Vec::new(),
             stdin: None,
             env: Vec::new(),
+            unset: Vec::new(),
             timeout: READ_TIMEOUT,
             stall: None,
             log_output: true,
         }
+    }
+
+    /// `git …` with no `-C`: for a command that names its repository itself
+    /// (`--git-dir`) or needs none (`--version`, `config --system`).
+    pub fn without_repo() -> Self {
+        Self { repo: None, ..Self::at(".") }
     }
 
     /// Keep this command's output out of the command log altogether.
@@ -249,6 +261,14 @@ impl GitCmd {
         self
     }
 
+    /// One variable this command must not inherit even where the hardening
+    /// keeps it — the push lock asks where the system scope lives with
+    /// `GIT_CONFIG_NOSYSTEM` removed, which the test builds otherwise keep.
+    pub fn env_remove(mut self, key: impl Into<String>) -> Self {
+        self.unset.push(key.into());
+        self
+    }
+
     pub fn stdin_bytes(mut self, data: Vec<u8>) -> Self {
         self.stdin = Some(data);
         self
@@ -287,12 +307,16 @@ impl GitCmd {
             .unwrap_or_else(|| "git".to_string())
     }
 
-    /// Run, returning the exit code and both streams. Only a failure to *spawn*
-    /// or a timeout is an `Err`; a non-zero exit is for the caller to read.
-    pub async fn run(mut self) -> Result<GitOutput, AppError> {
-        let sub = self.subcommand();
-        if let Some(kv) = parse_safe_cfg(&sub) {
-            self = self.cfg_raw(kv);
+    /// The child this command runs as, set up the way every git the app
+    /// starts must be — `-C`, top-level flags, the `-c` pairs (the `log`
+    /// family's signature pin last among them), the command's own arguments,
+    /// the hardened environment, both outputs piped and its whole process
+    /// tree killable — and the same argv as text, for the command log. `run`
+    /// spawns it; so does sparse.rs's progress reader, whose clock is its own.
+    pub(crate) fn prepare(&self) -> (tokio::process::Command, Vec<String>) {
+        let mut cfg: Vec<String> = self.cfg.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        if let Some(kv) = parse_safe_cfg(&self.subcommand()) {
+            cfg.push(kv.to_string());
         }
         let program = self.program.clone().unwrap_or_else(|| PathBuf::from("git"));
         // The argv is assembled straight onto the child below and never exists
@@ -303,13 +327,11 @@ impl GitCmd {
             argv.push(dir.to_string_lossy().to_string());
         }
         argv.extend(self.top.iter().cloned());
-        for (k, v) in &self.cfg {
+        for kv in &cfg {
             argv.push("-c".into());
-            argv.push(format!("{}={}", k, v));
+            argv.push(kv.clone());
         }
         argv.extend(self.args.iter().cloned());
-        let where_ = self.repo.clone().unwrap_or_else(|| PathBuf::from("."));
-        let started = std::time::Instant::now();
 
         let mut cmd = crate::spawn::async_command(program);
         if let Some(dir) = &self.repo {
@@ -318,8 +340,8 @@ impl GitCmd {
         for flag in &self.top {
             cmd.arg(flag);
         }
-        for (k, v) in &self.cfg {
-            cmd.arg("-c").arg(format!("{}={}", k, v));
+        for kv in &cfg {
+            cmd.arg("-c").arg(kv);
         }
         cmd.args(&self.args);
 
@@ -334,6 +356,9 @@ impl GitCmd {
             }
         }
         for key in inherited_git_env_to_strip() {
+            cmd.env_remove(key);
+        }
+        for key in &self.unset {
             cmd.env_remove(key);
         }
         // Caller-supplied variables come last: they are the only ones chosen
@@ -357,6 +382,16 @@ impl GitCmd {
         // Its own process group makes the whole tree killable at once.
         #[cfg(unix)]
         cmd.process_group(0);
+        (cmd, argv)
+    }
+
+    /// Run, returning the exit code and both streams. Only a failure to *spawn*
+    /// or a timeout is an `Err`; a non-zero exit is for the caller to read.
+    pub async fn run(self) -> Result<GitOutput, AppError> {
+        let sub = self.subcommand();
+        let (mut cmd, argv) = self.prepare();
+        let where_ = self.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+        let started = std::time::Instant::now();
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -540,6 +575,30 @@ impl GitCmd {
             _ => None,
         }
     }
+
+    /// `run`, for code that is not async: it IS `run` — the same arguments,
+    /// environment, clock, process-tree kill and log — on a runtime kept for
+    /// this, with the calling thread waiting for the answer. Unlike
+    /// `block_on` it works whether or not the caller is itself inside a
+    /// runtime (a blocking helper called from an async command).
+    pub fn run_blocking(self) -> Result<GitOutput, AppError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        blocking_runtime()?.spawn(async move {
+            let _ = tx.send(self.run().await);
+        });
+        // A sender dropped without sending is a run that panicked.
+        rx.recv().unwrap_or_else(|_| Err(AppError::Command("Failed to run git: it stopped before it answered".into())))
+    }
+}
+
+/// Where `run_blocking`'s commands run. Its own, because the caller's thread
+/// may belong to another runtime that it is blocking; two workers, because
+/// each command is mostly waiting on its pipes.
+fn blocking_runtime() -> Result<&'static tokio::runtime::Runtime, AppError> {
+    static RT: std::sync::OnceLock<Option<tokio::runtime::Runtime>> = std::sync::OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("gitswitch-git").enable_all().build().ok())
+        .as_ref()
+        .ok_or_else(|| AppError::Command("Failed to run git: no runtime to run it on".into()))
 }
 
 /// Stop a child and everything it started. A polite SIGTERM to the process
@@ -634,6 +693,16 @@ fn timeout_message(sub: &str, timeout: Duration, partial_stderr: &str) -> String
     m
 }
 
+/// Whether an error is `run` stopping a command on its clock (the overall
+/// timeout or the stall window), not git answering. A caller that reads a
+/// failure as "nothing there" must not read a stop that way: a History page
+/// whose walk was stopped is not a repository without commits.
+pub fn was_stopped(e: &AppError) -> bool {
+    let AppError::Command(m) = e else { return false };
+    (m.starts_with("git ") && (m.contains(" was stopped after ") || m.contains(" made no progress for ")))
+        || m.starts_with("The large-file download was stopped after ")
+}
+
 /// A git remote name we are willing to pass to git. Rejects anything that could
 /// be read as an option or a path.
 pub fn validate_remote_name(name: &str) -> Result<(), AppError> {
@@ -681,8 +750,223 @@ pub fn validate_branch_name(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// For the other modules' tests: proof that a runner goes through `GitCmd`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Arguments that make git print the environment its children get (an
+    /// alias needs no repository, so any existing folder will do).
+    pub(crate) const SHOW_ENV: [&str; 3] = ["-c", "alias.gitswitch-env=!env", "gitswitch-env"];
+
+    /// `env` output carries what `hardened_env` sets. Only the names are
+    /// reported, never the environment itself: it may hold a token.
+    pub(crate) fn assert_hardened(env: &str) {
+        for kv in ["GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS_REQUIRE=never", "GIT_EDITOR=true", "LC_ALL=C"] {
+            assert!(env.lines().any(|l| l.trim() == kv), "{} is missing: this git did not run through GitCmd", kv);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The lines of a source file that end up in the app: `#[cfg(test)]`
+    /// items (and `#[cfg(all(test, …))]` ones) and whole-line comments left
+    /// out. An item ends on its own line when that line ends it, otherwise
+    /// at the `}` at the attribute's own indentation.
+    fn production_lines(src: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let indent = |l: &str| l.len() - l.trim_start().len();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let t = lines[i].trim_start();
+            if t.starts_with("#[cfg(test)]") || t.starts_with("#[cfg(all(test") {
+                let at = indent(lines[i]);
+                let mut j = i;
+                let mut item = t[t.find(")]").map_or(t.len(), |p| p + 2)..].trim();
+                while (item.is_empty() || item.starts_with("#[")) && j + 1 < lines.len() {
+                    j += 1;
+                    item = lines[j].trim();
+                }
+                if item.ends_with(';') || item.ends_with('}') || item.ends_with(',') {
+                    i = j + 1;
+                } else {
+                    let mut k = j + 1;
+                    while k < lines.len() && !(indent(lines[k]) == at && lines[k].trim_start().starts_with('}')) {
+                        k += 1;
+                    }
+                    i = k + 1;
+                }
+                continue;
+            }
+            if !t.starts_with("//") {
+                out.push((i + 1, lines[i]));
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The lines where a production line starts git itself: a process
+    /// constructor (`spawn::command`, `spawn::async_command`,
+    /// `Command::new`) or `spawn::program` given `"git"`, `"git.exe"` or
+    /// `system_git()`, whatever path is written in front, across line
+    /// breaks. `GitCmd::with_program` is the runner and is not counted.
+    fn direct_git_spawns(src: &str) -> Vec<usize> {
+        let mut flat = String::new();
+        let mut at: Vec<usize> = Vec::new();
+        for (n, line) in production_lines(src) {
+            for ch in line.chars().filter(|c| !c.is_whitespace()) {
+                flat.push(ch);
+                at.extend(std::iter::repeat_n(n, ch.len_utf8()));
+            }
+        }
+        let mut found = Vec::new();
+        for head in ["command(", "Command::new(", "program("] {
+            for (i, _) in flat.match_indices(head) {
+                if flat[..i].ends_with("with_") {
+                    continue;
+                }
+                // `with_program(crate::spawn::program("git"))`: the runner
+                // given git found the way a terminal finds it, not a spawn.
+                if head == "program(" && flat[..i].trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':' || c == '&').ends_with("with_program(") {
+                    continue;
+                }
+                let mut arg = flat[i + head.len()..].trim_start_matches('&');
+                while let Some(p) = arg.find("::").filter(|&p| p > 0 && arg[..p].chars().all(|c| c.is_alphanumeric() || c == '_')) {
+                    arg = &arg[p + 2..];
+                }
+                if arg.starts_with("\"git\"") || arg.starts_with("\"git.exe\"") || arg.starts_with("system_git(") {
+                    found.push(at[i]);
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    #[test]
+    fn the_scan_sees_a_direct_git_spawn_and_leaves_tests_and_the_runner_alone() {
+        let src = [
+            "fn a() {",                                                                     // 1
+            "    let o = crate::spawn::command(\"git\").arg(\"status\").output();",          // 2
+            "}",                                                                            // 3
+            "fn b() {",                                                                     // 4
+            "    let o = std::process::Command::new(",                                      // 5
+            "        crate::push_lock::system_git(),",                                      // 6
+            "    );",                                                                       // 7
+            "    let p = crate::spawn::async_command(\"git.exe\");",                        // 8
+            "    let q = crate::spawn::async_command(crate::spawn::program(\"git\"));",      // 9
+            "}",                                                                            // 10
+            "fn c() {",                                                                     // 11
+            "    let o = crate::git_exec::GitCmd::without_repo().with_program(system_git());", // 12
+            "    let s = crate::spawn::command(\"ssh\");",                                  // 13
+            "    let d = crate::spawn::async_command(crate::spawn::program(bin));",         // 14
+            "    #[cfg(test)]",                                                             // 15
+            "    if let Some(x) = y {",                                                     // 16
+            "        crate::spawn::command(\"git\");",                                      // 17
+            "    }",                                                                        // 18
+            "}",                                                                            // 19
+            "// crate::spawn::command(\"git\") in a comment",                               // 20
+            "#[cfg(all(test, windows))]",                                                   // 21
+            "fn helper() { crate::spawn::command(\"git\"); }",                              // 22
+            "#[cfg(test)]",                                                                 // 23
+            "mod tests {",                                                                  // 24
+            "    fn t() {",                                                                 // 25
+            "        crate::spawn::command(\"git\").arg(\"init\");",                        // 26
+            "    }",                                                                        // 27
+            "}",                                                                            // 28
+            "fn d() { let _ = std::process::Command::new(\"git\"); }",                      // 29
+            "fn e() { let _ = GitCmd::without_repo().with_program(crate::spawn::program(\"git\")); }", // 30
+            "fn f() { let _ = GitCmd::without_repo().with_program(&spawn::program(\"git\")); }", // 31
+        ]
+        .join("\n");
+        assert_eq!(direct_git_spawns(&src), vec![2, 5, 8, 9, 29]);
+    }
+
+    /// Every git process the app starts goes through `GitCmd`: its hardened
+    /// environment, its clock, its command log, and whatever is pinned there
+    /// next. Exceptions live outside this crate's `src` (the elevated
+    /// lock-helper, the git-shim that runs the person's own commands) or are
+    /// compiled into the test binary only (`probe.rs`).
+    #[test]
+    fn every_git_the_app_starts_goes_through_gitcmd() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("the sources").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        assert!(files.len() > 20, "the sources were found: {}", files.len());
+        let mut found = Vec::new();
+        for f in &files {
+            let rel = f.strip_prefix(&root).unwrap_or(f);
+            if rel == std::path::Path::new("git_exec.rs") || rel == std::path::Path::new("probe.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(f).expect("a source file");
+            found.extend(direct_git_spawns(&src).into_iter().map(|n| format!("{}:{}", rel.display(), n)));
+        }
+        assert!(found.is_empty(), "git started outside git_exec::GitCmd (use GitCmd, `run_blocking` from code that is not async): {:?}", found);
+    }
+
+    /// `run_blocking` is `run`: the hardened environment, the command log,
+    /// and the clock that stops a command that never ends.
+    #[test]
+    fn the_blocking_entry_point_is_run_itself() {
+        let dir = std::env::temp_dir();
+        let before = crate::cmdlog::since(0, None).last().map_or(0, |e| e.id);
+        // An alias of this test's own: other tests run SHOW_ENV at the same
+        // time, and their log entries must not stand in for this one.
+        let out = super::GitCmd::at(&dir).args(["-c", "alias.gitswitch-blocking-log=!env", "gitswitch-blocking-log"]).run_blocking().expect("git runs");
+        assert!(out.ok(), "{}", out.stderr);
+        super::test_support::assert_hardened(&out.text());
+        assert!(
+            crate::cmdlog::since(before, None).iter().any(|e| e.argv.iter().any(|a| a == "gitswitch-blocking-log")),
+            "it is in the command log like any other command"
+        );
+
+        let started = std::time::Instant::now();
+        let err = super::GitCmd::at(&dir)
+            .cfg("alias.gitswitch-hang", "!sleep 30")
+            .args(["gitswitch-hang"])
+            .timeout(std::time::Duration::from_millis(500))
+            .run_blocking()
+            .err()
+            .expect("a command that never ends is stopped");
+        assert!(err.to_string().contains("was stopped after"), "{}", err);
+        assert!(started.elapsed() < std::time::Duration::from_secs(15), "stopped on the clock: {:?}", started.elapsed());
+    }
+
+    /// A stop on the clock is told apart from git's own answer, whatever
+    /// git happened to print.
+    #[test]
+    fn a_stop_on_the_clock_is_told_apart_from_a_failure() {
+        let stopped = |m: String| super::was_stopped(&crate::error::AppError::Command(m));
+        assert!(stopped(super::timeout_message("rev-list", super::LOCAL_TIMEOUT, "")));
+        assert!(stopped(super::timeout_message("fetch", super::NET_TIMEOUT, "Receiving objects")));
+        assert!(stopped(super::timeout_message("lfs", super::LFS_TIMEOUT, "")));
+        assert!(stopped("git fetch made no progress for 30s and was stopped — the remote may be unreachable, or the connection very slow.".into()));
+        assert!(!stopped("fatal: your current branch 'main' does not have any commits yet".into()));
+        assert!(!stopped("git log failed: fatal: bad revision 'x'".into()));
+        assert!(!super::was_stopped(&crate::error::AppError::Config("git rev-list was stopped after 60s".into())));
+    }
+
+    /// A blocking helper called from an async command: no panic (as
+    /// `block_on` inside a runtime would), no wait on itself.
+    #[tokio::test]
+    async fn the_blocking_entry_point_works_inside_a_runtime() {
+        let out = super::GitCmd::without_repo().arg("--version").run_blocking().expect("git runs");
+        assert!(out.text().starts_with("git version"), "{}", out.text());
+    }
+
     #[test]
     fn a_fetch_holds_back_housekeeping_and_keeps_what_arrives_as_a_pack() {
         let c = super::GitCmd::at(".").for_fetch();

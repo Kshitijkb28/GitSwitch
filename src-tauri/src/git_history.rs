@@ -266,38 +266,44 @@ pub(crate) fn is_remote_head(full_ref: &str) -> bool {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, AppError> {
-    let started = std::time::Instant::now();
-    // Signature checks must never land in output that is parsed.
-    let safe: Vec<&str> = match args.first().and_then(|sub| crate::git_exec::parse_safe_cfg(sub)) {
-        Some(kv) => vec!["-c", kv],
-        None => Vec::new(),
-    };
-    let out = crate::spawn::command("git")
-        .arg("-C")
-        .arg(repo)
-        .args(&safe)
-        .args(args)
-        .output()
-        .map_err(|e| AppError::Command(format!("failed to run git: {}", e)))?;
-    crate::cmdlog::record(
-        repo,
-        ["git", "-C", &repo.to_string_lossy()]
-            .iter()
-            .map(|a| a.to_string())
-            .chain(safe.iter().map(|a| a.to_string()))
-            .chain(args.iter().map(|a| a.to_string()))
-            .collect(),
-        out.status.code().unwrap_or(-1),
-        started.elapsed(),
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-    );
-    if !out.status.success() {
-        return Err(AppError::Command(
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ));
+    git_with(repo, args, crate::git_exec::LOCAL_TIMEOUT)
+}
+
+/// The clock for a walk of the whole history: the History page's count and
+/// list, the people list, a branch's merges. These are the slowest reads the
+/// app makes (path-limited `--full-history --simplify-merges` over a big
+/// repository with submodules), and before they went through `GitCmd` they
+/// had no clock at all. Waiting for a big walk is what the page has always
+/// done; the clock is there to end a hang, not a large repository.
+const WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own walk clock, so a stopped walk can be produced on demand.
+    /// Per thread: the page reads it on the caller's thread, and cargo runs
+    /// tests side by side.
+    static WALK_CLOCK: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+fn walk_clock() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(d) = WALK_CLOCK.with(|c| c.get()) {
+        return d;
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    WALK_TIMEOUT
+}
+
+fn git_with(repo: &Path, args: &[&str], timeout: std::time::Duration) -> Result<String, AppError> {
+    // The one runner: its environment, its log, and the signature pin that
+    // keeps verification text out of parsed output.
+    let out = crate::git_exec::GitCmd::at(repo)
+        .args(args.iter().copied())
+        .timeout(timeout)
+        .run_blocking()?;
+    if !out.ok() {
+        return Err(AppError::Command(out.stderr));
+    }
+    Ok(out.text())
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +658,7 @@ pub fn authors(repo_path: &str, rev: &str) -> Result<Vec<AuthorCount>, AppError>
         args.push(rev.to_string());
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let raw = git(&repo, &refs)?;
+    let raw = git_with(&repo, &refs, walk_clock())?;
     let mut list = parse_shortlog(&raw);
     list.truncate(300);
     Ok(list)
@@ -887,7 +893,14 @@ pub fn history_page(
     }
 
     let count_ref: Vec<&str> = count_args.iter().map(String::as_str).collect();
-    let counted = git(&repo, &count_ref).unwrap_or_default();
+    // A count that fails is read as nothing (a repository without commits),
+    // but a count stopped on its clock is not "no commits": reading it as 0
+    // emptied the graph's members and ended paging after the first page.
+    let counted = match git_with(&repo, &count_ref, walk_clock()) {
+        Ok(s) => s,
+        Err(e) if crate::git_exec::was_stopped(&e) => return Err(e),
+        Err(_) => String::new(),
+    };
     let is_oid = |l: &str| (l.len() == 40 || l.len() == 64) && l.chars().all(|c| c.is_ascii_hexdigit());
     let members: Option<std::collections::HashSet<String>> = filtered.then(|| counted.lines().map(str::trim).filter(|l| is_oid(l)).map(str::to_string).collect());
     let total: usize = match &members {
@@ -900,8 +913,10 @@ pub fn history_page(
     // history, not an error worth showing the user.
     // (With the unpushed filter a failure is a failure: an empty list would
     // claim everything is pushed.)
-    let raw = match git(&repo, &log_ref) {
+    // (Nor is a walk stopped on its clock: that is "this took too long".)
+    let raw = match git_with(&repo, &log_ref, walk_clock()) {
         Ok(r) => r,
+        Err(e) if crate::git_exec::was_stopped(&e) => return Err(e),
         Err(_) if total == 0 && !unpushed_only => String::new(),
         Err(e) => return Err(e),
     };
@@ -1116,7 +1131,12 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
 
     // The merges in the branch's history, newest first: fifty, and how many there are.
     let fmt = format!("%H{US}%h{US}%P{US}%aN{US}%aE{US}%cI{US}%D{US}%s{US}%aI", US = US);
-    let raw = git(&repo, &["log", "--merges", "--no-show-signature", "--date-order", "-n51", &format!("--format={}", fmt), "--end-of-options", branch]).unwrap_or_default();
+    // A walk stopped on its clock is an error, not "no merges".
+    let raw = match git_with(&repo, &["log", "--merges", "--no-show-signature", "--date-order", "-n51", &format!("--format={}", fmt), "--end-of-options", branch], walk_clock()) {
+        Ok(r) => r,
+        Err(e) if crate::git_exec::was_stopped(&e) => return Err(e),
+        Err(_) => String::new(),
+    };
     let mut merges: Vec<HistoryCommit> = parse_log(&raw)
         .into_iter()
         .map(|(hash, parents, f)| HistoryCommit {
@@ -1141,7 +1161,11 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
         .collect();
     let merges_truncated = merges.len() > 50;
     merges.truncate(50);
-    let merges_total = git(&repo, &["rev-list", "--count", "--merges", "--end-of-options", branch]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(merges.len());
+    let merges_total = match git_with(&repo, &["rev-list", "--count", "--merges", "--end-of-options", branch], walk_clock()) {
+        Ok(s) => s.trim().parse().unwrap_or(merges.len()),
+        Err(e) if crate::git_exec::was_stopped(&e) => return Err(e),
+        Err(_) => merges.len(),
+    };
 
     Ok(MergeInfo {
         merged_into,
@@ -1322,6 +1346,50 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The History page's runner is the one runner.
+    #[test]
+    fn the_history_runner_goes_through_gitcmd() {
+        let env = git(&std::env::temp_dir(), &crate::git_exec::test_support::SHOW_ENV).expect("git runs");
+        crate::git_exec::test_support::assert_hardened(&env);
+    }
+
+    /// A walk stopped on its clock comes back as an error: never as a page
+    /// that says "no commits" (or one that cannot page past the first), nor
+    /// as a branch without merges.
+    #[test]
+    fn a_walk_stopped_on_its_clock_is_an_error_not_an_empty_history() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-walk-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a folder");
+        git(&dir, &["init", "-q", "-b", "main"]).expect("init");
+        let id = ["-c", "user.name=Walk Test", "-c", "user.email=walk@example.test", "-c", "commit.gpgsign=false"];
+        for m in ["one", "two"] {
+            let mut args = id.to_vec();
+            args.extend(["commit", "-q", "--allow-empty", "--no-verify", "-m", m]);
+            git(&dir, &args).expect("commit");
+        }
+        let path = dir.to_string_lossy().to_string();
+
+        // With the real clock the walk answers.
+        let page = history_page(&path, "HEAD", 0, 50, None, None, false, false).expect("a page");
+        assert_eq!((page.total, page.commits.len()), (2, 2));
+
+        // A clock that has already run out: every walk is stopped.
+        WALK_CLOCK.with(|c| c.set(Some(std::time::Duration::ZERO)));
+        let page = history_page(&path, "HEAD", 0, 50, None, None, false, false);
+        let merges = branch_merge_info(&path, "main");
+        let people = authors(&path, "HEAD");
+        WALK_CLOCK.with(|c| c.set(None));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let Err(err) = page else { panic!("a stopped walk is not an empty history") };
+        assert!(crate::git_exec::was_stopped(&err), "{}", err);
+        let Err(err) = merges else { panic!("a stopped walk is not a branch without merges") };
+        assert!(crate::git_exec::was_stopped(&err), "{}", err);
+        let Err(err) = people else { panic!("a stopped walk is not a repository without authors") };
+        assert!(crate::git_exec::was_stopped(&err), "{}", err);
+    }
 
     #[test]
     fn a_tip_is_drawn_as_one_and_a_continuing_line_comes_from_above() {

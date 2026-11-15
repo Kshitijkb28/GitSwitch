@@ -377,34 +377,17 @@ async fn run_git_streaming(
     on_progress: &(dyn Fn(CloneProgress) + Sync),
 ) -> Result<String, AppError> {
     use tokio::io::AsyncReadExt;
-    let mut cmd = crate::spawn::async_command("git");
-    if let Some(dir) = repo {
-        cmd.current_dir(dir);
-    }
-    for (key, value) in crate::git_exec::hardened_env() {
-        match value {
-            Some(v) => {
-                cmd.env(key, v);
-            }
-            None => {
-                cmd.env_remove(key);
-            }
-        }
-    }
-    for key in crate::git_exec::inherited_git_env_to_strip() {
-        cmd.env_remove(key);
-    }
+    // The one runner's arguments and environment, its whole process tree
+    // killable (a stalled download's helpers go with it); only the clock and
+    // the reading of progress are this function's own.
+    let mut git = match repo {
+        Some(dir) => crate::git_exec::GitCmd::at(dir),
+        None => crate::git_exec::GitCmd::without_repo(),
+    };
     for kv in cfg {
-        cmd.arg("-c").arg(kv);
+        git = git.cfg_raw(kv);
     }
-    cmd.args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    // Its own process group, so a stalled download's helpers go with it.
-    #[cfg(unix)]
-    cmd.process_group(0);
+    let (mut cmd, argv) = git.args(args.iter().copied()).prepare();
     let started = std::time::Instant::now();
     let mut child = cmd.spawn().map_err(|e| AppError::Command(format!("Failed to run git: {}", e)))?;
     #[cfg(windows)]
@@ -502,7 +485,7 @@ async fn run_git_streaming(
         let secs = stall.unwrap_or_default().as_secs();
         crate::cmdlog::record(
             repo.unwrap_or(Path::new(".")),
-            std::iter::once("git".to_string()).chain(cfg.iter().flat_map(|kv| ["-c".to_string(), kv.clone()])).chain(args.iter().map(|a| a.to_string())).collect(),
+            argv,
             -9,
             started.elapsed(),
             "",
@@ -520,7 +503,7 @@ async fn run_git_streaming(
     let stdout_text = out_task.await.unwrap_or_default();
     crate::cmdlog::record(
         repo.unwrap_or(Path::new(".")),
-        std::iter::once("git".to_string()).chain(cfg.iter().flat_map(|kv| ["-c".to_string(), kv.clone()])).chain(args.iter().map(|a| a.to_string())).collect(),
+        argv,
         status.code().unwrap_or(-1),
         started.elapsed(),
         &stdout_text,
@@ -615,39 +598,27 @@ async fn size_estimate(url: &str, accounts: Option<&[String]>) -> Option<CloneSi
 }
 
 async fn run_git(repo: Option<&Path>, args: &[&str]) -> Result<String, AppError> {
-    let mut cmd = crate::spawn::async_command("git");
-    if let Some(dir) = repo {
-        cmd.current_dir(dir);
+    // The one runner: no prompt can hang it (no terminal exists for a GUI
+    // app), and it has a clock. Materialising a work tree can be a download
+    // — a partial clone fetches the blobs it now needs, Git LFS's smudge
+    // filter the large files — so `sparse-checkout` and `checkout` get the
+    // large-file ceiling, like the clone they finish; the rest is local.
+    let cmd = match repo {
+        Some(dir) => crate::git_exec::GitCmd::at(dir),
+        None => crate::git_exec::GitCmd::without_repo(),
+    };
+    let timeout = match args.first() {
+        Some(&"sparse-checkout") | Some(&"checkout") => crate::git_exec::LFS_TIMEOUT,
+        _ => crate::git_exec::LOCAL_TIMEOUT,
+    };
+    // Boxed: this is awaited deep in the submodule download chain, and the
+    // runner's state (child, pipes, clock, tree kill) inline in that chain
+    // is the shape that has overflowed a 2 MiB stack before.
+    let out = Box::pin(cmd.args(args.iter().copied()).timeout(timeout).run()).await?;
+    if !out.ok() {
+        return Err(AppError::Command(format!("git {} failed: {}", args.first().unwrap_or(&""), out.stderr)));
     }
-    // No terminal exists for a GUI app, so an HTTPS credential prompt would
-    // hang forever — make git fail fast with a readable error instead.
-    let started = std::time::Instant::now();
-    let output = cmd
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| AppError::Command(format!("Failed to run git: {}", e)))?;
-    // This runner takes its repository through `current_dir` rather than `-C`,
-    // so the log is told where it ran separately from the argv.
-    crate::cmdlog::record(
-        repo.unwrap_or(Path::new(".")),
-        std::iter::once("git".to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
-        output.status.code().unwrap_or(-1),
-        started.elapsed(),
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    );
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::Command(format!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&""),
-            stderr.trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(out.trimmed())
 }
 
 /// Derive the repo folder name from a clone URL (strip .git, take last segment).
@@ -1879,6 +1850,18 @@ pub async fn sparse_add(repo_path: &str, dirs: Vec<String>) -> Result<(), AppErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both clone-side runners are the one runner: the plain one entirely,
+    /// the progress reader through its arguments and environment.
+    #[tokio::test]
+    async fn the_clone_runners_go_through_gitcmd() {
+        use crate::git_exec::test_support::{assert_hardened, SHOW_ENV};
+        let dir = std::env::temp_dir();
+        assert_hardened(&run_git(Some(&dir), &SHOW_ENV).await.expect("git runs"));
+        let cfg = [SHOW_ENV[1].to_string()];
+        let env = run_git_streaming(Some(&dir), &cfg, &[SHOW_ENV[2]], None, true, &|_| {}).await.expect("git runs");
+        assert_hardened(&env);
+    }
 
     #[test]
     fn progress_counts_are_the_finished_share() {

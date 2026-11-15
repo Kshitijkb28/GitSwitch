@@ -91,21 +91,13 @@ pub(crate) fn mask_token(url: &str) -> String {
 }
 
 pub(crate) fn git_text(dir: &std::path::Path, args: &[&str]) -> Option<String> {
-    let started = std::time::Instant::now();
-    let d = dir.to_string_lossy().to_string();
-    let out = crate::spawn::command("git").arg("-C").arg(&d).args(args).output().ok()?;
-    crate::cmdlog::record(
-        dir,
-        ["git", "-C", &d].iter().map(|a| a.to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
-        out.status.code().unwrap_or(-1),
-        started.elapsed(),
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-    );
-    if !out.status.success() {
+    // The one runner, on its read clock: a repository that hangs a scan is
+    // stopped and reads as having no answer, like any other failure here.
+    let out = crate::git_exec::GitCmd::at(dir).args(args.iter().copied()).run_blocking().ok()?;
+    if !out.ok() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+    Some(out.trimmed()).filter(|s| !s.is_empty())
 }
 
 /// origin's URL, or — in a clone whose remote is called something else —
@@ -349,6 +341,13 @@ pub async fn scan_tracked(scan_id: String, root: String) -> Result<TrackedScan, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scan's runner is the one runner.
+    #[test]
+    fn the_scan_runner_goes_through_gitcmd() {
+        let env = git_text(&std::env::temp_dir(), &crate::git_exec::test_support::SHOW_ENV).expect("git runs");
+        crate::git_exec::test_support::assert_hardened(&env);
+    }
 
     #[test]
     fn parses_all_github_url_forms() {
