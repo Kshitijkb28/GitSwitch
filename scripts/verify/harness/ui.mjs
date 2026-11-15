@@ -4413,9 +4413,9 @@ try {
       await sleep(250);
       await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === "alice")?.click());
       await sleep(200);
-      // The row's own Register button, inside the expanded row.
+      // The panel's automatic route for a gh login.
       await page.evaluate(() => {
-        const buttons = [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Register" && !b.disabled);
+        const buttons = [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Register with GitHub CLI" && !b.disabled);
         buttons[buttons.length - 1]?.click();
       });
       await sleep(600);
@@ -4429,23 +4429,46 @@ try {
       await page.close();
     }
     {
-      // A sign-in kept here registers keys as well as a gh login does.
-      const page = await openSshPage(browser, server, { kept: ["octo-kept"], register: { resolve: "Registered on octo-kept" } });
+      // A sign-in kept here never uploads a key: GitHub would mark it as
+      // GitSwitch's, and organizations that restrict third-party apps hide
+      // their private repositories from such keys. Add to GitHub instead.
+      const page = await openSshPage(browser, server, { kept: ["octo-kept"] });
       await clickText(page, "Register");
       await sleep(250);
       await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Select an account…"))?.click());
       await sleep(250);
       const offered = await page.evaluate(() => [...document.querySelectorAll(".absolute button")].map((b) => b.innerText.trim()));
-      ok("a sign-in kept here is offered for registering a key, beside the gh logins", offered.includes("octo-kept (signed in here)") && offered.includes("alice"), JSON.stringify(offered));
+      ok("a sign-in kept here is offered beside the gh logins", offered.includes("octo-kept (signed in here)") && offered.includes("alice"), JSON.stringify(offered));
       await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === "octo-kept (signed in here)")?.click());
       await sleep(200);
-      await page.evaluate(() => {
-        const buttons = [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Register" && !b.disabled);
-        buttons[buttons.length - 1]?.click();
-      });
-      await sleep(600);
-      const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "gh_register_ssh_key")?.args ?? null);
-      ok("  and registering with it names that sign-in", call?.account === "signin:octo-kept", JSON.stringify(call));
+      const labels = await page.evaluate(() => [...document.querySelectorAll("button")].map((b) => b.innerText.trim()));
+      ok("  with it there is no automatic register, only Add to GitHub", labels.includes("Add to GitHub") && !labels.includes("Register with GitHub CLI"), JSON.stringify(labels.filter((l) => /Register|Add to GitHub/.test(l))));
+      await clickText(page, "Add to GitHub");
+      await sleep(400);
+      const calls = await page.evaluate(() => window.__CALLS__.map((c) => c.cmd));
+      ok("  Add to GitHub copies the key and opens GitHub, uploading nothing", calls.includes("get_public_key") && calls.includes("plugin:opener|open_url") && !calls.includes("gh_register_ssh_key"), JSON.stringify(calls.slice(-6)));
+      const opened = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "plugin:opener|open_url")?.args ?? null);
+      ok("  at GitHub's New SSH key page", JSON.stringify(opened ?? {}).includes("https://github.com/settings/ssh/new"), JSON.stringify(opened));
+      await clickText(page, "Check");
+      await sleep(400);
+      ok("  Check names the account the key signs in as when it is not the one picked", (await text(page)).includes("This key signs in as alice, not octo-kept"));
+      await page.close();
+    }
+    {
+      // A gh login: Add to GitHub is still the main route, and Check
+      // confirms the account.
+      const page = await openSshPage(browser, server);
+      await clickText(page, "Register");
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Select an account…"))?.click());
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === "alice")?.click());
+      await sleep(200);
+      await clickText(page, "Add to GitHub");
+      await sleep(300);
+      await clickText(page, "Check");
+      await sleep(400);
+      ok("a key added on GitHub by hand is confirmed by Check", (await text(page)).includes("Done: this key signs in as alice."));
       await page.close();
     }
     {

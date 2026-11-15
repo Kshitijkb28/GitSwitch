@@ -229,23 +229,24 @@ pub async fn gh_auth_login_cancel() -> Result<(), AppError> {
 /// `key_path` is the PRIVATE key path; we read `<key_path>.pub`.
 #[tauri::command]
 pub async fn gh_register_ssh_key(account: String, key_path: String) -> Result<String, AppError> {
-    let signin = credentials::signin_login(&account).map(str::to_string);
-    let token = match &signin {
-        Some(login) => credentials::signin_token(login)?.ok_or_else(|| AppError::NotFound(format!("The sign-in for {} is not kept on this computer any more — sign in again on the GitHub page.", login)))?,
-        None => gh_cli::gh_get_token(&account).await?,
-    };
-    let account = signin.clone().unwrap_or(account);
+    // Never with GitSwitch's own sign-in: GitHub marks a key that an app
+    // uploads as that app's, and an organization that restricts third-party
+    // apps (GitHub's default for new organizations) hides its private
+    // repositories from such a key, a "Repository not found" that no
+    // permission explains (Napnix-LLP, 2026-11-15). A key added by hand on
+    // github.com belongs to no app (the SSH page's "Add to GitHub"); a GitHub
+    // CLI login uploads as GitHub CLI, which GitHub lists among its
+    // privileged apps.
+    if let Some(login) = credentials::signin_login(&account) {
+        return Err(AppError::Command(format!(
+            "GitSwitch doesn't add keys with its own sign-in for {}: GitHub would mark the key as added by GitSwitch, and organizations that restrict third-party apps (GitHub's default for new organizations) hide their private repositories from such keys. Use \"Add to GitHub\" to add it on github.com yourself, or register it with a GitHub CLI login.",
+            login
+        )));
+    }
+    let token = gh_cli::gh_get_token(&account).await?;
     let public_key = ssh_keys::get_public_key(&key_path)?;
     let title = ssh_keys::key_title(ssh_keys::computer_name().as_deref());
     let (status, body, scope) = github::post_ssh_key(&token, &title, &public_key).await?;
-    // A kept sign-in is renewed on the GitHub page, not with gh.
-    if signin.is_some() {
-        match status {
-            401 => return Err(AppError::Command(format!("GitHub no longer accepts the sign-in kept for {} — sign in again on the GitHub page.", account))),
-            403 | 404 => return Err(AppError::Command(format!("The sign-in kept for {} may not add SSH keys — sign in again on the GitHub page, which asks GitHub for that.", account))),
-            _ => {}
-        }
-    }
     // "Already in use" is a success only when THIS account holds the key:
     // otherwise it is the wrong-account case the whole flow exists for.
     let (mine, holder) = if status == 422 {
@@ -1646,4 +1647,14 @@ pub async fn history_peek(repo_path: String) -> Result<crate::peek::RemotePeek, 
 #[tauri::command]
 pub async fn history_resolve(repo_path: String, text: String) -> Result<Option<crate::tree::CommitTarget>, AppError> {
     crate::tree::resolve_commit(&repo_path, &text).await
+}
+
+#[cfg(test)]
+mod key_register_tests {
+    #[tokio::test]
+    async fn gitswitchs_own_sign_in_never_uploads_a_key() {
+        // Refused before any token is read or any request is made.
+        let e = super::gh_register_ssh_key("signin:octo".into(), "/nowhere/id_key".into()).await.unwrap_err().to_string();
+        assert!(e.contains("Add to GitHub") && e.contains("restrict third-party apps"), "{e}");
+    }
 }

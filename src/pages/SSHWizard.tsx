@@ -23,33 +23,74 @@ import { SIGNIN_PREFIX } from "../lib/signins";
 import { RefreshButton } from "../components/RefreshButton";
 
 /**
- * Register one key on a GitHub account through a gh login, then say which
- * account the key authenticates as. Used for the key just generated and for
- * any key already in ~/.ssh — a key made on an earlier visit is no less
- * registrable.
+ * Put one key on a GitHub account, then say which account it signs in as.
+ * "Add to GitHub" is the route that always works: GitSwitch copies the public
+ * key and opens GitHub's New SSH key page, and the person adds it there. A key
+ * added like that belongs to no app. GitHub marks a key that an app uploads as
+ * that app's, and an organization that restricts third-party apps (GitHub's
+ * default for new organizations) hides its private repositories from such a
+ * key, so GitSwitch's own sign-in no longer uploads keys (the backend refuses
+ * it too). A GitHub CLI login can still register one automatically: GitHub
+ * lists GitHub CLI among its privileged apps, which organizations'
+ * restrictions don't block. Used for the key just generated and for any key
+ * already in ~/.ssh.
  */
 function RegisterKey({ keyPath, accounts }: { keyPath: string; accounts: string[] }) {
   const [account, setAccount] = useState("");
   const [busy, setBusy] = useState(false);
+  /** GitHub's page has been opened: Check is offered. */
+  const [opened, setOpened] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [resolved, setResolved] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
+  const signedInHere = account.startsWith(SIGNIN_PREFIX);
+  const login = signedInHere ? account.slice(SIGNIN_PREFIX.length) : account;
 
-  async function verify() {
+  async function verify(): Promise<string | null> {
     setVerifying(true);
     setResolved(null);
     try {
       const acct = await api.resolveKeyAccount(keyPath);
-      setResolved(acct ?? "(no GitHub account — not registered yet)");
+      setResolved(acct ?? "(no GitHub account — not on GitHub yet)");
+      return acct;
     } catch (e) {
       setResolved(`error: ${String(e)}`);
+      return null;
     } finally {
       setVerifying(false);
     }
   }
 
-  async function register() {
-    if (!account) return;
+  async function addOnGitHub() {
+    setMessage(null);
+    try {
+      const copied = await copyText(await api.getPublicKey(keyPath));
+      await openUrl("https://github.com/settings/ssh/new");
+      setOpened(true);
+      const where = login ? ` (signed in as ${login})` : "";
+      setMessage(
+        copied
+          ? { ok: true, text: `The public key is copied. On GitHub${where}, paste it into Key, give it any title, click Add SSH key, then come back and click Check.` }
+          : { ok: false, text: `GitHub's page is open, but the key couldn't be copied: paste the contents of the .pub file into Key${where}, click Add SSH key, then Check.` }
+      );
+    } catch (e) {
+      setMessage({ ok: false, text: String(e) });
+    }
+  }
+
+  async function check() {
+    const acct = await verify();
+    if (!acct) {
+      setMessage({ ok: false, text: "GitHub doesn't know this key yet. If you have just added it, wait a moment and Check again." });
+    } else if (login && acct.toLowerCase() !== login.toLowerCase()) {
+      setMessage({ ok: false, text: `This key signs in as ${acct}, not ${login}. Add it on GitHub while signed in as ${login} (and remove it from ${acct} if it shouldn't be there).` });
+    } else {
+      setMessage({ ok: true, text: `Done: this key signs in as ${acct}.` });
+    }
+  }
+
+  async function registerWithCli() {
+    if (!account || signedInHere) return;
     setBusy(true);
     setMessage(null);
     try {
@@ -62,60 +103,50 @@ function RegisterKey({ keyPath, accounts }: { keyPath: string; accounts: string[
     }
   }
 
-  // A key added by hand on github.com belongs to no app, so no organization's
-  // third-party app restriction can hide its private repositories from it.
-  async function addByHand() {
-    setMessage(null);
-    try {
-      const copied = await copyText(await api.getPublicKey(keyPath));
-      await openUrl("https://github.com/settings/ssh/new");
-      setMessage(
-        copied
-          ? { ok: true, text: "The public key is copied. On GitHub, paste it into Key (any title), then click Add SSH key." }
-          : { ok: false, text: "GitHub's page is open, but the key couldn't be copied: paste the contents of the .pub file by hand." }
-      );
-    } catch (e) {
-      setMessage({ ok: false, text: String(e) });
-    }
-  }
-
-  if (accounts.length === 0) {
-    return (
-      <p className="text-xs text-zinc-500">
-        No GitHub account is signed in here — sign in on the GitHub page (with GitHub, or the
-        GitHub CLI's <span className="font-mono">gh auth login</span>), then Refresh.
-      </p>
-    );
-  }
   return (
     <div>
-      <div className="flex gap-2">
+      {accounts.length > 0 && (
         <Select
           value={account}
           onChange={setAccount}
           placeholder="Select an account…"
           optionIcon={<GitHubIcon size={14} />}
           options={accounts.map((a) => ({ value: a, label: a.startsWith(SIGNIN_PREFIX) ? `${a.slice(SIGNIN_PREFIX.length)} (signed in here)` : a }))}
-          className="flex-1 min-w-0"
         />
-        <Button type="button" onClick={register} disabled={!account || busy}>
-          {busy ? (
-            <>
-              <Loader2 size={16} className="animate-spin" />
-              Registering…
-            </>
-          ) : (
-            "Register"
-          )}
+      )}
+      <div className="flex gap-2 flex-wrap mt-2">
+        <Button type="button" onClick={() => void addOnGitHub()}>
+          Add to GitHub
         </Button>
+        {opened && (
+          <Button type="button" variant="secondary" onClick={() => void check()} disabled={verifying}>
+            Check
+          </Button>
+        )}
+        {account && !signedInHere && (
+          <Button
+            type="button"
+            variant="ghost"
+            onClick={() => void registerWithCli()}
+            disabled={busy}
+            title="Upload it through this GitHub CLI login. GitHub lists GitHub CLI among its privileged apps, which organizations' third-party app restrictions don't block."
+          >
+            {busy ? (
+              <>
+                <Loader2 size={16} className="animate-spin" />
+                Registering…
+              </>
+            ) : (
+              "Register with GitHub CLI"
+            )}
+          </Button>
+        )}
       </div>
       <p className="mt-2 text-xs text-zinc-500 leading-relaxed">
-        GitHub marks a key that an app registers as added by that app, and an organization that restricts
-        third-party apps (GitHub's default for new organizations) hides its private repositories from such keys.
-        For those, add the key by hand instead; it works everywhere.{" "}
-        <button type="button" onClick={() => void addByHand()} className="text-emerald-400 hover:underline cursor-pointer">
-          Add it by hand on GitHub
-        </button>
+        Add to GitHub copies the key and opens GitHub's New SSH key page: paste it there and click Add SSH key. A key
+        you add yourself belongs to no app, so it works in every organization, including the ones that restrict
+        third-party apps (GitHub's default for new organizations) and hide their private repositories from keys an app
+        added.
       </p>
       {message && (
         <div className={`mt-3 flex items-start gap-2 text-sm break-words ${message.ok ? "text-emerald-400" : "text-red-400"}`}>

@@ -1533,7 +1533,10 @@ pub(crate) fn network_failure(stderr: &str) -> Option<String> {
 }
 
 /// Turn git/ssh's terse failures into something that says what to do — for
-/// the Clone page, where "Clone as" chooses the account.
+/// the Clone page, where "Clone as" chooses the account. The clone itself
+/// calls `explain_clone_error_as`, which can name the account; this is the
+/// tests' shorthand for it without one.
+#[cfg(test)]
 pub(crate) fn explain_clone_error(stderr: &str, key: Option<&str>, url: &str) -> String {
     explain_transport_error(stderr, key, url, true)
 }
