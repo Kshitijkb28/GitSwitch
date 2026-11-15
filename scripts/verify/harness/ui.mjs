@@ -192,6 +192,12 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "history_list_repos":
               // A test clones one "behind the app's back" by setting window.__REPOS__.
               return Promise.resolve(window.__REPOS__ ?? cfg.repos ?? repos);
+            case "repo_init": {
+              // The folder is a repository now: the next list says so.
+              const list = window.__REPOS__ ?? cfg.repos ?? repos;
+              window.__REPOS__ = list.map((r) => (r.path === args.path ? { ...r, kind: "repo", inside: null } : r));
+              return Promise.resolve({ path: args.path, branch: "main" });
+            }
             case "changes_repo_status": {
               const sub = args.repoPath && cfg.submoduleStatuses.find((s) => s.status.path === args.repoPath);
               if (sub) return Promise.resolve(sub.status);
@@ -575,7 +581,8 @@ async function openPage(browser, server, scenario, opts = {}) {
   await page.setViewport({ width: cfg.width, height: 900 });
   await page.evaluateOnNewDocument(bridge, REPOS, scenario, DIFF_TEXT, DIFF_BINARY, cfg);
   await page.goto(`${server.url}/repo/changes`, { waitUntil: "networkidle0" });
-  await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 5000 });
+  // The repository's tabs, or for a folder that is no repository the card in their place.
+  await page.waitForFunction(() => document.body.innerText.includes("Changes") || !!document.querySelector("[data-not-a-repository]"), { timeout: 5000 });
   return page;
 }
 
@@ -1159,7 +1166,8 @@ async function openNetSpeedPage(browser, server, opts = {}) {
         iface("veth", "vEthernet (WSL)", "virtual", { link_bps: 10_000_000_000, upload: 74 }),
       ],
       usage: { today: [1_240_000_000, 45_600_000], month: [38_500_000_000, 2_100_000_000], session: [340_000_000, 12_000_000], since: 1793950000 },
-      settings: { tray: false, style: "icon", bar: false, bar_place: "taskbar", bar_pos: null, show: "both", unit: "bytes", interval_ms: 1000, source: "auto", ...(opts.settings ?? {}) },
+      settings: { tray: false, style: "icon", bar: false, bar_place: "taskbar", bar_pos: null, show: "both", unit: "bytes", interval_ms: 1000, source: "auto", start_at_login: false, ...(opts.settings ?? {}) },
+      startup: opts.startup ?? { on: false, active: false, blocked: null, error: null },
     },
     tests: opts.tests ?? [
       { phase: "latency", progress: 0.05, latency_ms: null, down_bps: null, up_bps: null, used_bytes: 0, error: null, at: null },
@@ -1210,18 +1218,34 @@ async function openProfilePage(browser, server, opts = {}) {
     ghAccounts: opts.ghAccounts ?? [],
     user: opts.user ?? null,
     keyAccount: opts.keyAccount ?? null,
+    /** {[folder]: FolderState}: what folder_state answers (default: a repository). */
+    folderStates: opts.folderStates ?? {},
   };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
   await page.evaluateOnNewDocument((cfg) => {
     window.__CALLS__ = [];
     localStorage.clear();
+    // The store, as the backend keeps it: saving, making default and deleting change it.
+    let store = cfg.profiles.map((p) => ({ ...p }));
     window.__TAURI_INTERNALS__ = {
       invoke: (cmd, args) => {
         window.__CALLS__.push({ cmd, args });
         switch (cmd) {
           case "get_profiles":
-            return Promise.resolve(cfg.profiles);
+            return Promise.resolve(store.map((p) => ({ ...p })));
+          case "folder_state":
+            return Promise.resolve(cfg.folderStates[args?.path] ?? { kind: "repo" });
+          case "set_default_profile": {
+            store = store.map((p) => ({ ...p, is_default: p.id === args.id }));
+            return Promise.resolve({ ...store.find((p) => p.id === args.id) });
+          }
+          case "delete_profile": {
+            const wasDefault = store.find((p) => p.id === args.id)?.is_default;
+            store = store.filter((p) => p.id !== args.id);
+            if (wasDefault && store.length && !store.some((p) => p.is_default)) store[0].is_default = true;
+            return Promise.resolve(null);
+          }
           case "list_ssh_keys":
             return Promise.resolve([]);
           case "gh_list_accounts":
@@ -1233,8 +1257,29 @@ async function openProfilePage(browser, server, opts = {}) {
           case "resolve_key_account":
             return cfg.keyAccount ? Promise.resolve(cfg.keyAccount) : Promise.reject("the key could not be probed");
           case "create_profile":
-          case "update_profile":
-            return Promise.resolve({ ...(cfg.profiles[0] ?? {}), ...args });
+          case "update_profile": {
+            // As the backend answers: the profile as stored, in its own fields.
+            const given = {
+              name: args.name,
+              git_name: args.gitName,
+              git_email: args.gitEmail,
+              ssh_key_path: args.sshKeyPath === undefined ? undefined : args.sshKeyPath || null,
+              directories: args.directories,
+              allow_push: args.allowPush,
+              signing_enabled: args.signingEnabled,
+              remote_patterns: args.remotePatterns,
+              push_over_ssh: args.pushOverSsh,
+              github_login: args.githubLogin === undefined ? undefined : args.githubLogin || null,
+            };
+            const set = Object.fromEntries(Object.entries(given).filter(([, v]) => v !== undefined));
+            const base =
+              cmd === "update_profile"
+                ? store.find((p) => p.id === args.id) ?? store[0] ?? {}
+                : { id: "p-new", is_default: store.length === 0, created_at: "2026-01-02T00:00:00Z", updated_at: "2026-01-02T00:00:00Z" };
+            const saved = { ...base, ...set };
+            store = [...store.filter((p) => p.id !== saved.id), saved];
+            return Promise.resolve({ ...saved });
+          }
           default:
             return Promise.resolve(null);
         }
@@ -3916,6 +3961,115 @@ try {
     await nokey.waitForFunction(() => document.body.innerText.includes("Push HTTPS clones over SSH"), { timeout: 5000 }).catch(() => null);
     ok("  without a key it cannot be on", (await box(nokey)) === JSON.stringify({ checked: false, disabled: true }), await box(nokey));
     await nokey.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("A profile folder that holds no repository is on the Repository page, with the way to make it one");
+  {
+    const folderRepos = [
+      ...REPOS,
+      { path: "/work/SubtitleMaker", name: "SubtitleMaker", profile_id: "p2", profile_name: "Work", profile_email: "me@work.test", kind: "folder" },
+      { path: "/repos/gitswitch/docs", name: "docs", profile_id: "p2", profile_name: "Work", profile_email: "me@work.test", kind: "folder", inside: "/repos/gitswitch" },
+    ];
+    const page = await open(SCENARIOS.clean, { repos: folderRepos, storage: { "repo.path": "/work/SubtitleMaker" } });
+    await page.waitForFunction(() => !!document.querySelector("[data-not-a-repository]"), { timeout: 5000 }).catch(() => null);
+    ok(
+      "selected, it gets a card saying why it is listed, not tabs that would fail",
+      (await page.evaluate(() => document.querySelector('[data-not-a-repository="folder"]')?.innerText ?? "")).includes("SubtitleMaker isn’t a git repository yet") &&
+        !(await page.$('[aria-label="Repository tabs"]')) &&
+        !(await text(page)).includes("is not a git repository"),
+      await page.evaluate(() => document.querySelector("[data-not-a-repository]")?.innerText ?? "no card")
+    );
+    ok("  naming whose folder it is and the identity it will commit with", (await text(page)).includes("Work’s folders") && (await text(page)).includes("me@work.test"));
+    await page.evaluate(() => [...document.querySelectorAll("label")].find((l) => l.innerText.trim() === "Repository").parentElement.querySelector("button").click());
+    await page.waitForFunction(() => !!document.querySelector('input[aria-label="Search repositories"]'), { timeout: 4000 }).catch(() => null);
+    const notes = await page.evaluate(() =>
+      [...document.querySelectorAll("button")].filter((b) => b.querySelector("[data-option-note]")).map((b) => b.innerText.replace(/\s+/g, " ").trim())
+    );
+    ok("  in the picker it says what it is", notes.some((n) => n.includes("SubtitleMaker") && n.includes("not a repository yet")) && notes.some((n) => n.includes("docs") && n.includes("inside a repository")), JSON.stringify(notes));
+    await page.keyboard.press("Escape");
+    await page.evaluate(() => document.querySelector("[data-make-repository]")?.click());
+    await page.waitForFunction(() => !document.querySelector("[data-not-a-repository]") && !!document.querySelector('[aria-label="Repository tabs"]'), { timeout: 5000 }).catch(() => null);
+    const made = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "repo_init").map((c) => c.args));
+    ok("Make it a repository asks for exactly that folder, and the page shows it as one", JSON.stringify(made) === JSON.stringify([{ path: "/work/SubtitleMaker" }]) && !!(await page.$('[aria-label="Repository tabs"]')), JSON.stringify(made));
+    const said = await page.evaluate(() => [...document.querySelectorAll("[data-toast]")].map((t) => t.innerText).join(" | "));
+    ok("  and says what it made", said.includes("SubtitleMaker is now a git repository") && said.includes("Branch main") && said.includes("Work's identity (me@work.test)"), said);
+    await page.close();
+
+    const inner = await open(SCENARIOS.clean, { repos: folderRepos, storage: { "repo.path": "/repos/gitswitch/docs" } });
+    await inner.waitForFunction(() => !!document.querySelector('[data-not-a-repository="inside"]'), { timeout: 5000 }).catch(() => null);
+    ok("a profile folder inside a repository says so, and offers that repository", (await text(inner)).includes("inside the repository /repos/gitswitch") && !!(await inner.$("[data-open-enclosing]")) && !(await inner.$("[data-make-repository]")));
+    await inner.evaluate(() => document.querySelector("[data-open-enclosing]")?.click());
+    await inner.waitForFunction(() => !document.querySelector("[data-not-a-repository]"), { timeout: 5000 }).catch(() => null);
+    ok("  which opens it, tabs and all", !!(await inner.$('[aria-label="Repository tabs"]')) && (await inner.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:repo.path") ?? '""'))) === "/repos/gitswitch");
+    await inner.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Saving says what it changed");
+  {
+    const stamp = { created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+    const work = { id: "p2", name: "Work", git_name: "Work Person", git_email: "old@work.test", ssh_key_path: null, github_login: null, is_default: false, allow_push: true, signing_enabled: false, directories: ["/w/apps"], remote_patterns: [], ...stamp };
+    const home = { id: "p1", name: "Home", git_name: "Me", git_email: "me@home.test", ssh_key_path: null, github_login: null, is_default: true, allow_push: true, signing_enabled: false, directories: ["/w/shared"], remote_patterns: [], ...stamp };
+    const toasts = (pg) => pg.evaluate(() => [...document.querySelectorAll("[data-toast]")].map((t) => t.innerText).join("\n---\n"));
+    const states = { "/w/SubtitleMaker": { kind: "no-repo" }, "/w/shared": { kind: "contains-repos", count: 3 } };
+
+    const page = await openProfilePage(browser, server, { path: "/profile/p2/edit", profiles: [work, home], folderStates: states });
+    await page.waitForFunction(() => document.querySelector('input[placeholder="your@email.com"]')?.value === "old@work.test", { timeout: 5000 }).catch(() => null);
+    const email = await page.$('input[placeholder="your@email.com"]');
+    await email.click({ clickCount: 3 });
+    await email.type("new@work.test");
+    for (const d of ["/w/SubtitleMaker", "/w/shared"]) {
+      await page.type('input[placeholder="…or type a path, e.g. ~/projects/work"]', d);
+      await page.keyboard.press("Enter");
+    }
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Update Profile")?.click());
+    await page.waitForFunction(() => [...document.querySelectorAll("[data-toast]")].some((t) => t.innerText.includes("updated")), { timeout: 5000 }).catch(() => null);
+    let t = await toasts(page);
+    ok("the profile's confirmation lists what the save changed", t.includes("Profile “Work” updated") && t.includes("Commit email: old@work.test → new@work.test") && t.includes("Folder added: /w/SubtitleMaker"), t);
+    ok("  a folder taken from another profile says which", t.includes("Folder added: /w/shared (moved here from “Home”)"), t);
+    ok("  a folder with no repository says where it will be", t.includes("SubtitleMaker holds no git repository yet") && !t.includes("shared holds"), t);
+    ok("  and nothing that stayed the same is listed", !t.includes("Name:") && !t.includes("SSH key") && !t.includes("Pushes"), t);
+    await sleep(3700);
+    ok("  a confirmation with lines to read stays past the usual 3.2 seconds", (await toasts(page)).includes("Profile “Work” updated"));
+    await page.close();
+
+    const same = await openProfilePage(browser, server, { path: "/profile/p2/edit", profiles: [work, home] });
+    await same.waitForFunction(() => document.querySelector('input[placeholder="your@email.com"]')?.value === "old@work.test", { timeout: 5000 }).catch(() => null);
+    await same.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Update Profile")?.click());
+    await same.waitForFunction(() => [...document.querySelectorAll("[data-toast]")].some((x) => x.innerText.includes("Profile “Work”")), { timeout: 5000 }).catch(() => null);
+    t = await toasts(same);
+    ok("saving with no change says so", t.includes("Profile “Work” saved. Nothing changed."), t);
+    await same.close();
+
+    const created = await openProfilePage(browser, server, { path: "/profile/new", profiles: [home], folderStates: states });
+    await created.waitForFunction(() => !!document.querySelector('input[placeholder="your@email.com"]'), { timeout: 5000 }).catch(() => null);
+    await created.type('input[placeholder="e.g., Work, Personal, Open Source"]', "Side");
+    await created.type('input[placeholder="Your git user.name"]', "Side Person");
+    await created.type('input[placeholder="your@email.com"]', "side@example.test");
+    await created.type('input[placeholder="…or type a path, e.g. ~/projects/work"]', "/w/SubtitleMaker");
+    await created.keyboard.press("Enter");
+    await created.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Create Profile")?.click());
+    await created.waitForFunction(() => [...document.querySelectorAll("[data-toast]")].some((x) => x.innerText.includes("created")), { timeout: 5000 }).catch(() => null);
+    t = await toasts(created);
+    ok("a new profile's confirmation says what it was made with", t.includes("Profile “Side” created") && t.includes("Commits as Side Person <side@example.test>") && t.includes("Folder: /w/SubtitleMaker") && t.includes("SubtitleMaker holds no git repository yet"), t);
+    await created.close();
+
+    const dash = await openProfilePage(browser, server, { path: "/", profiles: [work, home] });
+    await dash.waitForFunction(() => document.body.innerText.includes("Work"), { timeout: 5000 }).catch(() => null);
+    await dash.evaluate(() => document.querySelector('button[title="Set as default"]')?.click());
+    await dash.waitForFunction(() => [...document.querySelectorAll("[data-toast]")].some((x) => x.innerText.includes("default profile")), { timeout: 5000 }).catch(() => null);
+    t = await toasts(dash);
+    ok("making a profile the default says so, and what it means", t.includes("“Work” is now the default profile") && t.includes("Was “Home”") && t.includes("commit as Work Person <old@work.test>"), t);
+    await dash.evaluate(() => [...document.querySelectorAll('button[title="Delete"]')][0]?.click());
+    await dash.waitForFunction(() => document.body.innerText.includes("Delete Profile"), { timeout: 4000 }).catch(() => null);
+    await dash.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Delete").pop()?.click());
+    await dash.waitForFunction(() => [...document.querySelectorAll("[data-toast]")].some((x) => x.innerText.includes("deleted")), { timeout: 5000 }).catch(() => null);
+    t = await toasts(dash);
+    const goneId = await dash.evaluate(() => window.__CALLS__.find((c) => c.cmd === "delete_profile")?.args?.id);
+    const gone = goneId === "p2" ? { name: "Work", dir: "/w/apps" } : { name: "Home", dir: "/w/shared" };
+    ok("deleting a profile says which folders have no profile now", t.includes(`Profile “${gone.name}” deleted`) && t.includes(`${gone.dir} no longer has a profile`), t);
+    await dash.close();
   }
 
   // -----------------------------------------------------------------
@@ -6763,6 +6917,48 @@ try {
     ok("Ubuntu: the top bar, with what it needs", (await text(lin)).includes("Show the speed in the top bar") && (await text(lin)).includes("AppIndicator"));
     await lin.close();
 
+    // Starting at sign-in, to show the speed.
+    const st = await openNetSpeedPage(browser, server);
+    ok("Windows: 'Start with Windows', off", (await text(st)).includes("Start with Windows") && !(await st.evaluate(() => document.querySelector('[aria-label="Start with Windows"]').checked)) && (await st.evaluate(() => document.querySelector("[data-startup]")?.getAttribute("data-startup"))) === "off");
+    await st.evaluate(() => document.querySelector('[aria-label="Start with Windows"]').click());
+    await sleep(200);
+    let ss = await calls(st, "netspeed_set_settings");
+    ok("  ticked with nothing shown: it is sent with the speed turned on too", ss.length === 1 && ss[0].settings.start_at_login === true && ss[0].settings.tray === true, JSON.stringify(ss));
+    ok("  the page says what happens at sign-in", (await st.evaluate(() => document.querySelector("[data-startup-tip]")?.innerText ?? "")).includes("starts in the background, without its window") && (await st.evaluate(() => document.querySelector('[aria-label="Show the speed in the taskbar"]').checked)));
+    await st.evaluate(() => document.querySelector('[aria-label="Show the speed in the taskbar"]').click());
+    await sleep(200);
+    ss = await calls(st, "netspeed_set_settings");
+    ok("  the speed turned off: starting at sign-in goes off with it, at once", ss.length === 2 && ss[1].settings.tray === false && ss[1].settings.start_at_login === false && !(await st.evaluate(() => document.querySelector('[aria-label="Start with Windows"]').checked)), JSON.stringify(ss[1]));
+    await st.close();
+
+    const blocked = await openNetSpeedPage(browser, server, { settings: { tray: true, start_at_login: true }, startup: { on: true, active: true, blocked: "Windows' Startup apps has GitSwitch turned off, so it won't start when you sign in.", error: null } });
+    ok("Startup apps has it off: said, with the way there", (await blocked.evaluate(() => document.querySelector("[data-startup-blocked]")?.innerText ?? "")).includes("Startup apps has GitSwitch turned off") && !(await blocked.$("[data-startup-tip]")));
+    await blocked.evaluate(() => document.querySelector("[data-startup-blocked] [data-startup-settings]").click());
+    await sleep(150);
+    ok("  Open Startup apps asks for exactly that", JSON.stringify(await calls(blocked, "netspeed_open_settings")) === JSON.stringify([{ which: "startupapps" }]));
+    await blocked.close();
+
+    const missing = await openNetSpeedPage(browser, server, { settings: { tray: true, start_at_login: true }, startup: { on: true, active: false, blocked: null, error: null } });
+    ok("the entry gone from the system: said, with a way to set it up again", !!(await missing.$("[data-startup-missing]")));
+    await missing.evaluate(() => document.querySelector("[data-startup-missing] button").click());
+    await sleep(150);
+    ok("  'Set it up again' saves the choice again", (await calls(missing, "netspeed_set_settings")).pop()?.settings.start_at_login === true);
+    await missing.close();
+
+    const failed = await openNetSpeedPage(browser, server, { settings: { tray: true, start_at_login: true }, startup: { on: true, active: false, blocked: null, error: "GitSwitch could not be set to start when you sign in: Access is denied." } });
+    ok("writing the entry failed: the error is shown, not the tip", (await failed.evaluate(() => document.querySelector("[data-startup-error]")?.innerText ?? "")).includes("Access is denied") && !(await failed.$("[data-startup-tip]")) && !(await failed.$("[data-startup-missing]")));
+    await failed.close();
+
+    const macStart = await openNetSpeedPage(browser, server, { platform: "macos", settings: { tray: false, bar: true, start_at_login: true } });
+    ok("macOS: 'Open at login', on with only the floating bar shown, with the way to Login Items", (await macStart.evaluate(() => document.querySelector('[aria-label="Open at login"]')?.checked)) === true && (await macStart.evaluate(() => document.querySelector("[data-startup-tip]")?.innerText ?? "")).includes("Login Items"));
+    await macStart.evaluate(() => document.querySelector("[data-startup-tip] [data-startup-settings]").click());
+    await sleep(150);
+    ok("  Open Login Items asks for exactly that", JSON.stringify(await calls(macStart, "netspeed_open_settings")) === JSON.stringify([{ which: "loginitems" }]));
+    await macStart.close();
+    const linStart = await openNetSpeedPage(browser, server, { platform: "linux" });
+    ok("Ubuntu: 'Start when I log in'", !!(await linStart.$('[aria-label="Start when I log in"]')));
+    await linStart.close();
+
     const bar = await openNetSpeedPage(browser, server, { path: "/?speedbar" });
     await bar.waitForFunction(() => document.querySelector("[data-speed-bar]")?.innerText.includes("MB/s"), { timeout: 5000 }).catch(() => null);
     const bt = await bar.evaluate(() => document.querySelector("[data-speed-bar]")?.innerText ?? "");
@@ -6776,12 +6972,13 @@ try {
   section("Settings › Uninstall GitSwitch: what is taken back and what is kept, the locks refused stops everything");
   {
     const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
-    const plan = { platform: "macos", app: { kind: "trash", bundle: "/Applications/GitSwitch.app", trash: "/Users/me/.Trash" }, how: "/Applications/GitSwitch.app is moved to the Trash once GitSwitch has quit.", gitconfig: "/Users/me/.gitconfig", signers: null, repos: ["/w/one", "/w/two"], lock_helper: true, locks: ["/w/two"], signins: ["me-home"], data: ["/Users/me/Library/Application Support/com.gitswitch.app"] };
+    const plan = { platform: "macos", app: { kind: "trash", bundle: "/Applications/GitSwitch.app", trash: "/Users/me/.Trash" }, how: "/Applications/GitSwitch.app is moved to the Trash once GitSwitch has quit.", gitconfig: "/Users/me/.gitconfig", signers: null, repos: ["/w/one", "/w/two"], lock_helper: true, locks: ["/w/two"], signins: ["me-home"], startup: true, data: ["/Users/me/Library/Application Support/com.gitswitch.app"] };
     const page = await openUninstallPage(browser, server, { path: "/settings", plan });
     await page.evaluate(() => document.querySelector("[data-uninstall-open]").click());
     await page.waitForFunction(() => document.querySelector("[data-uninstall-now]"), { timeout: 5000 }).catch(() => null);
     const t = await text(page);
     ok("the dialog lists what is taken back now", t.includes("The push locks (1) and the lock helper") && t.includes("in 2 repositories") && t.includes("/Users/me/.gitconfig") && t.includes("@me-home"));
+    ok("  including starting GitSwitch at sign-in", t.includes("Starting GitSwitch when you sign in"));
     ok("  what goes once GitSwitch has quit", t.includes("com.gitswitch.app") && t.includes("moved to the Trash once GitSwitch has quit"));
     ok("  and what is kept", t.includes("Your SSH keys") && t.includes("Your repositories and their files"));
     await page.evaluate(() => document.querySelector('[aria-label="Keep my profiles and sign-ins"]').click());

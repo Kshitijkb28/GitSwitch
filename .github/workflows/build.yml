@@ -31,7 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # The Rust in rust-toolchain.toml: 1.100 breaks tauri-build 2.6 (see there).
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
+          components: clippy
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
@@ -82,6 +86,7 @@ jobs:
           bash scripts/verify/regression.sh
           bash scripts/verify/identity.sh
           bash scripts/verify/findrepos.sh
+          bash scripts/verify/folders.sh
           bash scripts/verify/uninstall.sh
           bash scripts/verify/apps.sh
           bash scripts/verify/github.sh
@@ -93,6 +98,7 @@ jobs:
           bash scripts/verify/states.sh
           bash scripts/verify/ports.sh
           bash scripts/verify/workspace.sh
+          NETSPEED_LIVE=1 bash scripts/verify/netspeed.sh
       # The same suites under Git Bash. Informational until they have been seen
       # green there: a failure is reported in the log and the step is marked,
       # but does not fail the run.
@@ -103,6 +109,7 @@ jobs:
         run: |
           bash scripts/verify/sandbox.sh
           bash scripts/verify/regression.sh
+          bash scripts/verify/folders.sh
           bash scripts/verify/submodules.sh
           bash scripts/verify/lfs.sh
           bash scripts/verify/sync.sh
@@ -125,6 +132,7 @@ jobs:
           powershell -NoProfile -NonInteractive -Command "Get-NetTCPConnection -State Listen | Select-Object -First 5 LocalAddress,LocalPort,OwningProcess | ConvertTo-Json -Compress"
           bash scripts/verify/ports.sh
           bash scripts/verify/workspace.sh
+          NETSPEED_LIVE=1 bash scripts/verify/netspeed.sh
       # A real shell in a real pty, through the real git shim. Kept separate so
       # a failure here is attributed to the terminal rather than to git.
       # The shell is pinned per platform: runners set SHELL=/bin/bash even on
@@ -177,7 +185,10 @@ jobs:
       - name: Packaging and install docs
         run: python3 scripts/verify/harness/packaging.py
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # The Rust in rust-toolchain.toml: 1.100 breaks tauri-build 2.6 (see there).
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.1"
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
@@ -298,8 +309,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # The Rust in rust-toolchain.toml: 1.100 breaks tauri-build 2.6 (see there).
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.1"
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache

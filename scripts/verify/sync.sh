@@ -855,8 +855,10 @@ for world in tj tk; do
   if [ "$world" = tj ]; then git -C "$W/upstream" config -f .gitmodules submodule.A.ignore all; git -C "$W/upstream" add .gitmodules; fi
   git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A at two"; git -C "$W/upstream" push -q origin main 2>/dev/null
   git -C "$W/local" pull -q --ff-only 2>/dev/null; git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" merge -q --ff-only "$TWO"
-  [ "$world" = tk ] && git -C "$W/local" config diff.ignoreSubmodules all
   git -C "$W/local/A" reset -q --hard "$ONE"; git -C "$W/local" add A; git -C "$W/local" commit -qm "pin A back to one"
+  # Set once the commit is made: an older git (2.34) lets this setting hide
+  # the staged pointer from `git commit` itself, and no commit would be made.
+  [ "$world" = tk ] && git -C "$W/local" config diff.ignoreSubmodules all
   printf 'u\n' > "$W/upstream/up.txt"; git -C "$W/upstream" add up.txt; git -C "$W/upstream" commit -qm "super: unrelated"; git -C "$W/upstream" push -q origin main 2>/dev/null
   OUT=$(probe sync_plan "$W/local")
   ok "($world) my pin is previewed as kept" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(c['subject'],c['already_upstream']) for c in d['superproject']['own_commits']])")" "[('pin A back to one', False)]"
@@ -1653,9 +1655,11 @@ ok "  and its large file is content" "$(wc -c < "$LS/r/model.bin" | tr -d ' ')" 
 LFS_BIN="$(command -v git-lfs)"; mkdir -p "$LS/wrap"
 cat > "$LS/wrap/git-lfs" <<WRAP
 #!/bin/sh
-if [ "\$1" = "filter-process" ]; then
-  case "\$(ps -o args= -p \$PPID 2>/dev/null)" in
+if [ "\$1" = "filter-process" ] || [ "\$1" = "smudge" ]; then
+  parent="\$(ps -o args= -p \$PPID 2>/dev/null)"
+  case "\$parent" in
     *" rebase "*) echo "rebase progress=\${GIT_LFS_PROGRESS:-none}" >> "$LS/lfs-env.log" ;;
+    *) echo "other(\$(printf '%s' "\$parent" | cut -c1-90)) \$1 progress=\${GIT_LFS_PROGRESS:-none}" >> "$LS/lfs-other.log" ;;
   esac
 fi
 exec "$LFS_BIN" "\$@"
@@ -1665,12 +1669,13 @@ chmod +x "$LS/wrap/git-lfs"
 printf 'd\n' > "$LS/d/mine.txt"; git -C "$LS/d" add mine.txt >/dev/null; git -C "$LS/d" commit -qm "mine: d"
 head -c 6000 /dev/urandom > "$LS/d/other.bin"
 head -c 5500 /dev/urandom > "$LS/author/model.bin"; git -C "$LS/author" commit -qam "upstream: another model"; git -C "$LS/author" push -q origin main 2>/dev/null
-rm -f "$LS/lfs-env.log"
+rm -f "$LS/lfs-env.log" "$LS/lfs-other.log"
 probe sync_plan "$LS/d" >/dev/null; OUT=$(PATH="$LS/wrap:$PATH" probe sync_run "$LS/d")
 ok "(an uncommitted large file: git downloads inside the rebase, and the update still finishes)" "$(printf '%s' "$OUT" | jqf ok)" "True"
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) echo "  SKIP the git-lfs inside the rebase writes its progress where the page reads it (Git Bash's ps cannot name the caller)" ;;
-  *) ok "  the git-lfs inside the rebase writes its progress where the page reads it" "$(sort -u "$LS/lfs-env.log" 2>/dev/null | tr '\\' '/' | tr '\n' '|')" "rebase progress=$LS/d/.git/gitswitch-lfs.progress|" ;;
+  # The other git-lfs runs follow, so a failure shows what git ran it from.
+  *) ok "  the git-lfs inside the rebase writes its progress where the page reads it" "$(sort -u "$LS/lfs-env.log" 2>/dev/null | tr '\\' '/' | tr '\n' '|') [others: $(sort -u "$LS/lfs-other.log" 2>/dev/null | tr '\n' '|')]" "rebase progress=$LS/d/.git/gitswitch-lfs.progress|" ;;
 esac
 ok "  and upstream's new large file arrived as content" "$(wc -c < "$LS/d/model.bin" | tr -d ' ')" "5500"
 

@@ -115,10 +115,11 @@ export function UninstallDialog({ open, onClose }: { open: boolean; onClose: () 
                 )}
                 {plan.gitconfig && <Item text="GitSwitch's block in your git config (a backup is kept beside it)" path={plan.gitconfig} />}
                 {plan.signers && <Item text="GitSwitch's entries in allowed_signers (your own lines stay)" path={plan.signers} />}
+                {plan.startup && <Item text="Starting GitSwitch when you sign in (the Net speed tab's choice)" />}
                 {!keepData && plan.signins.length > 0 && (
                   <Item text={`GitHub sign-ins kept by GitSwitch: ${plan.signins.map((s) => "@" + s).join(", ")}`} />
                 )}
-                {!plan.lock_helper && locks === 0 && plan.repos.length === 0 && !plan.gitconfig && !plan.signers && (keepData || plan.signins.length === 0) && (
+                {!plan.lock_helper && locks === 0 && plan.repos.length === 0 && !plan.gitconfig && !plan.signers && !plan.startup && (keepData || plan.signins.length === 0) && (
                   <li className="list-none text-zinc-500">Nothing — GitSwitch changed nothing outside its own folders.</li>
                 )}
               </ul>

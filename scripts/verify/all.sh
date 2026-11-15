@@ -47,6 +47,7 @@ run "Changes sandbox"     bash "$HERE/sandbox.sh"
 run "Regression"          bash "$HERE/regression.sh"
 run "Identity (gitconfig round-trip)" bash "$HERE/identity.sh"
 run "Find repositories"   bash "$HERE/findrepos.sh"
+run "Folders without a repository" bash "$HERE/folders.sh"
 run "Uninstalling GitSwitch" bash "$HERE/uninstall.sh"
 run "Uninstall tab (apps and leftovers)" bash "$HERE/apps.sh"
 run "GitHub pull requests" bash "$HERE/github.sh"
@@ -60,6 +61,7 @@ run "Push lock"           bash "$HERE/lock.sh"
 run "Terminal"            bash "$HERE/console.sh"
 run "Ports"               bash "$HERE/ports.sh"
 run "Workspaces"          bash "$HERE/workspace.sh"
+run "Net speed (start at sign-in)" bash "$HERE/netspeed.sh"
 if [ -d "$HERE/harness/node_modules/puppeteer-core" ] && [ -n "$JS" ]; then
   # One run each: the log's tail is the summary, its exit code the verdict
   # (running twice for the two doubled the time and the exposure to a flaky Chrome start).

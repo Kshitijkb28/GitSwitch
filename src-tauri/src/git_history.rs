@@ -15,6 +15,21 @@ pub struct RepoRef {
     pub profile_id: String,
     pub profile_name: String,
     pub profile_email: String,
+    /// A repository, or a profile folder that holds none (see `list_repos`).
+    pub kind: RepoKind,
+    /// A folder entry inside a repository: that repository's top folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inside: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoKind {
+    #[default]
+    Repo,
+    /// A profile folder with no repository in it: listed so it doesn't vanish
+    /// from the page, which offers to make it one.
+    Folder,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -394,7 +409,11 @@ pub fn graph_parents(parents: &[String], members: Option<&std::collections::Hash
 // Queries
 // ---------------------------------------------------------------------------
 
-/// Every repo inside the profile folders, so the picker needs no typing.
+/// Every repo inside the profile folders, so the picker needs no typing — and
+/// every profile folder that holds none (a project git doesn't know yet, or a
+/// folder inside a repository), so a folder added to a profile never just
+/// vanishes. Those are `RepoKind::Folder`; whoever needs repositories only
+/// leaves them out.
 pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
     let store = profiles::load_profiles()?;
     let mut out: Vec<RepoRef> = Vec::new();
@@ -403,7 +422,27 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
             if !PathBuf::from(dir).is_dir() {
                 continue;
             }
-            for r in repo_scan::scan_repos(dir.clone()).await.unwrap_or_default() {
+            let found = repo_scan::scan_repos(dir.clone()).await.unwrap_or_default();
+            if found.is_empty() && !out.iter().any(|e| e.path == *dir) {
+                let inside = match repo_scan::folder_state(dir.clone()).await {
+                    Ok(repo_scan::FolderState::NoRepo) => None,
+                    Ok(repo_scan::FolderState::InsideRepo { top }) => Some(top),
+                    // Missing by now, or holding a clone still being written.
+                    _ => continue,
+                };
+                let owner = crate::commit_audit::owning_profile(dir, &store.profiles).unwrap_or(p);
+                out.push(RepoRef {
+                    name: crate::paths::base_name(dir),
+                    path: dir.clone(),
+                    profile_id: owner.id.clone(),
+                    profile_name: owner.name.clone(),
+                    profile_email: owner.git_email.clone(),
+                    kind: RepoKind::Folder,
+                    inside,
+                });
+                continue;
+            }
+            for r in found {
                 if out.iter().any(|e| e.path == r.path) {
                     continue;
                 }
@@ -418,6 +457,8 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
                     profile_id,
                     profile_name,
                     profile_email,
+                    kind: RepoKind::Repo,
+                    inside: None,
                 });
             }
         }

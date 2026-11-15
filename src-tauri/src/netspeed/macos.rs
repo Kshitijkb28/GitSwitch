@@ -158,7 +158,9 @@ pub fn read() -> Vec<Iface> {
             c.ports = Some((Instant::now(), parse_hardware_ports(&run("networksetup", &["-listallhardwareports"]))));
         }
         if c.route.as_ref().is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(10)) {
-            c.route = Some((Instant::now(), parse_route_get(&run("route", &["-n", "get", "default"]))));
+            // The IPv4 default route; on an IPv6-only network, the IPv6 one.
+            let route = parse_route_get(&run("route", &["-n", "get", "default"])).or_else(|| parse_route_get(&run("route", &["-n", "get", "-inet6", "default"])));
+            c.route = Some((Instant::now(), route));
         }
         (c.ports.as_ref().map(|p| p.1.clone()).unwrap_or_default(), c.route.as_ref().and_then(|r| r.1.clone()))
     };
@@ -239,6 +241,8 @@ mod tests {
         assert_eq!(kind_of_port("USB 10/100/1000 LAN"), Kind::Ethernet);
         assert_eq!(parse_route_get("   route to: default\ndestination: default\n  gateway: 192.168.1.1\n  interface: en1\n").as_deref(), Some("en1"));
         assert_eq!(parse_route_get("route: writing to routing socket: not in table"), None);
+        // `route -n get -inet6 default` answers in the same form.
+        assert_eq!(parse_route_get("   route to: ::\ndestination: ::\n       mask: default\n    gateway: fe80::1%en0\n  interface: en0\n      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING>\n").as_deref(), Some("en0"));
         assert_eq!(parse_media_mbps("en7: flags=8863\n\tmedia: autoselect (1000baseT <full-duplex>)\n\tstatus: active"), Some(1000));
         assert_eq!(parse_media_mbps("\tmedia: autoselect (10Gbase-T <full-duplex>)"), Some(10000));
         assert_eq!(parse_media_mbps("\tmedia: autoselect (2500Base-T <full-duplex>)"), Some(2500));

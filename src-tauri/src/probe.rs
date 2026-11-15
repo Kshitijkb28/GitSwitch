@@ -202,6 +202,8 @@ pub(crate) mod tests {
             "gh_auth_login_cancel" => forward!(c::gh_auth_login_cancel, args),
             "apply_git_config" => reply(c::apply_git_config()),
             "history_list_repos" => forward!(c::history_list_repos, args),
+            "folder_state" => forward!(c::folder_state, args, path),
+            "repo_init" => forward!(c::repo_init, args, path),
             "path_exists" => {
                 let path: String = match arg(&args, "path") { Ok(v) => v, Err(e) => return reply_err(e) };
                 reply(Ok::<_, crate::error::AppError>(c::path_exists(path)))
@@ -277,6 +279,34 @@ pub(crate) mod tests {
                 let (rates, _) = crate::netspeed::rates_between(&prev, &b, 1.0);
                 let wifi = crate::netspeed::wifi_for_probe();
                 reply(Ok::<_, crate::error::AppError>(serde_json::json!({ "interfaces": b, "rates": rates, "wifi": wifi })))
+            }
+            // Read only: the speed as the app works it out, once a second for
+            // `seconds` (at most 60), with what moved through the connection in use.
+            "netspeed_watch" => {
+                let secs = arg::<Option<u64>>(&args, "seconds").ok().flatten().unwrap_or(10).clamp(1, 60);
+                reply(Ok::<_, crate::error::AppError>(crate::netspeed::watch_for_probe(secs)))
+            }
+            // The tab's two calls. Saving without the tray menu's tick, which needs the app.
+            "netspeed_snapshot" => {
+                crate::netspeed::load_for_probe();
+                reply(Ok::<_, crate::error::AppError>(crate::netspeed::snapshot()))
+            }
+            "netspeed_set_settings" => match arg::<crate::netspeed::Settings>(&args, "settings") {
+                Ok(s) => {
+                    crate::netspeed::load_for_probe();
+                    reply(Ok::<_, crate::error::AppError>(crate::netspeed::set_settings_core(s)))
+                }
+                Err(e) => reply_err(e),
+            },
+            // What a start at sign-in decides about the window, for these arguments.
+            "netspeed_start_hidden" => {
+                crate::netspeed::load_for_probe();
+                let argv = arg::<Vec<String>>(&args, "argv").unwrap_or_default();
+                let at_login = crate::netspeed::autostart::launched_at_login(&argv);
+                reply(Ok::<_, crate::error::AppError>(serde_json::json!({
+                    "at_login": at_login,
+                    "hidden": crate::netspeed::autostart::start_hidden(at_login, crate::netspeed::keeps_running()),
+                })))
             }
             // Read only: this computer's taskbar, its buttons (UI Automation),
             // the free stretches, and where the speed bar would go.
@@ -488,7 +518,10 @@ pub(crate) mod tests {
                 let url = a.get(1).cloned().unwrap_or_default();
                 let guard = crate::sparse::CloneGuard::hold(std::path::Path::new(&dest), &url);
                 let during = crate::remote_repos::local_clones().await.ok();
-                let picker: Vec<String> = crate::git_history::list_repos().await.map(|v| v.into_iter().map(|r| r.path).collect()).unwrap_or_default();
+                let picker: Vec<String> = crate::git_history::list_repos()
+                    .await
+                    .map(|v| v.into_iter().filter(|r| r.kind == crate::git_history::RepoKind::Repo).map(|r| r.path).collect())
+                    .unwrap_or_default();
                 drop(guard);
                 let after = crate::remote_repos::local_clones().await.ok();
                 emit(&serde_json::json!({ "during": during, "picker": picker, "after": after }));

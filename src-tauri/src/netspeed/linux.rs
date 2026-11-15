@@ -30,6 +30,26 @@ pub(crate) fn parse_default_route(text: &str) -> Option<String> {
         .map(|(name, _)| name)
 }
 
+/// `/proc/net/ipv6_route` → the adapter of the IPv6 default route (`::/0`)
+/// with the lowest metric: what an IPv6-only network goes through. The
+/// kernel's own unreachable default (on `lo`, flagged reject) is not a route out.
+pub(crate) fn parse_default_route6(text: &str) -> Option<String> {
+    const RTF_UP: u32 = 0x0001;
+    const RTF_REJECT: u32 = 0x0200;
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.len() < 10 || f[0].chars().any(|c| c != '0') || f[1] != "00" || f[9] == "lo" {
+                return None;
+            }
+            let flags = u32::from_str_radix(f[8], 16).ok()?;
+            let metric = u32::from_str_radix(f[5], 16).unwrap_or(u32::MAX);
+            (flags & RTF_UP != 0 && flags & RTF_REJECT == 0).then(|| (f[9].to_string(), metric))
+        })
+        .min_by_key(|(_, metric)| *metric)
+        .map(|(name, _)| name)
+}
+
 /// One `nmcli -t` line's fields: `:` separates them, `\:` is a colon inside one.
 fn nmcli_fields(line: &str) -> Vec<String> {
     let mut out = vec![String::new()];
@@ -98,7 +118,11 @@ pub fn read() -> Vec<Iface> {
         return Vec::new();
     }
     let Ok(dev) = std::fs::read_to_string("/proc/net/dev") else { return Vec::new() };
-    let default = std::fs::read_to_string("/proc/net/route").ok().and_then(|t| parse_default_route(&t));
+    // The IPv4 default route; on an IPv6-only network, the IPv6 one.
+    let default = std::fs::read_to_string("/proc/net/route")
+        .ok()
+        .and_then(|t| parse_default_route(&t))
+        .or_else(|| std::fs::read_to_string("/proc/net/ipv6_route").ok().and_then(|t| parse_default_route6(&t)));
     let sys = Path::new("/sys/class/net");
     parse_proc_net_dev(&dev)
         .into_iter()
@@ -154,6 +178,16 @@ mod tests {
         let route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\neth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\nwlp2s0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\nwlp2s0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n";
         assert_eq!(parse_default_route(route).as_deref(), Some("eth0"), "the lowest metric");
         assert_eq!(parse_default_route("Iface\tDestination\n"), None);
+        // An IPv6-only network: the kernel's table, with its unreachable default on lo.
+        let route6 = "fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 wlp2s0\n\
+                      00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000258 00000002 00000000 00450003 enp3s0\n\
+                      00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000064 00000003 00000000 00450003 wlp2s0\n\
+                      00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo\n";
+        assert_eq!(parse_default_route6(route6).as_deref(), Some("wlp2s0"), "the lowest metric (0x64 < 0x258)");
+        let only_unreachable = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo\n";
+        assert_eq!(parse_default_route6(only_unreachable), None, "no way out");
+        let rejected = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 00000400 00000001 00000000 00000201 eth0\n";
+        assert_eq!(parse_default_route6(rejected), None, "a reject route goes nowhere");
         let nm = "no:Neighbour:30:54 Mbit/s:wlp2s0\nyes:Home\\:5G:72:540 Mbit/s:wlp2s0\n";
         let (w, dev) = parse_nmcli_wifi(nm).unwrap();
         assert_eq!((w.ssid.as_deref(), w.signal, w.rx_mbps, dev.as_str()), (Some("Home:5G"), Some(72), Some(540.0), "wlp2s0"));

@@ -103,9 +103,14 @@ pub fn run() {
     let builder = tauri::Builder::default();
     // First of all: a second launch — a gitswitch:// link opened while the
     // app runs — hands its link over (the deep-link plugin routes it) and
-    // brings this window forward instead of starting another app.
+    // brings this window forward instead of starting another app. A start at
+    // sign-in finding GitSwitch already running changes nothing.
     #[cfg(desktop)]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| tray::show_main(app)));
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        if !netspeed::autostart::launched_at_login(&argv) {
+            tray::show_main(app)
+        }
+    }));
     builder
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
@@ -244,6 +249,8 @@ pub fn run() {
             commands::clone_progress,
             commands::clone_size_estimate,
             commands::history_list_repos,
+            commands::folder_state,
+            commands::repo_init,
             commands::history_branches,
             commands::history_page,
             commands::history_commit_detail,
@@ -326,6 +333,13 @@ pub fn run() {
         .setup(|app| {
             tray::setup_tray(app.handle())?;
             netspeed::start(app.handle());
+            // The window is made hidden (tauri.conf.json) and shown here, unless
+            // GitSwitch was started at sign-in to show the net speed: then it
+            // stays in the tray until asked for.
+            let at_login = netspeed::autostart::launched_at_login(&std::env::args().collect::<Vec<_>>());
+            if !netspeed::autostart::start_hidden(at_login, netspeed::keeps_running()) {
+                tray::show_main(app.handle());
+            }
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 let handle = app.handle().clone();

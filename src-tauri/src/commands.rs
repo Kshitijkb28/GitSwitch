@@ -772,6 +772,19 @@ pub async fn history_list_repos() -> Result<Vec<RepoRef>, AppError> {
     git_history::list_repos().await
 }
 
+/// What a folder is to git: a repository, a folder of them, one inside a
+/// repository, or a project git doesn't know yet. Read only.
+#[tauri::command]
+pub async fn folder_state(path: String) -> Result<crate::repo_scan::FolderState, AppError> {
+    crate::repo_scan::folder_state(path).await
+}
+
+/// Make a folder that holds no repository one (`git init`).
+#[tauri::command]
+pub async fn repo_init(path: String) -> Result<crate::git_ops::InitOutcome, AppError> {
+    crate::git_ops::init_repo(&path).await
+}
+
 #[tauri::command]
 pub async fn history_branches(repo_path: String) -> Result<Vec<BranchInfo>, AppError> {
     tokio::task::spawn_blocking(move || git_history::list_branches(&repo_path))

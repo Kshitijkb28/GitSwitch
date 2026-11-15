@@ -1,0 +1,42 @@
+# GitSwitch's verification suites on Linux, the way CI's Ubuntu runner has
+# them (Ubuntu 22.04: git 2.34, the oldest git GitSwitch supports), on any
+# Docker host. scripts/docker/verify.sh builds it from a copy of the tree as
+# it is (never a mount: a Linux build must not overwrite the host's
+# src-tauri/target) and runs one suite, or all of them, in it.
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential pkg-config file curl wget ca-certificates \
+      git git-lfs openssh-client python3 \
+      libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libssl-dev patchelf \
+      desktop-file-utils xvfb xdotool dbus dbus-x11 procps lsof iproute2 psmisc fonts-dejavu-core \
+ && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get install -y nodejs && rm -rf /var/lib/apt/lists/*
+# Chrome, for the headless browser suites (the harness looks for /usr/bin/google-chrome).
+RUN wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+ && apt-get update && apt-get install -y /tmp/chrome.deb && rm -rf /var/lib/apt/lists/* /tmp/chrome.deb
+
+# The suites run as a person, as on CI's runner, not as root: root can write
+# into a read-only folder, and some checks rely on that being refused.
+RUN useradd -m -s /bin/bash tester
+USER tester
+ENV CARGO_HOME=/home/tester/.cargo RUSTUP_HOME=/home/tester/.rustup PATH=/home/tester/.cargo/bin:$PATH SHELL=/bin/bash
+# The Rust GitSwitch is built with (rust-toolchain.toml says the same): Rust
+# 1.100 moved build scripts' output, which tauri-build 2.6 cannot follow.
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1 --component clippy
+
+WORKDIR /home/tester/src
+COPY --chown=tester:tester package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY --chown=tester:tester vscode-extension/package.json vscode-extension/package-lock.json vscode-extension/
+RUN cd vscode-extension && npm ci --no-audit --no-fund
+COPY --chown=tester:tester scripts/verify/harness/package.json scripts/verify/harness/
+RUN cd scripts/verify/harness && npm install --no-audit --no-fund
+COPY --chown=tester:tester . .
+# Built once, here: the sidecars, the frontend, and every test binary (the
+# crates fetched now, so the live harness can build offline later).
+RUN bash scripts/build-lock-helper.sh debug && npm run build && cd src-tauri && cargo test --workspace --no-run -q
+# WebKitGTK in a container without a GPU.
+ENV WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 NO_AT_BRIDGE=1
+CMD ["bash", "scripts/verify/all.sh"]

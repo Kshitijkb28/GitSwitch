@@ -71,7 +71,7 @@ mod sys {
     use super::*;
     use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetBestInterfaceEx, GetIfTable2, MIB_IF_TABLE2};
     use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR, SOCKADDR_IN};
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6};
 
     /// NdisPhysicalMediumBluetooth.
     const MEDIUM_BLUETOOTH: i32 = 10;
@@ -81,15 +81,23 @@ mod sys {
         String::from_utf16_lossy(&buf[..n]).trim().to_string()
     }
 
-    /// The adapter Windows would send internet traffic through now.
+    /// The adapter Windows would send internet traffic through now: the route
+    /// to 1.1.1.1, or on an IPv6-only network the one to 2606:4700:4700::1111.
+    /// A route lookup only; nothing is sent.
     fn best_interface() -> Option<u32> {
-        // SAFETY: a zeroed SOCKADDR_IN filled for 1.1.1.1; the out-pointer is valid.
+        let mut index = 0u32;
+        // SAFETY: zeroed socket addresses filled for the two addresses; the out-pointer is valid.
         unsafe {
             let mut addr: SOCKADDR_IN = std::mem::zeroed();
             addr.sin_family = AF_INET;
             addr.sin_addr.S_un.S_addr = u32::from_ne_bytes([1, 1, 1, 1]);
-            let mut index = 0u32;
-            (GetBestInterfaceEx(&addr as *const SOCKADDR_IN as *const SOCKADDR, &mut index) == 0).then_some(index)
+            if GetBestInterfaceEx(&addr as *const SOCKADDR_IN as *const SOCKADDR, &mut index) == 0 {
+                return Some(index);
+            }
+            let mut addr6: SOCKADDR_IN6 = std::mem::zeroed();
+            addr6.sin6_family = AF_INET6;
+            addr6.sin6_addr.u.Byte = [0x26, 0x06, 0x47, 0x00, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11];
+            (GetBestInterfaceEx(&addr6 as *const SOCKADDR_IN6 as *const SOCKADDR, &mut index) == 0).then_some(index)
         }
     }
 

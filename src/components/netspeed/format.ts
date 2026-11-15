@@ -12,7 +12,8 @@ export function speed(bytesPerS: number, bits: boolean): string {
     v /= 1000;
     i++;
   }
-  return `${v < 100 ? v.toFixed(1) : v.toFixed(0)} ${units[i]}`;
+  // Decided on the value as it will print: 99.96 is "100", not "100.0".
+  return `${Math.round(v * 10) / 10 < 100 ? v.toFixed(1) : v.toFixed(0)} ${units[i]}`;
 }
 
 /** Bytes as an amount: "1.24 GB", "340 MB". */

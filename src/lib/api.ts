@@ -328,6 +328,24 @@ export interface RepoRef {
   profile_id: string;
   profile_name: string;
   profile_email: string;
+  /** A repository, or a profile folder that holds none (listed so it doesn't vanish). */
+  kind?: "repo" | "folder";
+  /** A folder entry inside a repository: that repository's top folder. */
+  inside?: string | null;
+}
+
+/** What a folder is to git. */
+export type FolderState =
+  | { kind: "missing" }
+  | { kind: "repo" }
+  | { kind: "inside-repo"; top: string }
+  | { kind: "contains-repos"; count: number }
+  | { kind: "no-repo" };
+
+/** What making a folder a repository made. */
+export interface InitOutcome {
+  path: string;
+  branch: string;
 }
 
 export interface BranchInfo {
@@ -505,6 +523,16 @@ export interface MergedBy {
 
 export async function historyListRepos(): Promise<RepoRef[]> {
   return invoke("history_list_repos");
+}
+
+/** What a folder is to git. Read only. */
+export async function folderState(path: string): Promise<FolderState> {
+  return invoke("folder_state", { path });
+}
+
+/** Make a folder that holds no repository one (`git init`). */
+export async function repoInit(path: string): Promise<InitOutcome> {
+  return invoke("repo_init", { path });
 }
 
 export async function historyBranches(repoPath: string): Promise<BranchInfo[]> {
@@ -2709,6 +2737,8 @@ export interface UninstallPlan {
   lock_helper: boolean;
   locks: string[];
   signins: string[];
+  /** GitSwitch starts when the person signs in (the Net speed tab's choice). */
+  startup: boolean;
   data: string[];
 }
 
@@ -2874,6 +2904,19 @@ export interface NetSettings {
   interval_ms: number;
   /** "auto", "all" or an adapter's id. */
   source: string;
+  /** Start GitSwitch at sign-in, without a window, to show the speed (only while it is shown). */
+  start_at_login: boolean;
+}
+
+/** Starting at sign-in: the choice, and what the system has. */
+export interface NetStartup {
+  on: boolean;
+  /** The system's entry is there and starts this GitSwitch. */
+  active: boolean;
+  /** The system has it turned off (Windows' Startup apps). */
+  blocked: string | null;
+  /** Writing or removing the entry failed. */
+  error: string | null;
 }
 
 export interface NetSnapshot {
@@ -2888,6 +2931,7 @@ export interface NetSnapshot {
   interfaces: NetIface[];
   usage: { today: [number, number]; month: [number, number]; session: [number, number]; since: number };
   settings: NetSettings;
+  startup: NetStartup;
 }
 
 export interface NetBar {
@@ -2927,8 +2971,8 @@ export async function netspeedBarReset(): Promise<void> {
   return invoke("netspeed_bar_reset");
 }
 
-/** The system's settings page: the taskbar's icons (Windows) or location access. */
-export async function netspeedOpenSettings(which: "taskbar" | "location"): Promise<void> {
+/** The system's settings page: the taskbar's icons (Windows), location access, or the apps that start at sign-in. */
+export async function netspeedOpenSettings(which: "taskbar" | "location" | "startupapps" | "loginitems"): Promise<void> {
   return invoke("netspeed_open_settings", { which });
 }
 

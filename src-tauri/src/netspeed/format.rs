@@ -16,7 +16,8 @@ pub fn full(bytes_per_s: f64, bits: bool) -> String {
         v /= 1000.0;
         i += 1;
     }
-    let text = if v < 100.0 { format!("{:.1}", v) } else { format!("{:.0}", v) };
+    // Decided on the value as it will print: 99.96 is "100", not "100.0".
+    let text = if (v * 10.0).round() / 10.0 < 100.0 { format!("{:.1}", v) } else { format!("{:.0}", v) };
     format!("{} {}", text, units[i])
 }
 
@@ -72,6 +73,9 @@ mod tests {
         assert_eq!(full(12_400_000.0, false), "12.4 MB/s");
         assert_eq!(full(340_000.0, false), "340 KB/s");
         assert_eq!(full(999_960.0, false), "1.0 MB/s", "rounds up into the next unit");
+        assert_eq!(full(99_960.0, false), "100 KB/s", "not 100.0");
+        assert_eq!(full(99_940.0, false), "99.9 KB/s");
+        assert_eq!(full(12_499_000.0, true), "100 Mbps", "bits too");
         assert_eq!(full(12_400_000.0, true), "99.2 Mbps");
         assert_eq!(full(2_500_000_000.0, true), "20.0 Gbps");
         assert_eq!(full(f64::NAN, false), "0.0 KB/s");

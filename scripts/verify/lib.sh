@@ -46,6 +46,19 @@ verify_init() {
   # any config, so none is passed on (a check that wants one sets it itself).
   export GH_CONFIG_DIR="$HOME/.config/gh"
   unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+  # The XDG config folder inside the sandbox too: git reads
+  # $XDG_CONFIG_HOME/git/config, and Linux keeps start-up entries under it.
+  export XDG_CONFIG_HOME="$HOME/.config"
+  # Starting at sign-in (the Net speed tab): a suite's entry goes to a test
+  # key (Windows) or a folder in the sandbox, never the real one. The debug
+  # build honours these; a test build without them has nowhere to write.
+  if command -v cygpath >/dev/null 2>&1; then
+    export GITSWITCH_AUTOSTART_KEY="Software\\GitSwitchVerify\\$suite"
+  elif [ "$(uname -s)" = Darwin ]; then
+    export GITSWITCH_AUTOSTART_DIR="$HOME/Library/LaunchAgents"
+  else
+    export GITSWITCH_AUTOSTART_DIR="$HOME/.config/autostart"
+  fi
   # Windows: the app finds its data folder and ~/.ssh through the system, not
   # HOME, so without these a suite's profiles land in the real store (they
   # once showed up as "Ports" and "Workspaces" in the installed app).

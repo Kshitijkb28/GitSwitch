@@ -3110,16 +3110,58 @@ fn unmatched<'a>(originals: &'a [Replayed], copies: &mut Copies, certain: &dyn F
 
 /// Would replaying this commit onto HEAD change nothing — is everything it
 /// did already there? Asked of git itself: a merge of the commit onto HEAD
-/// with its parent as the base, compared with HEAD's own tree. A conflict, a
-/// root commit, or a git too old to answer (before 2.40) all mean "cannot
-/// say", which is no.
+/// with its parent as the base, compared with HEAD's own tree. A conflict or
+/// a root commit means "cannot say", which is no. A git too old for that
+/// merge (before 2.40) is asked the other way round (`already_in_head`).
 async fn adds_nothing(repo: &Path, commit: &str) -> bool {
     let Ok(out) = g(repo).args(["merge-tree", "--write-tree", &format!("--merge-base={}^", commit), "HEAD", commit]).run().await else { return false };
+    // Before 2.40 git doesn't know `--merge-base` (before 2.38, `--write-tree`
+    // either) and answers with its usage, exit code 129.
+    if out.code == 129 {
+        return already_in_head(repo, commit).await;
+    }
     if !out.ok() {
         return false;
     }
     let tree = out.text().lines().next().unwrap_or("").trim().to_string();
     !tree.is_empty() && oid(repo, "HEAD^{tree}").await.as_deref() == Some(tree.as_str())
+}
+
+/// For a git too old for `merge-tree --merge-base` (Ubuntu 22.04 ships
+/// 2.34): does the commit's own change come back out of HEAD cleanly? If
+/// git can take every hunk of it back out, HEAD already holds everything it
+/// did. Checked in a throwaway index, never the work tree. A root commit, a
+/// commit that changed nothing, or anything git can't apply means "cannot
+/// say", which is no.
+async fn already_in_head(repo: &Path, commit: &str) -> bool {
+    // A plain patch whatever the person's diff settings: prefixes, colour,
+    // external tools and renames all as `git apply` reads them.
+    let Ok(patch) = g(repo)
+        .args(["diff", "--binary", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", &format!("{}^", commit), commit])
+        .run()
+        .await
+    else {
+        return false;
+    };
+    if !patch.ok() || patch.stdout.is_empty() {
+        return false;
+    }
+    let Some(index) = g(repo).args(["rev-parse", "--path-format=absolute", "--git-path", &format!("gitswitch-check-{}.index", std::process::id())]).ok_text().await else {
+        return false;
+    };
+    let with_index = |cmd: GitCmd| cmd.cfg("core.splitIndex", "false").env("GIT_INDEX_FILE", index.clone());
+    let read = with_index(g(repo)).args(["read-tree", "HEAD"]).run().await;
+    let answer = match read {
+        Ok(r) if r.ok() => with_index(g(repo))
+            .args(["apply", "--cached", "-R", "--check", "--whitespace=nowarn", "-"])
+            .stdin_bytes(patch.stdout)
+            .run()
+            .await
+            .is_ok_and(|o| o.ok()),
+        _ => false,
+    };
+    let _ = std::fs::remove_file(&index);
+    answer
 }
 
 /// Which of the commits the plan listed are no longer on top by subject, each

@@ -2841,9 +2841,110 @@ pub async fn continue_op(repo_path: &str, allow_markers: bool) -> Result<OpResul
     Ok(OpResult::done(headline, detail, after))
 }
 
+// ---------------------------------------------------------------------------
+// Making a folder a repository
+// ---------------------------------------------------------------------------
+
+/// What `init_repo` made.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+pub struct InitOutcome {
+    pub path: String,
+    /// The first branch, as git now names it.
+    pub branch: String,
+}
+
+/// Make a folder a git repository (`git init`), but only a folder that is on
+/// this computer, holds no repository and is inside none; otherwise nothing
+/// is written and the reason is given. The first branch is the person's
+/// `init.defaultBranch`, or `main`. No identity is written: a profile whose
+/// folder this is applies through its `includeIf "gitdir:"` rule the moment
+/// `.git` exists.
+pub async fn init_repo(path: &str) -> Result<InitOutcome, AppError> {
+    use crate::repo_scan::FolderState;
+    match crate::repo_scan::folder_state(path.to_string()).await? {
+        FolderState::NoRepo => {}
+        FolderState::Missing => return Err(AppError::NotFound(format!("{} is not on this computer.", path))),
+        FolderState::Repo => return Err(AppError::Config(format!("{} is already a git repository.", path))),
+        FolderState::InsideRepo { top } => {
+            return Err(AppError::Config(format!("{} is inside the repository {}, so it can't be a repository of its own.", path, top)));
+        }
+        FolderState::ContainsRepos { count } => {
+            let (n, it) = if count == 1 { ("1 repository".to_string(), "it") } else { (format!("{} repositories", count), "them") };
+            return Err(AppError::Config(format!("{} already holds {}; making the folder around {} a repository would nest {} inside another.", path, n, it, it)));
+        }
+    }
+    let configured = GitCmd::at(path).args(["config", "--get", "init.defaultBranch"]).ok_text().await.filter(|b| !b.trim().is_empty());
+    let mut args = vec!["init", "--quiet"];
+    if configured.is_none() {
+        args.extend(["--initial-branch", "main"]);
+    }
+    let out = GitCmd::at(path).args(args).timeout(LOCAL_TIMEOUT).run().await?;
+    if !out.ok() {
+        return Err(AppError::Command(format!("git init failed: {}", out.stderr.trim())));
+    }
+    // Measured, not assumed.
+    if !std::path::Path::new(path).join(".git").exists() || GitCmd::at(path).args(["rev-parse", "--git-dir"]).ok_text().await.is_none() {
+        return Err(AppError::Command(format!("git init said it was done, but {} is still not a repository.", path)));
+    }
+    let branch = GitCmd::at(path)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .ok_text()
+        .await
+        .unwrap_or_else(|| configured.unwrap_or_else(|| "main".into()));
+    Ok(InitOutcome { path: path.to_string(), branch })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A throwaway folder with a project in it, no git anywhere above it.
+    fn project(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("gitswitch-init-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app").join("src")).unwrap();
+        std::fs::write(dir.join("README.md"), "a project\n").unwrap();
+        dir
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = crate::spawn::command("git").arg("-C").arg(dir).args(args).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_folder_with_no_repository_becomes_one_and_nothing_else_does() {
+        // Only where git finds no repository above the temporary folder.
+        if crate::repo_scan::enclosing_repo(&std::env::temp_dir()).is_some() {
+            return;
+        }
+        let dir = project("make");
+        let path = dir.to_string_lossy().to_string();
+        let made = init_repo(&path).await.unwrap();
+        assert!(dir.join(".git").is_dir());
+        assert!(!made.branch.is_empty());
+        assert_eq!(git(&dir, &["symbolic-ref", "--short", "HEAD"]), made.branch);
+        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "a project\n", "the files stay as they were");
+
+        let again = init_repo(&path).await.unwrap_err().to_string();
+        assert!(again.contains("already a git repository"), "{again}");
+        let inner = dir.join("app").join("src").to_string_lossy().to_string();
+        let inside = init_repo(&inner).await.unwrap_err().to_string();
+        assert!(inside.contains("inside the repository"), "{inside}");
+        assert!(!dir.join("app").join("src").join(".git").exists(), "nothing written");
+        let gone = init_repo(&dir.join("nope").to_string_lossy()).await.unwrap_err().to_string();
+        assert!(gone.contains("not on this computer"), "{gone}");
+
+        let parent = project("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        git(&child, &["init", "--quiet"]);
+        let around = init_repo(&parent.to_string_lossy()).await.unwrap_err().to_string();
+        assert!(around.contains("already holds 1 repository"), "{around}");
+        assert!(!parent.join(".git").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
 
     fn clean() -> StatusFacts {
         StatusFacts {

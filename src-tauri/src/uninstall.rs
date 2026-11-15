@@ -51,6 +51,8 @@ pub struct UninstallPlan {
     pub locks: Vec<String>,
     /// Logins whose tokens are in the system's credential store.
     pub signins: Vec<String>,
+    /// GitSwitch starts when the person signs in (the Net speed tab's choice).
+    pub startup: bool,
     /// GitSwitch's own folders that exist: profiles, logs, update backups, the web view's data.
     pub data: Vec<String>,
 }
@@ -231,7 +233,8 @@ async fn holds_pieces(dir: &Path) -> bool {
 /// The repositories the Repository page lists, and their populated submodules.
 async fn repos_and_submodules() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for r in crate::git_history::list_repos().await.unwrap_or_default() {
+    // Repositories only: a profile folder that holds none has nothing of GitSwitch's in it.
+    for r in crate::git_history::list_repos().await.unwrap_or_default().into_iter().filter(|r| r.kind == crate::git_history::RepoKind::Repo) {
         let repo = PathBuf::from(&r.path);
         for rel in crate::push_guard::populated_submodules(&repo).await {
             out.push(repo.join(rel));
@@ -260,6 +263,7 @@ pub async fn plan() -> UninstallPlan {
         lock_helper: locks.installed,
         locks: locks.locks.iter().map(|l| l.repo.clone()).collect(),
         signins: crate::credentials::kept_signins().into_iter().map(|s| s.login).collect(),
+        startup: crate::netspeed::autostart::present(),
         data: data_folders().into_iter().filter(|p| p.exists()).map(|p| p.to_string_lossy().to_string()).collect(),
     }
 }
@@ -325,6 +329,12 @@ pub async fn prepare(keep_data: bool) -> PrepareReport {
         Ok(true) => done.push("Removed GitSwitch's entries from ~/.ssh/allowed_signers".into()),
         Ok(false) => {}
         Err(e) => problems.push(format!("~/.ssh/allowed_signers: {}", e)),
+    }
+    // Starting at sign-in: the entry would start a program that is gone.
+    match crate::netspeed::autostart::take_back() {
+        Ok(true) => done.push("Removed GitSwitch from the apps that start when you sign in".into()),
+        Ok(false) => {}
+        Err(e) => problems.push(format!("Starting at sign-in: {}", e)),
     }
     if !keep_data {
         let signins = crate::credentials::kept_signins();
