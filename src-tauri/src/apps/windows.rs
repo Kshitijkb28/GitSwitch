@@ -208,6 +208,50 @@ fn lower(p: &Path) -> String {
     p.to_string_lossy().to_lowercase().replace('/', "\\").trim_end_matches('\\').to_string()
 }
 
+/// A path the administrator's run may act on is written plainly: a drive,
+/// its root, then names, each meaning what it says. Refused: `..` and `.`,
+/// device and verbatim prefixes (`\\?\`, `\\.\`, `\??\`) and network paths,
+/// drive-relative and relative paths, an empty name (a doubled or trailing
+/// separator), a name ending in a dot or a space (Windows drops those, so
+/// `X.` opens `X`), `:` inside a name (a data stream), and `* ? " < > |` or
+/// control characters. Pure (and not `Path::components`, which drops `.` in
+/// the middle on Windows), so it is tested on every platform.
+pub(crate) fn plain_windows_path(s: &str) -> Result<(), String> {
+    let odd = |what: &str| Err(format!("It is not where it says ({} on the way).", what));
+    if s.starts_with(r"\\") || s.starts_with("//") || s.starts_with(r"\??\") {
+        return odd("a device or network path");
+    }
+    let b = s.as_bytes();
+    if b.len() < 4 || !b[0].is_ascii_alphabetic() || b[1] != b':' || !(b[2] == b'\\' || b[2] == b'/') {
+        return odd("a path that doesn't start at a drive's root");
+    }
+    for name in s[3..].split(['\\', '/']) {
+        if name.is_empty() {
+            return odd("an empty name");
+        }
+        if name == "." || name == ".." {
+            return odd("a . or ..");
+        }
+        if name.ends_with('.') || name.ends_with(' ') {
+            return odd("a name ending in a dot or a space");
+        }
+        if name.chars().any(|c| matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()) {
+            return odd("a character Windows reads differently");
+        }
+    }
+    Ok(())
+}
+
+/// Windows' own folder as Windows says it (`GetSystemWindowsDirectoryW`), not
+/// the SystemRoot variable, which a process can be started with any value of.
+fn windows_dir() -> String {
+    #[cfg(windows)]
+    if let Some(d) = sys::windows_dir() {
+        return d.to_lowercase().replace('/', "\\").trim_end_matches('\\').to_string();
+    }
+    std::env::var("SystemRoot").map(|s| s.to_lowercase()).unwrap_or_else(|_| r"c:\windows".into())
+}
+
 /// An install folder that may be offered: two levels below its drive or
 /// more, not one of Windows' own folders or a parent of one.
 pub fn safe_install_dir(dir: &Path) -> bool {
@@ -488,15 +532,19 @@ pub(crate) fn force_items(s: &Session) -> Result<Vec<(JobItem, bool)>, String> {
     Ok(items)
 }
 
-/// What the administrator's cleanup may touch: inside Program Files,
-/// ProgramData, the shared Desktop, the person's app-data folders, or a
-/// program's own folder elsewhere — never Windows itself, a folder Windows
-/// uses, or one of the folders shared by many programs.
+/// What the administrator's cleanup may touch: a plainly written path inside
+/// Program Files, ProgramData, the shared Desktop or the person's app-data
+/// folders — never Windows itself, a folder Windows uses, or one of the
+/// folders shared by many programs. A program's folder anywhere else (D:\Games\X)
+/// is left to the person's own run, which acts with their own rights.
 pub(crate) fn elevated_path_ok(path: &Path) -> Result<(), String> {
+    plain_windows_path(&path.to_string_lossy())?;
     let p = lower(path);
-    let system_root = std::env::var("SystemRoot").map(|s| s.to_lowercase()).unwrap_or_else(|_| r"c:\windows".into());
-    if p == system_root || p.starts_with(&format!("{}\\", system_root)) {
-        return Err("It is inside Windows' own folder.".into());
+    let from_env = std::env::var("SystemRoot").map(|s| s.to_lowercase()).unwrap_or_else(|_| r"c:\windows".into());
+    for system_root in [windows_dir(), from_env] {
+        if p == system_root || p.starts_with(&format!("{}\\", system_root)) {
+            return Err("It is inside Windows' own folder.".into());
+        }
     }
     if known_folders().iter().map(|k| lower(k)).any(|k| k == p || k.starts_with(&format!("{}\\", p))) {
         return Err("It is a folder Windows itself uses.".into());
@@ -507,9 +555,7 @@ pub(crate) fn elevated_path_ok(path: &Path) -> Result<(), String> {
     let parts: Vec<&str> = p.split('\\').filter(|x| !x.is_empty()).collect();
     // The shared Desktop's shortcuts.
     let public_shortcut = parts.len() == 5 && parts[1] == "users" && parts[2] == "public" && parts[3] == "desktop" && parts[4].ends_with(".lnk");
-    // A program's own folder on another drive or outside the profiles (D:\Games\X).
-    let elsewhere = parts.get(1).is_some_and(|s| *s != "users") && safe_install_dir(path);
-    if in_install_root(path) || public_shortcut || elsewhere {
+    if in_install_root(path) || public_shortcut {
         Ok(())
     } else {
         Err("It is not in a place programs are installed in.".into())
@@ -1362,6 +1408,33 @@ pub fn recycle_refusal(path: &Path) -> Option<String> {
     sys::recycle_refusal(path)
 }
 
+/// The folders above an item, held open by the administrator's run until it
+/// has moved the item (see `pin_for_elevated`); closed when dropped.
+#[cfg(windows)]
+pub(crate) struct Pinned {
+    handles: Vec<windows_sys::Win32::Foundation::HANDLE>,
+    /// The item's folder as Windows opened it: normalized, long names.
+    pub final_parent: PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        for h in self.handles.drain(..) {
+            sys::close_handle(h);
+        }
+    }
+}
+
+/// Hold every folder from the drive's root down to `path`'s folder still for
+/// the administrator's run: open without share-delete (so none of them can be
+/// renamed or replaced while it works), none a link, junction or mount point,
+/// and the folder Windows opens the one the path names.
+#[cfg(windows)]
+pub(crate) fn pin_for_elevated(path: &Path) -> Result<Pinned, String> {
+    sys::pin_for_elevated(path)
+}
+
 #[cfg(windows)]
 mod sys {
     use super::*;
@@ -1464,6 +1537,87 @@ $j = ConvertTo-Json -InputObject $out -Compress
             return None;
         }
         run_ps(SIGNER, &[("GS_FILE", &file.to_string_lossy())]).ok().filter(|s| !s.is_empty())
+    }
+
+    pub fn windows_dir() -> Option<String> {
+        use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+        let mut buf = vec![0u16; 512];
+        // SAFETY: the buffer is valid for its length.
+        let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        (n > 0 && n < buf.len()).then(|| String::from_utf16_lossy(&buf[..n]))
+    }
+
+    pub fn close_handle(h: windows_sys::Win32::Foundation::HANDLE) {
+        // SAFETY: a handle `pin_for_elevated` opened, closed once (Pinned's drop).
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(h);
+        }
+    }
+
+    pub fn pin_for_elevated(path: &Path) -> Result<super::Pinned, String> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+            FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS,
+        };
+        let text = path.to_string_lossy().replace('/', "\\");
+        super::plain_windows_path(&text)?;
+        let parent = match text.rfind('\\') {
+            Some(i) if i >= 2 => text[..i].to_string(),
+            _ => return Err("It has no folder above it.".into()),
+        };
+        let mut pinned = super::Pinned { handles: Vec::new(), final_parent: PathBuf::new() };
+        let mut at = String::new();
+        for (i, name) in parent.split('\\').enumerate() {
+            if i == 0 {
+                at = format!("{}\\", name);
+            } else {
+                if !at.ends_with('\\') {
+                    at.push('\\');
+                }
+                at.push_str(name);
+            }
+            let w = wide(OsStr::new(&at));
+            // Listing access makes the share mode count: a handle that only
+            // reads attributes takes no part in sharing, and then anyone could
+            // still rename the folder. Without FILE_SHARE_DELETE, nobody may
+            // rename or delete it while this handle is open.
+            // SAFETY: a valid wide path; the handle goes into `pinned`, which closes it.
+            let h = unsafe {
+                CreateFileW(w.as_ptr(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut())
+            };
+            if h == INVALID_HANDLE_VALUE {
+                return Err("A folder on the way to it couldn't be held still (something has it open to move it); try again.".into());
+            }
+            pinned.handles.push(h);
+            // SAFETY: zeroed is a valid BY_HANDLE_FILE_INFORMATION; a valid handle.
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { GetFileInformationByHandle(h, &mut info) } == 0 {
+                return Err("A folder on the way to it couldn't be read.".into());
+            }
+            if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err("A folder on the way to it is a link, a junction or a mount point, which the administrator's run never follows.".into());
+            }
+        }
+        let last = *pinned.handles.last().ok_or("It has no folder above it.")?;
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: a valid handle; the buffer is valid for its length.
+        let n = unsafe { GetFinalPathNameByHandleW(last, buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) } as usize;
+        if n == 0 || n >= buf.len() {
+            return Err("The folder above it couldn't be read.".into());
+        }
+        let opened = String::from_utf16_lossy(&buf[..n]);
+        if opened.starts_with(r"\\?\UNC\") {
+            return Err("It is on a network share.".into());
+        }
+        let opened = opened.trim_start_matches(r"\\?\").trim_end_matches('\\').to_string();
+        // Against the long form, so an 8.3 temp path (C:\Users\RUNNER~1\...) still matches.
+        let named = if parent.len() == 2 { parent.clone() } else { long_path(Path::new(&parent)).to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_string() };
+        if opened.to_lowercase() != named.to_lowercase() {
+            return Err("It is not where it says: the folder above it opens as somewhere else.".into());
+        }
+        pinned.final_parent = PathBuf::from(opened);
+        Ok(pinned)
     }
 
     pub fn long_path(p: &Path) -> PathBuf {
@@ -2279,6 +2433,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_a_plainly_written_path_reaches_the_administrators_run() {
+        for bad in [
+            r"C:\Program Files\..\Windows\System32",
+            r"C:\ProgramData\X\..",
+            r"C:\Program Files\.\X",
+            r"C:\Program Files\X.",
+            "C:\\Program Files\\X ",
+            r"\\?\C:\X\Y",
+            r"\\.\C:\X",
+            r"\??\C:\X",
+            r"\\srv\share\x\y",
+            r"C:\X\Y:s",
+            r"C:X\Y",
+            r"C:\X\\Y",
+            r"C:\X\Y\",
+            r"X\Y",
+            r"C:\",
+            r"C:\X\a*b",
+        ] {
+            assert!(plain_windows_path(bad).is_err(), "{bad}");
+        }
+        for good in [r"C:\Program Files\7-Zip", "C:/Program Files/X", r"D:\Program Files\Acme Studio", r"C:\Users\RUNNER~1\AppData\Local\Temp\x"] {
+            assert!(plain_windows_path(good).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
     fn product_codes_come_from_the_entry_never_from_an_install_command() {
         let g = "{23170F69-40C1-2702-2301-000001000000}";
         let e = RegEntry { key: g.into(), windows_installer: true, uninstall: Some(format!("MsiExec.exe /I{}", g)), ..Default::default() };
@@ -2515,7 +2696,13 @@ mod tests {
         for bad in [r"C:\", r"C:\Program Files", r"C:\Windows\System32\drivers", r"C:\Program Files\Common Files", r"C:\Program Files\Microsoft Office", r"C:\Program Files\WindowsApps"] {
             assert!(elevated_path_ok(Path::new(bad)).is_err(), "{bad}");
         }
-        assert!(elevated_path_ok(Path::new(r"D:\Games\Some Game")).is_ok(), "a program's own folder on another drive");
+        // A program's folder outside the install places is the person's own
+        // run's, never the administrator's (step 7a, owner decision 1).
+        assert!(elevated_path_ok(Path::new(r"D:\Games\Some Game")).is_err(), "a folder outside the install places");
+        // The audit's proof steps: each passed on the text before.
+        for bad in ["C:/Program Files/../Windows/System32", "C:/ProgramData/X/..", r"C:\Program Files\X\..\..\Windows\System32\drivers\etc"] {
+            assert!(elevated_path_ok(Path::new(bad)).is_err(), "{bad}");
+        }
         for bad in [r"C:\Users\me\Documents\Taxes", r"C:\Users\other\AppData", r"C:\Users\Public\Desktop\Notes.txt", r"C:\Users\me\Desktop\Projects"] {
             assert!(elevated_path_ok(Path::new(bad)).is_err(), "{bad}: a person's own files");
         }

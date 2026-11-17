@@ -1238,6 +1238,17 @@ fn result_path_of(job: &Path) -> PathBuf {
 /// the administrator's run, which refuses anything outside the places
 /// programs live in.
 fn trash_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: bool) -> (&'static str, String) {
+    // The administrator's run decides on the folder Windows opens: held still
+    // from here until the move is over.
+    #[cfg(windows)]
+    let pinned = if elevated {
+        match pin_elevated(path, root) {
+            Ok(p) => Some(p),
+            Err(why) => return ("refused", format!("{} It was kept.", why)),
+        }
+    } else {
+        None
+    };
     if std::fs::symlink_metadata(path).is_err() {
         return ("gone", "Already gone.".into());
     }
@@ -1250,8 +1261,8 @@ fn trash_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: bool)
     }
     #[cfg(windows)]
     {
-        if elevated {
-            if let Err(why) = windows::elevated_path_ok(path) {
+        if let Some(p) = &pinned {
+            if let Err(why) = windows::elevated_path_ok(&p.final_parent.join(path.file_name().unwrap_or_default())) {
                 return ("refused", format!("{} It was kept.", why));
             }
         }
@@ -1330,6 +1341,15 @@ pub(crate) fn failed_move_for_test(path: &Path, m: &str) -> (&'static str, Strin
 /// What may be deleted at the next restart: the item that was looked at, in
 /// a place programs live in (the administrator's run) — then scheduled.
 fn at_restart_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: bool) -> (&'static str, String) {
+    #[cfg(windows)]
+    let pinned = if elevated {
+        match pin_elevated(path, root) {
+            Ok(p) => Some(p),
+            Err(why) => return ("refused", format!("{} It was kept.", why)),
+        }
+    } else {
+        None
+    };
     if std::fs::symlink_metadata(path).is_err() {
         return ("gone", "Already gone.".into());
     }
@@ -1341,14 +1361,23 @@ fn at_restart_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: 
         _ => return ("changed", "It changed since it was looked at, so it was kept. Look again.".into()),
     }
     #[cfg(windows)]
-    if elevated {
-        if let Err(why) = windows::elevated_path_ok(path) {
+    if let Some(p) = &pinned {
+        if let Err(why) = windows::elevated_path_ok(&p.final_parent.join(path.file_name().unwrap_or_default())) {
             return ("refused", format!("{} It was kept.", why));
         }
     }
     #[cfg(not(windows))]
     let _ = elevated;
     windows::delete_at_restart(path)
+}
+
+/// The administrator's run, before it reads an item: its place written
+/// plainly (`link_on_the_way` trusts that text), and every folder above the
+/// item held still and checked (`windows::pin_for_elevated`).
+#[cfg(windows)]
+fn pin_elevated(path: &Path, root: &Path) -> Result<windows::Pinned, String> {
+    windows::plain_windows_path(&root.to_string_lossy())?;
+    windows::pin_for_elevated(path)
 }
 
 /// Carry out cleanup items in order, each checked again first.
@@ -2037,6 +2066,61 @@ mod tests {
         for v in ["GITSWITCH_ELEVATE", "GITSWITCH_DATA_DIR", "GITSWITCH_TRASH_DIR"] {
             std::env::remove_var(v);
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ELEV-B-01: an item named through `..` passed every check on its text
+    /// (Temp is under AppData\Local), so the administrator moved another folder.
+    #[cfg(windows)]
+    #[test]
+    fn the_administrators_run_refuses_an_item_reached_through_dot_dot() {
+        let _g = env_lock();
+        let root = plain_tmp("dotdot");
+        std::env::set_var("GITSWITCH_TRASH_DIR", root.join("trash"));
+        std::fs::create_dir_all(root.join("place")).unwrap();
+        std::fs::create_dir_all(root.join("victim")).unwrap();
+        std::fs::write(root.join("victim").join("keep.txt"), "keep").unwrap();
+        let via = root.join("place").join("..");
+        let items = vec![JobItem { id: "v".into(), what: JobWhat::Trash { path: via.join("victim"), root: via.clone(), ident: ident(&root.join("victim")) } }];
+        let out = run_items(&items, false, &root.join("b"), true);
+        std::env::remove_var("GITSWITCH_TRASH_DIR");
+        assert_eq!(out[0].outcome, "refused", "{out:?}");
+        assert!(root.join("victim").join("keep.txt").exists(), "the other folder stays");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// DEST-A-02: a junction above the job's place was never looked at.
+    #[cfg(windows)]
+    #[test]
+    fn the_administrators_run_refuses_an_item_under_a_junction_above_its_place() {
+        let _g = env_lock();
+        let root = plain_tmp("junction-up");
+        std::env::set_var("GITSWITCH_TRASH_DIR", root.join("trash"));
+        std::fs::create_dir_all(root.join("real").join("inner").join("x")).unwrap();
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(root.join("j")).arg(root.join("real")).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let place = root.join("j").join("inner");
+        let items = vec![JobItem { id: "x".into(), what: JobWhat::Trash { path: place.join("x"), root: place.clone(), ident: ident(&place.join("x")) } }];
+        let out = run_items(&items, false, &root.join("b"), true);
+        std::env::remove_var("GITSWITCH_TRASH_DIR");
+        assert_eq!(out[0].outcome, "refused", "{out:?}");
+        assert!(root.join("real").join("inner").join("x").exists(), "the folder behind the junction stays");
+        let _ = std::fs::remove_dir(root.join("j"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The folders above a pinned item can't be renamed until the pin goes.
+    #[cfg(windows)]
+    #[test]
+    fn the_folders_above_a_pinned_item_stay_where_they_are() {
+        let root = plain_tmp("pinned");
+        std::fs::create_dir_all(root.join("real").join("inner")).unwrap();
+        std::fs::write(root.join("real").join("inner").join("x"), "x").unwrap();
+        let p = windows::pin_for_elevated(&root.join("real").join("inner").join("x")).unwrap();
+        assert!(p.final_parent.ends_with("inner"), "{:?}", p.final_parent);
+        assert!(std::fs::rename(root.join("real"), root.join("moved")).is_err(), "pinned: it can't be renamed");
+        drop(p);
+        assert!(std::fs::rename(root.join("real"), root.join("moved")).is_ok(), "the pin is gone");
         let _ = std::fs::remove_dir_all(&root);
     }
 
