@@ -1624,6 +1624,13 @@ pub(crate) struct ParentToken {
 }
 
 #[cfg(windows)]
+impl std::fmt::Debug for ParentToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ParentToken")
+    }
+}
+
+#[cfg(windows)]
 impl Drop for ParentToken {
     fn drop(&mut self) {
         sys::close_handle(self.token);
@@ -1643,8 +1650,8 @@ pub(crate) fn gitswitch_parent() -> Result<ParentToken, String> {
     sys::gitswitch_parent()
 }
 
-/// This process's own token (the tests' stand-in for the asking GitSwitch).
-#[cfg(all(windows, test))]
+/// This process's own token: the test mode's stand-in for the asking GitSwitch.
+#[cfg(windows)]
 pub(crate) fn own_token() -> Result<ParentToken, String> {
     sys::own_token()
 }
@@ -1654,6 +1661,34 @@ pub(crate) fn own_token() -> Result<ParentToken, String> {
 #[cfg(windows)]
 pub(crate) fn read_own_job(job: &Path, who: &ParentToken) -> Result<Vec<u8>, String> {
     sys::read_own_job(job, who)
+}
+
+/// Could `who` delete `path`, change its permissions or owner, or delete it
+/// from its folder? Windows' own AccessCheck with an impersonation copy of
+/// their token, so groups, deny entries, entries for children only, owner
+/// rights and CREATOR OWNER count as Windows counts them. Not told: true.
+#[cfg(windows)]
+pub(crate) fn person_can_change(path: &Path, who: &ParentToken) -> bool {
+    sys::person_can_change(path, who)
+}
+
+/// What a delete at the next restart queues for `path`, in order: its files,
+/// then its folders from the deepest up (a link as itself).
+#[cfg(windows)]
+pub(crate) fn restart_names(path: &Path) -> Vec<PathBuf> {
+    sys::restart_names(path)
+}
+
+/// Queue exactly `names` for deletion when Windows next starts.
+#[cfg(windows)]
+pub(crate) fn schedule_at_restart(names: &[PathBuf]) -> (&'static str, String) {
+    sys::schedule_at_restart(names)
+}
+
+/// Paths Windows deletes at the next restart.
+#[cfg(all(windows, test))]
+pub(crate) fn pending_renames() -> Vec<String> {
+    sys::pending_renames()
 }
 
 /// `who`'s profile folder, as the machine records it (ProfileList, which only
@@ -1902,7 +1937,6 @@ $j = ConvertTo-Json -InputObject $out -Compress
         Ok(t)
     }
 
-    #[cfg(test)]
     pub fn own_token() -> Result<super::ParentToken, String> {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         // SAFETY: the pseudo-handle of this process.
@@ -2530,9 +2564,65 @@ $j = ConvertTo-Json -InputObject $out -Compress
         names
     }
 
+    pub fn person_can_change(path: &Path, who: &super::ParentToken) -> bool {
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER};
+        let any = |p: &Path, rights: &[u32]| rights.iter().any(|r| access_allowed(p, who, *r).unwrap_or(true));
+        any(path, &[DELETE, WRITE_DAC, WRITE_OWNER]) || path.parent().is_some_and(|parent| any(parent, &[FILE_DELETE_CHILD]))
+    }
+
+    /// May `who` have `right` on `path`? None: it couldn't be told.
+    fn access_allowed(path: &Path, who: &super::ParentToken, right: u32) -> Option<bool> {
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            AccessCheck, DuplicateToken, MapGenericMask, SecurityImpersonation, DACL_SECURITY_INFORMATION, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSECURITY_DESCRIPTOR,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+        let w = wide(path.as_os_str());
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a valid wide path; the descriptor Windows allocates is freed below.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                w.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != 0 || sd.is_null() {
+            return None;
+        }
+        let mut imp: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        // SAFETY: the person's token, opened with TOKEN_DUPLICATE; the copy is closed below.
+        let out = if unsafe { DuplicateToken(who.token, SecurityImpersonation, &mut imp) } != 0 {
+            let mapping = GENERIC_MAPPING { GenericRead: FILE_GENERIC_READ, GenericWrite: FILE_GENERIC_WRITE, GenericExecute: FILE_GENERIC_EXECUTE, GenericAll: FILE_ALL_ACCESS };
+            let mut desired = right;
+            // SAFETY: plain values; the privilege set is the size given.
+            unsafe { MapGenericMask(&mut desired, &mapping) };
+            let mut privileges: PRIVILEGE_SET = unsafe { std::mem::zeroed() };
+            let mut privileges_len = std::mem::size_of::<PRIVILEGE_SET>() as u32;
+            let (mut granted, mut status) = (0u32, 0i32);
+            let ok = unsafe { AccessCheck(sd, imp, desired, &mapping, &mut privileges, &mut privileges_len, &mut granted, &mut status) } != 0;
+            // SAFETY: duplicated above, closed once.
+            unsafe { CloseHandle(imp) };
+            ok.then_some(status != 0)
+        } else {
+            None
+        };
+        // SAFETY: allocated by GetNamedSecurityInfoW, freed once.
+        unsafe { LocalFree(sd as _) };
+        out
+    }
+
     pub fn delete_at_restart(path: &Path) -> (&'static str, String) {
-        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED};
-        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+        schedule_at_restart(&restart_names(path))
+    }
+
+    pub fn restart_names(path: &Path) -> Vec<PathBuf> {
         // Files first, then folders from the deepest up: Windows works the
         // list in order when it starts. A link is removed as itself.
         fn walk(p: &Path, files: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) {
@@ -2551,8 +2641,15 @@ $j = ConvertTo-Json -InputObject $out -Compress
         let (mut files, mut dirs) = (Vec::new(), Vec::new());
         walk(path, &mut files, &mut dirs);
         dirs.reverse();
+        files.extend(dirs);
+        files
+    }
+
+    pub fn schedule_at_restart(names: &[PathBuf]) -> (&'static str, String) {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED};
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
         let (mut failed, mut denied) = (0usize, false);
-        for p in files.iter().chain(dirs.iter()) {
+        for p in names {
             let w = wide(p.as_os_str());
             // SAFETY: a valid wide path; no new name (delete).
             if unsafe { MoveFileExW(w.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) } == 0 {
@@ -2565,7 +2662,7 @@ $j = ConvertTo-Json -InputObject $out -Compress
         } else if denied {
             ("needs-admin", "Only the administrator can have Windows delete it at the next restart.".into())
         } else {
-            ("failed", format!("{} of its {} files and folders could not be scheduled for the next restart.", failed, files.len() + dirs.len()))
+            ("failed", format!("{} of its {} files and folders could not be scheduled for the next restart.", failed, names.len()))
         }
     }
 
@@ -3265,9 +3362,12 @@ mod tests {
         let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
         let users = users_of(&dir);
         assert!(!users.is_empty(), "this test process holds it");
-        let (outcome, why) = crate::apps::failed_move_for_test(&dir, "Unknown { description: \"Some operations were aborted\" }");
+        let (outcome, why) = crate::apps::failed_move_for_test(&dir, "Unknown { description: \"Some operations were aborted\" }", true);
         assert_eq!(outcome, "in-use", "{why}");
         assert!(why.starts_with("In use by ") && why.contains("delete it at the next restart"), "{why}");
+        // The person's own run: their folder never gets a delete at restart (7d).
+        let (outcome, why) = crate::apps::failed_move_for_test(&dir, "Unknown { description: \"Some operations were aborted\" }", false);
+        assert!(outcome == "in-use" && why.ends_with("then look again.") && !why.contains("next restart"), "{why}");
         drop(held);
         // Scheduling a delete at the next restart is the administrator's; as
         // a person nothing is scheduled and nothing goes now.

@@ -1174,7 +1174,8 @@ fn delete_one(s: &Session, others: &Others, item: &ScanItem) -> Step {
             format!("The system protects it ({}). Allow GitSwitch in System Settings › Privacy & Security, or move it to the Trash yourself.", m),
         ),
         TrashOutcome::Failed(m) => {
-            let (o, why) = failed_move(&item.path, &m);
+            // A delete at restart is offered only for what needs the administrator (7d).
+            let (o, why) = failed_move(&item.path, &m, item.admin);
             Done(o, why)
         }
     }
@@ -1306,7 +1307,7 @@ fn trash_checked(path: &Path, root: &Path, want: Option<&Ident>, el: Option<&Ele
         TrashOutcome::Gone => ("gone", "Already gone.".into()),
         TrashOutcome::NeedsAdmin(m) => ("needs-admin", format!("It needs the administrator: {}", m)),
         TrashOutcome::Protected(m) => ("protected", m),
-        TrashOutcome::Failed(m) => failed_move(path, &m),
+        TrashOutcome::Failed(m) => failed_move(path, &m, el.is_some()),
     }
 }
 
@@ -1336,7 +1337,7 @@ pub(crate) fn name_list(names: &[String]) -> String {
 /// A move to the Trash that failed, explained. On Windows the system only
 /// says "some operations were aborted": the running programs that still
 /// have its files open or loaded are asked for, and named.
-fn failed_move(path: &Path, m: &str) -> (&'static str, String) {
+fn failed_move(path: &Path, m: &str, elevated: bool) -> (&'static str, String) {
     #[cfg(windows)]
     {
         let users = windows::users_of(path);
@@ -1344,7 +1345,12 @@ fn failed_move(path: &Path, m: &str) -> (&'static str, String) {
             let them = if users.len() == 1 { "it" } else { "them" };
             return (
                 "in-use",
-                format!("In use by {}: one of its files is open or loaded in {}. Close {} or restart, then look again — or delete it at the next restart.", name_list(&users), them, them),
+                if elevated {
+                    format!("In use by {}: one of its files is open or loaded in {}. Close {} or restart, then look again — or delete it at the next restart.", name_list(&users), them, them)
+                } else {
+                    // The person's own folders are never deleted at restart (7d).
+                    format!("In use by {}: one of its files is open or loaded in {}. Close {} or restart, then look again.", name_list(&users), them, them)
+                },
             );
         }
         if m.contains("Some operations were aborted") {
@@ -1363,8 +1369,8 @@ pub(crate) fn users_of(path: &Path) -> Vec<String> {
 }
 
 #[cfg(all(test, windows))]
-pub(crate) fn failed_move_for_test(path: &Path, m: &str) -> (&'static str, String) {
-    failed_move(path, m)
+pub(crate) fn failed_move_for_test(path: &Path, m: &str, elevated: bool) -> (&'static str, String) {
+    failed_move(path, m, elevated)
 }
 
 /// What may be deleted at the next restart: the item that was looked at, in
@@ -1394,6 +1400,17 @@ fn at_restart_checked(path: &Path, root: &Path, want: Option<&Ident>, el: Option
         if let Err(why) = elevated_place_ok(&p.final_parent.join(path.file_name().unwrap_or_default()), el) {
             return ("refused", format!("{} It was kept.", why));
         }
+        // What the person can change themselves is never queued for the next
+        // boot, when nothing checks it again (DEST-A-03): no folder from the
+        // drive down to it, and no name the walk queues. Then exactly those
+        // names are queued.
+        let names = windows::restart_names(path);
+        let person = el.and_then(|e| e.person.as_ref());
+        let theirs = |q: &Path| person.is_none_or(|t| windows::person_can_change(q, t));
+        if path.ancestors().skip(1).any(theirs) || names.iter().any(|n| theirs(n)) {
+            return ("refused", "It is in a folder you can change, so Windows is not asked to delete it at restart. Close the program that holds it, then delete it again.".into());
+        }
+        return windows::schedule_at_restart(&names);
     }
     #[cfg(not(windows))]
     let _ = el;
@@ -1428,16 +1445,23 @@ pub(crate) fn run_items(items: &[JobItem], registry_needs_files: bool, backups: 
 /// Who the administrator's run acts for: the person whose GitSwitch asked
 /// (their profile folder), so AppData items are judged against theirs, not
 /// the approving administrator's.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct Elevation {
     pub profile: Option<PathBuf>,
+    /// Their token: what they can change themselves is never deleted at restart.
+    #[cfg(windows)]
+    pub person: Option<windows::ParentToken>,
 }
 
 impl Elevation {
     /// This process's own person: the test mode's, and the tests'.
     pub(crate) fn own() -> Elevation {
-        Elevation { profile: crate::paths::home_dir() }
+        Elevation {
+            profile: crate::paths::home_dir(),
+            #[cfg(windows)]
+            person: windows::own_token().ok(),
+        }
     }
 }
 
@@ -1541,7 +1565,7 @@ pub(crate) fn elevated_cleanup_from(args: &[String]) -> i32 {
         }
         let Ok(parent) = windows::gitswitch_parent() else { return 2 };
         let Ok(bytes) = own_job_bytes(&job, &parent) else { return 2 };
-        let el = Elevation { profile: windows::profile_of(&parent) };
+        let el = Elevation { profile: windows::profile_of(&parent), person: Some(parent) };
         run_job_as(&job, &sha, &el, move |_| Ok(bytes))
     }
     #[cfg(not(windows))]
@@ -2275,6 +2299,40 @@ mod tests {
         ];
         let out = run_items(&items, false, &std::env::temp_dir(), true);
         assert!(out.iter().all(|d| d.outcome == "refused"), "{out:?}");
+    }
+
+    /// DEST-A-03: the administrator's run never queues for the next boot a
+    /// folder the person can change (here: their own temp folder).
+    #[cfg(windows)]
+    #[test]
+    fn the_administrators_run_never_queues_the_persons_own_folder_for_restart() {
+        let _g = env_lock();
+        let root = plain_tmp("held");
+        std::fs::create_dir_all(root.join("held")).unwrap();
+        std::fs::write(root.join("held").join("f"), "x").unwrap();
+        let el = Elevation::own();
+        let (o, m) = at_restart_checked(&root.join("held"), &root, ident(&root.join("held")).as_ref(), Some(&el));
+        assert_eq!(o, "refused", "{m}");
+        assert!(m.contains("a folder you can change"), "{m}");
+        assert!(!windows::pending_renames().iter().any(|p| p.to_lowercase().contains("gitswitch-apps-held")), "nothing was queued");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Windows' own AccessCheck decides what the person can change.
+    #[cfg(windows)]
+    #[test]
+    fn what_the_person_can_change_is_asked_of_windows() {
+        let me = windows::own_token().unwrap();
+        let t = plain_tmp("can-change");
+        assert!(windows::person_can_change(&t, &me), "a temp folder of theirs");
+        // SAFETY: no arguments. (CI's Windows runner runs elevated.)
+        if unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } == 0 {
+            let system32 = PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32");
+            assert!(!windows::person_can_change(&system32, &me), "System32");
+            assert!(!windows::person_can_change(Path::new(&std::env::var("ProgramFiles").unwrap()), &me), "Program Files");
+            assert!(!windows::person_can_change(Path::new(r"C:\"), &me), "C:\\ itself: its entries for children don't count");
+        }
+        let _ = std::fs::remove_dir_all(&t);
     }
 
     /// ELEV-B-01: an item named through `..` passed every check on its text

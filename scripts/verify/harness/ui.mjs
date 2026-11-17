@@ -7067,6 +7067,23 @@ try {
     ok("  Delete at the next restart sends that one, and says so", later.length === 1 && JSON.stringify(later[0]) === JSON.stringify({ scan: "scan-uv", ids: ["u0"] }) && (await text(held)).includes("Deleted at the next restart") && !(await held.$("[data-flow-in-use]")), JSON.stringify(later));
     await held.close();
 
+    // In use in the person's own AppData: closed and looked at again, never deleted at the next restart (step 7d).
+    const ownHeld = await openUninstallPage(browser, server, {
+      platform: "windows",
+      apps,
+      sessions: [{ session: "sess-own", name: "UltraViewer", state: "gone", started: 1760000000 }],
+      scan: { scan: "scan-own", notes: [], items: [{ id: "o0", path: "C:\\Users\\me\\AppData\\Roaming\\UltraViewer", place: "App data", kind: "folder", size: 2000, size_complete: true, confidence: "high", reason: "named like the app", admin: false, command: null, elevate: false }] },
+      deleteRounds: [{ o0: { outcome: "in-use", message: "In use by UltraViewer: one of its files is open or loaded in it. Close it or restart, then look again." } }],
+    });
+    await (await button(ownHeld, "Continue")).click();
+    await ownHeld.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    await ownHeld.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await ownHeld.waitForFunction(() => document.querySelector("[data-flow-delete]"), { timeout: 5000 }).catch(() => null);
+    await ownHeld.evaluate(() => document.querySelector("[data-flow-delete]").click());
+    await ownHeld.waitForFunction(() => document.querySelector('[data-flow-stage="done"]'), { timeout: 5000 }).catch(() => null);
+    ok("in use in your own folder: no delete at the next restart, close it and look again instead", !!(await ownHeld.$("[data-flow-in-use]")) && !(await ownHeld.$("[data-flow-at-restart]")) && (await text(ownHeld)).includes("close the program that holds it, then look again"));
+    await ownHeld.close();
+
     // Uninstalled with GitSwitch before: looked at again, long after.
     const again = await openUninstallPage(browser, server, { platform: "windows", apps, history: [{ key: "win:HKLM64:{DD}", name: "Disk Drill 6.3.1398.0", at: 1793912817 }, { key: "win:HKLM64:zoho", name: "Zoho Mail - Desktop 1.7.4", at: 1793901026 }] });
     await again.waitForFunction(() => document.querySelector("[data-past]"), { timeout: 5000 }).catch(() => null);
