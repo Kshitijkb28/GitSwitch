@@ -91,21 +91,13 @@ pub(crate) fn mask_token(url: &str) -> String {
 }
 
 pub(crate) fn git_text(dir: &std::path::Path, args: &[&str]) -> Option<String> {
-    let started = std::time::Instant::now();
-    let d = dir.to_string_lossy().to_string();
-    let out = crate::spawn::command("git").arg("-C").arg(&d).args(args).output().ok()?;
-    crate::cmdlog::record(
-        dir,
-        ["git", "-C", &d].iter().map(|a| a.to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
-        out.status.code().unwrap_or(-1),
-        started.elapsed(),
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-    );
-    if !out.status.success() {
+    // The one runner, on its read clock: a repository that hangs a scan is
+    // stopped and reads as having no answer, like any other failure here.
+    let out = crate::git_exec::GitCmd::at(dir).args(args.iter().copied()).run_blocking().ok()?;
+    if !out.ok() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+    Some(out.trimmed()).filter(|s| !s.is_empty())
 }
 
 /// origin's URL, or — in a clone whose remote is called something else —
@@ -137,6 +129,12 @@ pub(crate) fn walk_repo_dirs(root: &std::path::Path) -> Vec<PathBuf> {
 /// found — and stopping, with what it found until then, once `observe`
 /// answers false. The walk itself is the same, folder for folder.
 pub(crate) fn walk_repo_dirs_observed(root: &std::path::Path, observe: &mut dyn FnMut(&std::path::Path, usize, usize) -> bool) -> Vec<PathBuf> {
+    walk(root, false, observe)
+}
+
+/// The walk itself. `with_clones`: a clone still being written counts as a
+/// repository too — for asking whether a folder holds one at all.
+fn walk(root: &std::path::Path, with_clones: bool, observe: &mut dyn FnMut(&std::path::Path, usize, usize) -> bool) -> Vec<PathBuf> {
     const MAX_DEPTH: u32 = 5;
     let mut out = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0u32)];
@@ -149,7 +147,7 @@ pub(crate) fn walk_repo_dirs_observed(root: &std::path::Path, observe: &mut dyn 
         }
         if dir.join(".git").exists() {
             // A clone still writing this folder: not a repository yet.
-            if crate::sparse::clone_running_at(&dir.to_string_lossy()) {
+            if !with_clones && crate::sparse::clone_running_at(&dir.to_string_lossy()) {
                 continue;
             }
             out.push(dir);
@@ -174,6 +172,56 @@ pub(crate) fn walk_repo_dirs_observed(root: &std::path::Path, observe: &mut dyn 
         }
     }
     out
+}
+
+/// What a folder is to git. A profile folder usually holds repositories; one
+/// that holds none is still the person's project, and the Repository page
+/// lists it rather than letting it vanish.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum FolderState {
+    /// Not on this computer, or not a folder.
+    Missing,
+    /// A repository itself.
+    Repo,
+    /// Inside the repository at `top`: a folder there can't be a repository
+    /// of its own, and a profile's `gitdir:` rule for it never applies.
+    InsideRepo { top: String },
+    /// Holds repositories (a clone still being written counts).
+    ContainsRepos { count: usize },
+    /// Holds no repository and is in none: a project git doesn't know yet.
+    NoRepo,
+}
+
+/// The repository `dir` is inside, as git finds it walking up: its top
+/// folder, spelled the way this system writes paths.
+pub(crate) fn enclosing_repo(dir: &std::path::Path) -> Option<String> {
+    let top = git_text(dir, &["rev-parse", "--show-toplevel"])?;
+    Some(if cfg!(windows) { top.replace('/', "\\") } else { top })
+}
+
+pub(crate) fn folder_state_sync(dir: &std::path::Path) -> FolderState {
+    if !dir.is_dir() {
+        return FolderState::Missing;
+    }
+    if dir.join(".git").exists() {
+        return FolderState::Repo;
+    }
+    let count = walk(dir, true, &mut |_, _, _| true).len();
+    if count > 0 {
+        return FolderState::ContainsRepos { count };
+    }
+    match enclosing_repo(dir) {
+        Some(top) => FolderState::InsideRepo { top },
+        None => FolderState::NoRepo,
+    }
+}
+
+/// `folder_state_sync` on a blocking thread: the walk can be large.
+pub async fn folder_state(path: String) -> Result<FolderState, AppError> {
+    tokio::task::spawn_blocking(move || folder_state_sync(std::path::Path::new(&path)))
+        .await
+        .map_err(|e| AppError::Command(format!("Background task failed: {}", e)))
 }
 
 /// One repository folder as the scan reports it: its origin (masked), the
@@ -293,6 +341,13 @@ pub async fn scan_tracked(scan_id: String, root: String) -> Result<TrackedScan, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scan's runner is the one runner.
+    #[test]
+    fn the_scan_runner_goes_through_gitcmd() {
+        let env = git_text(&std::env::temp_dir(), &crate::git_exec::test_support::SHOW_ENV).expect("git runs");
+        crate::git_exec::test_support::assert_hardened(&env);
+    }
 
     #[test]
     fn parses_all_github_url_forms() {
@@ -445,6 +500,33 @@ mod scan_tests {
         assert!(!names.contains(&"dep".to_string()), "a repository inside node_modules is not walked into: {names:?}");
         let plain = found.iter().find(|r| r.path.ends_with("plain")).unwrap();
         assert_eq!((plain.owner.as_str(), plain.name.as_str()), ("acme", "x"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_is_told_apart_from_a_repository_a_folder_of_them_and_a_folder_inside_one() {
+        // Only where git finds no repository above the temporary folder.
+        if enclosing_repo(&std::env::temp_dir()).is_some() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("gitswitch-folder-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["project/app/src", "holder/one", "holder/two", "repo/sub"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        for r in ["holder/one", "holder/two", "repo"] {
+            if !crate::spawn::command("git").args(["init", "-q"]).arg(base.join(r)).status().is_ok_and(|s| s.success()) {
+                return; // no git here: nothing to prove
+            }
+        }
+        assert_eq!(folder_state_sync(&base.join("project")), FolderState::NoRepo, "a project git doesn't know");
+        assert_eq!(folder_state_sync(&base.join("holder")), FolderState::ContainsRepos { count: 2 });
+        assert_eq!(folder_state_sync(&base.join("repo")), FolderState::Repo);
+        match folder_state_sync(&base.join("repo/sub")) {
+            FolderState::InsideRepo { top } => assert!(top.replace('\\', "/").ends_with("/repo"), "{top}"),
+            other => panic!("a folder inside a repository: {other:?}"),
+        }
+        assert_eq!(folder_state_sync(&base.join("nowhere")), FolderState::Missing);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

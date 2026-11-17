@@ -8,7 +8,8 @@ import {
   Globe,
   Download,
   FolderOpen,
-  Copy,
+  Building2,
+  User,
   ChevronLeft,
   ChevronRight,
   AlertTriangle,
@@ -27,11 +28,45 @@ import { useRefreshOnFocus } from "../lib/focus";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
 import { RefreshButton } from "../components/RefreshButton";
+import { CopyLinkMenu } from "../components/repos/CopyLinkMenu";
+import { RepoActionsMenu } from "../components/repos/RepoActionsMenu";
+import { changesSince, onRepoChange, sameRepo, type RepoChange } from "../lib/repoChanges";
 
 const PAGE_SIZE = 25;
 
 // Listings survive navigating away and back within a session; Refresh re-fetches.
 const listingCache = new Map<string, { listing: api.RepoListing; fetchedAt: number }>();
+
+/**
+ * A listing as it is after a change made here: the row made private or
+ * public, or gone. A repository created here is left to Refresh: the listing
+ * has no row for it to change.
+ */
+function withChange(listing: api.RepoListing, change: RepoChange): api.RepoListing {
+  if (change.kind === "created") return listing;
+  if (!listing.repos.some((r) => sameRepo(r.full_name, change.fullName))) return listing;
+  return {
+    ...listing,
+    repos:
+      change.kind === "deleted"
+        ? listing.repos.filter((r) => !sameRepo(r.full_name, change.fullName))
+        : listing.repos.map((r) => (sameRepo(r.full_name, change.fullName) ? { ...r, private: change.private } : r)),
+  };
+}
+
+/** A listing asked for at `since`, with what was changed here since then. */
+const withChangesSince = (listing: api.RepoListing, since: number) => changesSince(since).reduce(withChange, listing);
+
+// A repository made private or public, or deleted, from anywhere in the app:
+// the listings kept for later visits say so too, and so do the pages of a
+// listing still arriving (a visit that joins that load is painted with them).
+onRepoChange((change) => {
+  for (const [key, entry] of listingCache) {
+    const listing = withChange(entry.listing, change);
+    if (listing !== entry.listing) listingCache.set(key, { ...entry, listing });
+  }
+  for (const e of inflight.values()) if (e.partial) e.partial = { ...e.partial, listing: withChange(e.partial.listing, change) };
+});
 // A listing can take a while for big accounts — never ask GitHub twice at once
 // for the same account (double mounts, quick account flips back and forth).
 // A visit that joins a load already running is painted too: it gets what has
@@ -105,12 +140,18 @@ function fetchListing(
     return running.promise;
   }
   const entry: InflightLoad = { promise: Promise.resolve() as unknown as Promise<api.RepoListing>, partial: null, listeners: new Set([onPartial]) };
-  entry.promise = loadProgressively(key, (listing, more) => {
+  // A row changed here while the rest was still arriving: the pages that land
+  // later were asked for before the change, so they get it applied.
+  const startedAt = Date.now();
+  entry.promise = loadProgressively(key, (arrived, more) => {
+    const listing = withChangesSince(arrived, startedAt);
     entry.partial = { listing, more };
     for (const paint of entry.listeners) paint(listing, more);
-  }).finally(() => {
-    if (inflight.get(key) === entry) inflight.delete(key);
-  });
+  })
+    .then((listing) => withChangesSince(listing, startedAt))
+    .finally(() => {
+      if (inflight.get(key) === entry) inflight.delete(key);
+    });
   inflight.set(key, entry);
   return entry.promise;
 }
@@ -255,6 +296,9 @@ export function Repositories() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account]);
 
+  // A repository made private or public, or deleted, from a row's menu: its row says so at once.
+  useEffect(() => onRepoChange((change) => setListing((l) => (l ? withChange(l, change) : l))), []);
+
   // Any filter change starts from the first page.
   useEffect(() => setPage(0), [account, search, owner, visibility, hideArchived, hideForks, notClonedOnly, sort]);
 
@@ -267,21 +311,42 @@ export function Repositories() {
     if (listing && owner && !owners.includes(owner)) setOwner("");
   }, [listing, owner, owners, setOwner]);
 
-  const filtered = useMemo(() => {
+  // Every filter but the organization: the chips count these.
+  const baseRows = useMemo(() => {
     const q = search.trim().toLowerCase();
-    const rows = (listing?.repos ?? []).filter(
+    return (listing?.repos ?? []).filter(
       (r) =>
         (!q || r.full_name.toLowerCase().includes(q) || (r.description ?? "").toLowerCase().includes(q)) &&
-        (!owner || r.owner === owner) &&
         (visibility === "all" || (visibility === "private") === r.private) &&
         (!hideArchived || !r.archived) &&
         (!hideForks || !r.fork) &&
         (!notClonedOnly || !localPathOf(r))
     );
+  }, [listing, local, search, visibility, hideArchived, hideForks, notClonedOnly]);
+
+  const filtered = useMemo(() => {
+    const rows = baseRows.filter((r) => !owner || r.owner === owner);
     if (sort === "name") rows.sort((a, b) => a.full_name.localeCompare(b.full_name));
     else rows.sort((a, b) => (b.pushed_at ?? "").localeCompare(a.pushed_at ?? ""));
     return rows;
-  }, [listing, local, search, owner, visibility, hideArchived, hideForks, notClonedOnly, sort]);
+  }, [baseRows, owner, sort]);
+
+  // Every owner in the listing as a chip: the account itself first, then its
+  // organizations, then the people whose repositories it works on. A chip's
+  // count follows the other filters, so it says what clicking it shows.
+  const ownerChips = useMemo(() => {
+    const me = (listing?.login ?? "").toLowerCase();
+    const chips = new Map<string, { owner: string; count: number; org: boolean; you: boolean }>();
+    for (const r of listing?.repos ?? []) {
+      if (!chips.has(r.owner)) chips.set(r.owner, { owner: r.owner, count: 0, org: r.owner_is_org, you: r.owner.toLowerCase() === me });
+    }
+    for (const r of baseRows) {
+      const c = chips.get(r.owner);
+      if (c) c.count++;
+    }
+    const rank = (c: { org: boolean; you: boolean }) => (c.you ? 0 : c.org ? 1 : 2);
+    return [...chips.values()].sort((a, b) => rank(a) - rank(b) || a.owner.localeCompare(b.owner));
+  }, [listing, baseRows]);
 
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount - 1);
@@ -318,15 +383,6 @@ export function Repositories() {
     }
     handOff("history", path);
     navigate("/repo/history");
-  }
-
-  async function copyLink(url: string) {
-    try {
-      await navigator.clipboard.writeText(url);
-      toast.success("SSH link copied");
-    } catch {
-      setError(`Couldn't copy — the link is ${url}`);
-    }
   }
 
   const noAccounts = accounts !== null && accounts.length === 0;
@@ -372,7 +428,7 @@ export function Repositories() {
           <BookMarked size={32} className="mx-auto text-zinc-600 mb-3" />
           <h3 className="text-lg font-medium text-zinc-300">No GitHub accounts signed in</h3>
           <p className="text-sm text-zinc-500 mt-1 max-w-md mx-auto">
-            Sign in on the GitHub page — with GitHub itself, or the GitHub CLI's{" "}
+            Sign in on the GitHub Auth page — with GitHub itself, or the GitHub CLI's{" "}
             <span className="font-mono">gh auth login</span> — then Refresh, and the repositories each account
             can reach show up here.
           </p>
@@ -429,13 +485,6 @@ export function Repositories() {
                 </button>
               )}
             </div>
-            <div className="w-full lg:w-52">
-              <Select
-                value={owner}
-                onChange={setOwner}
-                options={[{ value: "", label: "All owners" }, ...owners.map((o) => ({ value: o, label: o }))]}
-              />
-            </div>
             <div className="w-full lg:w-44">
               <Select
                 value={sort}
@@ -474,6 +523,29 @@ export function Repositories() {
               </label>
             ))}
           </div>
+
+          {ownerChips.length > 1 && (
+            <div className="flex items-center gap-1.5 flex-wrap mt-3" role="group" aria-label="Organization">
+              <span className="text-xs text-zinc-500 mr-1">Organization</span>
+              {[{ owner: "", count: baseRows.length, org: false, you: false }, ...ownerChips].map((c) => (
+                <button
+                  key={c.owner || "(all)"}
+                  type="button"
+                  aria-pressed={owner === c.owner}
+                  onClick={() => setOwner(c.owner)}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border transition-colors cursor-pointer ${
+                    owner === c.owner
+                      ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-300"
+                      : "border-zinc-700/70 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600"
+                  }`}
+                >
+                  {c.owner === "" ? null : c.org ? <Building2 size={12} /> : <User size={12} />}
+                  {c.owner === "" ? "All" : c.you ? `${c.owner} (you)` : c.owner}
+                  <span className="text-zinc-500">{c.count}</span>
+                </button>
+              ))}
+            </div>
+          )}
 
           <div className="flex items-center justify-between gap-3 flex-wrap mt-4 mb-2 text-xs text-zinc-500">
             <span>
@@ -526,8 +598,8 @@ export function Repositories() {
               const localPath = localPathOf(r);
               const cloningPath = localPath ? null : cloningPathOf(r);
               return (
-                <div key={r.full_name} className="flex items-start gap-3 py-3 min-w-0">
-                  <span className="mt-0.5 shrink-0 text-zinc-500" title={r.private ? "Private" : "Public"}>
+                <div key={r.full_name} className="flex items-start gap-3 py-3 min-w-0" data-repo-row={r.full_name}>
+                  <span className="mt-0.5 shrink-0 text-zinc-500" role="img" title={r.private ? "Private" : "Public"} aria-label={r.private ? "Private" : "Public"} data-visibility={r.private ? "private" : "public"}>
                     {r.private ? <Lock size={15} /> : <Globe size={15} />}
                   </span>
                   <div className="min-w-0 flex-1">
@@ -563,14 +635,8 @@ export function Repositories() {
                     </p>
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">
-                    <button
-                      onClick={() => copyLink(cloneUrlOf(r))}
-                      title={`Copy ${cloneUrlOf(r)}`}
-                      className="p-2 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer"
-                      aria-label="Copy SSH link"
-                    >
-                      <Copy size={14} />
-                    </button>
+                    <CopyLinkMenu fullName={r.full_name} sshUrl={cloneUrlOf(r)} />
+                    {listing && <RepoActionsMenu repo={r} account={listing.account} login={listing.login} localPath={localPath} />}
                     {localPath ? (
                       <Button size="sm" variant="secondary" onClick={() => openInHistory(localPath)}>
                         <FolderOpen size={14} />

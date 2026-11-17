@@ -70,7 +70,8 @@ export function tally() {
       } else {
         fail++;
         failures.push(label);
-        console.log(`  \x1b[31mFAIL\x1b[0m ${label}${detail ? `\n       ${detail}` : ""}`);
+        // Every line of the detail indented, so all.sh keeps it with the FAIL line.
+        console.log(`  \x1b[31mFAIL\x1b[0m ${label}${detail ? `\n       ${String(detail).replace(/\n/g, "\n       ")}` : ""}`);
       }
     },
     section(t) {

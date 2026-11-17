@@ -531,11 +531,12 @@ ok "  listed as kept, with no token in the list" "$(pinvoke github_signins '{}' 
 ok "  and offered on the Repositories page as an account" "$(pinvoke repo_accounts '{}' | "$PY" -c 'import sys,json;print([a["key"] for a in json.load(sys.stdin)["value"] if a["key"].startswith("signin:")])')" "['signin:octo-home']"
 if command -v ssh-keygen >/dev/null 2>&1; then
   ssh-keygen -q -t ed25519 -N '' -C kept -f "$SB/kept_key" </dev/null
+  # GitHub marks a key an app uploads as that app's, and organizations that
+  # restrict third-party apps hide their private repositories from it: the
+  # kept sign-in never uploads keys, so nothing reaches GitHub.
+  : > "$SB/emails-api.log"
   OUT=$(GITSWITCH_GITHUB_API="$EAPI" pinvoke gh_register_ssh_key "{\"account\":\"signin:octo-home\",\"keyPath\":\"$SB/kept_key\"}")
-  ok "a key is registered with the kept sign-in's own token, no gh involved" "$(printf '%s' "$OUT" | jqf value):$(grep -c 'POST /user/keys t-scoped' "$SB/emails-api.log")" "Registered on octo-home:1"
-  GITSWITCH_GITHUB_API="$EAPI" pinvoke github_signin_keep '{"token":"t-plain"}' >/dev/null
-  OUT=$(GITSWITCH_GITHUB_API="$EAPI" pinvoke gh_register_ssh_key "{\"account\":\"signin:octo-home\",\"keyPath\":\"$SB/kept_key\"}")
-  ok "  a kept sign-in GitHub no longer accepts says to sign in again on the GitHub page, not with gh" "$(printf '%s' "$OUT" | jqf error)" "sign in again on the GitHub page"
+  ok "a kept GitSwitch sign-in does not upload a key, and says to add it on GitHub by hand" "$(printf '%s' "$OUT" | jqf error | grep -c 'Add to GitHub'):$(grep -c 'POST /user/keys' "$SB/emails-api.log")" "1:0"
 fi
 pinvoke github_signin_forget '{"login":"Octo-Home"}' >/dev/null
 ok "Forget removes the token and the login, whatever the letter case" "$([ -e "$GITSWITCH_TOKEN_DIR/github_octo-home" ] && echo kept || echo gone):$(pinvoke github_signins '{}' | jqf value)" "gone:[]"

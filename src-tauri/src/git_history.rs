@@ -15,6 +15,21 @@ pub struct RepoRef {
     pub profile_id: String,
     pub profile_name: String,
     pub profile_email: String,
+    /// A repository, or a profile folder that holds none (see `list_repos`).
+    pub kind: RepoKind,
+    /// A folder entry inside a repository: that repository's top folder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inside: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoKind {
+    #[default]
+    Repo,
+    /// A profile folder with no repository in it: listed so it doesn't vanish
+    /// from the page, which offers to make it one.
+    Folder,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -168,8 +183,11 @@ pub struct SyncStatus {
     pub remote_tip: Option<CommitRef>,
 }
 
+/// `rev` is a branch name the repository supplies (HEAD's, its upstream's):
+/// after `--end-of-options` (git 2.24) it is never read as an option, even
+/// for a ref named `refs/heads/--output=<file>`.
 fn commit_ref(repo: &Path, rev: &str) -> Option<CommitRef> {
-    let raw = git(repo, &["log", "-1", &format!("--format=%h{US}%s{US}%an{US}%cI", US = US), rev]).ok()?;
+    let raw = git(repo, &["log", "-1", &format!("--format=%h{US}%s{US}%an{US}%cI", US = US), "--end-of-options", rev]).ok()?;
     let f: Vec<&str> = raw.splitn(4, US).collect();
     if f.len() < 4 {
         return None;
@@ -220,15 +238,15 @@ pub struct MergeCommit {
 /// being the tip means the commits sit on that line — a fast-forward; anything
 /// else is the merge that brought the tip in through another parent.
 fn merged_by(repo: &Path, tip: &str, target: &str) -> Option<(String, Option<MergeCommit>)> {
-    let fp = git(repo, &["rev-list", "--first-parent", &format!("{}..{}", tip, target)]).ok()?;
+    let fp = git(repo, &["rev-list", "--first-parent", "--end-of-options", &format!("{}..{}", tip, target)]).ok()?;
     let fp: Vec<&str> = fp.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if fp.is_empty() {
         return Some(("same-commit".into(), None));
     }
-    let anc = git(repo, &["rev-list", "--ancestry-path", &format!("{}..{}", tip, target)]).ok()?;
+    let anc = git(repo, &["rev-list", "--ancestry-path", "--end-of-options", &format!("{}..{}", tip, target)]).ok()?;
     let anc: std::collections::HashSet<&str> = anc.lines().map(str::trim).collect();
     let m = fp.iter().rev().find(|c| anc.contains(**c))?;
-    let raw = git(repo, &["log", "-n1", "--no-show-signature", &format!("--format=%H{US}%h{US}%P{US}%aN{US}%aI{US}%s", US = US), m]).ok()?;
+    let raw = git(repo, &["log", "-n1", "--no-show-signature", &format!("--format=%H{US}%h{US}%P{US}%aN{US}%aI{US}%s", US = US), "--end-of-options", m]).ok()?;
     let f: Vec<&str> = raw.trim_end_matches('\n').splitn(6, US).collect();
     if f.len() < 6 {
         return None;
@@ -251,38 +269,44 @@ pub(crate) fn is_remote_head(full_ref: &str) -> bool {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, AppError> {
-    let started = std::time::Instant::now();
-    // Signature checks must never land in output that is parsed.
-    let safe: Vec<&str> = match args.first().and_then(|sub| crate::git_exec::parse_safe_cfg(sub)) {
-        Some(kv) => vec!["-c", kv],
-        None => Vec::new(),
-    };
-    let out = crate::spawn::command("git")
-        .arg("-C")
-        .arg(repo)
-        .args(&safe)
-        .args(args)
-        .output()
-        .map_err(|e| AppError::Command(format!("failed to run git: {}", e)))?;
-    crate::cmdlog::record(
-        repo,
-        ["git", "-C", &repo.to_string_lossy()]
-            .iter()
-            .map(|a| a.to_string())
-            .chain(safe.iter().map(|a| a.to_string()))
-            .chain(args.iter().map(|a| a.to_string()))
-            .collect(),
-        out.status.code().unwrap_or(-1),
-        started.elapsed(),
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-    );
-    if !out.status.success() {
-        return Err(AppError::Command(
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ));
+    git_with(repo, args, crate::git_exec::LOCAL_TIMEOUT)
+}
+
+/// The clock for a walk of the whole history: the History page's count and
+/// list, the people list, a branch's merges. These are the slowest reads the
+/// app makes (path-limited `--full-history --simplify-merges` over a big
+/// repository with submodules), and before they went through `GitCmd` they
+/// had no clock at all. Waiting for a big walk is what the page has always
+/// done; the clock is there to end a hang, not a large repository.
+const WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own walk clock, so a stopped walk can be produced on demand.
+    /// Per thread: the page reads it on the caller's thread, and cargo runs
+    /// tests side by side.
+    static WALK_CLOCK: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+fn walk_clock() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(d) = WALK_CLOCK.with(|c| c.get()) {
+        return d;
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    WALK_TIMEOUT
+}
+
+fn git_with(repo: &Path, args: &[&str], timeout: std::time::Duration) -> Result<String, AppError> {
+    // The one runner: its environment, its log, and the signature pin that
+    // keeps verification text out of parsed output.
+    let out = crate::git_exec::GitCmd::at(repo)
+        .args(args.iter().copied())
+        .timeout(timeout)
+        .run_blocking()?;
+    if !out.ok() {
+        return Err(AppError::Command(out.stderr));
+    }
+    Ok(out.text())
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +418,11 @@ pub fn graph_parents(parents: &[String], members: Option<&std::collections::Hash
 // Queries
 // ---------------------------------------------------------------------------
 
-/// Every repo inside the profile folders, so the picker needs no typing.
+/// Every repo inside the profile folders, so the picker needs no typing — and
+/// every profile folder that holds none (a project git doesn't know yet, or a
+/// folder inside a repository), so a folder added to a profile never just
+/// vanishes. Those are `RepoKind::Folder`; whoever needs repositories only
+/// leaves them out.
 pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
     let store = profiles::load_profiles()?;
     let mut out: Vec<RepoRef> = Vec::new();
@@ -403,7 +431,27 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
             if !PathBuf::from(dir).is_dir() {
                 continue;
             }
-            for r in repo_scan::scan_repos(dir.clone()).await.unwrap_or_default() {
+            let found = repo_scan::scan_repos(dir.clone()).await.unwrap_or_default();
+            if found.is_empty() && !out.iter().any(|e| e.path == *dir) {
+                let inside = match repo_scan::folder_state(dir.clone()).await {
+                    Ok(repo_scan::FolderState::NoRepo) => None,
+                    Ok(repo_scan::FolderState::InsideRepo { top }) => Some(top),
+                    // Missing by now, or holding a clone still being written.
+                    _ => continue,
+                };
+                let owner = crate::commit_audit::owning_profile(dir, &store.profiles).unwrap_or(p);
+                out.push(RepoRef {
+                    name: crate::paths::base_name(dir),
+                    path: dir.clone(),
+                    profile_id: owner.id.clone(),
+                    profile_name: owner.name.clone(),
+                    profile_email: owner.git_email.clone(),
+                    kind: RepoKind::Folder,
+                    inside,
+                });
+                continue;
+            }
+            for r in found {
                 if out.iter().any(|e| e.path == r.path) {
                     continue;
                 }
@@ -418,6 +466,8 @@ pub async fn list_repos() -> Result<Vec<RepoRef>, AppError> {
                     profile_id,
                     profile_name,
                     profile_email,
+                    kind: RepoKind::Repo,
+                    inside: None,
                 });
             }
         }
@@ -611,7 +661,7 @@ pub fn authors(repo_path: &str, rev: &str) -> Result<Vec<AuthorCount>, AppError>
         args.push(rev.to_string());
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let raw = git(&repo, &refs)?;
+    let raw = git_with(&repo, &refs, walk_clock())?;
     let mut list = parse_shortlog(&raw);
     list.truncate(300);
     Ok(list)
@@ -846,7 +896,16 @@ pub fn history_page(
     }
 
     let count_ref: Vec<&str> = count_args.iter().map(String::as_str).collect();
-    let counted = git(&repo, &count_ref).unwrap_or_default();
+    // A count that fails is read as nothing (a repository without commits),
+    // but a count stopped on its clock is not "no commits": reading it as 0
+    // emptied the graph's members and ended paging after the first page.
+    // Nor is one the safety prelude refused (a partial clone whose own
+    // settings name a transport program): the page says why instead.
+    let counted = match git_with(&repo, &count_ref, walk_clock()) {
+        Ok(s) => s,
+        Err(e) if crate::git_exec::was_stopped(&e) || crate::git_exec::was_refused(&e) => return Err(e),
+        Err(_) => String::new(),
+    };
     let is_oid = |l: &str| (l.len() == 40 || l.len() == 64) && l.chars().all(|c| c.is_ascii_hexdigit());
     let members: Option<std::collections::HashSet<String>> = filtered.then(|| counted.lines().map(str::trim).filter(|l| is_oid(l)).map(str::to_string).collect());
     let total: usize = match &members {
@@ -859,8 +918,11 @@ pub fn history_page(
     // history, not an error worth showing the user.
     // (With the unpushed filter a failure is a failure: an empty list would
     // claim everything is pushed.)
-    let raw = match git(&repo, &log_ref) {
+    // (Nor is a walk stopped on its clock: that is "this took too long".
+    // Nor a refusal of the prelude's.)
+    let raw = match git_with(&repo, &log_ref, walk_clock()) {
         Ok(r) => r,
+        Err(e) if crate::git_exec::was_stopped(&e) || crate::git_exec::was_refused(&e) => return Err(e),
         Err(_) if total == 0 && !unpushed_only => String::new(),
         Err(e) => return Err(e),
     };
@@ -977,7 +1039,7 @@ pub fn commit_detail(repo_path: &str, hash: &str) -> Result<CommitDetail, AppErr
         "%H{US}%h{US}%an{US}%ae{US}%aI{US}%cn{US}%ce{US}%P{US}%D{US}%G?{US}%s{US}%b",
         US = US
     );
-    let raw = git(&repo, &["show", "-s", &format!("--format={}", fmt), hash])?;
+    let raw = git(&repo, &["show", "-s", &format!("--format={}", fmt), "--end-of-options", hash])?;
     let f: Vec<&str> = raw.splitn(12, US).collect();
     if f.len() < 12 {
         return Err(AppError::NotFound(format!("Commit {} not found", hash)));
@@ -987,7 +1049,7 @@ pub fn commit_detail(repo_path: &str, hash: &str) -> Result<CommitDetail, AppErr
     // rename detection: a rename would otherwise print `dir/{old => new}`,
     // which is not a path the file diff can be asked for; as a deletion plus
     // an addition both rows carry real paths.
-    let stat = git(&repo, &["show", "--numstat", "--no-renames", "--format=", hash]).unwrap_or_default();
+    let stat = git(&repo, &["show", "--numstat", "--no-renames", "--format=", "--end-of-options", hash]).unwrap_or_default();
     let files = stat
         .lines()
         .filter_map(|l| {
@@ -1038,7 +1100,7 @@ pub fn commit_detail(repo_path: &str, hash: &str) -> Result<CommitDetail, AppErr
 /// merge commits along its own history.
 pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, AppError> {
     let repo = PathBuf::from(repo_path);
-    let tip = git(&repo, &["rev-parse", branch])?;
+    let tip = git(&repo, &["rev-parse", "--verify", "--end-of-options", branch])?;
 
     // Full ref names, so each remote's symbolic HEAD (short name: just
     // "origin") can be recognised and left out.
@@ -1075,7 +1137,12 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
 
     // The merges in the branch's history, newest first: fifty, and how many there are.
     let fmt = format!("%H{US}%h{US}%P{US}%aN{US}%aE{US}%cI{US}%D{US}%s{US}%aI", US = US);
-    let raw = git(&repo, &["log", "--merges", "--no-show-signature", "--date-order", "-n51", &format!("--format={}", fmt), "--end-of-options", branch]).unwrap_or_default();
+    // A walk stopped on its clock, or refused, is an error, not "no merges".
+    let raw = match git_with(&repo, &["log", "--merges", "--no-show-signature", "--date-order", "-n51", &format!("--format={}", fmt), "--end-of-options", branch], walk_clock()) {
+        Ok(r) => r,
+        Err(e) if crate::git_exec::was_stopped(&e) || crate::git_exec::was_refused(&e) => return Err(e),
+        Err(_) => String::new(),
+    };
     let mut merges: Vec<HistoryCommit> = parse_log(&raw)
         .into_iter()
         .map(|(hash, parents, f)| HistoryCommit {
@@ -1100,7 +1167,11 @@ pub fn branch_merge_info(repo_path: &str, branch: &str) -> Result<MergeInfo, App
         .collect();
     let merges_truncated = merges.len() > 50;
     merges.truncate(50);
-    let merges_total = git(&repo, &["rev-list", "--count", "--merges", "--end-of-options", branch]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(merges.len());
+    let merges_total = match git_with(&repo, &["rev-list", "--count", "--merges", "--end-of-options", branch], walk_clock()) {
+        Ok(s) => s.trim().parse().unwrap_or(merges.len()),
+        Err(e) if crate::git_exec::was_stopped(&e) || crate::git_exec::was_refused(&e) => return Err(e),
+        Err(_) => merges.len(),
+    };
 
     Ok(MergeInfo {
         merged_into,
@@ -1133,6 +1204,12 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
     if remotes.is_empty() {
         return Err(AppError::Config("This repo has no remote to fetch from.".into()));
     }
+    // This fetch runs on its own when "auto fetch" is on, so it is a passive
+    // command (`GitCmd::history_fetch`): refused, once and naming the keys,
+    // when the repository's own config names a program a fetch would run.
+    // Called from a blocking thread, hence `block_on`.
+    let rt = tokio::runtime::Handle::current();
+    rt.block_on(crate::git_exec::check_history_fetch(&repo))?;
 
     let head_before = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_default();
     let worktree_before = git(&repo, &["status", "--porcelain"]).unwrap_or_default();
@@ -1148,7 +1225,6 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
     // downloads. The remotes `--all` would skip (`skipFetchAll`) are skipped.
     // No submodule recursion, as everywhere else in the app. Called from a
     // blocking thread, hence `block_on`.
-    let rt = tokio::runtime::Handle::current();
     let mut failures: Vec<String> = Vec::new();
     for remote in &remotes {
         if git(&repo, &["config", "--bool", "--get", &format!("remote.{}.skipFetchAll", remote)]).map(|v| v.trim() == "true").unwrap_or(false) {
@@ -1160,6 +1236,7 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
         }
         let fetched = rt.block_on(
             crate::git_exec::GitCmd::at(&repo)
+                .history_fetch()
                 .for_fetch()
                 .args(["fetch", "--progress", "--no-recurse-submodules", "--", remote])
                 .run(),
@@ -1178,7 +1255,7 @@ pub fn fetch_repo(repo_path: &str) -> Result<FetchResult, AppError> {
             Err(e) => failures.push(format!("{}: {}", remote, e)),
         }
     }
-    rt.block_on(crate::git_exec::housekeeping(&repo));
+    rt.block_on(crate::git_exec::history_housekeeping(&repo));
     if !failures.is_empty() {
         return Err(AppError::Command(failures.join("\n\n")));
     }
@@ -1243,6 +1320,12 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
     } else {
         branch.to_string()
     };
+    // Read from the repository (HEAD can point at `refs/heads/--output=<file>`,
+    // which git lets a ref be called) or sent by the page: it starts the
+    // arguments below, where a leading `-` would make it an option.
+    if branch.starts_with('-') {
+        return Err(AppError::Config(format!("Invalid revision: {}", branch)));
+    }
 
     let upstream = git(
         &repo,
@@ -1255,7 +1338,7 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
     if let Some(up) = upstream.as_ref() {
         if let Ok(counts) = git(
             &repo,
-            &["rev-list", "--left-right", "--count", &format!("{}...{}", branch, up)],
+            &["rev-list", "--left-right", "--count", "--end-of-options", &format!("{}...{}", branch, up)],
         ) {
             let mut it = counts.split_whitespace();
             ahead = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -1281,6 +1364,83 @@ pub fn sync_status(repo_path: &str, branch: &str) -> Result<SyncStatus, AppError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The History page's runner is the one runner.
+    #[test]
+    fn the_history_runner_goes_through_gitcmd() {
+        let env = git(&std::env::temp_dir(), &crate::git_exec::test_support::SHOW_ENV).expect("git runs");
+        crate::git_exec::test_support::assert_hardened(&env);
+    }
+
+    /// Text that reaches these runners as a revision (a branch named
+    /// `--output=<file>`, which git allows, or a hash the page sends) is
+    /// never an option: each puts `--end-of-options` (git 2.24) right before
+    /// it, and the file it names is not written. hostile.sh shows plain git
+    /// writing it.
+    #[test]
+    fn a_dash_led_revision_is_never_an_option() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-history-eoo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a folder");
+        git(&dir, &["init", "-q", "-b", "main"]).expect("init");
+        git(&dir, &["-c", "user.name=x", "-c", "user.email=x@x.test", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "--no-verify", "-m", "one"]).expect("commit");
+        let rev = "--output=canary.txt";
+        // A ref of that name, so each walk gets past its first command.
+        git(&dir, &["update-ref", &format!("refs/heads/{}", rev), "HEAD"]).expect("a branch named like an option");
+        std::fs::write(dir.join("canary.txt"), "precious\n").unwrap();
+        let path = dir.to_string_lossy().to_string();
+
+        assert!(commit_ref(&dir, rev).is_some(), "the branch is read as a branch");
+        assert_eq!(merged_by(&dir, rev, "HEAD").map(|(how, _)| how).as_deref(), Some("same-commit"));
+        assert_eq!(commit_detail(&path, rev).expect("the commit, by that name").subject, "one");
+
+        assert_eq!(std::fs::read_to_string(dir.join("canary.txt")).unwrap(), "precious\n", "nothing was written to the file the name names");
+        let ran: Vec<Vec<String>> = crate::git_exec::test_support::ran_under(&dir).into_iter().map(|r| r.args).filter(|a| a.iter().any(|x| x.starts_with(rev))).collect();
+        let subs: Vec<&str> = ran.iter().map(|a| a[0].as_str()).collect();
+        assert_eq!(subs, vec!["log", "rev-list", "show", "show"], "commit_ref, merged_by, and both reads of commit_detail: {:?}", ran);
+        for a in &ran {
+            let at = a.iter().position(|x| x.starts_with(rev)).unwrap();
+            assert_eq!(a[at - 1], "--end-of-options", "{:?}", a);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A walk stopped on its clock comes back as an error: never as a page
+    /// that says "no commits" (or one that cannot page past the first), nor
+    /// as a branch without merges.
+    #[test]
+    fn a_walk_stopped_on_its_clock_is_an_error_not_an_empty_history() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-walk-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a folder");
+        git(&dir, &["init", "-q", "-b", "main"]).expect("init");
+        let id = ["-c", "user.name=Walk Test", "-c", "user.email=walk@example.test", "-c", "commit.gpgsign=false"];
+        for m in ["one", "two"] {
+            let mut args = id.to_vec();
+            args.extend(["commit", "-q", "--allow-empty", "--no-verify", "-m", m]);
+            git(&dir, &args).expect("commit");
+        }
+        let path = dir.to_string_lossy().to_string();
+
+        // With the real clock the walk answers.
+        let page = history_page(&path, "HEAD", 0, 50, None, None, false, false).expect("a page");
+        assert_eq!((page.total, page.commits.len()), (2, 2));
+
+        // A clock that has already run out: every walk is stopped.
+        WALK_CLOCK.with(|c| c.set(Some(std::time::Duration::ZERO)));
+        let page = history_page(&path, "HEAD", 0, 50, None, None, false, false);
+        let merges = branch_merge_info(&path, "main");
+        let people = authors(&path, "HEAD");
+        WALK_CLOCK.with(|c| c.set(None));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let Err(err) = page else { panic!("a stopped walk is not an empty history") };
+        assert!(crate::git_exec::was_stopped(&err), "{}", err);
+        let Err(err) = merges else { panic!("a stopped walk is not a branch without merges") };
+        assert!(crate::git_exec::was_stopped(&err), "{}", err);
+        let Err(err) = people else { panic!("a stopped walk is not a repository without authors") };
+        assert!(crate::git_exec::was_stopped(&err), "{}", err);
+    }
 
     #[test]
     fn a_tip_is_drawn_as_one_and_a_continuing_line_comes_from_above() {

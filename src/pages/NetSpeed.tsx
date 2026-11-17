@@ -24,6 +24,16 @@ function where(platform: api.NetSnapshot["platform"]): string {
   return platform === "windows" ? "the taskbar" : platform === "macos" ? "the menu bar" : "the top bar";
 }
 
+/** Starting at sign-in, in this system's words. */
+function startLabel(platform: api.NetSnapshot["platform"]): string {
+  return platform === "windows" ? "Start with Windows" : platform === "macos" ? "Open at login" : "Start when I log in";
+}
+
+/** The speed is shown outside the window (Windows: the tray icon or the speed bar; elsewhere also the floating bar alone). */
+function showsSomething(s: api.NetSettings, platform: api.NetSnapshot["platform"]): boolean {
+  return s.tray || (platform !== "windows" && s.bar);
+}
+
 /**
  * The Net speed tab: how fast the connection is moving data now, the
  * connection itself, the last two minutes, what was used, a speed test, and
@@ -68,6 +78,8 @@ export function NetSpeed() {
   async function save(change: Partial<api.NetSettings>) {
     if (!snap) return;
     const next = { ...snap.settings, ...change };
+    // As the backend has it: starting at sign-in is to show the speed, so with nothing shown it is off.
+    if (!showsSomething(next, snap.platform)) next.start_at_login = false;
     setSnap({ ...snap, settings: next });
     try {
       const s = await api.netspeedSetSettings(next);
@@ -102,7 +114,9 @@ export function NetSpeed() {
   const physical = snap.interfaces.filter((i) => i.kind !== "virtual");
   const virtual = snap.interfaces.filter((i) => i.kind === "virtual");
   const place = where(snap.platform);
-  const showsOutside = s.tray || (snap.platform !== "windows" && s.bar);
+  const showsOutside = showsSomething(s, snap.platform);
+  const startup: api.NetStartup = snap.startup ?? { on: false, active: false, blocked: null, error: null };
+  const startsAtLogin = !!s.start_at_login;
 
   return (
     <div className="space-y-5" data-netspeed>
@@ -358,6 +372,51 @@ export function NetSpeed() {
               Also show a floating speed bar (drag it anywhere)
             </label>
           )}
+          <div className="space-y-1" data-startup={startsAtLogin ? "on" : "off"}>
+            {/* Ticked with nothing shown: the speed goes to the taskbar / menu bar / top bar too. */}
+            <label className="flex items-center gap-2 cursor-pointer text-zinc-200 text-sm">
+              <Checkbox
+                checked={startsAtLogin}
+                onChange={(v) => save(v ? (showsOutside ? { start_at_login: true } : { start_at_login: true, tray: true }) : { start_at_login: false })}
+                aria-label={startLabel(snap.platform)}
+              />
+              {startLabel(snap.platform)}
+            </label>
+            {startsAtLogin && !startup.blocked && !startup.error && (
+              <p className="text-zinc-500 pl-6" data-startup-tip>
+                When you sign in, GitSwitch starts in the background, without its window, and shows the speed in {place}. Open the window from its icon.
+                {snap.platform === "macos" && (
+                  <>
+                    {" "}If macOS asks, allow GitSwitch under Login Items.{" "}
+                    <button type="button" data-startup-settings className="text-emerald-400 hover:underline cursor-pointer" onClick={() => api.netspeedOpenSettings("loginitems").catch((e) => setError(cleanError(e)))}>
+                      Open Login Items
+                    </button>
+                  </>
+                )}
+              </p>
+            )}
+            {startsAtLogin && startup.on && !startup.active && !startup.blocked && !startup.error && (
+              <p className="text-amber-400 pl-6" data-startup-missing>
+                The system's start-up entry is missing, so GitSwitch won't start when you sign in.{" "}
+                <button type="button" className="text-emerald-400 hover:underline cursor-pointer" onClick={() => save({ start_at_login: true })}>
+                  Set it up again
+                </button>
+              </p>
+            )}
+            {startsAtLogin && startup.blocked && (
+              <p className="text-amber-400 pl-6" data-startup-blocked>
+                {startup.blocked}{" "}
+                <button type="button" data-startup-settings className="text-emerald-400 hover:underline cursor-pointer" onClick={() => api.netspeedOpenSettings("startupapps").catch((e) => setError(cleanError(e)))}>
+                  Open Startup apps
+                </button>
+              </p>
+            )}
+            {startup.error && (
+              <p className="text-red-400 pl-6 whitespace-pre-wrap" data-startup-error>
+                {startup.error}
+              </p>
+            )}
+          </div>
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="flex items-center gap-3 flex-wrap">
               <span className="text-zinc-400 w-20">Show</span>

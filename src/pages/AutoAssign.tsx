@@ -347,8 +347,13 @@ export function AutoAssign() {
         await api.updateProfile({ id: profileId, directories: merged });
         profs = await api.getProfiles();
       }
+      const nameOf = (pid: string | null | undefined) => (pid ? profs.find((p) => p.id === pid)?.name : undefined);
       toast.success(
-        `Assigned ${changes.length} repo${changes.length === 1 ? "" : "s"} to the right account`
+        `Assigned ${changes.length} repo${changes.length === 1 ? "" : "s"} to the right account`,
+        changes.map((c) => {
+          const was = nameOf(c.currentProfileId);
+          return `${baseName(c.repo.path)} → ${nameOf(c.proposedProfileId) ?? "its profile"}${was ? ` (was ${was})` : ""}`;
+        })
       );
       // Refresh state so rows show as aligned.
       setProfiles(profs);

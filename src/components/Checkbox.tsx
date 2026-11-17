@@ -6,6 +6,8 @@ interface CheckboxProps {
   disabled?: boolean;
   className?: string;
   "aria-label"?: string;
+  /** The box gets the focus when it is drawn (a dialog's first step). */
+  autoFocus?: boolean;
 }
 
 /**

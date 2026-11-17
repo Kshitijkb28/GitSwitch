@@ -150,6 +150,8 @@ export function ConsoleDrawer() {
     ...visible.map((r) => ({
       value: r.path,
       label: account ? r.name : `${r.name}  ·  ${r.profile_name}`,
+      // A profile folder that holds no repository: a shell works there all the same.
+      ...(r.kind === "folder" ? { note: r.inside ? "inside a repository" : "not a repository yet" } : {}),
     })),
     ...(repo && !visible.some((r) => r.path === repo)
       ? [{ value: repo, label: owner && owner.path !== repo ? `${owner.name} / ${relative(repo, owner.path)}` : baseName(repo) }]

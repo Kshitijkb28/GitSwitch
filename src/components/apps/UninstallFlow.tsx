@@ -293,6 +293,9 @@ export function UninstallFlow({
   const tickedAdmin = tickedItems.filter((i) => i.admin).length;
   const retryable = results.filter((r) => r.outcome === "needs-admin" && scan?.items.find((i) => i.id === r.id)?.elevate);
   const inUse = results.filter((r) => r.outcome === "in-use");
+  // Only what needs the administrator can be deleted at the next restart: the
+  // person's own folders never are (their run is not checked again at boot).
+  const restartable = inUse.filter((r) => scan?.items.find((i) => i.id === r.id)?.admin);
   const force = platform === "windows" ? prep?.force ?? null : null;
 
   const forcePanel = force && forceOpen && (
@@ -632,11 +635,16 @@ export function UninstallFlow({
             {platform === "windows" && inUse.length > 0 && (
               <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 space-y-1.5" data-flow-in-use>
                 <p className="text-zinc-300">
-                  What a running program holds can't go to the Recycle Bin. Restart this PC and choose Continue under "Not finished" — or let Windows delete {inUse.length === 1 ? "it" : "them"} at the next restart, for good.
+                  What a running program holds can't go to the Recycle Bin. Restart this PC and choose Continue under "Not finished"
+                  {restartable.length > 0
+                    ? ` — or let Windows delete ${restartable.length === 1 ? "it" : "them"} at the next restart, for good.`
+                    : ", or close the program that holds it, then look again."}
                 </p>
-                <Button variant="danger" size="sm" onClick={() => atRestart(inUse.map((r) => r.id))} data-flow-at-restart>
-                  <Shield size={14} /> Delete at the next restart
-                </Button>
+                {restartable.length > 0 && (
+                  <Button variant="danger" size="sm" onClick={() => atRestart(restartable.map((r) => r.id))} data-flow-at-restart>
+                    <Shield size={14} /> Delete at the next restart
+                  </Button>
+                )}
               </div>
             )}
             <div className="flex items-center gap-2">

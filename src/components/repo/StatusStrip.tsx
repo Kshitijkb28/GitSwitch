@@ -40,6 +40,12 @@ export type RepoActions = StripActions & {
   update: (repo: string, stash: boolean, bundles: boolean, fingerprint: [string, string][]) => Promise<unknown>;
   /** Stashes the uncommitted changes that collide with the update, so it can run. */
   stashNow: (repo: string) => Promise<unknown>;
+  /**
+   * Opens the Publish dialog to make "owner/name" again on GitHub — the
+   * repository GitHub lost — under the same name, at the address the folder
+   * already has (the GitHub tab's "Create it again on GitHub…").
+   */
+  publishAgain?: (fullName: string) => void;
 };
 
 interface Props {
@@ -228,7 +234,19 @@ export function StatusStrip({
             size="sm"
             variant={status && status.behind > 0 ? "secondary" : "primary"}
             disabled={busy || !status || status.push.blocked || status.detached || status.unborn || !actions}
-            title={status?.push.blocked ? status.push.reason : undefined}
+            title={
+              status?.push.blocked
+                ? status.push.reason
+                : busy
+                  ? "Wait for the running operation to finish"
+                  : !status || !actions
+                    ? "Reading this repository…"
+                    : status.unborn
+                      ? "Nothing to publish yet: make the first commit first"
+                      : status.detached
+                        ? "Not on a branch: switch to a branch to push it"
+                        : undefined
+            }
             onClick={() => actions?.push()}
             className="min-w-[8.5rem]"
           >

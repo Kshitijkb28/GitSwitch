@@ -6,6 +6,7 @@ use crate::find_clones;
 use crate::gh_api::Gh;
 use crate::gh_cli;
 use crate::gh_repo;
+use crate::publish;
 use crate::pulls;
 use crate::git_config;
 use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, FetchResult, MergeInfo, RepoRef, SyncStatus};
@@ -229,23 +230,24 @@ pub async fn gh_auth_login_cancel() -> Result<(), AppError> {
 /// `key_path` is the PRIVATE key path; we read `<key_path>.pub`.
 #[tauri::command]
 pub async fn gh_register_ssh_key(account: String, key_path: String) -> Result<String, AppError> {
-    let signin = credentials::signin_login(&account).map(str::to_string);
-    let token = match &signin {
-        Some(login) => credentials::signin_token(login)?.ok_or_else(|| AppError::NotFound(format!("The sign-in for {} is not kept on this computer any more — sign in again on the GitHub page.", login)))?,
-        None => gh_cli::gh_get_token(&account).await?,
-    };
-    let account = signin.clone().unwrap_or(account);
+    // Never with GitSwitch's own sign-in: GitHub marks a key that an app
+    // uploads as that app's, and an organization that restricts third-party
+    // apps (GitHub's default for new organizations) hides its private
+    // repositories from such a key, a "Repository not found" that no
+    // permission explains (Napnix-LLP, 2026-11-15). A key added by hand on
+    // github.com belongs to no app (the SSH page's "Add to GitHub"); a GitHub
+    // CLI login uploads as GitHub CLI, which GitHub lists among its
+    // privileged apps.
+    if let Some(login) = credentials::signin_login(&account) {
+        return Err(AppError::Command(format!(
+            "GitSwitch doesn't add keys with its own sign-in for {}: GitHub would mark the key as added by GitSwitch, and organizations that restrict third-party apps (GitHub's default for new organizations) hide their private repositories from such keys. Use \"Add to GitHub\" to add it on github.com yourself, or register it with a GitHub CLI login.",
+            login
+        )));
+    }
+    let token = gh_cli::gh_get_token(&account).await?;
     let public_key = ssh_keys::get_public_key(&key_path)?;
     let title = ssh_keys::key_title(ssh_keys::computer_name().as_deref());
     let (status, body, scope) = github::post_ssh_key(&token, &title, &public_key).await?;
-    // A kept sign-in is renewed on the GitHub page, not with gh.
-    if signin.is_some() {
-        match status {
-            401 => return Err(AppError::Command(format!("GitHub no longer accepts the sign-in kept for {} — sign in again on the GitHub page.", account))),
-            403 | 404 => return Err(AppError::Command(format!("The sign-in kept for {} may not add SSH keys — sign in again on the GitHub page, which asks GitHub for that.", account))),
-            _ => {}
-        }
-    }
     // "Already in use" is a success only when THIS account holds the key:
     // otherwise it is the wrong-account case the whole flow exists for.
     let (mine, holder) = if status == 422 {
@@ -772,6 +774,19 @@ pub async fn history_list_repos() -> Result<Vec<RepoRef>, AppError> {
     git_history::list_repos().await
 }
 
+/// What a folder is to git: a repository, a folder of them, one inside a
+/// repository, or a project git doesn't know yet. Read only.
+#[tauri::command]
+pub async fn folder_state(path: String) -> Result<crate::repo_scan::FolderState, AppError> {
+    crate::repo_scan::folder_state(path).await
+}
+
+/// Make a folder that holds no repository one (`git init`).
+#[tauri::command]
+pub async fn repo_init(path: String) -> Result<crate::git_ops::InitOutcome, AppError> {
+    crate::git_ops::init_repo(&path).await
+}
+
 #[tauri::command]
 pub async fn history_branches(repo_path: String) -> Result<Vec<BranchInfo>, AppError> {
     tokio::task::spawn_blocking(move || git_history::list_branches(&repo_path))
@@ -1250,6 +1265,104 @@ pub async fn changes_push(repo_path: String, set_upstream: bool, allow_unpushed_
     git_ops::push(&repo_path, set_upstream, allow_unpushed_submodules.unwrap_or(false)).await
 }
 
+/// Connect a repository that has no remote yet to an address, as origin:
+/// Publish's "Add a remote…", so a repository made here can be published
+/// without the terminal. The address is checked before anything is saved;
+/// `allow_existing`: save it although the repository there has branches.
+#[tauri::command]
+pub async fn changes_add_remote(repo_path: String, url: String, allow_existing: Option<bool>) -> Result<git_ops::RemoteCheck, AppError> {
+    Box::pin(git_ops::add_origin(&repo_path, &url, allow_existing.unwrap_or(false))).await
+}
+
+/// A repository as GitHub has it now, for the visibility and delete dialogs;
+/// with `repo_path`, also which of its branches that folder lacks.
+#[tauri::command]
+pub async fn github_repo_facts(account: String, owner: String, name: String, repo_path: Option<String>) -> Result<crate::repo_admin::RepoFacts, AppError> {
+    let gh = crate::repo_admin::gh_for(&account).await?;
+    Box::pin(crate::repo_admin::facts(&gh, &owner, &name, repo_path.as_deref())).await
+}
+
+/// Make a repository private or public on GitHub (the one with `expect_id`).
+#[tauri::command]
+pub async fn github_set_visibility(account: String, owner: String, name: String, private: bool, expect_id: u64) -> Result<crate::repo_admin::RepoFacts, AppError> {
+    let gh = Gh::for_account(&account).await?;
+    Box::pin(crate::repo_admin::set_visibility(&gh, &owner, &name, private, expect_id)).await
+}
+
+/// Delete a repository on GitHub: `confirm` is what the person typed.
+#[tauri::command]
+pub async fn github_delete_repo(account: String, owner: String, name: String, confirm: String, expect_id: u64) -> Result<crate::repo_admin::DeleteOutcome, AppError> {
+    let gh = crate::repo_admin::gh_for(&account).await?;
+    Box::pin(crate::repo_admin::delete(&gh, &owner, &name, &confirm, expect_id)).await
+}
+
+/// Ask GitHub for the person's approval to delete repositories as `account`'s login.
+#[tauri::command]
+pub async fn github_delete_grant_start(account: String) -> Result<crate::repo_admin::GrantPrompt, AppError> {
+    crate::repo_admin::grant_start(crate::gh_api::login_of(&account)).await
+}
+
+/// Wait for that approval on github.com.
+#[tauri::command]
+pub async fn github_delete_grant_wait() -> Result<String, AppError> {
+    Box::pin(crate::repo_admin::grant_wait()).await
+}
+
+#[tauri::command]
+pub fn github_delete_grant_cancel() {
+    crate::repo_admin::grant_cancel();
+}
+
+/// The Publish dialog's accounts, from local files only: drawn at once.
+#[tauri::command]
+pub async fn github_publish_accounts(repo_path: String) -> Result<crate::publish::PublishAccounts, AppError> {
+    Ok(Box::pin(crate::publish::accounts(&repo_path)).await)
+}
+
+/// Who the folder pushes as, asking github.com about its key if need be.
+#[tauri::command]
+pub async fn github_publish_push_login(repo_path: String) -> Result<Option<String>, AppError> {
+    Ok(Box::pin(crate::publish::push_login(&repo_path)).await)
+}
+
+/// Publishing a repository made here: the accounts that could create it on
+/// GitHub, the one this folder pushes as, where it would be connected, and a
+/// name for it.
+#[tauri::command]
+pub async fn github_publish_context(repo_path: String) -> Result<publish::PublishContext, AppError> {
+    Box::pin(publish::context(&repo_path)).await
+}
+
+/// Where an account can create a repository: itself and its organizations.
+#[tauri::command]
+pub async fn github_owners(account: String) -> Result<gh_repo::Owners, AppError> {
+    gh_repo::owners(&Gh::for_account(&account).await?).await
+}
+
+/// Create the repository on GitHub as `account` and connect it to this
+/// folder (`target`: add origin, or change a never-reached remote), ready
+/// to publish.
+#[tauri::command]
+pub async fn changes_create_github_repo(
+    repo_path: String,
+    account: String,
+    owner: String,
+    name: String,
+    description: String,
+    private: bool,
+    target: publish::TargetArg,
+) -> Result<publish::Published, AppError> {
+    Box::pin(publish::create_and_connect(&repo_path, &account, &owner, &name, &description, private, target)).await
+}
+
+/// Publish's "Change the address…": a new address for a remote that a push
+/// found nothing at, while it still has the address `from` and was never
+/// fetched from or pushed to. Checked before it is saved, as above.
+#[tauri::command]
+pub async fn changes_change_remote(repo_path: String, remote: String, from: String, url: String, allow_existing: Option<bool>) -> Result<git_ops::RemoteCheck, AppError> {
+    Box::pin(git_ops::change_remote_address(&repo_path, &remote, &from, &url, allow_existing.unwrap_or(false))).await
+}
+
 /// `mode` is one of "ff-only", "merge", "rebase" — chosen by the user, never
 /// inferred from their git settings. `with_lfs` additionally downloads the
 /// content behind any LFS pointer stub, which a plain pull does not do unless
@@ -1625,4 +1738,14 @@ pub async fn history_peek(repo_path: String) -> Result<crate::peek::RemotePeek, 
 #[tauri::command]
 pub async fn history_resolve(repo_path: String, text: String) -> Result<Option<crate::tree::CommitTarget>, AppError> {
     crate::tree::resolve_commit(&repo_path, &text).await
+}
+
+#[cfg(test)]
+mod key_register_tests {
+    #[tokio::test]
+    async fn gitswitchs_own_sign_in_never_uploads_a_key() {
+        // Refused before any token is read or any request is made.
+        let e = super::gh_register_ssh_key("signin:octo".into(), "/nowhere/id_key".into()).await.unwrap_err().to_string();
+        assert!(e.contains("Add to GitHub") && e.contains("restrict third-party apps"), "{e}");
+    }
 }

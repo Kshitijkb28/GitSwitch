@@ -152,6 +152,10 @@ async function onInvoke(cmd, args) {
 // ONE http server: dist/ with an SPA fallback, plus POST /invoke.
 // ---------------------------------------------------------------------------
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon" };
+// Answers by request id. The page sends a request again when the network
+// dropped it (Chrome's ERR_NETWORK_CHANGED, when this PC's network moves); the
+// second copy gets the first one's answer, so a git command never runs twice.
+const answered = new Map();
 function serveLive() {
   const server = http.createServer((req, res) => {
     if (req.method === "POST" && req.url === "/invoke") {
@@ -160,8 +164,16 @@ function serveLive() {
       req.on("end", async () => {
         let reply;
         try {
-          const { cmd, args } = JSON.parse(body);
-          reply = await onInvoke(cmd, args ?? {});
+          const { cmd, args, id } = JSON.parse(body);
+          let run = id ? answered.get(id) : undefined;
+          if (!run) {
+            run = onInvoke(cmd, args ?? {});
+            if (id) {
+              answered.set(id, run);
+              setTimeout(() => answered.delete(id), 10 * 60 * 1000).unref();
+            }
+          }
+          reply = await run;
         } catch (e) {
           reply = { ok: false, error: `harness: ${e}` };
         }
@@ -211,6 +223,18 @@ async function waitGone(page, needle, timeout = WAIT) {
   } catch {
     return false;
   }
+}
+/**
+ * The page reports `file` resolved: its "1 file(s) resolved." result, or,
+ * since a later refresh may replace that result, the state it leaves (git has
+ * nothing unmerged and the page no longer lists the conflict).
+ */
+async function resolvedShown(file, timeout = WAIT) {
+  return waitUntilAsync(async () => {
+    const s = (await text(page)).replace(/\s+/g, " ");
+    if (s.includes("1 file(s) resolved.")) return true;
+    return git(WORK, "diff", "--name-only", "--diff-filter=U") === "" && !(s.includes(file) && s.includes("both modified"));
+  }, timeout);
 }
 /** Poll an asynchronous predicate until true or the timeout. */
 async function waitUntilAsync(fn, timeout = WAIT) {
@@ -279,6 +303,10 @@ async function clickWhenEnabled(page, label, timeout = WAIT) {
   }
   return click(page, label);
 }
+/** `clickWhenEnabled`, or an error naming the button: what follows needs the click. */
+async function mustClick(label) {
+  if (!(await clickWhenEnabled(page, label))) throw new Error(`${label} never became enabled: ` + (await text(page)).slice(0, 300));
+}
 /** Click a button inside the first <li> whose text mentions `rowText` and that has the button. */
 async function clickInRow(page, rowText, pick) {
   return page.evaluate(
@@ -290,7 +318,9 @@ async function clickInRow(page, rowText, pick) {
           pick.title !== undefined
             ? buttons.find((x) => x.title === pick.title || x.title.startsWith(pick.title))
             : pick.text !== undefined
-              ? buttons.find((x) => x.innerText.trim() === pick.text)
+              ? // The label exactly, else with a count after it: "Pull inside" is
+                // "Pull inside (1)" once the page knows the submodule is behind.
+                buttons.find((x) => x.innerText.trim() === pick.text) ?? buttons.find((x) => x.innerText.trim().startsWith(`${pick.text} (`))
               : buttons[pick.index];
         if (b) {
           b.click();
@@ -426,34 +456,69 @@ await page.evaluateOnNewDocument((repo) => {
     invoke: (cmd, args) => {
       window.__CALLS__.push({ cmd, args });
       if (cmd.startsWith("plugin:")) return Promise.resolve(null); // Tauri runtime, not a backend command
-      return fetch("/invoke", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ cmd, args: args ?? {} }),
-      })
-        .then((r) => r.json())
-        .then((j) => (j.ok ? j.value : Promise.reject(new Error(j.error))));
+      // One id per call: sent again after a network error, it is answered from
+      // the first run (see `answered` in the harness), never run twice.
+      const id = `${Date.now()}-${(window.__INVOKE_SEQ__ = (window.__INVOKE_SEQ__ || 0) + 1)}`;
+      const once = () =>
+        fetch("/invoke", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cmd, args: args ?? {}, id }),
+        }).then((r) => r.json());
+      const send = (tries) =>
+        once().catch((e) => (tries > 0 ? new Promise((r) => setTimeout(r, 400)).then(() => send(tries - 1)) : Promise.reject(e)));
+      return send(8).then((j) => (j.ok ? j.value : Promise.reject(new Error(j.error))));
     },
   };
 }, WORK);
 
+/** page.goto, again when this PC's network moved under it (ERR_NETWORK_CHANGED). */
+async function gotoSteady(url) {
+  for (let i = 0; ; i++) {
+    try {
+      return await page.goto(url, { waitUntil: "networkidle0", timeout: WAIT });
+    } catch (e) {
+      if (i >= 3 || !/ERR_NETWORK_CHANGED|ERR_NETWORK_IO_SUSPENDED|ERR_INTERNET_DISCONNECTED/.test(String(e))) throw e;
+      await sleep(1000);
+    }
+  }
+}
 async function openChanges() {
-  await page.goto(`${server.url}/repo/changes`, { waitUntil: "networkidle0", timeout: WAIT });
+  await gotoSteady(`${server.url}/repo/changes`);
   if (!(await waitText(page, "Committing as"))) throw new Error("the Changes page never showed the repository: " + (await text(page)).slice(0, 400));
 }
 async function openHistory() {
-  await page.goto(`${server.url}/repo/history`, { waitUntil: "networkidle0", timeout: WAIT });
+  await gotoSteady(`${server.url}/repo/history`);
   await page.waitForFunction(() => /showing \d/.test(document.body.innerText), { timeout: WAIT });
 }
 /** "Go to commit" → the detail panel for `hash`. */
 async function openPanel(hash) {
   await typeInto(page, 'input[aria-label="Go to commit"]', hash);
-  await click(page, "Go");
+  await mustClick("Go");
   await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Copy hash"), { timeout: WAIT });
+}
+/**
+ * Open the Branches dialog. The page disables Branches while it re-reads the
+ * repository (after navigating, after an action), and a click on a disabled
+ * button does nothing: once that cost a whole run, when scenario c's dialog
+ * never opened and every later scenario started on the wrong branch. So it is
+ * clicked once it is enabled, and again if the dialog's title has not appeared
+ * a moment later (never while the dialog is open: a click there would land on
+ * its backdrop).
+ */
+async function openBranchesDialog() {
+  const isOpen = () => page.evaluate((src) => !!eval(src)("Branches"), modalPanel.toString());
+  const end = Date.now() + WAIT;
+  while (Date.now() < end) {
+    if (await isOpen()) return;
+    await clickWhenEnabled(page, "Branches", Math.max(1000, end - Date.now()));
+    if (await waitUntilAsync(isOpen, 3000)) return;
+  }
+  throw new Error("the Branches dialog never opened: " + (await text(page)).slice(0, 300));
 }
 /** Open the Branches dialog and wait until it lists the branch `rowNeedle`. */
 async function openBranches(rowNeedle) {
-  await click(page, "Branches");
+  await openBranchesDialog();
   await page.waitForFunction(
     (n, modalPanelSrc) => {
       const panel = eval(modalPanelSrc)("Branches");
@@ -526,7 +591,7 @@ try {
   await scenario("d. Undo last commit takes the commit apart", async () => {
     await openChanges();
     write(`${WORK}/d.txt`, "d\n");
-    await click(page, "Refresh");
+    await mustClick("Refresh");
     ok("a new file appears under Untracked after Refresh", await waitListed(page, "Untracked", "d.txt"));
     ok("Stage on its row", await clickInRow(page, "d.txt", { title: "Stage" }));
     ok("  stages it", await waitUntil(() => git(WORK, "diff", "--cached", "--name-only") === "d.txt"));
@@ -555,7 +620,7 @@ try {
     await openChanges();
     const st = await buttonState(page, "Stash changes…");
     ok("Stash changes… is offered on a dirty tree", st?.disabled === false, JSON.stringify(st));
-    await click(page, "Stash changes…");
+    await mustClick("Stash changes…");
     await page.waitForSelector('input[aria-label="Stash message"]', { timeout: WAIT });
     ok("the dialog counts the change", (await text(page)).includes("1 uncommitted change (0 staged, 1 not staged, 0 new)"));
     await page.type('input[aria-label="Stash message"]', "wip live");
@@ -579,7 +644,7 @@ try {
   // -----------------------------------------------------------------------
   await scenario("c. Branches: create, switch, rename, delete", async () => {
     await openChanges();
-    await click(page, "Branches");
+    await openBranchesDialog();
     await page.waitForSelector('input[aria-label="New branch name"]', { timeout: WAIT });
     await page.type('input[aria-label="New branch name"]', "feature/live");
     ok("the switch checkbox is on by default", await page.$eval('input[aria-label="Switch to the new branch"]', (el) => el.checked));
@@ -696,7 +761,7 @@ try {
     ok("  the row offers Keep mine and Take theirs", row !== null && row.buttons.some((b) => b.text === "Keep mine") && row.buttons.some((b) => b.text === "Take theirs"), JSON.stringify(row?.buttons));
     ok("  and Commit is blocked while the conflict remains", (await buttonState(page, "Commit"))?.disabled === true);
     ok("Take theirs", await clickInRow(page, "c.txt", { text: "Take theirs" }));
-    ok("  the page reports the file resolved", await waitText(page, "1 file(s) resolved."));
+    ok("  the page shows the file resolved", await resolvedShown("c.txt"));
     ok("  c.txt holds their content", fs.readFileSync(`${WORK}/c.txt`, "utf8") === "theirs\n");
     ok("  and is staged, no conflict left", git(WORK, "diff", "--cached", "--name-only") === "c.txt" && git(WORK, "diff", "--name-only", "--diff-filter=U") === "");
     s = await text(page);
@@ -706,7 +771,9 @@ try {
     const commit = await buttonState(page, "Commit");
     ok("  and Commit enabled", commit?.disabled === false, JSON.stringify(commit));
     ok("Commit", await click(page, "Commit"));
-    const settled = await Promise.race([waitText(page, "Committed ", 15000), waitText(page, "A commit needs a message", 15000)]);
+    // WAIT, not 15 s: on a loaded PC the page's refresh ran first and the
+    // commit only started after a shorter wait had given up (H3's run).
+    const settled = await Promise.race([waitText(page, "Committed "), waitText(page, "A commit needs a message")]);
     s = await text(page);
     ok("  the merge is concluded (no MERGE_HEAD)", settled && !exists(`${WORK}/.git/MERGE_HEAD`), s.includes("A commit needs a message") ? "the page sent an empty message: 'A commit needs a message.'" : "");
     ok("  git: HEAD is a merge commit with the right subject", git(WORK, "rev-list", "--parents", "-1", "HEAD").split(" ").length === 3 && subjectOf(WORK, "HEAD") === "Merge remote-tracking branch 'origin/main'");
@@ -760,7 +827,7 @@ try {
     await openPanel(target);
     let s = await text(page);
     ok("Go to commit opens the panel with the real subject and hash", s.includes(subjectOf(WORK, target)) && s.includes(target));
-    await click(page, "Go back to this commit…");
+    await mustClick("Go back to this commit…");
     await page.waitForSelector('[role="radiogroup"][aria-label="Go back mode"]', { timeout: WAIT });
     await waitGone(page, "Checking where this commit sits");
     s = await text(page);
@@ -790,7 +857,7 @@ try {
     ok("the tip is a plain commit on main", git(WORK, "branch", "--show-current") === "main" && git(WORK, "rev-list", "--parents", "-1", "HEAD").split(" ").length === 2);
     await openHistory();
     await openPanel(head);
-    await click(page, "Undo this commit (revert)");
+    await mustClick("Undo this commit (revert)");
     ok(`it asks "Revert ${short(head)}?"`, await waitText(page, `Revert ${short(head)}?`));
     ok("  with no mainline question for a plain commit", (await page.$('[role="radiogroup"][aria-label="Mainline"]')) === null);
     ok("  Revert", await click(page, "Revert"));
@@ -878,7 +945,7 @@ try {
     ok("  the conflict list names it with the sides", await waitText(page, "both modified"));
     ok("  Continue update waits", (await buttonState(page, "Continue update"))?.disabled === true);
     ok("Keep mine", await clickInRowWhen(page, "c.txt", { text: "Keep mine" }));
-    ok("  the page reports the file resolved", await waitText(page, "1 file(s) resolved."));
+    ok("  the page shows the file resolved", await resolvedShown("c.txt"));
     ok("  c.txt holds my content", fs.readFileSync(`${WORK}/c.txt`, "utf8") === "mine again\n");
     ok("  Continue update is enabled once nothing is unmerged", await waitUntilAsync(async () => (await buttonState(page, "Continue update"))?.disabled === false));
     ok("Continue update", await click(page, "Continue update"));

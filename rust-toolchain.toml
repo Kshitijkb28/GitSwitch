@@ -1,0 +1,11 @@
+# The Rust GitSwitch is built and tested with (CI and the Linux test image
+# install the same).
+#
+# Rust 1.100 (2026-11-09) moved where cargo puts build scripts' output, to
+# build/<package>/<hash>/out. tauri-build 2.6 finds the target folder by going
+# up a fixed number of levels from there, lands in the wrong folder, and the
+# app no longer builds ("Is a directory"). tauri-build 2.7.4 looks for the
+# `build` folder instead: move this on together with Tauri.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

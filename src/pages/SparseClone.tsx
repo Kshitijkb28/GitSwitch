@@ -28,6 +28,8 @@ import { useRefreshOnFocus } from "../lib/focus";
 import { arrivedLabel, formatKb, timeLeftLabel } from "../lib/gitJobs";
 import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
+import { copyText } from "../lib/clipboard";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { RefreshButton } from "../components/RefreshButton";
 
 /** Longest matching folder wins — the same rule the generated gitconfig uses. */
@@ -158,6 +160,18 @@ export function SparseClone() {
   // GitHub shows org-<ID>@github.com links for orgs with an SSH certificate authority.
   const certOrgUrl = /^(?:ssh:\/\/)?org-[^@\s]+@github\.com[:/]/i.test(url.trim());
   const keyInUse = effective?.ssh_key_path ?? null;
+  // A key an app put on GitHub is hidden from organizations that restrict
+  // third-party apps; the same key added by hand is not. Copy it and open the
+  // keys page, where the old entry is deleted and the key added again.
+  async function reAddKey(keyPath: string) {
+    const copied = await copyText(await api.getPublicKey(keyPath)).catch(() => false);
+    await openUrl("https://github.com/settings/keys").catch(() => undefined);
+    toast.info(
+      copied
+        ? "The public key is copied. On GitHub: delete this key's old entry, click New SSH key, paste it, then clone again."
+        : "On GitHub: delete this key's old entry, click New SSH key, paste the contents of its .pub file, then clone again."
+    );
+  }
   // Bumped when the user returns to the app, and by Refresh: the destination
   // folder may have been created or deleted, a certificate may have
   // appeared, git-lfs may have been installed, GitHub may answer about the
@@ -507,6 +521,13 @@ export function SparseClone() {
       {error && (
         <div className="px-4 py-3 rounded-lg bg-red-500/10 border border-red-500/30 text-red-400 text-sm break-words">
           {error}
+          {keyInUse && error.includes("restricts third-party apps") && (
+            <div className="mt-2">
+              <Button size="sm" variant="secondary" onClick={() => void reAddKey(keyInUse)}>
+                Re-add the key on GitHub
+              </Button>
+            </div>
+          )}
         </div>
       )}
 

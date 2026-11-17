@@ -11,6 +11,7 @@ import { Select } from "../components/Select";
 import { useToast } from "../components/Toast";
 import type { Profile } from "../types/profile";
 import { baseName } from "../lib/paths";
+import { folderNotes, profileChanges } from "../lib/changes";
 import * as api from "../lib/api";
 import { identityOf, isSignInValue, loginOfValue, rememberedSignIns, SIGNIN_PREFIX } from "../lib/signins";
 
@@ -255,8 +256,11 @@ export function ProfileForm() {
     setError(null);
 
     try {
+      // The profiles as stored right before the save: what it changed is told
+      // against these (and a folder it takes from another profile, named).
+      const prior: Profile[] = await api.getProfiles().catch(() => []);
       if (isEdit) {
-        await api.updateProfile({
+        const saved = await api.updateProfile({
           id: id!,
           name,
           gitName,
@@ -272,9 +276,12 @@ export function ProfileForm() {
           // background preselection is a display guess, not a decision.
           githubLogin: userPicked.current && autofillAccount ? pickedLogin : githubLogin,
         });
-        toast.success(`Profile "${name}" updated successfully`);
+        const before = prior.find((p) => p.id === id) ?? null;
+        const lines = [...profileChanges(before, saved, prior), ...(await folderNotes(before, saved))];
+        if (lines.length) toast.success(`Profile “${saved.name}” updated`, lines);
+        else toast.info(`Profile “${saved.name}” saved. Nothing changed.`);
       } else {
-        await api.createProfile({
+        const saved = await api.createProfile({
           name,
           gitName,
           gitEmail,
@@ -286,7 +293,7 @@ export function ProfileForm() {
           pushOverSsh,
           githubLogin: (userPicked.current && pickedLogin) || githubLogin || null,
         });
-        toast.success(`Profile "${name}" created successfully`);
+        toast.success(`Profile “${saved.name}” created`, [...profileChanges(null, saved, prior), ...(await folderNotes(null, saved))]);
       }
       navigate("/");
     } catch (e) {

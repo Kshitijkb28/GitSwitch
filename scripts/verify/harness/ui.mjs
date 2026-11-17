@@ -65,6 +65,24 @@ async function openPage(browser, server, scenario, opts = {}) {
     repairLockResult: opts.repairLockResult ?? null,
     pushResult: opts.pushResult ?? null,
     subPushResult: opts.subPushResult ?? null,
+    // Publish's address checks to answer, in order (then: saved).
+    addressChecks: opts.addressChecks ?? [],
+    // Publish's create form: its context, the owners, the answer, and a delay to catch a double submit.
+    publishContext: opts.publishContext ?? null,
+    owners: opts.owners ?? null,
+    /** github_owners by account ({"gh:work-me": RepoOwners}): an account named here answers this instead of `owners`. */
+    ownersBy: opts.ownersBy ?? null,
+    createResult: opts.createResult ?? null,
+    /** changes_create_github_repo refuses with this text (the backend's words), and creates nothing. */
+    createError: opts.createError ?? null,
+    createDelay: opts.createDelay ?? 0,
+    // How late the dialog's reads answer (ms), and a login its key turns out to sign in as.
+    accountsDelay: opts.accountsDelay ?? 0,
+    contextDelay: opts.contextDelay ?? 0,
+    ownersDelay: opts.ownersDelay ?? 0,
+    pushLoginPending: opts.pushLoginPending ?? false,
+    pushLoginLater: opts.pushLoginLater ?? null,
+    pushLoginDelay: opts.pushLoginDelay ?? 0,
     consoleEntries: opts.consoleEntries ?? [],
     lfsListing: opts.lfsListing ?? LFS_LISTING,
     lfsProgress: opts.lfsProgress ?? null,
@@ -134,8 +152,19 @@ async function openPage(browser, server, scenario, opts = {}) {
      * Merging, inviting and removing change it, as GitHub would.
      */
     gh: opts.gh ?? null,
+    /**
+     * Who can see a repository, and deleting it (the GitHub tab's Settings):
+     * {facts: {"owner/name": RepoFacts (+ admins: account keys that are admins)},
+     *  needsPermission: GitHub wants an approval before the first delete,
+     *  grantWaits: what each approval wait answers, in order — "hold" (window.__GRANT__.approve() / .decline(text)), {resolve}, {reject},
+     *  cancelEnds: "hold" — a stopped wait ends only when the test calls window.__STOPPED__.shift()() (else 300 ms later),
+     *  grantPrompt, grantStartRefuse, setRefuse, deleteRefuse, and delays: factsDelay, setDelay, deleteDelay}.
+     */
+    admin: opts.admin ?? null,
     /** What changes_file_diff answers for a text file; null → DIFF_TEXT. */
     diffText: opts.diffText ?? null,
+    /** The Repositories page's listing, every account the same (list_remote_repos_page): RemoteRepo rows. Null: none. */
+    remoteRepos: opts.remoteRepos ?? null,
   };
   // Named, so another engine can be handed the very same bridge (webkit.sh).
   const bridge = (
@@ -192,6 +221,12 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "history_list_repos":
               // A test clones one "behind the app's back" by setting window.__REPOS__.
               return Promise.resolve(window.__REPOS__ ?? cfg.repos ?? repos);
+            case "repo_init": {
+              // The folder is a repository now: the next list says so.
+              const list = window.__REPOS__ ?? cfg.repos ?? repos;
+              window.__REPOS__ = list.map((r) => (r.path === args.path ? { ...r, kind: "repo", inside: null } : r));
+              return Promise.resolve({ path: args.path, branch: "main" });
+            }
             case "changes_repo_status": {
               const sub = args.repoPath && cfg.submoduleStatuses.find((s) => s.status.path === args.repoPath);
               if (sub) return Promise.resolve(sub.status);
@@ -322,7 +357,8 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "changes_push":
               if (cfg.hang) return new Promise(() => {}); // never settles
               // The refusal is the repository's own; a submodule pushed first succeeds.
-              if (cfg.pushResult && args.repoPath === window.__SCENARIO__.path) return Promise.resolve({ ...cfg.pushResult, status: window.__SCENARIO__ });
+              // Once a repository was created for it on GitHub, the publish goes through.
+              if (cfg.pushResult && !window.__CREATED__ && args.repoPath === window.__SCENARIO__.path) return Promise.resolve({ ...cfg.pushResult, status: window.__SCENARIO__ });
               // A submodule's own push answering with its own refusal.
               if (cfg.subPushResult && args.repoPath !== window.__SCENARIO__.path) return Promise.resolve({ ...cfg.subPushResult, status: statusFor(args.repoPath) });
               return done("Done.");
@@ -501,8 +537,13 @@ async function openPage(browser, server, scenario, opts = {}) {
             case "plugin:dialog|open":
               return Promise.resolve((cfg.find && cfg.find.pick) || null);
             // GitHub: pull requests, reviews, merging, collaborators
-            case "github_repo_context":
-              return cfg.gh ? Promise.resolve(cfg.gh.context) : Promise.reject("Command execution error: no GitHub here");
+            case "github_repo_context": {
+              if (!cfg.gh) return Promise.reject("Command execution error: no GitHub here");
+              // Deleted from the GitHub tab: GitHub shows it to no account any more.
+              const c = cfg.gh.context;
+              const gone = !!(window.__ADMIN__ && c.owner && window.__ADMIN__.deleted.includes(`${c.owner}/${c.name}`.toLowerCase()));
+              return Promise.resolve(gone ? { ...c, suggested: null, accounts: c.accounts.map((a) => ({ ...a, permission: "none", private: null })) } : c);
+            }
             case "repo_accounts":
               return Promise.resolve(cfg.gh ? cfg.gh.accounts ?? [] : []);
             case "github_pulls": {
@@ -559,8 +600,159 @@ async function openPage(browser, server, scenario, opts = {}) {
               gh.people.invitations = gh.people.invitations.filter((i) => i.id !== args.id);
               return Promise.resolve(null);
             }
+            // Who can see a repository, and deleting it: as GitHub would, by the backend's rules.
+            case "github_repo_facts":
+            case "github_set_visibility":
+            case "github_delete_repo":
+            case "github_delete_grant_start":
+            case "github_delete_grant_wait":
+            case "github_delete_grant_cancel": {
+              const a = cfg.admin || {};
+              const st = (window.__ADMIN__ ??= { facts: JSON.parse(JSON.stringify(a.facts || {})), granted: false, deleted: [], waits: [...(a.grantWaits || ["hold"])] });
+              const later = (ms, v) => new Promise((res) => setTimeout(() => res(v), ms || 0));
+              const fail = (text) => Promise.reject(`Command execution error: ${text}`);
+              const login = String((args && args.account) || "").split(":")[1] || "";
+              const key = args && args.owner ? `${args.owner}/${args.name}`.toLowerCase() : "";
+              const facts = key && !st.deleted.includes(key) ? Object.entries(st.facts).find(([k]) => k.toLowerCase() === key)?.[1] : null;
+              const shown = (f) => {
+                const { admins, ...rest } = f;
+                return { ...rest, admin: admins ? admins.includes(args.account) : f.admin, can_delete: st.granted ? true : f.can_delete };
+              };
+              const notOurs = () => fail(`GitHub has no repository ${args.owner}/${args.name} that @${login} can see.`);
+              const another = () => fail(`${args.owner}/${args.name} on GitHub is no longer the repository this page showed (it was deleted and made again). Nothing was changed. Refresh and try again.`);
+              if (cmd === "github_repo_facts") {
+                if (!facts) return notOurs();
+                // Branches are compared only with a folder named, and capped at 1,000 there.
+                return later(a.factsDelay, { ...shown(facts), missing_here: args.repoPath ? facts.missing_here || [] : [], local_checked: !!args.repoPath, branches_capped: !!args.repoPath && !!facts.branches_capped });
+              }
+              if (cmd === "github_set_visibility") {
+                if (!facts) return notOurs();
+                if (args.expectId !== facts.id) return another();
+                if (a.setRefuse) return later(a.setDelay, null).then(() => fail(a.setRefuse));
+                facts.private = !!args.private;
+                facts.visibility = args.private ? "private" : "public";
+                return later(a.setDelay, { ...shown(facts), missing_here: [], local_checked: false });
+              }
+              if (cmd === "github_delete_repo") {
+                if (String(args.confirm).trim().toLowerCase() !== key) return Promise.reject(`Configuration error: Nothing was deleted: type ${args.owner}/${args.name} to confirm.`);
+                if (!facts) return notOurs();
+                if (args.expectId !== facts.id) return another();
+                if (a.needsPermission && !st.granted)
+                  return later(a.deleteDelay, { outcome: "needs-permission", message: `GitHub asks for your approval before an app can delete repositories as @${login}. Approve it once: GitSwitch keeps the permission in memory for 10 minutes and never saves it. Nothing was deleted.`, restore_url: null });
+                if (a.deleteRefuse) return later(a.deleteDelay, null).then(() => fail(a.deleteRefuse));
+                st.deleted.push(key);
+                // Worded by owner, as the backend does: who can restore it, and from where — and where that is on
+                // github.com (restore_url), read from the same facts as the words: GitHub's at delete time, which may
+                // no longer be what the dialog read when it opened. None for a fork network.
+                const network = facts.fork || facts.forks > 0;
+                const restore = network
+                  ? "It can't be restored from settings (it was part of a fork network): only GitHub Support can bring it back, on paid plans."
+                  : facts.owner_kind === "org"
+                    ? `Changed your mind? GitHub keeps it for 90 days: an owner of ${facts.owner} can restore it from ${facts.owner}'s settings › Deleted repositories (it can take up to an hour to show there).`
+                    : `Changed your mind? GitHub keeps it for 90 days: restore it from @${facts.owner}'s settings on GitHub › Repositories › Deleted repositories (it can take up to an hour to show there).`;
+                const restore_url = network
+                  ? null
+                  : facts.owner_kind === "org"
+                    ? `https://github.com/organizations/${facts.owner}/settings/deleted_repositories`
+                    : "https://github.com/settings/deleted_repositories";
+                return later(a.deleteDelay, { outcome: "deleted", message: `Deleted ${facts.full_name} on GitHub. ${restore}`, restore_url });
+              }
+              if (cmd === "github_delete_grant_start") {
+                st.waitFor = login;
+                if (a.grantStartRefuse) return fail(a.grantStartRefuse);
+                return Promise.resolve(a.grantPrompt || { user_code: "WDJB-MJHT", verification_uri: "https://github.com/login/device", expires_in: 899 });
+              }
+              if (cmd === "github_delete_grant_wait") {
+                const entry = st.waits.length ? st.waits.shift() : "hold";
+                const approved = () => {
+                  st.granted = true;
+                  return `Approved: GitSwitch can delete repositories as @${st.waitFor} for the next 10 minutes.`;
+                };
+                if (entry === "hold")
+                  return new Promise((res, rej) => {
+                    window.__GRANT__ = { approve: () => res(approved()), decline: (text) => rej(`Command execution error: ${text}`) };
+                  });
+                if (entry.reject !== undefined) return later(entry.delay, null).then(() => fail(entry.reject));
+                return later(entry.delay, null).then(approved);
+              }
+              // github_delete_grant_cancel: a wait still running ends LATER, as the backend's
+              // does at its next look (seconds later) — by then a new wait may be running, which
+              // it must not end. 300 ms later by default; held, the test says when.
+              const running = window.__GRANT__;
+              window.__GRANT__ = null;
+              if (running) {
+                const end = () => running.decline("Stopped waiting for GitHub. Nothing was deleted.");
+                if (a.cancelEnds === "hold") (window.__STOPPED__ ??= []).push(end);
+                else setTimeout(end, 300);
+              }
+              return Promise.resolve(null);
+            }
+            case "changes_add_remote":
+            case "changes_change_remote": {
+              // The address checks to answer, in order; then: saved.
+              const queue = (window.__ADDRESS_CHECKS__ ??= [...(cfg.addressChecks ?? [])]);
+              return Promise.resolve(queue.length ? queue.shift() : { saved: true, problem: "", create_url: null, existing_branches: [] });
+            }
+            case "github_publish_accounts": {
+              const c = cfg.publishContext;
+              const answer = {
+                accounts: c ? c.accounts : [{ account: "gh:me", login: "me", source: "GitHub CLI" }],
+                suggested: c ? c.suggested : "gh:me",
+                push_login: c ? c.push_login : "me",
+                push_login_pending: !!cfg.pushLoginPending,
+              };
+              return cfg.accountsDelay ? new Promise((r) => setTimeout(() => r(answer), cfg.accountsDelay)) : Promise.resolve(answer);
+            }
+            case "github_publish_push_login":
+              return new Promise((r) => setTimeout(() => r(cfg.pushLoginLater), cfg.pushLoginDelay || 0));
+            case "github_publish_context": {
+              const later = (v) => (cfg.contextDelay ? new Promise((r) => setTimeout(() => r(v), cfg.contextDelay)) : Promise.resolve(v));
+              if (cfg.publishContext) return later(cfg.publishContext);
+              const remotes = (window.__SCENARIO__.push && window.__SCENARIO__.push.remotes) || [];
+              return later({
+                accounts: [{ account: "gh:me", login: "me", source: "GitHub CLI" }],
+                suggested: "gh:me",
+                push_login: "me",
+                target: remotes.length
+                  ? { kind: "change", remote: remotes[0].name, url: remotes[0].fetch_url, repo: null }
+                  : { kind: "add", remote: "origin", url: null, repo: null },
+                default_name: window.__SCENARIO__.name || "repository",
+                branch: window.__SCENARIO__.branch || "main",
+                blocked: null,
+              });
+            }
+            case "github_owners": {
+              const answer = (cfg.ownersBy && cfg.ownersBy[args.account]) ?? cfg.owners ?? { owners: [{ login: String(args.account || "").split(":")[1] || "me", kind: "user" }, { login: "acme", kind: "org" }], sso_hidden: 0 };
+              return cfg.ownersDelay ? new Promise((r) => setTimeout(() => r(answer), cfg.ownersDelay)) : Promise.resolve(answer);
+            }
+            case "changes_create_github_repo": {
+              // Refused (a name taken, say): nothing created, so a push still fails as before.
+              if (cfg.createError) return Promise.reject(`Command execution error: ${cfg.createError}`);
+              // Made again: the remote's address is kept; changed: replaced; else origin is added.
+              const kind = (args.target && args.target.kind) || "add";
+              const made = cfg.createResult ?? {
+                saved: kind === "again" ? "kept" : kind === "change" ? "changed" : "added",
+                full_name: args.owner + "/" + args.name,
+                html_url: "https://github.com/" + args.owner + "/" + args.name,
+                private: args.private,
+                renamed: false,
+                remote: kind === "add" ? "origin" : args.target.remote,
+                url: kind === "again" ? args.target.from : "git@github.com:" + args.owner + "/" + args.name + ".git",
+                problem: "",
+              };
+              // GitHub has a repository there now: a push goes through, and one deleted earlier is back.
+              window.__CREATED__ = true;
+              if (window.__ADMIN__) window.__ADMIN__.deleted = window.__ADMIN__.deleted.filter((k) => k !== `${args.owner}/${args.name}`.toLowerCase());
+              return cfg.createDelay ? new Promise((r) => setTimeout(() => r(made), cfg.createDelay)) : Promise.resolve(made);
+            }
             case "plugin:opener|open_url":
               return Promise.resolve(null);
+            // The Repositories page, reached from here: one page of the listing.
+            case "list_remote_repos_page": {
+              if (!cfg.remoteRepos) return Promise.reject("Command execution error: no listing here");
+              const login = String(args.account || "").split(":")[1] || "";
+              return Promise.resolve({ listing: { account: args.account, login, suggested_profile_id: null, repos: cfg.remoteRepos, truncated: false, sso_hidden_orgs: 0 }, page: args.page, per_page: args.perPage, has_more: false });
+            }
             default:
               return Promise.resolve(null);
           }
@@ -575,12 +767,36 @@ async function openPage(browser, server, scenario, opts = {}) {
   await page.setViewport({ width: cfg.width, height: 900 });
   await page.evaluateOnNewDocument(bridge, REPOS, scenario, DIFF_TEXT, DIFF_BINARY, cfg);
   await page.goto(`${server.url}/repo/changes`, { waitUntil: "networkidle0" });
-  await page.waitForFunction(() => document.body.innerText.includes("Changes"), { timeout: 5000 });
+  // The repository's tabs, or for a folder that is no repository the card in their place.
+  await page.waitForFunction(() => document.body.innerText.includes("Changes") || !!document.querySelector("[data-not-a-repository]"), { timeout: 5000 });
   return page;
 }
 
 const text = (page) => page.evaluate(() => document.body.innerText);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Every dialog drawn by Modal that is open: whether it is a modal dialog named
+ * by its own title, its ✕ named "Close dialog" (not "Close", which other
+ * panels' ✕ answer to), and the dimmed area behind it hidden from screen readers.
+ */
+const modalA11y = (page) =>
+  page.evaluate(() =>
+    [...document.querySelectorAll("body > div.fixed > div[role='dialog']")].map((d) => {
+      const id = d.getAttribute("aria-labelledby");
+      const h = id ? document.getElementById(id) : null;
+      const x = d.querySelector(":scope > div:first-child > button");
+      return {
+        modal: d.getAttribute("aria-modal") === "true",
+        title: h && d.contains(h) && h.tagName === "H2" ? h.innerText.trim() : null,
+        close: x ? `${x.getAttribute("type")}:${x.getAttribute("aria-label")}` : null,
+        backdrop: d.previousElementSibling?.getAttribute("aria-hidden") ?? null,
+      };
+    })
+  );
+/** The one open Modal is exactly as `modalA11y` wants it, titled `title`. */
+const modalOk = (dialogs, title) =>
+  dialogs.length === 1 && dialogs[0].modal && dialogs[0].title === title && dialogs[0].close === "button:Close dialog" && dialogs[0].backdrop === "true";
 
 /** Find a button by its visible label: an exact match wins, else the first one starting with it. */
 async function button(page, label) {
@@ -632,6 +848,12 @@ async function openReposPage(browser, server, opts = {}) {
     restDelay: opts.restDelay ?? 400,
     /** What local_clone_index answers: by default nothing is cloned. */
     local: opts.local ?? { clones: {}, owner_profiles: {}, org_ssh_users: {} },
+    /** More of alice's repositories, newest first, listed with her first page: [{full_name, ...what differs}]. */
+    extraRepos: opts.extraRepos ?? [],
+    /** What GitHub has for a repository when its menu acts on it: {"owner/name": RepoFacts}; set and delete change it. */
+    facts: opts.facts ?? {},
+    /** What the Pull requests page lists for alice (github_pull_repos). */
+    pullRepos: opts.pullRepos ?? null,
   };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
@@ -639,6 +861,18 @@ async function openReposPage(browser, server, opts = {}) {
     window.__CALLS__ = [];
     localStorage.clear();
     localStorage.setItem("gitswitch:repos.account", JSON.stringify("gh:alice"));
+    localStorage.setItem("gitswitch:pulls.account", JSON.stringify("gh:alice"));
+    const facts = JSON.parse(JSON.stringify(cfg.facts));
+    const deleted = [];
+    const factsOf = (args) => {
+      const key = `${args.owner}/${args.name}`.toLowerCase();
+      return deleted.includes(key) ? null : Object.entries(facts).find(([k]) => k.toLowerCase() === key)?.[1] ?? null;
+    };
+    const extra = (r) => ({
+      owner_is_org: false, description: null, private: false, archived: false, fork: false, default_branch: "main",
+      clone_url: `git@github.com:${r.full_name}.git`, pushed_at: new Date().toISOString(), permission: "admin", local_path: null, suggested_profile_id: null,
+      owner: r.full_name.split("/")[0], name: r.full_name.split("/")[1], ...r,
+    });
     const repo = (owner, i) => ({
       full_name: `${owner}/${owner[0]}-${i}`, owner, name: `${owner[0]}-${i}`, owner_is_org: false, description: null,
       private: i % 2 === 0, archived: false, fork: false, default_branch: "main", clone_url: `git@github.com:${owner}/${owner[0]}-${i}.git`,
@@ -663,13 +897,53 @@ async function openReposPage(browser, server, opts = {}) {
             const total = 30;
             if (args.perPage === 10) {
               if (login === "bob") await wait(cfg.firstDelayBob);
-              return { listing: listing(login, Array.from({ length: 10 }, (_, i) => repo(login, i + 1))), page: 1, per_page: 10, has_more: true };
+              const extras = login === "alice" ? cfg.extraRepos.map(extra) : [];
+              return { listing: listing(login, [...extras, ...Array.from({ length: 10 }, (_, i) => repo(login, i + 1))]), page: 1, per_page: 10, has_more: true };
             }
             await wait(cfg.restDelay);
             const start = (args.page - 1) * 100;
             const repos = Array.from({ length: Math.max(0, Math.min(100, total - start)) }, (_, i) => repo(login, start + i + 1));
             return { listing: listing(login, repos), page: args.page, per_page: 100, has_more: start + 100 < total };
           }
+          // A row's menu: who can see it, and deleting it, as GitHub would.
+          case "github_repo_facts": {
+            const f = factsOf(args);
+            if (!f) throw `Command execution error: GitHub has no repository ${args.owner}/${args.name} that @alice can see.`;
+            return { ...f, missing_here: args.repoPath ? f.missing_here || [] : [], local_checked: !!args.repoPath };
+          }
+          case "github_set_visibility": {
+            const f = factsOf(args);
+            if (!f || f.id !== args.expectId) throw "Command execution error: Nothing was changed. Refresh and try again.";
+            f.private = !!args.private;
+            f.visibility = args.private ? "private" : "public";
+            return { ...f, missing_here: [], local_checked: false };
+          }
+          case "github_delete_repo": {
+            const f = factsOf(args);
+            if (String(args.confirm).trim().toLowerCase() !== `${args.owner}/${args.name}`.toLowerCase()) throw `Configuration error: Nothing was deleted: type ${args.owner}/${args.name} to confirm.`;
+            if (!f || f.id !== args.expectId) throw "Command execution error: Nothing was deleted. Refresh and try again.";
+            deleted.push(`${args.owner}/${args.name}`.toLowerCase());
+            // Worded by owner, as the backend does — and where on github.com it can be restored (restore_url), from the
+            // same facts: none for a fork network.
+            const network = f.fork || f.forks > 0;
+            const restore = network
+              ? "It can't be restored from settings (it was part of a fork network): only GitHub Support can bring it back, on paid plans."
+              : f.owner_kind === "org"
+                ? `Changed your mind? GitHub keeps it for 90 days: an owner of ${f.owner} can restore it from ${f.owner}'s settings › Deleted repositories (it can take up to an hour to show there).`
+                : `Changed your mind? GitHub keeps it for 90 days: restore it from @${f.owner}'s settings on GitHub › Repositories › Deleted repositories (it can take up to an hour to show there).`;
+            const restore_url = network
+              ? null
+              : f.owner_kind === "org"
+                ? `https://github.com/organizations/${f.owner}/settings/deleted_repositories`
+                : "https://github.com/settings/deleted_repositories";
+            return { outcome: "deleted", message: `Deleted ${f.full_name} on GitHub. ${restore}`, restore_url };
+          }
+          // The Pull requests page, for the lists it keeps between visits.
+          case "github_pull_repos":
+            return cfg.pullRepos ?? { login: "alice", repos: [], truncated: false, notes: [] };
+          case "github_pulls":
+          case "github_pulls_search":
+            return { items: [], next_page: null, total: 0 };
           default:
             return null;
         }
@@ -1159,7 +1433,8 @@ async function openNetSpeedPage(browser, server, opts = {}) {
         iface("veth", "vEthernet (WSL)", "virtual", { link_bps: 10_000_000_000, upload: 74 }),
       ],
       usage: { today: [1_240_000_000, 45_600_000], month: [38_500_000_000, 2_100_000_000], session: [340_000_000, 12_000_000], since: 1793950000 },
-      settings: { tray: false, style: "icon", bar: false, bar_place: "taskbar", bar_pos: null, show: "both", unit: "bytes", interval_ms: 1000, source: "auto", ...(opts.settings ?? {}) },
+      settings: { tray: false, style: "icon", bar: false, bar_place: "taskbar", bar_pos: null, show: "both", unit: "bytes", interval_ms: 1000, source: "auto", start_at_login: false, ...(opts.settings ?? {}) },
+      startup: opts.startup ?? { on: false, active: false, blocked: null, error: null },
     },
     tests: opts.tests ?? [
       { phase: "latency", progress: 0.05, latency_ms: null, down_bps: null, up_bps: null, used_bytes: 0, error: null, at: null },
@@ -1210,18 +1485,34 @@ async function openProfilePage(browser, server, opts = {}) {
     ghAccounts: opts.ghAccounts ?? [],
     user: opts.user ?? null,
     keyAccount: opts.keyAccount ?? null,
+    /** {[folder]: FolderState}: what folder_state answers (default: a repository). */
+    folderStates: opts.folderStates ?? {},
   };
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 900 });
   await page.evaluateOnNewDocument((cfg) => {
     window.__CALLS__ = [];
     localStorage.clear();
+    // The store, as the backend keeps it: saving, making default and deleting change it.
+    let store = cfg.profiles.map((p) => ({ ...p }));
     window.__TAURI_INTERNALS__ = {
       invoke: (cmd, args) => {
         window.__CALLS__.push({ cmd, args });
         switch (cmd) {
           case "get_profiles":
-            return Promise.resolve(cfg.profiles);
+            return Promise.resolve(store.map((p) => ({ ...p })));
+          case "folder_state":
+            return Promise.resolve(cfg.folderStates[args?.path] ?? { kind: "repo" });
+          case "set_default_profile": {
+            store = store.map((p) => ({ ...p, is_default: p.id === args.id }));
+            return Promise.resolve({ ...store.find((p) => p.id === args.id) });
+          }
+          case "delete_profile": {
+            const wasDefault = store.find((p) => p.id === args.id)?.is_default;
+            store = store.filter((p) => p.id !== args.id);
+            if (wasDefault && store.length && !store.some((p) => p.is_default)) store[0].is_default = true;
+            return Promise.resolve(null);
+          }
           case "list_ssh_keys":
             return Promise.resolve([]);
           case "gh_list_accounts":
@@ -1233,8 +1524,29 @@ async function openProfilePage(browser, server, opts = {}) {
           case "resolve_key_account":
             return cfg.keyAccount ? Promise.resolve(cfg.keyAccount) : Promise.reject("the key could not be probed");
           case "create_profile":
-          case "update_profile":
-            return Promise.resolve({ ...(cfg.profiles[0] ?? {}), ...args });
+          case "update_profile": {
+            // As the backend answers: the profile as stored, in its own fields.
+            const given = {
+              name: args.name,
+              git_name: args.gitName,
+              git_email: args.gitEmail,
+              ssh_key_path: args.sshKeyPath === undefined ? undefined : args.sshKeyPath || null,
+              directories: args.directories,
+              allow_push: args.allowPush,
+              signing_enabled: args.signingEnabled,
+              remote_patterns: args.remotePatterns,
+              push_over_ssh: args.pushOverSsh,
+              github_login: args.githubLogin === undefined ? undefined : args.githubLogin || null,
+            };
+            const set = Object.fromEntries(Object.entries(given).filter(([, v]) => v !== undefined));
+            const base =
+              cmd === "update_profile"
+                ? store.find((p) => p.id === args.id) ?? store[0] ?? {}
+                : { id: "p-new", is_default: store.length === 0, created_at: "2026-01-02T00:00:00Z", updated_at: "2026-01-02T00:00:00Z" };
+            const saved = { ...base, ...set };
+            store = [...store.filter((p) => p.id !== saved.id), saved];
+            return Promise.resolve({ ...saved });
+          }
           default:
             return Promise.resolve(null);
         }
@@ -2277,6 +2589,25 @@ try {
     ok("discarding a new file warns it will be deleted from disk", (await text(page)).includes("deleted from disk"));
     await page.close();
   }
+  {
+    // Discarding goes back to the last commit, which has no file at a rename's new name.
+    const page = await open(SCENARIOS.renamed);
+    ok("(control: the rename's row is listed)", await clickInRow(page, "src/new.ts", { title: "Discard — this cannot be undone" }));
+    await page.waitForFunction(() => document.body.innerText.includes("Discard these changes?"), { timeout: 4000 });
+    const s = await text(page);
+    ok("discarding a staged rename warns its new name is deleted from disk", s.includes("1 of them is a new file and will be deleted from disk."));
+    ok("  a modal dialog named by its title, its ✕ named Close dialog, the page behind hidden from screen readers", modalOk(await modalA11y(page), "Discard these changes?"), JSON.stringify(await modalA11y(page)));
+    ok("  its ✕ is not one of the panels' Close buttons", !(await page.$('body > div.fixed > div[role="dialog"] button[aria-label="Close"]')));
+    ok("  and says the file goes back to its old name", s.includes("it goes back to its old name, as in the last commit"));
+    await page.close();
+  }
+  {
+    const page = await open(SCENARIOS.renamed);
+    await clickInRow(page, "src/mod.ts", { title: "Discard — this cannot be undone" });
+    await page.waitForFunction(() => document.body.innerText.includes("Discard these changes?"), { timeout: 4000 });
+    ok("(control: a plain modified file is not called deleted)", !(await text(page)).includes("deleted from disk"));
+    await page.close();
+  }
 
   // -----------------------------------------------------------------
   section("Staging");
@@ -2320,6 +2651,757 @@ try {
     await sleep(300);
     ok("no submodule card when the repo has no gitlinks", !(await text(page)).includes("Submodules"));
     await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Publish: the address is checked before it is saved");
+  {
+    const missing = { saved: false, problem: "There's no repository me/brand-new on GitHub yet: the key id_me signs in as me, who would see it even if it were private. Create it there (empty: no README, licence or .gitignore), then publish again.", create_url: "https://github.com/new?owner=me&name=brand-new&visibility=private", existing_branches: [], repo: "me/brand-new" };
+    const notEmpty = { saved: false, problem: "That repository isn't empty: it already has a branch (dev). Publishing puts main there beside it, with a history of its own. Use an empty repository instead (no README, licence or .gitignore), or publish there anyway.", create_url: null, existing_branches: ["dev"], repo: null };
+    const page = await open(SCENARIOS.noRemote, { addressChecks: [missing, notEmpty] });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Create and publish"), { timeout: 4000 });
+    const atOpen = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length);
+    ok("Publish branch with no remote opens the dialog at once, on Create on GitHub, with no refused push first", atOpen === 0, `pushes=${atOpen}`);
+    await (await button(page, "Use an address")).click();
+    await page.waitForSelector('input[aria-label="Remote address"]', { timeout: 4000 });
+    await page.type('input[aria-label="Remote address"]', "git@github.com:me/brand-new.git");
+    await (await button(page, "Add and publish")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("There's no repository me/brand-new on GitHub yet"), { timeout: 4000 });
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/publish-address-problem.png` });
+    const pushes = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length);
+    ok("an address with no repository behind it is not saved: the dialog says so, stays open and publishes nothing", (await text(page)).includes("Create it on GitHub") && pushes === 0, `pushes=${pushes}`);
+    await (await button(page, "Create it on GitHub")).click();
+    await page.waitForSelector('input[aria-label="Repository name"]', { timeout: 4000 });
+    const named = await page.$eval('input[aria-label="Repository name"]', (el) => el.value);
+    const browsed = await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"));
+    ok("  Create it on GitHub opens the create form here, filled in from the address, not the browser", named === "brand-new" && !browsed, `name=${named} browser=${browsed}`);
+    await (await button(page, "Use an address")).click();
+    await page.waitForSelector('input[aria-label="Remote address"]', { timeout: 4000 });
+    await (await button(page, "Add and publish")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("isn't empty"), { timeout: 4000 });
+    ok("a repository that already has branches is not saved without the person's word", (await text(page)).includes("Publish there anyway"));
+    await (await button(page, "Publish there anyway")).click();
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_add_remote").length >= 3, { timeout: 4000 });
+    const adds = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_add_remote").map((c) => c.args));
+    ok("  Publish there anyway sends the person's word, for the same address", adds.length === 3 && adds[2].allowExisting === true && adds[2].url === "git@github.com:me/brand-new.git" && adds[0].allowExisting === false, JSON.stringify(adds));
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 1, { timeout: 4000 });
+    const last = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").at(-1).args);
+    ok("  once saved, the branch is published", last.setUpstream === true, JSON.stringify(last));
+    await page.close();
+  }
+  {
+    // A page behind the folder: it shows a remote, the push is refused as no-remote.
+    const noRemote = { ok: false, headline: "This repository isn't on a server yet.", detail: "", refusal: { code: "no-remote", message: "This repository isn't on a server yet: it has no remote to push to. Add one (the address of an empty repository) and publish there." } };
+    const page = await open(SCENARIOS.unpublished, { pushResult: noRemote, publishContext: { accounts: [{ account: "gh:me", login: "me", source: "GitHub CLI" }], suggested: "gh:me", push_login: "me", target: { kind: "add", remote: "origin", url: null, repo: null }, default_name: "gitswitch", branch: "main", blocked: null } });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("isn't on a server yet"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a no-remote refusal offers to create it on GitHub, or an address", s.includes("Create it on GitHub") && s.includes("Use an address"));
+    await (await button(page, "Use an address")).click();
+    const addressTab = await page.waitForSelector('input[aria-label="Remote address"]', { timeout: 4000 }).then(() => true, () => false);
+    ok("  Use an address opens the dialog on the address tab", addressTab);
+    await page.close();
+  }
+  {
+    // A push that found no repository at an address nothing was ever fetched from or pushed to.
+    const guidance = "There's no repository me/gitswitch on GitHub: the SSH key id_me signs in as me, who would see it even if it were private. If it's new, create it on GitHub (empty: no README, licence or .gitignore), then try again; otherwise the address is wrong, or the repository was deleted.";
+    const failed = {
+      ok: false,
+      headline: "GitHub has no repository at this address.",
+      detail: guidance,
+      advice: { headline: "GitHub has no repository at this address.", guidance, action: "change-remote", link: "https://github.com/new?owner=me&name=gitswitch&visibility=private", remote: "origin", git_said: "ERROR: Repository not found." },
+    };
+    const page = await open(SCENARIOS.unpublished, { pushResult: failed });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("GitHub has no repository at this address"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a push that found no repository offers to create it and to correct the address", s.includes("Create it on GitHub") && s.includes("Change the address"));
+    await (await button(page, "Change the address")).click();
+    await page.waitForSelector('input[aria-label="Remote address"]', { timeout: 4000 });
+    const prefilled = await page.$eval('input[aria-label="Remote address"]', (el) => el.value);
+    ok("  the dialog starts from the remote's current address", prefilled === "git@github.com:me/gitswitch.git", prefilled);
+    await page.click('input[aria-label="Remote address"]', { clickCount: 3 });
+    await page.keyboard.type("git@github.com:me/gitswitch-app.git");
+    await (await button(page, "Change and publish")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_change_remote"), { timeout: 4000 });
+    const change = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_change_remote").args);
+    ok("  Change and publish names the remote and the address it replaces", change.remote === "origin" && change.from === "git@github.com:me/gitswitch.git" && change.url === "git@github.com:me/gitswitch-app.git" && change.allowExisting === false, JSON.stringify(change));
+    const published = await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 2, { timeout: 4000 }).then(() => true, () => false);
+    ok("  then publishes", published);
+    await page.close();
+  }
+  {
+    // The create form, end to end: what it starts from, what it sends, then the publish.
+    const page = await open(SCENARIOS.noRemote, { createDelay: 300 });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForSelector('input[aria-label="Repository name"]', { timeout: 4000 });
+    await page.waitForFunction(() => !document.body.innerText.includes("Loading…"), { timeout: 4000 });
+    const named = await page.$eval('input[aria-label="Repository name"]', (el) => el.value);
+    const privateBox = await page.$eval('input[name="visibility"][aria-label^="Private"]', (el) => el.checked);
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/publish-create.png` });
+    const s = await text(page);
+    ok("Create on GitHub starts from the folder's account, you as owner, the folder's name, and private", named === "gitswitch" && privateBox && s.includes("me") && s.includes("Creates me/gitswitch on GitHub as a private repository, then publishes main to it"), `name=${named} private=${privateBox}`);
+    ok("  a modal dialog named by its title, Publish this repository, with its tabs", modalOk(await modalA11y(page), "Publish this repository") && !!(await page.$('[role="tablist"][aria-label="Where to publish"]')), JSON.stringify(await modalA11y(page)));
+    await page.click('input[aria-label="Repository name"]', { clickCount: 3 });
+    await page.keyboard.type("Subtitle Maker!");
+    ok("  a name GitHub would rewrite shows what it will be", (await text(page)).includes("Will be created as Subtitle-Maker"));
+    await page.type('input[aria-label="Description"]', "Makes subtitles");
+    const go = await button(page, "Create and publish");
+    await go.click();
+    await go.click().catch(() => {});
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 1, { timeout: 4000 });
+    const creates = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_create_github_repo").map((c) => c.args));
+    ok("  a double click asks GitHub once", creates.length === 1, `creates=${creates.length}`);
+    const c = creates[0] || {};
+    ok("  it sends the account, owner, name, description, private and where to connect it", c.account === "gh:me" && c.owner === "me" && c.name === "Subtitle-Maker" && c.description === "Makes subtitles" && c.private === true && JSON.stringify(c.target) === '{"kind":"add"}', JSON.stringify(c));
+    const last = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").at(-1).args);
+    ok("  then the branch is published", last.setUpstream === true, JSON.stringify(last));
+    ok("  and it says what was created", (await text(page)).includes("Created me/Subtitle-Maker on GitHub (private)"));
+    await page.close();
+  }
+  {
+    // A failed push to a repository that doesn't exist: created here, filled in from the remote, never the browser.
+    const guidance = "There's no repository me/gitswitch on GitHub: the SSH key id_me signs in as me, who would see it even if it were private.";
+    const failed = {
+      ok: false,
+      headline: "GitHub has no repository at this address.",
+      detail: guidance,
+      advice: { headline: "GitHub has no repository at this address.", guidance, action: "change-remote", link: "https://github.com/new?owner=me&name=gitswitch&visibility=private", remote: "origin", repo: "me/gitswitch", git_said: "ERROR: Repository not found." },
+    };
+    const page = await open(SCENARIOS.unpublished, { pushResult: failed });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("GitHub has no repository at this address"), { timeout: 4000 });
+    await (await button(page, "Create it on GitHub")).click();
+    await page.waitForSelector('input[aria-label="Repository name"]', { timeout: 4000 });
+    const named = await page.$eval('input[aria-label="Repository name"]', (el) => el.value);
+    const browsed = await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"));
+    ok("after a failed push, Create it on GitHub opens the form here, filled in from the remote", named === "gitswitch" && !browsed, `name=${named} browser=${browsed}`);
+    await page.waitForFunction(() => !document.body.innerText.includes("Loading…"), { timeout: 4000 });
+    await (await button(page, "Create and publish")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 });
+    const c = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_github_repo").args);
+    ok("  and connects it in place of the address the push found nothing at", JSON.stringify(c.target) === JSON.stringify({ kind: "change", remote: "origin", from: "git@github.com:me/gitswitch.git" }), JSON.stringify(c.target));
+    await page.close();
+  }
+  {
+    // No GitHub account in GitSwitch: say so, and where to sign in.
+    const page = await open(SCENARIOS.noRemote, { publishContext: { accounts: [], suggested: null, push_login: null, target: { kind: "add", remote: "origin", url: null, repo: null }, default_name: "gitswitch", branch: "main", blocked: null } });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("no GitHub account"), { timeout: 4000 });
+    const s = await text(page);
+    ok(
+      "with no GitHub account, the create tab says so and offers the GitHub Auth page (named as the sidebar names it) and an address",
+      s.includes("Sign in on the GitHub Auth page") && !!(await button(page, "Go to GitHub Auth")) && !s.includes("the GitHub page") && s.includes("Use an address")
+    );
+    await page.close();
+  }
+  {
+    // The folder pushes as another account than the one picked: warned before anything is created.
+    const page = await open(SCENARIOS.noRemote, { publishContext: { accounts: [{ account: "gh:me", login: "me", source: "GitHub CLI" }], suggested: null, push_login: "work-me", target: { kind: "add", remote: "origin", url: null, repo: null }, default_name: "gitswitch", branch: "main", blocked: null } });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForSelector('input[aria-label="Repository name"]', { timeout: 4000 });
+    await page.waitForFunction(() => document.body.innerText.includes("This folder pushes as @work-me"), { timeout: 4000 }).catch(() => {});
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/publish-mismatch.png` });
+    ok("an owner the folder doesn't push as is warned about", (await text(page)).includes("This folder pushes as @work-me, and a repository under @me won't accept its pushes"));
+    await page.close();
+  }
+  const createReady = (page, ms) =>
+    page
+      .waitForFunction(
+        () => {
+          const b = [...document.querySelectorAll("button")].find((x) => x.innerText.trim() === "Create and publish");
+          return !!b && !b.disabled;
+        },
+        { timeout: ms }
+      )
+      .then(
+        () => true,
+        () => false
+      );
+  {
+    // GitHub slow to list the organizations, the folder slow to read: the form is usable at once all the same.
+    const page = await open(SCENARIOS.noRemote, { ownersDelay: 5000, contextDelay: 5000 });
+    const t0 = Date.now();
+    await (await button(page, "Publish branch")).click();
+    const ready = await createReady(page, 1500);
+    const took = Date.now() - t0;
+    ok("Publish's form is usable at once though GitHub takes 5 s to list the organizations", ready && took < 1500, `ready=${ready} after ${took} ms`);
+    const s = await text(page);
+    ok("  it says the organizations are still being listed", s.includes("Listing your organizations"));
+    const ctx = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "github_publish_context").length);
+    ok("  with no remote on the page, the folder isn't read again before Create (the create command checks)", ctx === 0, `context reads=${ctx}`);
+    await (await button(page, "Create and publish")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 });
+    const c = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_github_repo").args);
+    ok("  Create goes ahead under the account itself, origin to be added", c.owner === "me" && c.account === "gh:me" && JSON.stringify(c.target) === '{"kind":"add"}', JSON.stringify(c));
+    await page.close();
+  }
+  {
+    // Public, chosen on purpose: said plainly, with what it shows.
+    const page = await open(SCENARIOS.noRemote);
+    await (await button(page, "Publish branch")).click();
+    await createReady(page, 4000);
+    await page.evaluate(() => document.querySelector('input[name="visibility"][aria-label^="Public"]').closest("label").click());
+    await sleep(100);
+    const s = await text(page);
+    ok("Public says who can see it and warns about the whole history", s.includes("Anyone on the internet can see it") && s.includes("Everything in this branch's history becomes visible") && s.includes("as a public repository"));
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/publish-public.png` });
+    await (await button(page, "Create and publish")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 });
+    const c = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_github_repo").args);
+    ok("  and creates it public", c.private === false, JSON.stringify(c));
+    await page.close();
+  }
+  {
+    // Accounts read late (a moment): drawn at once, Create waits for an account.
+    const page = await open(SCENARIOS.noRemote, { accountsDelay: 1200 });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForSelector('input[aria-label="Repository name"]', { timeout: 1000 });
+    const early = await buttonState(page, "Create and publish");
+    ok("the form is drawn before the accounts are read, Create waiting for one", early && early.disabled && (await text(page)).includes("Reading this folder's accounts"), JSON.stringify(early));
+    ok("  then Create is ready", await createReady(page, 3000));
+    await page.close();
+  }
+  {
+    // The folder's key turns out to sign in as the other account: the form follows until the person picks.
+    const two = { accounts: [{ account: "gh:me", login: "me", source: "GitHub CLI" }, { account: "gh:work-me", login: "work-me", source: "GitHub CLI" }], suggested: null, push_login: null, target: { kind: "add", remote: "origin", url: null, repo: null }, default_name: "gitswitch", branch: "main", blocked: null };
+    const page = await open(SCENARIOS.noRemote, { publishContext: two, pushLoginPending: true, pushLoginLater: "work-me", pushLoginDelay: 700 });
+    await (await button(page, "Publish branch")).click();
+    await createReady(page, 3000);
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "github_publish_push_login"), { timeout: 3000 });
+    await sleep(1000);
+    await (await button(page, "Create and publish")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 });
+    const c = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_github_repo").args);
+    ok("who the folder's key signs in as, found after the form was drawn, picks the account", c.account === "gh:work-me" && c.owner === "work-me", JSON.stringify(c));
+    await page.close();
+  }
+  {
+    // Publish pressed on another tab: the dialog shows there, over the page.
+    const page = await open(SCENARIOS.noRemote);
+    await page.evaluate(() => [...document.querySelectorAll('a[role="tab"]')].find((a) => a.innerText.trim().startsWith("History"))?.click());
+    await sleep(400);
+    await (await button(page, "Publish branch")).click();
+    const shown = await page
+      .waitForFunction(
+        () => {
+          const i = document.querySelector('input[aria-label="Repository name"]');
+          return !!i && i.getClientRects().length > 0;
+        },
+        { timeout: 2000 }
+      )
+      .then(
+        () => true,
+        () => false
+      );
+    ok("Publish pressed on the History tab shows the dialog right there", shown && (await page.evaluate(() => location.pathname)) === "/repo/history");
+    await page.close();
+  }
+  {
+    // Another folder picked while the Publish dialog is open (the page behind it can still be reached): the dialog
+    // closes — it never creates or publishes for one folder with what it read for the other.
+    const page = await open(SCENARIOS.noRemote);
+    await (await button(page, "Publish branch")).click();
+    await createReady(page, 4000);
+    const before = await page.$eval('input[aria-label="Repository name"]', (el) => el.value).catch(() => null);
+    const opened = await page.evaluate(() => {
+      const label = [...document.querySelectorAll("label")].find((l) => l.innerText.trim() === "Repository");
+      label?.parentElement.querySelector("button")?.click();
+      return !!label;
+    });
+    await page.waitForFunction(() => [...document.querySelectorAll(".absolute.z-50 button")].some((b) => b.innerText.trim().startsWith("argos")), { timeout: 2000 }).catch(() => null);
+    const chose = await page.evaluate(() => {
+      const b = [...document.querySelectorAll(".absolute.z-50 button")].find((x) => x.innerText.trim().startsWith("argos"));
+      b?.click();
+      return !!b;
+    });
+    await page.waitForFunction(() => !document.querySelector("[data-create-mode]"), { timeout: 4000 }).catch(() => null);
+    await sleep(200);
+    const dialogs = await modalA11y(page);
+    ok(
+      "another folder picked while the Publish dialog is open: the dialog closes, nothing created — it never acts on one folder with what it read for the other",
+      before === "gitswitch" && opened && chose && !(await page.$("[data-create-mode]")) && dialogs.length === 0 && (await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_create_github_repo").length)) === 0,
+      JSON.stringify({ before, opened, chose, dialogs })
+    );
+    await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Publish branch" && !b.disabled), { timeout: 4000 }).catch(() => null);
+    await (await button(page, "Publish branch"))?.click();
+    await createReady(page, 4000);
+    const named = await page.$eval('input[aria-label="Repository name"]', (el) => el.value).catch(() => null);
+    ok("  opened again, it is the new folder's: named argos", named === "argos", String(named));
+    await page.close();
+  }
+  {
+    // Before the first commit there is nothing to publish: the button says so instead of doing nothing.
+    const page = await open({ ...SCENARIOS.noRemote, unborn: true, branch: "main" });
+    await page.waitForFunction(() => document.body.innerText.includes("Publish branch"), { timeout: 4000 });
+    const st = await buttonState(page, "Publish branch");
+    ok("a disabled Publish says why: no commit yet", st && st.disabled && st.title === "Nothing to publish yet: make the first commit first", JSON.stringify(st));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Publish: GitHub lost the repository a folder pushes to — made again here under the same name, the address kept, never the browser");
+  {
+    const guidance = "There's no repository me/gitswitch on GitHub: the SSH key id_me signs in as me, who would see it even if it were private.";
+    // A remote reached before (action null: no address to correct), under the key's own account.
+    const failed = {
+      ok: false,
+      headline: "GitHub has no repository at this address.",
+      detail: guidance,
+      advice: { headline: "GitHub has no repository at this address.", guidance, action: null, link: "https://github.com/new?owner=me&name=gitswitch&visibility=private", remote: "origin", repo: "me/gitswitch", git_said: "ERROR: Repository not found." },
+    };
+    const reached = { accounts: [{ account: "gh:me", login: "me", source: "GitHub CLI" }], suggested: "gh:me", push_login: "me", target: { kind: "none", remote: "origin", url: "git@github.com:me/gitswitch.git", repo: "me/gitswitch" }, default_name: "gitswitch", branch: "main", blocked: null };
+    // Named as the GitHub tab names it: it opens the dialog to make it again.
+    const AGAIN = "Create it again on GitHub…";
+    const againDialog = (page) => page.evaluate(() => document.querySelector("[data-create-mode]")?.closest("[role=dialog]")?.innerText ?? "");
+    const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+    /** Pick an account by its login in the open dialog's Account list, as a person would. */
+    const pickAccount = async (page, login) => {
+      await page.evaluate(() => {
+        const label = [...document.querySelectorAll("[data-create-mode] span")].find((s) => s.innerText.trim() === "Account");
+        label?.nextElementSibling?.querySelector(":scope > button")?.click();
+      });
+      await page.waitForSelector("[data-create-mode] .absolute.z-50 button", { timeout: 2000 }).catch(() => null);
+      return page.evaluate((login) => {
+        const b = [...document.querySelectorAll("[data-create-mode] .absolute.z-50 button")].find((x) => x.querySelector("span.truncate.flex-1")?.innerText.trim() === login);
+        b?.click();
+        return !!b;
+      }, login);
+    };
+    /** What the dialog says when the account picked can't create repositories in the owner, or null. */
+    const cantCreate = (page) => page.evaluate(() => document.querySelector("[data-cant-create-here] p")?.innerText.trim() ?? null);
+    const pushAndCreate = async (page) => {
+      await (await button(page, "Push (1)")).click();
+      await page.waitForFunction(() => document.body.innerText.includes("GitHub has no repository at this address"), { timeout: 4000 });
+      await (await button(page, AGAIN))?.click();
+      await page.waitForSelector("[data-again-repo]", { timeout: 4000 }).catch(() => null);
+    };
+    {
+      // The folder is read a moment late, so what is shown before its answer can be looked at.
+      const page = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failed, publishContext: reached, contextDelay: 700 });
+      await (await button(page, "Push (1)")).click();
+      await page.waitForFunction(() => document.body.innerText.includes("GitHub has no repository at this address"), { timeout: 4000 });
+      const s = await text(page);
+      ok(
+        "a push to a remote reached before that finds nothing there offers to create it again — named as the GitHub tab names it; no address to change, no browser",
+        s.includes(AGAIN) && !s.includes("Change the address") && !s.includes("Create it on github.com")
+      );
+      await (await button(page, AGAIN))?.click();
+      await page.waitForSelector("[data-again-repo]", { timeout: 4000 }).catch(() => null);
+      const early = await againDialog(page);
+      const earlyRepo = await page.evaluate(() => document.querySelector("[data-again-repo]")?.innerText.trim() ?? null);
+      ok(
+        "  while the folder's address is still being read, nothing is claimed about it: the repository, and the wait",
+        early.includes("Checking this folder's address…") &&
+          earlyRepo === "me/gitswitch" &&
+          !(await page.$("[data-again-intro]")) &&
+          !(await page.$('[data-testid="create-summary"]')) &&
+          !early.includes("stays as it is"),
+        `${earlyRepo} | ${early}`
+      );
+      await createReady(page, 4000);
+      const d = await againDialog(page);
+      ok(
+        "  Create it again on GitHub… opens the dialog here: no tabs, no name to type, the repository fixed as the folder's address",
+        !(await page.$('[role="tablist"][aria-label="Where to publish"]')) &&
+          !(await page.$('input[aria-label="Repository name"]')) &&
+          !d.includes("Owner") &&
+          !d.includes("Use an address") &&
+          !!(await page.$('[data-again-repo="me/gitswitch"]')) &&
+          d.includes("this folder's address"),
+        d
+      );
+      ok("  it is a dialog named by its title, Create it again on GitHub", modalOk(await modalA11y(page), "Create it again on GitHub"), JSON.stringify(await modalA11y(page)));
+      ok(
+        "  it says what happened and what it does: same name, the address kept, private, nothing else added",
+        d.includes("GitHub has no repository at this folder's address any more, or @me can't see it. Create it again under the same name: this folder's address stays as it is.") &&
+          d.includes("Creates me/gitswitch on GitHub again as a private repository, then publishes main to it. This folder's address stays as it is. Nothing else is added (no README, licence or .gitignore).") &&
+          (await page.$eval('input[name="visibility"][aria-label^="Private"]', (el) => el.checked).catch(() => false)) &&
+          d.includes("or create it on github.com") &&
+          !d.includes("Publish to it"),
+        d
+      );
+      ok(
+        "  and that it is no undo: a new, empty repository — GitSwitch didn't delete it, so of restoring it only what may be true: GitHub may still keep it, not for a fork network, an organization's restored by its owners; no restore link",
+        d.includes(
+          "It is a new, empty repository: only this folder's commits go to it. If it was deleted by mistake, GitHub may still keep it for 90 days: restoring it brings back its issues and pull requests too (not for a fork network; an organization's is restored by its owners)."
+        ) &&
+          !d.includes("Restore it instead") &&
+          !(await page.$("[data-again-restore]")),
+        d
+      );
+      ok("  the folder was read for where it publishes, though the page shows a remote", (await calls(page, "github_publish_context")).length >= 1);
+      if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-from-push.png` });
+      await (await button(page, "Create and publish"))?.click();
+      await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 }).catch(() => null);
+      const c = (await calls(page, "changes_create_github_repo"))[0] ?? {};
+      ok(
+        "  Create makes it again: me/gitswitch as @me, private, at the address origin has (kept)",
+        JSON.stringify(c.target) === JSON.stringify({ kind: "again", remote: "origin", from: "git@github.com:me/gitswitch.git" }) && c.owner === "me" && c.name === "gitswitch" && c.account === "gh:me" && c.private === true,
+        JSON.stringify(c)
+      );
+      await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 2, { timeout: 4000 }).catch(() => null);
+      const pushes = await calls(page, "changes_push");
+      ok("  then publishes the branch, as before", pushes.length === 2 && pushes[1].setUpstream === true, JSON.stringify(pushes));
+      ok("  and says it was created again; the browser was never opened", (await text(page)).includes("Created me/gitswitch again on GitHub (private).") && (await calls(page, "plugin:opener|open_url")).length === 0);
+      await page.close();
+    }
+    {
+      // Cancelled: the focus goes back where it was. Later the dialog opens for this folder with no remote any more
+      // (another folder picked, say): nothing read for the earlier opening is used.
+      const page = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failed, publishContext: reached });
+      await pushAndCreate(page);
+      await createReady(page, 4000);
+      await page.evaluate(() => document.querySelector("[data-create-cancel]")?.click());
+      await page.waitForFunction(() => !document.querySelector("[data-create-mode]"), { timeout: 4000 }).catch(() => null);
+      await page.waitForFunction((label) => document.activeElement?.innerText?.trim() === label, { timeout: 2000 }, AGAIN).catch(() => null);
+      ok(
+        "Cancel closes it with nothing created, and the focus is back on Create it again on GitHub…, the button that opened it",
+        !(await page.$("[data-create-mode]")) && (await page.evaluate(() => document.activeElement?.innerText?.trim() ?? "")) === AGAIN && (await calls(page, "changes_create_github_repo")).length === 0
+      );
+      await page.evaluate(() => {
+        window.__SCENARIO__ = { ...window.__SCENARIO__, upstream: null, ahead: 0, push: { ...window.__SCENARIO__.push, remotes: [] } };
+        document.querySelector('button[title="Re-read this repository"]')?.click();
+      });
+      await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Publish branch" && !b.disabled), { timeout: 4000 }).catch(() => null);
+      const reads = (await calls(page, "github_publish_context")).length;
+      await (await button(page, "Publish branch"))?.click();
+      await page.waitForSelector('input[aria-label="Repository name"]', { timeout: 4000 }).catch(() => null);
+      const ready = await createReady(page, 4000);
+      const d = await againDialog(page);
+      const named = await page.$eval('input[aria-label="Repository name"]', (el) => el.value).catch(() => null);
+      ok(
+        "  a later opening for this folder, now with no remote: the usual form, its tabs, the folder's name and Create ready — nothing of the earlier opening's address",
+        ready &&
+          named === "gitswitch" &&
+          !!(await page.$('[role="tablist"][aria-label="Where to publish"]')) &&
+          !(await page.$("[data-again-repo]")) &&
+          !d.includes("already publishes") &&
+          !d.includes("origin") &&
+          (await calls(page, "github_publish_context")).length === reads,
+        d
+      );
+      await (await button(page, "Create and publish"))?.click();
+      await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 }).catch(() => null);
+      const c = (await calls(page, "changes_create_github_repo"))[0] ?? {};
+      ok("  and Create adds origin for it", JSON.stringify(c.target) === '{"kind":"add"}' && c.name === "gitswitch", JSON.stringify(c));
+      await page.close();
+    }
+    {
+      // Two accounts, the folder pushing as @work-me: the repository is @me's, so @me makes it again.
+      const both = {
+        ...reached,
+        accounts: [{ account: "gh:work-me", login: "work-me", source: "GitHub CLI" }, { account: "gh:me", login: "me", source: "GitHub CLI" }],
+        suggested: "gh:work-me",
+        push_login: "work-me",
+      };
+      const page = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failed, publishContext: both });
+      await pushAndCreate(page);
+      await createReady(page, 4000);
+      const d = await againDialog(page);
+      await (await button(page, "Create and publish"))?.click();
+      await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 }).catch(() => null);
+      const c = (await calls(page, "changes_create_github_repo"))[0] ?? {};
+      ok(
+        "two accounts, the folder pushing as @work-me (the suggested one): the repository is @me's, so @me makes it again, at the address origin has",
+        c.account === "gh:me" && c.owner === "me" && c.name === "gitswitch" && JSON.stringify(c.target) === JSON.stringify({ kind: "again", remote: "origin", from: "git@github.com:me/gitswitch.git" }),
+        JSON.stringify(c)
+      );
+      ok("  and it said first that @work-me needs access to it before the publish works", d.includes("This folder pushes as @work-me, but the repository is @me's: @work-me needs access to it before the publish works."), d);
+      await page.close();
+    }
+    {
+      // The folder's address names another repository by now: nothing to make again there.
+      const page = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failed, publishContext: { ...reached, target: { kind: "none", remote: "origin", url: "git@github.com:me/other.git", repo: "me/other" } } });
+      await pushAndCreate(page);
+      await page.waitForFunction(() => document.body.innerText.includes("This folder publishes to origin"), { timeout: 4000 }).catch(() => null);
+      const d = await againDialog(page);
+      const st = await buttonState(page, "Create and publish");
+      ok(
+        "a folder whose address names another repository: says so, and the way that is left, without the form it couldn't use; Create stays greyed",
+        d.includes("This folder publishes to origin (me/other), not me/gitswitch, so it can't be made again from here. To create it anyway, use the link below.") &&
+          st?.disabled === true &&
+          !d.includes("this folder's address stays") &&
+          !d.includes("Creates me/gitswitch") &&
+          !(await page.$("[data-create-mode] [data-again-repo]")) &&
+          !(await page.$('[data-create-mode] input[aria-label="Description"]')) &&
+          !(await page.$('[data-create-mode] input[name="visibility"]')) &&
+          d.includes("Create it on github.com"),
+        d
+      );
+      await page.waitForFunction(() => !!document.activeElement?.hasAttribute("data-create-cancel"), { timeout: 2000 }).catch(() => null);
+      if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-elsewhere.png` });
+      ok("  the field that had the focus went with the form: the focus is on Cancel", await page.evaluate(() => !!document.activeElement?.hasAttribute("data-create-cancel")));
+      await page.evaluate(() => [...document.querySelectorAll("[data-create-mode] button")].find((b) => b.innerText.trim() === "Create it on github.com")?.click());
+      await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"), { timeout: 2000 }).catch(() => null);
+      ok(
+        "  the link opens GitHub's form for me/gitswitch, private",
+        JSON.stringify((await calls(page, "plugin:opener|open_url")).map((a) => a.url)) === JSON.stringify(["https://github.com/new?owner=me&name=gitswitch&visibility=private"]),
+        JSON.stringify(await calls(page, "plugin:opener|open_url"))
+      );
+      await page.close();
+    }
+    {
+      // The account can't create repositories in that owner, and GitSwitch has no other account.
+      const failedAcme = { ...failed, advice: { ...failed.advice, link: "https://github.com/new?owner=acme&name=gitswitch&visibility=private", repo: "acme/gitswitch" } };
+      const acme = { ...reached, target: { kind: "none", remote: "origin", url: "git@github.com:acme/gitswitch.git", repo: "acme/gitswitch" } };
+      const onlyMe = { owners: [{ login: "me", kind: "user" }], sso_hidden: 0 };
+      const page = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failedAcme, publishContext: acme, owners: onlyMe });
+      await pushAndCreate(page);
+      await page.waitForSelector("[data-cant-create-here]", { timeout: 4000 }).catch(() => null);
+      const d = await againDialog(page);
+      const st = await buttonState(page, "Create and publish");
+      if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-cant-create.png` });
+      ok(
+        "an account that can't create repositories in that owner, and no other account: says so, and that another sign-in is the way on; Create stays greyed",
+        d.includes("@me can't create repositories in acme. Sign in on the GitHub Auth page with an account that can, then come back.") &&
+          !d.includes("Pick another account") &&
+          (await page.$eval("[data-cant-create-here] button", (b) => b.innerText.trim()).catch(() => null)) === "Go to GitHub Auth" &&
+          st?.disabled === true &&
+          !!(await page.$('[data-again-repo="acme/gitswitch"]')),
+        d
+      );
+      ok("  nothing was created", (await calls(page, "changes_create_github_repo")).length === 0);
+      await page.close();
+      // With another account in GitSwitch, not in acme either: "Pick another account" only while it may be.
+      const two = { ...acme, accounts: [...acme.accounts, { account: "gh:work-me", login: "work-me", source: "GitHub CLI" }] };
+      const workMeAlone = { owners: [{ login: "work-me", kind: "user" }], sso_hidden: 0 };
+      const other = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failedAcme, publishContext: two, owners: onlyMe, ownersBy: { "gh:work-me": workMeAlone } });
+      await pushAndCreate(other);
+      await other.waitForSelector("[data-cant-create-here]", { timeout: 4000 }).catch(() => null);
+      const d2 = await againDialog(other);
+      ok(
+        "  with another account in GitSwitch whose organizations aren't read yet (it may be in acme), it says to pick another account (no sign-in button)",
+        d2.includes("@me can't create repositories in acme. Pick another account.") && !(await other.$("[data-cant-create-here] button")),
+        d2
+      );
+      const pickedWork = await pickAccount(other, "work-me");
+      await other.waitForFunction(() => (document.querySelector("[data-cant-create-here] p")?.innerText ?? "").includes("@work-me"), { timeout: 4000 }).catch(() => null);
+      const d3 = await cantCreate(other);
+      if (process.env.UI_SHOTS) await other.screenshot({ path: `${process.env.UI_SHOTS}/again-cant-create-no-other.png` });
+      ok(
+        "  @work-me picked and read, not in acme either: no account left that may create it there — the sign-in sentence and Go to GitHub Auth, not “Pick another account”; Create stays greyed",
+        pickedWork &&
+          JSON.stringify((await calls(other, "github_owners")).map((a) => a.account)) === JSON.stringify(["gh:me", "gh:work-me"]) &&
+          d3 === "@work-me can't create repositories in acme. Sign in on the GitHub Auth page with an account that can, then come back." &&
+          (await other.$eval("[data-cant-create-here] button", (b) => b.innerText.trim()).catch(() => null)) === "Go to GitHub Auth" &&
+          (await buttonState(other, "Create and publish"))?.disabled === true,
+        JSON.stringify({ pickedWork, d3, owners: await calls(other, "github_owners") })
+      );
+      await pickAccount(other, "me");
+      await other.waitForFunction(() => (document.querySelector("[data-cant-create-here] p")?.innerText ?? "").includes("@me"), { timeout: 4000 }).catch(() => null);
+      const d4 = await cantCreate(other);
+      ok(
+        "  back to @me: @work-me is known not to be in acme, so the sign-in sentence and Go to GitHub Auth again — no account to point at",
+        d4 === "@me can't create repositories in acme. Sign in on the GitHub Auth page with an account that can, then come back." &&
+          (await other.$eval("[data-cant-create-here] button", (b) => b.innerText.trim()).catch(() => null)) === "Go to GitHub Auth" &&
+          (await calls(other, "changes_create_github_repo")).length === 0,
+        String(d4)
+      );
+      await other.close();
+      // The other account is in acme: once read, it is the way on — and it makes it.
+      const workMeInAcme = { owners: [{ login: "work-me", kind: "user" }, { login: "acme", kind: "org" }], sso_hidden: 0 };
+      const member = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failedAcme, publishContext: two, owners: onlyMe, ownersBy: { "gh:work-me": workMeInAcme } });
+      await pushAndCreate(member);
+      await member.waitForSelector("[data-cant-create-here]", { timeout: 4000 }).catch(() => null);
+      await pickAccount(member, "work-me");
+      const readyAsWork = await createReady(member, 4000);
+      const asWork = { cant: await cantCreate(member), create: await buttonState(member, "Create and publish") };
+      await pickAccount(member, "me");
+      await member.waitForSelector("[data-cant-create-here]", { timeout: 4000 }).catch(() => null);
+      const d5 = await cantCreate(member);
+      ok(
+        "  another account known to be in acme: picked, Create is ready; back on @me, “Pick another account” points at it (no sign-in button)",
+        readyAsWork &&
+          asWork.cant === null &&
+          d5 === "@me can't create repositories in acme. Pick another account." &&
+          !(await member.$("[data-cant-create-here] button")),
+        JSON.stringify({ asWork, d5 })
+      );
+      await pickAccount(member, "work-me");
+      await createReady(member, 4000);
+      await (await button(member, "Create and publish"))?.click();
+      await member.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 }).catch(() => null);
+      const madeAs = (await calls(member, "changes_create_github_repo"))[0] ?? {};
+      ok(
+        "    and picking it makes acme/gitswitch again as @work-me, at the address origin has",
+        madeAs.account === "gh:work-me" && madeAs.owner === "acme" && madeAs.name === "gitswitch" && JSON.stringify(madeAs.target) === JSON.stringify({ kind: "again", remote: "origin", from: "git@github.com:acme/gitswitch.git" }),
+        JSON.stringify(madeAs)
+      );
+      await member.close();
+    }
+    {
+      // GitHub lists @me's organizations without acme, but hides one behind single sign-on: acme may be that one, so it
+      // is not called an owner @me can't create in. GitHub decides when it is created: Create isn't greyed for it.
+      const failedAcme = { ...failed, advice: { ...failed.advice, link: "https://github.com/new?owner=acme&name=gitswitch&visibility=private", repo: "acme/gitswitch" } };
+      const acme = { ...reached, target: { kind: "none", remote: "origin", url: "git@github.com:acme/gitswitch.git", repo: "acme/gitswitch" } };
+      const page = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failedAcme, publishContext: acme, owners: { owners: [{ login: "me", kind: "user" }], sso_hidden: 1 } });
+      await pushAndCreate(page);
+      const ready = await createReady(page, 4000);
+      await page.waitForSelector("[data-sso-maybe]", { timeout: 2000 }).catch(() => null);
+      const d = await againDialog(page);
+      const sso = await page.evaluate(() => document.querySelector("[data-sso-maybe]")?.innerText.trim() ?? null);
+      if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-sso-maybe.png` });
+      ok(
+        "an organization GitHub may be hiding behind single sign-on: no “can't create repositories in acme” — a line saying acme may be one of those, GitHub decides — and Create is not greyed for it",
+        ready &&
+          !(await page.$("[data-cant-create-here]")) &&
+          sso === "acme isn't among @me's organizations as GitHub lists them, but it may be one of those hidden by single sign-on: GitHub says whether @me can create it there when you create it." &&
+          d.includes("1 organization is hidden: this login isn't authorized for its single sign-on.") &&
+          !d.includes("can't create repositories in acme"),
+        JSON.stringify({ ready, sso, d })
+      );
+      await (await button(page, "Create and publish"))?.click();
+      await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 }).catch(() => null);
+      const c = (await calls(page, "changes_create_github_repo"))[0] ?? {};
+      ok(
+        "  Create asks GitHub to make acme/gitswitch again as @me, at the address origin has: GitHub says whether it can",
+        c.account === "gh:me" && c.owner === "acme" && c.name === "gitswitch" && JSON.stringify(c.target) === JSON.stringify({ kind: "again", remote: "origin", from: "git@github.com:acme/gitswitch.git" }),
+        JSON.stringify(c)
+      );
+      await page.close();
+    }
+    {
+      // GitHub still has it after all (the folder's account can't reach it): the backend refuses; nothing is created.
+      const still = "me/gitswitch is still on GitHub, so nothing was created. The account this folder pushes with can't reach it: ask for access to it, or check this folder's profile.";
+      const page = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failed, publishContext: reached, createError: still });
+      await pushAndCreate(page);
+      await createReady(page, 4000);
+      await (await button(page, "Create and publish"))?.click();
+      await page.waitForFunction(() => !!document.querySelector("[data-create-mode] p[role=alert]"), { timeout: 4000 }).catch(() => null);
+      await createReady(page, 2000);
+      const d = await againDialog(page);
+      const alerts = await page.evaluate(() => [...document.querySelectorAll("[data-create-mode] [role=alert]")].map((a) => a.innerText.trim()));
+      ok(
+        "GitHub still has it: the backend's words in the dialog, which stays open with Create ready again — no Publish to it, nothing pushed, no browser",
+        alerts.includes(still) &&
+          !!(await page.$("[data-create-mode]")) &&
+          (await buttonState(page, "Create and publish"))?.disabled === false &&
+          !d.includes("Publish to it") &&
+          (await calls(page, "changes_push")).length === 1 &&
+          (await calls(page, "plugin:opener|open_url")).length === 0,
+        JSON.stringify({ alerts, d })
+      );
+      await page.close();
+    }
+    {
+      // Made again where the address points, a name taken said in the usual words: still no "Publish to it" and no
+      // tabs — the folder's address is the repository's; there is no address tab to finish it on.
+      const taken = 'There\'s already a repository me/gitswitch on GitHub. Pick another name, or publish to that one with "Use an address" (only if it\'s empty).';
+      const page = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failed, publishContext: reached, createError: taken });
+      await pushAndCreate(page);
+      await createReady(page, 4000);
+      await (await button(page, "Create and publish"))?.click();
+      await page.waitForFunction(() => !!document.querySelector("[data-create-mode] p[role=alert]"), { timeout: 4000 }).catch(() => null);
+      const d = await againDialog(page);
+      ok(
+        "made again where the address points, a name taken in GitHub's usual words: still no Publish to it and no tabs, the dialog titled Create it again on GitHub",
+        d.includes(taken) && !(await button(page, "Publish to it")) && !(await page.$('[role="tablist"][aria-label="Where to publish"]')) && modalOk(await modalA11y(page), "Create it again on GitHub"),
+        d
+      );
+      await page.close();
+    }
+    {
+      // Made again, but git can't reach it yet: created on GitHub, not published. The reason is said where the person
+      // is (an error toast), and stays on the Changes tab as a red card in place of the push's "GitHub has no
+      // repository" card — its Create it again on GitHub… with it: GitHub has it now. A status read (Refresh, coming
+      // back to the window) leaves the card as it is. Nothing is pushed.
+      const problem = "me/gitswitch was created on GitHub, but git can't reach it yet: the SSH key id_me isn't allowed to push to it. Then push again.";
+      const made = { saved: "kept", full_name: "me/gitswitch", html_url: "https://github.com/me/gitswitch", private: true, renamed: false, remote: "origin", url: "git@github.com:me/gitswitch.git", problem };
+      const page = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: failed, publishContext: reached, createResult: made });
+      const panel = () => page.evaluate(() => document.querySelector('[role="tabpanel"][aria-label="Changes"]')?.innerText ?? "");
+      /** The headlines of the Changes tab's red result cards. */
+      const headlines = () => page.evaluate(() => [...document.querySelectorAll('[role="tabpanel"][aria-label="Changes"] p.text-red-100')].map((p) => p.innerText.trim()));
+      const statusReads = () => page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status").length);
+      await pushAndCreate(page);
+      const before = await headlines();
+      await createReady(page, 4000);
+      await (await button(page, "Create and publish"))?.click();
+      await page.waitForFunction(() => !document.querySelector("[data-create-mode]"), { timeout: 4000 }).catch(() => null);
+      await page.waitForFunction((p) => [...document.querySelectorAll('[data-toast="error"]')].some((t) => t.innerText.includes(p)), { timeout: 4000 }, problem).catch(() => null);
+      await sleep(300);
+      if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-problem-card.png` });
+      const toastSaid = await page.evaluate((p) => [...document.querySelectorAll('[data-toast="error"]')].some((t) => t.innerText.includes(p)), problem);
+      let h = await headlines();
+      const p1 = await panel();
+      ok(
+        "made again, but git can't reach it yet: an error toast with the reason, and on the Changes tab a red card whose headline is the reason, in place of the push's “GitHub has no repository” card",
+        JSON.stringify(before) === JSON.stringify(["GitHub has no repository at this address."]) && toastSaid && JSON.stringify(h) === JSON.stringify([problem]) && !p1.includes("GitHub has no repository at this address"),
+        JSON.stringify({ before, toastSaid, h, panel: p1.slice(0, 500) })
+      );
+      ok(
+        "  the earlier card's Create it again on GitHub… went with it (GitHub has the repository now), and nothing was pushed",
+        !p1.includes(AGAIN) && !(await button(page, AGAIN)) && (await calls(page, "changes_push")).length === 1,
+        JSON.stringify(await calls(page, "changes_push"))
+      );
+      await page.waitForFunction(() => !!document.activeElement?.closest?.('[role="tablist"][aria-label="Repository tabs"]'), { timeout: 2000 }).catch(() => null);
+      const focusedTab = await page.evaluate(() => {
+        const a = document.activeElement;
+        return a?.matches('[role="tablist"][aria-label="Repository tabs"] [role="tab"][aria-selected="true"]') ? a.getAttribute("href") : (a?.outerHTML.slice(0, 120) ?? null);
+      });
+      ok(
+        "  the button that opened the dialog went with the card: the focus is on the Changes tab, the Repository page's tab the person is on — not lost to the start of the window",
+        focusedTab === "/repo/changes",
+        String(focusedTab)
+      );
+      let reads = await statusReads();
+      await page.evaluate(() => document.querySelector('button[title="Re-read this repository"]')?.click());
+      await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status").length > n, { timeout: 4000 }, reads).catch(() => null);
+      await sleep(300);
+      h = await headlines();
+      ok("  Refresh reads the folder again and leaves the card as it is", (await statusReads()) > reads && JSON.stringify(h) === JSON.stringify([problem]), JSON.stringify(h));
+      // Coming back to the window: the page reads the folder again (at most every few seconds; asked until it does).
+      reads = await statusReads();
+      await page
+        .waitForFunction(
+          (n) => {
+            window.dispatchEvent(new Event("focus"));
+            return window.__CALLS__.filter((c) => c.cmd === "changes_repo_status").length > n;
+          },
+          { timeout: 7000, polling: 500 },
+          reads
+        )
+        .catch(() => null);
+      await sleep(300);
+      h = await headlines();
+      ok(
+        "  coming back to the window reads it again too, and the card stays; still nothing pushed",
+        (await statusReads()) > reads && JSON.stringify(h) === JSON.stringify([problem]) && (await calls(page, "changes_push")).length === 1,
+        JSON.stringify(h)
+      );
+      await page.close();
+    }
+    {
+      // The usual form, for comparison: a name taken there offers to publish to it instead.
+      const taken = 'There\'s already a repository me/gitswitch on GitHub. Pick another name, or publish to that one with "Use an address" (only if it\'s empty).';
+      const page = await open(SCENARIOS.noRemote, { createError: taken });
+      await (await button(page, "Publish branch"))?.click();
+      await createReady(page, 4000);
+      await (await button(page, "Create and publish"))?.click();
+      await page.waitForFunction(() => !!document.querySelector("[data-create-mode] p[role=alert]"), { timeout: 4000 }).catch(() => null);
+      ok("the usual form, for comparison: a name taken there offers Publish to it", (await text(page)).includes(taken) && !!(await button(page, "Publish to it")));
+      await page.close();
+    }
+    {
+      // A push that found nothing, GitHub's form given but no repository named: GitSwitch can't tell what to make again.
+      const page = await open({ ...SCENARIOS.clean, ahead: 1 }, { pushResult: { ...failed, advice: { ...failed.advice, repo: null } }, publishContext: reached });
+      await (await button(page, "Push (1)")).click();
+      await page.waitForFunction(() => document.body.innerText.includes("GitHub has no repository at this address"), { timeout: 4000 });
+      const s = await text(page);
+      ok("a push that found nothing, with no repository named: the button says it opens github.com", s.includes("Create it on github.com") && !s.includes(AGAIN));
+      await (await button(page, "Create it on github.com"))?.click();
+      await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"), { timeout: 2000 }).catch(() => null);
+      await sleep(200);
+      ok(
+        "  it opens exactly GitHub's form the advice gave, and no dialog",
+        JSON.stringify((await calls(page, "plugin:opener|open_url")).map((a) => a.url)) === JSON.stringify(["https://github.com/new?owner=me&name=gitswitch&visibility=private"]) &&
+          !(await page.$("[data-create-mode]")) &&
+          (await calls(page, "github_publish_context")).length === 0,
+        JSON.stringify(await calls(page, "plugin:opener|open_url"))
+      );
+      await page.close();
+    }
   }
 
   // -----------------------------------------------------------------
@@ -3816,6 +4898,392 @@ try {
     ok("  then the rest arrives on this visit too", s.includes("of 30"));
     await page.close();
   }
+  {
+    // No GitHub account signed in: the page says where to sign in, by the name the sidebar gives that page.
+    const page = await open(SCENARIOS.clean, { find: { profiles: [] } });
+    await page.evaluate(() => [...document.querySelectorAll("nav a")].find((a) => a.textContent.trim() === "Repositories")?.click());
+    await page.waitForFunction(() => document.body.innerText.includes("No GitHub accounts signed in"), { timeout: 5000 }).catch(() => null);
+    const s = await text(page);
+    ok(
+      "no GitHub account signed in: the Repositories page says to sign in on the GitHub Auth page, as the sidebar names it (not “the GitHub page”), with Go to GitHub Auth",
+      s.includes("No GitHub accounts signed in") &&
+        s.includes("Sign in on the GitHub Auth page — with GitHub itself, or the GitHub CLI's gh auth login — then Refresh") &&
+        !s.includes("the GitHub page") &&
+        !!(await button(page, "Go to GitHub Auth")) &&
+        (await page.evaluate(() => [...document.querySelectorAll("nav a")].some((a) => a.textContent.trim() === "GitHub Auth"))),
+      s.slice(0, 700)
+    );
+    await page.close();
+  }
+
+  section("Repositories page: each row's ⋯ menu — make it private or public, open its settings, delete it on GitHub; a step this account can't take is greyed, with the reason");
+  {
+    const F = (full_name, id, extra = {}) => ({
+      id, full_name, owner: full_name.split("/")[0], name: full_name.split("/")[1], owner_kind: "user", private: false, visibility: "public", fork: false, parent: null, archived: false,
+      admin: true, stars: 0, watchers: 0, forks: 0, has_pages: false, html_url: `https://github.com/${full_name}`, can_delete: true, missing_here: [], ...extra,
+    });
+    const EXTRA = [
+      { full_name: "alice/site", private: false },
+      { full_name: "alice/doomed", private: true },
+      { full_name: "alice/stale", private: true },
+      { full_name: "alice/old", private: true, archived: true },
+      { full_name: "alice/forked", private: true, fork: true },
+      // A public fork: GitHub doesn't let it be made private on its own either.
+      { full_name: "alice/pubfork", private: false, fork: true },
+      { full_name: "acme/shared", private: false, permission: "write", owner_is_org: true },
+      // Listed as public; made private on github.com since.
+      { full_name: "alice/moved", private: false },
+      // Internal: a listing has no word for it, and says private.
+      { full_name: "acme/inner", private: true, owner_is_org: true },
+    ];
+    const FACTS = {
+      "alice/site": F("alice/site", 11, { forks: 2, has_pages: true }),
+      "alice/doomed": F("alice/doomed", 12, { private: true, visibility: "private", stars: 1 }),
+      // The listing said admin; GitHub says otherwise now.
+      "alice/stale": F("alice/stale", 13, { private: true, visibility: "private", admin: false }),
+      "alice/moved": F("alice/moved", 14, { private: true, visibility: "private" }),
+      "acme/inner": F("acme/inner", 15, { owner_kind: "org", private: true, visibility: "internal" }),
+      "alice/pubfork": F("alice/pubfork", 16, { fork: true, parent: "upstream/pubfork", forks: 1 }),
+    };
+    const PULL_REPO = (repo, isPrivate) => ({ repo, private: isPrivate, archived: false, fork: false, pushed_at: "2026-11-01T00:00:00Z", permission: "admin", open: 1, to_review: 0, mine: 0, affiliated: true });
+    const pullRepos = { login: "alice", truncated: false, notes: [], repos: [PULL_REPO("alice/site", false), PULL_REPO("alice/doomed", true)] };
+    const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
+    const nav = (page, name) => page.evaluate((n) => [...document.querySelectorAll("nav a")].find((a) => a.textContent.trim() === n)?.click(), name);
+    const trigger = (full) => `button[aria-label="More actions for ${full}"]`;
+    const openMenu = async (page, full) => {
+      await page.evaluate((sel) => document.querySelector(sel)?.click(), trigger(full));
+      await page.waitForSelector('[role="menu"] [data-repo-action]', { timeout: 3000 }).catch(() => null);
+    };
+    const items = (page) =>
+      page.evaluate(() =>
+        [...document.querySelectorAll('[role="menu"] [role="menuitem"]')].map((b) => ({ key: b.dataset.repoAction, text: b.innerText.trim(), disabled: b.getAttribute("aria-disabled") === "true", title: b.title }))
+      );
+    const item = async (page, key) => (await items(page)).find((i) => i.key === key) ?? null;
+    const pick = (page, key) => page.evaluate((key) => document.querySelector(`[role="menu"] [data-repo-action="${key}"]`)?.click(), key);
+    const shut = async (page) => {
+      await page.keyboard.press("Escape");
+      await sleep(100);
+    };
+    const visibilityOf = (page, full) => page.evaluate((full) => document.querySelector(`[data-repo-row="${full}"] [data-visibility]`)?.getAttribute("data-visibility") ?? null, full);
+    const dialog = (page, which) => page.evaluate((which) => document.querySelector(`[data-${which}-dialog]`)?.parentElement?.innerText ?? "", which);
+    const stateIs = (page, which, want) => page.waitForFunction((which, want) => document.querySelector(`[data-${which}-dialog]`)?.getAttribute(`data-${which}-dialog`) === want, { timeout: 4000 }, which, want).catch(() => null);
+    const inDialog = (page, which, label) =>
+      page.evaluate(
+        (which, label) => {
+          const d = document.querySelector(`[data-${which}-dialog]`)?.parentElement;
+          const b = d && [...d.querySelectorAll("button")].find((x) => x.innerText.trim() === label);
+          if (b && !b.disabled) b.click();
+          return b ? (b.disabled ? "disabled" : "clicked") : "missing";
+        },
+        which,
+        label
+      );
+
+    const page = await openReposPage(browser, server, { restDelay: 50, extraRepos: EXTRA, facts: FACTS, pullRepos });
+    await page.waitForFunction(() => !document.body.innerText.includes("loading more…") && document.body.innerText.includes("alice / site"), { timeout: 5000 }).catch(() => null);
+    // Archived ones are hidden by default: show them, to see what their menu offers.
+    await page.evaluate(() => [...document.querySelectorAll("label")].find((l) => l.innerText.trim() === "Hide archived")?.querySelector("input")?.click());
+    await sleep(150);
+    // The Pull requests page lists alice's repositories once, and keeps them.
+    await nav(page, "Pull requests");
+    await page.waitForSelector('[data-pull-repo="alice/doomed"]', { timeout: 5000 }).catch(() => null);
+    await nav(page, "Repositories");
+    await page.waitForFunction(() => document.body.innerText.includes("alice / site"), { timeout: 5000 }).catch(() => null);
+    ok("every row has a ⋯ button, named for its repository, beside Copy link", (await page.$(trigger("alice/site"))) !== null && (await page.$(trigger("acme/shared"))) !== null && (await page.$(trigger("alice/a-1"))) !== null);
+    ok(
+      "  and its Private / Public icon is an image named for it, so a screen reader says which",
+      (await page.$eval('[data-repo-row="alice/site"] [data-visibility]', (e) => `${e.getAttribute("role")}:${e.getAttribute("aria-label")}`).catch(() => null)) === "img:Public" &&
+        (await page.$eval('[data-repo-row="alice/doomed"] [data-visibility]', (e) => `${e.getAttribute("role")}:${e.getAttribute("aria-label")}`).catch(() => null)) === "img:Private"
+    );
+
+    await openMenu(page, "alice/site");
+    let it = await items(page);
+    ok("an admin's public repository: Make private…, Open settings on GitHub, a line, then Delete on GitHub… in red", JSON.stringify(it.map((i) => [i.key, i.text, i.disabled])) === JSON.stringify([["visibility", "Make private…", false], ["settings", "Open settings on GitHub", false], ["delete", "Delete on GitHub…", false]]) && !!(await page.$('[role="menu"] [role="separator"]')) && (await page.$eval('[data-repo-action="delete"] span span', (s) => s.className.includes("text-red"))), JSON.stringify(it));
+    ok("  opening the menu asks GitHub nothing", (await calls(page, "github_repo_facts")).length === 0);
+    await shut(page);
+    ok("  Escape closes it", !(await page.$('[role="menu"]')));
+
+    await openMenu(page, "acme/shared");
+    const sharedVis = await item(page, "visibility");
+    const sharedDel = await item(page, "delete");
+    ok("a repository this account can only write to: both greyed, each with the reason", sharedVis?.disabled && sharedVis.title === "Only an admin can change who can see it, and @alice isn't one." && sharedVis.text.includes("Only an admin can change who can see it") && sharedDel?.disabled && sharedDel.title === "Only an admin can delete it, and @alice isn't one.", JSON.stringify({ sharedVis, sharedDel }));
+    const sharedOpen = await item(page, "open");
+    ok("  its settings, which GitHub shows to admins only, are not offered: Open on GitHub is, in their place", sharedOpen?.text === "Open on GitHub" && sharedOpen.disabled === false && !(await item(page, "settings")), JSON.stringify(await items(page)));
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/repos-row-menu-greyed.png` });
+    await pick(page, "visibility");
+    await sleep(150);
+    ok("  a greyed item does nothing when clicked", !(await page.$("[data-visibility-dialog]")) && (await calls(page, "github_repo_facts")).length === 0);
+    await pick(page, "open");
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"), { timeout: 2000 }).catch(() => null);
+    ok("  Open on GitHub opens the repository's own page", JSON.stringify((await calls(page, "plugin:opener|open_url")).map((a) => a.url)) === JSON.stringify(["https://github.com/acme/shared"]), JSON.stringify(await calls(page, "plugin:opener|open_url")));
+    await shut(page);
+
+    await openMenu(page, "alice/old");
+    const old = await item(page, "visibility");
+    ok("an archived repository: Make public… is greyed (unarchive it first); Delete is not", old?.text.startsWith("Make public…") && old.disabled && old.title === "It is archived on GitHub: unarchive it there first." && (await item(page, "delete"))?.disabled === false, JSON.stringify(old));
+    await shut(page);
+    await openMenu(page, "alice/forked");
+    const forked = await item(page, "visibility");
+    // The listing doesn't name a fork's parent; nor is the fork said to follow it (GitHub leaves forks as they are when a parent changes).
+    ok("a private fork: Make public… is greyed, as GitHub doesn't let a fork's visibility change", forked?.disabled && forked.title === "It is a fork, and GitHub doesn't let a fork's visibility change." && !forked.text.includes("follows"), JSON.stringify(forked));
+    await shut(page);
+    await openMenu(page, "alice/pubfork");
+    const pubfork = await item(page, "visibility");
+    ok(
+      "a public fork: Make private… is greyed too, for the same reason — GitHub doesn't let a fork change either way",
+      pubfork?.text.startsWith("Make private…") && pubfork.disabled && pubfork.title === "It is a fork, and GitHub doesn't let a fork's visibility change." && (await item(page, "delete"))?.disabled === false,
+      JSON.stringify(pubfork)
+    );
+    await pick(page, "visibility");
+    await sleep(150);
+    ok("  and does nothing when clicked", !(await page.$("[data-visibility-dialog]")));
+    await shut(page);
+
+    // The keyboard: Enter opens it on the first item, the arrows move, Escape goes back to the button.
+    await page.focus(trigger("alice/site"));
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => document.activeElement?.getAttribute("role") === "menuitem", { timeout: 2000 }).catch(() => null);
+    const first = await page.evaluate(() => document.activeElement?.dataset?.repoAction ?? null);
+    await page.keyboard.press("ArrowDown");
+    const second = await page.evaluate(() => document.activeElement?.dataset?.repoAction ?? null);
+    await page.keyboard.press("Escape");
+    await sleep(100);
+    const after = await page.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? null);
+    ok("the menu works from the keyboard: Enter opens it on its first item, ↓ moves, Escape returns to the ⋯ button", first === "visibility" && second === "settings" && after === "More actions for alice/site" && !(await page.$('[role="menu"]')), JSON.stringify({ first, second, after }));
+
+    await openMenu(page, "alice/site");
+    await pick(page, "settings");
+    await sleep(150);
+    ok("Open settings on GitHub opens the repository's settings page", (await calls(page, "plugin:opener|open_url")).some((a) => a.url === "https://github.com/alice/site/settings"), JSON.stringify(await calls(page, "plugin:opener|open_url")));
+
+    // Make private, from the row.
+    await openMenu(page, "alice/site");
+    await pick(page, "visibility");
+    await stateIs(page, "visibility", "private");
+    let d = await dialog(page, "visibility");
+    ok(
+      "Make private… reads it as the account that listed it and says only what applies: its forks, its Pages site; no stars to lose, so no tick",
+      JSON.stringify((await calls(page, "github_repo_facts"))[0]) === JSON.stringify({ account: "gh:alice", owner: "alice", name: "site", repoPath: null }) &&
+        d.includes("Only you and the people you invite will be able to see it.") &&
+        d.includes("Its 2 forks stay public and are split off from it.") &&
+        d.includes("Its GitHub Pages site stops being published unless the account has a paid plan.") &&
+        !d.includes("I understand") &&
+        !(await page.$('[data-visibility-dialog] input[type="checkbox"]')),
+      d
+    );
+    ok("  nothing is lost for good, so Make private is the usual green, not red", (await page.$eval('[data-confirm="make-private"]', (b) => b.className.includes("bg-emerald") && !b.className.includes("bg-red")).catch(() => false)) === true);
+    ok("  the dialog is named by its title, its ✕ is Close dialog, the page behind is hidden from screen readers", modalOk(await modalA11y(page), "Make this repository private?"), JSON.stringify(await modalA11y(page)));
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/repos-make-private.png` });
+    ok("  Make private is ready at once", (await inDialog(page, "visibility", "Make private")) === "clicked");
+    await page.waitForFunction(() => !document.querySelector("[data-visibility-dialog]"), { timeout: 4000 }).catch(() => null);
+    ok("  done: the row's lock shows at once, without listing again", (await visibilityOf(page, "alice/site")) === "private" && (await text(page)).includes("alice/site is now private") && JSON.stringify((await calls(page, "github_set_visibility"))[0]) === JSON.stringify({ account: "gh:alice", owner: "alice", name: "site", private: true, expectId: 11 }), String(await visibilityOf(page, "alice/site")));
+    ok("  and the menu now offers Make public…", (await openMenu(page, "alice/site"), (await item(page, "visibility"))?.text) === "Make public…");
+    // Private now, with 2 forks: deleting it deletes them too.
+    await pick(page, "delete");
+    await stateIs(page, "delete", "confirm");
+    d = await dialog(page, "delete");
+    ok("  its Delete says, with the number, that its 2 forks are deleted too", d.includes("Its 2 forks are deleted too.") && !!(await page.$("[data-forks-line]")), d);
+    await inDialog(page, "delete", "Cancel");
+    await page.waitForFunction(() => !document.querySelector("[data-delete-dialog]"), { timeout: 2000 }).catch(() => null);
+    // A public fork with one fork of its own: that fork stays.
+    await openMenu(page, "alice/pubfork");
+    await pick(page, "delete");
+    await stateIs(page, "delete", "confirm");
+    d = await dialog(page, "delete");
+    ok("a public repository's Delete says its one fork stays on GitHub", d.includes("Its 1 fork stays on GitHub.") && !d.includes("deleted too"), d);
+    await inDialog(page, "delete", "Cancel");
+    await page.waitForFunction(() => !document.querySelector("[data-delete-dialog]"), { timeout: 2000 }).catch(() => null);
+
+    // The listing is behind: GitHub has it private already. The dialog never turns Make private… into Make public.
+    await openMenu(page, "alice/moved");
+    ok("a row the listing has as public offers Make private…", (await item(page, "visibility"))?.text === "Make private…");
+    await pick(page, "visibility");
+    await stateIs(page, "visibility", "already");
+    d = await dialog(page, "visibility");
+    ok(
+      "  GitHub has it private already: the dialog says so, offers neither Make public nor Make private, only Close",
+      d.includes("alice/moved is private now: only you and the people you invite can see it.") &&
+        d.includes("It is already private on GitHub, so there is nothing to change.") &&
+        (await inDialog(page, "visibility", "Make public")) === "missing" &&
+        (await inDialog(page, "visibility", "Make private")) === "missing" &&
+        !(await page.$("[data-visibility-dialog] input")) &&
+        d.includes("Close"),
+      d
+    );
+    ok("  the row corrects itself at once: its lock", (await visibilityOf(page, "alice/moved")) === "private", String(await visibilityOf(page, "alice/moved")));
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/repos-visibility-already.png` });
+    await inDialog(page, "visibility", "Close");
+    await page.waitForFunction(() => !document.querySelector("[data-visibility-dialog]"), { timeout: 2000 }).catch(() => null);
+    ok("  closed, nothing sent; its menu now offers Make public…", (await calls(page, "github_set_visibility")).length === 1 && (await openMenu(page, "alice/moved"), (await item(page, "visibility"))?.text) === "Make public…");
+    await shut(page);
+
+    // Internal, listed as private: Make public… opens the reason, not the private form.
+    await openMenu(page, "acme/inner");
+    ok("an internal repository is listed as private, so its menu offers Make public…", (await item(page, "visibility"))?.text === "Make public…");
+    await pick(page, "visibility");
+    await stateIs(page, "visibility", "internal");
+    d = await dialog(page, "visibility");
+    ok(
+      "  GitHub has it internal: the dialog says GitSwitch can only make it private and points to its settings; no button to make it either",
+      d.includes("acme/inner is internal now: everyone in acme's enterprise can see it.") &&
+        d.includes("GitSwitch can make an internal repository private, not public. To make it public, use its settings on GitHub.") &&
+        (await inDialog(page, "visibility", "Make public")) === "missing" &&
+        (await inDialog(page, "visibility", "Make private")) === "missing",
+      d
+    );
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/repos-visibility-internal.png` });
+    ok("  Open its settings on GitHub opens them", (await inDialog(page, "visibility", "Open its settings on GitHub")) === "clicked" && (await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url" && c.args?.url === "https://github.com/acme/inner/settings"), { timeout: 2000 }).then(() => true, () => false)));
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector("[data-visibility-dialog]"), { timeout: 2000 }).catch(() => null);
+    ok("  closed, nothing sent; the row stays as listed", (await calls(page, "github_set_visibility")).length === 1 && (await visibilityOf(page, "acme/inner")) === "private");
+
+    // The listing said admin; GitHub doesn't any more.
+    await openMenu(page, "alice/stale");
+    await pick(page, "visibility");
+    await stateIs(page, "visibility", "blocked");
+    d = await dialog(page, "visibility");
+    ok("an admin no more: the dialog gives the reason and no button to press", d.includes("Only an admin can change who can see it, and @alice isn't one.") && (await inDialog(page, "visibility", "Make public")) === "missing" && (await inDialog(page, "visibility", "Make private")) === "missing" && d.includes("Close"), d);
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/repos-visibility-not-admin.png` });
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector("[data-visibility-dialog]"), { timeout: 2000 }).catch(() => null);
+    ok("  Escape closes the dialog", !(await page.$("[data-visibility-dialog]")) && (await calls(page, "github_set_visibility")).length === 1);
+
+    // The same row's Delete: offered (the listing says admin), and GitHub's answer gives the reason instead of the form.
+    await openMenu(page, "alice/stale");
+    ok("  its Delete on GitHub… is offered, as the listing says admin", (await item(page, "delete"))?.disabled === false);
+    await pick(page, "delete");
+    await stateIs(page, "delete", "confirm");
+    d = await dialog(page, "delete");
+    ok(
+      "  Delete as an admin no more: the reason, no name box, no Delete button, nothing about forks or restoring it; only Close — no github.com link, as GitHub shows the settings page to admins only",
+      d.includes("Only an admin can delete it, and @alice isn't one.") &&
+        d.includes("This deletes alice/stale on GitHub") &&
+        !d.includes("Its forks are deleted too.") &&
+        !d.includes("restore") &&
+        !d.includes("No folder on this computer was checked") &&
+        !!(await page.$("[data-delete-block]")) &&
+        !(await page.$('input[aria-label="Type alice/stale to confirm"]')) &&
+        (await inDialog(page, "delete", "Delete this repository")) === "missing" &&
+        d.includes("Close") &&
+        !d.includes("Cancel") &&
+        !d.includes("github.com"),
+      d
+    );
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/repos-delete-not-admin.png` });
+    ok("  Close closes it", (await inDialog(page, "delete", "Close")) === "clicked");
+    await page.waitForFunction(() => !document.querySelector("[data-delete-dialog]"), { timeout: 2000 }).catch(() => null);
+    ok("  nothing was deleted; the row is still there", !(await page.$("[data-delete-dialog]")) && (await calls(page, "github_delete_repo")).length === 0 && !!(await page.$('[data-repo-row="alice/stale"]')));
+
+    // One star: said in the singular. Cancel changes nothing.
+    await openMenu(page, "alice/doomed");
+    await pick(page, "visibility");
+    await stateIs(page, "visibility", "public");
+    d = await dialog(page, "visibility");
+    ok("one star is said in the singular", d.includes("Its 1 star is removed for good.") && !d.includes("watcher"), d);
+    await inDialog(page, "visibility", "Cancel");
+    await page.waitForFunction(() => !document.querySelector("[data-visibility-dialog]"), { timeout: 2000 }).catch(() => null);
+    ok("  Cancel closes it and changes nothing", !(await page.$("[data-visibility-dialog]")) && (await calls(page, "github_set_visibility")).length === 1 && (await visibilityOf(page, "alice/doomed")) === "private");
+
+    // GitHub won't show it: the reason in words, Try again, and github.com instead.
+    await openMenu(page, "alice/old");
+    await pick(page, "delete");
+    await stateIs(page, "delete", "error");
+    d = await dialog(page, "delete");
+    ok("a repository GitHub won't show: the dialog says why in words, offers Try again and github.com instead", d.includes("GitHub has no repository alice/old that @alice can see.") && !d.includes("Command execution error") && d.includes("Delete it on github.com instead") && (await inDialog(page, "delete", "Try again")) === "clicked", d);
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "github_repo_facts" && c.args.name === "old").length === 2, { timeout: 2000 }).catch(() => null);
+    await stateIs(page, "delete", "error");
+    ok("  Try again asks GitHub again", (await calls(page, "github_repo_facts")).filter((a) => a.name === "old").length === 2);
+    await inDialog(page, "delete", "Cancel");
+    await page.waitForFunction(() => !document.querySelector("[data-delete-dialog]"), { timeout: 2000 }).catch(() => null);
+    ok("  Cancel closes it; nothing was deleted", !(await page.$("[data-delete-dialog]")) && (await calls(page, "github_delete_repo")).length === 0 && !!(await page.$('[data-repo-row="alice/old"]')));
+
+    // Delete, from the row of a repository not cloned here.
+    await openMenu(page, "alice/doomed");
+    await pick(page, "delete");
+    await stateIs(page, "delete", "confirm");
+    d = await dialog(page, "delete");
+    ok(
+      "Delete on GitHub…: not cloned, so no folder to compare — said; restorable for 90 days; no forks, so no word of them; Delete waits for the name",
+      (await calls(page, "github_repo_facts")).at(-1)?.repoPath === null &&
+        d.includes("No folder on this computer was checked for its commits.") &&
+        d.includes("GitHub keeps it for 90 days") &&
+        !(await page.$("[data-forks-line]")) &&
+        !d.includes("fork") &&
+        (await inDialog(page, "delete", "Delete this repository")) === "disabled",
+      d
+    );
+    await page.type('input[aria-label="Type alice/doomed to confirm"]', "alice/doomed");
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/repos-delete.png` });
+    await page.keyboard.press("Enter");
+    await page.waitForFunction(() => !document.querySelector("[data-delete-dialog]"), { timeout: 4000 }).catch(() => null);
+    const deletedSaid = "Deleted alice/doomed on GitHub. Changed your mind? GitHub keeps it for 90 days: restore it from @alice's settings on GitHub › Repositories › Deleted repositories (it can take up to an hour to show there).";
+    const toastAt = Date.now();
+    await sleep(150);
+    ok(
+      "  Enter in the name box deletes it: the row is gone, and GitHub's answer is said as the backend words it — 90 days, from @alice's settings",
+      JSON.stringify((await calls(page, "github_delete_repo"))[0]) === JSON.stringify({ account: "gh:alice", owner: "alice", name: "doomed", confirm: "alice/doomed", expectId: 12 }) &&
+        !(await page.$('[data-repo-row="alice/doomed"]')) &&
+        (await text(page)).includes(deletedSaid)
+    );
+    await page.waitForFunction(() => (document.activeElement?.getAttribute("aria-label") ?? "").startsWith("More actions for"), { timeout: 2000 }).catch(() => null);
+    const focusAfter = await page.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? document.activeElement?.tagName ?? null);
+    ok("  its row went with it, so the focus is on another row's ⋯ button, not lost", !!focusAfter && focusAfter.startsWith("More actions for") && focusAfter !== "More actions for alice/doomed", String(focusAfter));
+
+    // Leave and come back: the kept listing has both changes, and GitHub isn't asked again.
+    const listed = (await calls(page, "list_remote_repos_page")).length;
+    await nav(page, "Profiles");
+    await sleep(200);
+    await nav(page, "Repositories");
+    await page.waitForFunction(() => document.body.innerText.includes("alice / site"), { timeout: 5000 }).catch(() => null);
+    ok("coming back to the page: the deleted row stays gone and the changed one stays private, from the kept listing", !(await page.$('[data-repo-row="alice/doomed"]')) && (await visibilityOf(page, "alice/site")) === "private" && (await calls(page, "list_remote_repos_page")).length === listed);
+    await nav(page, "Pull requests");
+    await page.waitForSelector('[data-pull-repo="alice/site"]', { timeout: 5000 }).catch(() => null);
+    await sleep(200);
+    ok("the Pull requests page's kept list follows too: the deleted one gone, the other marked private, without asking again", !(await page.$('[data-pull-repo="alice/doomed"]')) && !!(await page.$('[data-pull-repo="alice/site"] [aria-label="private"]')) && (await calls(page, "github_pull_repos")).length === 1, JSON.stringify(await calls(page, "github_pull_repos")));
+    // The only place that says how to undo it: it stays long enough to read (35 words), not the 3.2 s of a short one.
+    await sleep(Math.max(0, toastAt + 4500 - Date.now()));
+    const toasts = await page.evaluate(() => [...document.querySelectorAll("[data-toast]")].map((t) => t.innerText).join(" | "));
+    ok("  4.5 s on, GitHub's answer is still on screen to be read", toasts.includes(deletedSaid), toasts);
+    await page.close();
+  }
+  {
+    // A row changed while the rest of the listing is still arriving: a visit that joins that load is painted with the change.
+    const page = await openReposPage(browser, server, {
+      restDelay: 6000,
+      extraRepos: [{ full_name: "alice/site", private: false }],
+      facts: {
+        "alice/site": {
+          id: 11, full_name: "alice/site", owner: "alice", name: "site", owner_kind: "user", private: false, visibility: "public", fork: false, parent: null, archived: false,
+          admin: true, stars: 0, watchers: 0, forks: 0, has_pages: false, html_url: "https://github.com/alice/site", can_delete: true, missing_here: [],
+        },
+      },
+    });
+    const nav = (name) => page.evaluate((n) => [...document.querySelectorAll("nav a")].find((a) => a.textContent.trim() === n)?.click(), name);
+    const rowVisibility = () => page.evaluate(() => document.querySelector('[data-repo-row="alice/site"] [data-visibility]')?.getAttribute("data-visibility") ?? null);
+    await page.waitForFunction(() => document.body.innerText.includes("alice / site") && document.body.innerText.includes("loading more…"), { timeout: 5000 }).catch(() => null);
+    await page.evaluate(() => document.querySelector('button[aria-label="More actions for alice/site"]')?.click());
+    await page.waitForSelector('[role="menu"] [data-repo-action="visibility"]', { timeout: 3000 }).catch(() => null);
+    await page.evaluate(() => document.querySelector('[role="menu"] [data-repo-action="visibility"]')?.click());
+    await page.waitForFunction(() => document.querySelector("[data-visibility-dialog]")?.getAttribute("data-visibility-dialog") === "private", { timeout: 4000 }).catch(() => null);
+    await page.evaluate(() => document.querySelector('[data-confirm="make-private"]')?.click());
+    await page.waitForFunction(() => !document.querySelector("[data-visibility-dialog]"), { timeout: 4000 }).catch(() => null);
+    const here = await rowVisibility();
+    await nav("Profiles");
+    await sleep(150);
+    await nav("Repositories");
+    await page.waitForFunction(() => document.body.innerText.includes("alice / site"), { timeout: 3000 }).catch(() => null);
+    const back = await rowVisibility();
+    const still = await page.evaluate(() => document.body.innerText.includes("loading more…"));
+    const firsts = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "list_remote_repos_page" && c.args.perPage === 10).length);
+    ok(
+      "made private while the rest of the listing was still arriving, then away and back: the row is private at once, from the load it joined",
+      here === "private" && back === "private" && still && firsts === 1,
+      JSON.stringify({ here, back, still, firsts })
+    );
+    await page.waitForFunction(() => !document.body.innerText.includes("loading more…"), { timeout: 9000 }).catch(() => null);
+    ok("  and still private once the rest has arrived", (await rowVisibility()) === "private");
+    await page.close();
+  }
 
   section("Clone page: progress after the main download");
   {
@@ -3916,6 +5384,115 @@ try {
     await nokey.waitForFunction(() => document.body.innerText.includes("Push HTTPS clones over SSH"), { timeout: 5000 }).catch(() => null);
     ok("  without a key it cannot be on", (await box(nokey)) === JSON.stringify({ checked: false, disabled: true }), await box(nokey));
     await nokey.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("A profile folder that holds no repository is on the Repository page, with the way to make it one");
+  {
+    const folderRepos = [
+      ...REPOS,
+      { path: "/work/SubtitleMaker", name: "SubtitleMaker", profile_id: "p2", profile_name: "Work", profile_email: "me@work.test", kind: "folder" },
+      { path: "/repos/gitswitch/docs", name: "docs", profile_id: "p2", profile_name: "Work", profile_email: "me@work.test", kind: "folder", inside: "/repos/gitswitch" },
+    ];
+    const page = await open(SCENARIOS.clean, { repos: folderRepos, storage: { "repo.path": "/work/SubtitleMaker" } });
+    await page.waitForFunction(() => !!document.querySelector("[data-not-a-repository]"), { timeout: 5000 }).catch(() => null);
+    ok(
+      "selected, it gets a card saying why it is listed, not tabs that would fail",
+      (await page.evaluate(() => document.querySelector('[data-not-a-repository="folder"]')?.innerText ?? "")).includes("SubtitleMaker isn’t a git repository yet") &&
+        !(await page.$('[aria-label="Repository tabs"]')) &&
+        !(await text(page)).includes("is not a git repository"),
+      await page.evaluate(() => document.querySelector("[data-not-a-repository]")?.innerText ?? "no card")
+    );
+    ok("  naming whose folder it is and the identity it will commit with", (await text(page)).includes("Work’s folders") && (await text(page)).includes("me@work.test"));
+    await page.evaluate(() => [...document.querySelectorAll("label")].find((l) => l.innerText.trim() === "Repository").parentElement.querySelector("button").click());
+    await page.waitForFunction(() => !!document.querySelector('input[aria-label="Search repositories"]'), { timeout: 4000 }).catch(() => null);
+    const notes = await page.evaluate(() =>
+      [...document.querySelectorAll("button")].filter((b) => b.querySelector("[data-option-note]")).map((b) => b.innerText.replace(/\s+/g, " ").trim())
+    );
+    ok("  in the picker it says what it is", notes.some((n) => n.includes("SubtitleMaker") && n.includes("not a repository yet")) && notes.some((n) => n.includes("docs") && n.includes("inside a repository")), JSON.stringify(notes));
+    await page.keyboard.press("Escape");
+    await page.evaluate(() => document.querySelector("[data-make-repository]")?.click());
+    await page.waitForFunction(() => !document.querySelector("[data-not-a-repository]") && !!document.querySelector('[aria-label="Repository tabs"]'), { timeout: 5000 }).catch(() => null);
+    const made = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "repo_init").map((c) => c.args));
+    ok("Make it a repository asks for exactly that folder, and the page shows it as one", JSON.stringify(made) === JSON.stringify([{ path: "/work/SubtitleMaker" }]) && !!(await page.$('[aria-label="Repository tabs"]')), JSON.stringify(made));
+    const said = await page.evaluate(() => [...document.querySelectorAll("[data-toast]")].map((t) => t.innerText).join(" | "));
+    ok("  and says what it made", said.includes("SubtitleMaker is now a git repository") && said.includes("Branch main") && said.includes("Work's identity (me@work.test)"), said);
+    await page.close();
+
+    const inner = await open(SCENARIOS.clean, { repos: folderRepos, storage: { "repo.path": "/repos/gitswitch/docs" } });
+    await inner.waitForFunction(() => !!document.querySelector('[data-not-a-repository="inside"]'), { timeout: 5000 }).catch(() => null);
+    ok("a profile folder inside a repository says so, and offers that repository", (await text(inner)).includes("inside the repository /repos/gitswitch") && !!(await inner.$("[data-open-enclosing]")) && !(await inner.$("[data-make-repository]")));
+    await inner.evaluate(() => document.querySelector("[data-open-enclosing]")?.click());
+    await inner.waitForFunction(() => !document.querySelector("[data-not-a-repository]"), { timeout: 5000 }).catch(() => null);
+    ok("  which opens it, tabs and all", !!(await inner.$('[aria-label="Repository tabs"]')) && (await inner.evaluate(() => JSON.parse(localStorage.getItem("gitswitch:repo.path") ?? '""'))) === "/repos/gitswitch");
+    await inner.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Saving says what it changed");
+  {
+    const stamp = { created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z" };
+    const work = { id: "p2", name: "Work", git_name: "Work Person", git_email: "old@work.test", ssh_key_path: null, github_login: null, is_default: false, allow_push: true, signing_enabled: false, directories: ["/w/apps"], remote_patterns: [], ...stamp };
+    const home = { id: "p1", name: "Home", git_name: "Me", git_email: "me@home.test", ssh_key_path: null, github_login: null, is_default: true, allow_push: true, signing_enabled: false, directories: ["/w/shared"], remote_patterns: [], ...stamp };
+    const toasts = (pg) => pg.evaluate(() => [...document.querySelectorAll("[data-toast]")].map((t) => t.innerText).join("\n---\n"));
+    const states = { "/w/SubtitleMaker": { kind: "no-repo" }, "/w/shared": { kind: "contains-repos", count: 3 } };
+
+    const page = await openProfilePage(browser, server, { path: "/profile/p2/edit", profiles: [work, home], folderStates: states });
+    await page.waitForFunction(() => document.querySelector('input[placeholder="your@email.com"]')?.value === "old@work.test", { timeout: 5000 }).catch(() => null);
+    const email = await page.$('input[placeholder="your@email.com"]');
+    await email.click({ clickCount: 3 });
+    await email.type("new@work.test");
+    for (const d of ["/w/SubtitleMaker", "/w/shared"]) {
+      await page.type('input[placeholder="…or type a path, e.g. ~/projects/work"]', d);
+      await page.keyboard.press("Enter");
+    }
+    await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Update Profile")?.click());
+    await page.waitForFunction(() => [...document.querySelectorAll("[data-toast]")].some((t) => t.innerText.includes("updated")), { timeout: 5000 }).catch(() => null);
+    let t = await toasts(page);
+    ok("the profile's confirmation lists what the save changed", t.includes("Profile “Work” updated") && t.includes("Commit email: old@work.test → new@work.test") && t.includes("Folder added: /w/SubtitleMaker"), t);
+    ok("  a folder taken from another profile says which", t.includes("Folder added: /w/shared (moved here from “Home”)"), t);
+    ok("  a folder with no repository says where it will be", t.includes("SubtitleMaker holds no git repository yet") && !t.includes("shared holds"), t);
+    ok("  and nothing that stayed the same is listed", !t.includes("Name:") && !t.includes("SSH key") && !t.includes("Pushes"), t);
+    await sleep(3700);
+    ok("  a confirmation with lines to read stays past the usual 3.2 seconds", (await toasts(page)).includes("Profile “Work” updated"));
+    await page.close();
+
+    const same = await openProfilePage(browser, server, { path: "/profile/p2/edit", profiles: [work, home] });
+    await same.waitForFunction(() => document.querySelector('input[placeholder="your@email.com"]')?.value === "old@work.test", { timeout: 5000 }).catch(() => null);
+    await same.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Update Profile")?.click());
+    await same.waitForFunction(() => [...document.querySelectorAll("[data-toast]")].some((x) => x.innerText.includes("Profile “Work”")), { timeout: 5000 }).catch(() => null);
+    t = await toasts(same);
+    ok("saving with no change says so", t.includes("Profile “Work” saved. Nothing changed."), t);
+    await same.close();
+
+    const created = await openProfilePage(browser, server, { path: "/profile/new", profiles: [home], folderStates: states });
+    await created.waitForFunction(() => !!document.querySelector('input[placeholder="your@email.com"]'), { timeout: 5000 }).catch(() => null);
+    await created.type('input[placeholder="e.g., Work, Personal, Open Source"]', "Side");
+    await created.type('input[placeholder="Your git user.name"]', "Side Person");
+    await created.type('input[placeholder="your@email.com"]', "side@example.test");
+    await created.type('input[placeholder="…or type a path, e.g. ~/projects/work"]', "/w/SubtitleMaker");
+    await created.keyboard.press("Enter");
+    await created.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim() === "Create Profile")?.click());
+    await created.waitForFunction(() => [...document.querySelectorAll("[data-toast]")].some((x) => x.innerText.includes("created")), { timeout: 5000 }).catch(() => null);
+    t = await toasts(created);
+    ok("a new profile's confirmation says what it was made with", t.includes("Profile “Side” created") && t.includes("Commits as Side Person <side@example.test>") && t.includes("Folder: /w/SubtitleMaker") && t.includes("SubtitleMaker holds no git repository yet"), t);
+    await created.close();
+
+    const dash = await openProfilePage(browser, server, { path: "/", profiles: [work, home] });
+    await dash.waitForFunction(() => document.body.innerText.includes("Work"), { timeout: 5000 }).catch(() => null);
+    await dash.evaluate(() => document.querySelector('button[title="Set as default"]')?.click());
+    await dash.waitForFunction(() => [...document.querySelectorAll("[data-toast]")].some((x) => x.innerText.includes("default profile")), { timeout: 5000 }).catch(() => null);
+    t = await toasts(dash);
+    ok("making a profile the default says so, and what it means", t.includes("“Work” is now the default profile") && t.includes("Was “Home”") && t.includes("commit as Work Person <old@work.test>"), t);
+    await dash.evaluate(() => [...document.querySelectorAll('button[title="Delete"]')][0]?.click());
+    await dash.waitForFunction(() => document.body.innerText.includes("Delete Profile"), { timeout: 4000 }).catch(() => null);
+    await dash.evaluate(() => [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Delete").pop()?.click());
+    await dash.waitForFunction(() => [...document.querySelectorAll("[data-toast]")].some((x) => x.innerText.includes("deleted")), { timeout: 5000 }).catch(() => null);
+    t = await toasts(dash);
+    const goneId = await dash.evaluate(() => window.__CALLS__.find((c) => c.cmd === "delete_profile")?.args?.id);
+    const gone = goneId === "p2" ? { name: "Work", dir: "/w/apps" } : { name: "Home", dir: "/w/shared" };
+    ok("deleting a profile says which folders have no profile now", t.includes(`Profile “${gone.name}” deleted`) && t.includes(`${gone.dir} no longer has a profile`), t);
+    await dash.close();
   }
 
   // -----------------------------------------------------------------
@@ -4242,9 +5819,9 @@ try {
       await sleep(250);
       await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === "alice")?.click());
       await sleep(200);
-      // The row's own Register button, inside the expanded row.
+      // The panel's automatic route for a gh login.
       await page.evaluate(() => {
-        const buttons = [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Register" && !b.disabled);
+        const buttons = [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Register with GitHub CLI" && !b.disabled);
         buttons[buttons.length - 1]?.click();
       });
       await sleep(600);
@@ -4258,23 +5835,46 @@ try {
       await page.close();
     }
     {
-      // A sign-in kept here registers keys as well as a gh login does.
-      const page = await openSshPage(browser, server, { kept: ["octo-kept"], register: { resolve: "Registered on octo-kept" } });
+      // A sign-in kept here never uploads a key: GitHub would mark it as
+      // GitSwitch's, and organizations that restrict third-party apps hide
+      // their private repositories from such keys. Add to GitHub instead.
+      const page = await openSshPage(browser, server, { kept: ["octo-kept"] });
       await clickText(page, "Register");
       await sleep(250);
       await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Select an account…"))?.click());
       await sleep(250);
       const offered = await page.evaluate(() => [...document.querySelectorAll(".absolute button")].map((b) => b.innerText.trim()));
-      ok("a sign-in kept here is offered for registering a key, beside the gh logins", offered.includes("octo-kept (signed in here)") && offered.includes("alice"), JSON.stringify(offered));
+      ok("a sign-in kept here is offered beside the gh logins", offered.includes("octo-kept (signed in here)") && offered.includes("alice"), JSON.stringify(offered));
       await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === "octo-kept (signed in here)")?.click());
       await sleep(200);
-      await page.evaluate(() => {
-        const buttons = [...document.querySelectorAll("button")].filter((b) => b.innerText.trim() === "Register" && !b.disabled);
-        buttons[buttons.length - 1]?.click();
-      });
-      await sleep(600);
-      const call = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "gh_register_ssh_key")?.args ?? null);
-      ok("  and registering with it names that sign-in", call?.account === "signin:octo-kept", JSON.stringify(call));
+      const labels = await page.evaluate(() => [...document.querySelectorAll("button")].map((b) => b.innerText.trim()));
+      ok("  with it there is no automatic register, only Add to GitHub", labels.includes("Add to GitHub") && !labels.includes("Register with GitHub CLI"), JSON.stringify(labels.filter((l) => /Register|Add to GitHub/.test(l))));
+      await clickText(page, "Add to GitHub");
+      await sleep(400);
+      const calls = await page.evaluate(() => window.__CALLS__.map((c) => c.cmd));
+      ok("  Add to GitHub copies the key and opens GitHub, uploading nothing", calls.includes("get_public_key") && calls.includes("plugin:opener|open_url") && !calls.includes("gh_register_ssh_key"), JSON.stringify(calls.slice(-6)));
+      const opened = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "plugin:opener|open_url")?.args ?? null);
+      ok("  at GitHub's New SSH key page", JSON.stringify(opened ?? {}).includes("https://github.com/settings/ssh/new"), JSON.stringify(opened));
+      await clickText(page, "Check");
+      await sleep(400);
+      ok("  Check names the account the key signs in as when it is not the one picked", (await text(page)).includes("This key signs in as alice, not octo-kept"));
+      await page.close();
+    }
+    {
+      // A gh login: Add to GitHub is still the main route, and Check
+      // confirms the account.
+      const page = await openSshPage(browser, server);
+      await clickText(page, "Register");
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("Select an account…"))?.click());
+      await sleep(250);
+      await page.evaluate(() => [...document.querySelectorAll(".absolute button")].find((b) => b.innerText.trim() === "alice")?.click());
+      await sleep(200);
+      await clickText(page, "Add to GitHub");
+      await sleep(300);
+      await clickText(page, "Check");
+      await sleep(400);
+      ok("a key added on GitHub by hand is confirmed by Check", (await text(page)).includes("Done: this key signs in as alice."));
       await page.close();
     }
     {
@@ -6386,6 +7986,1207 @@ try {
       ok("  Show all lists it and shows its pull requests", JSON.stringify(await repoRows(none)) === JSON.stringify(["quiet/repo"]) && (await gcalls(none, "github_pulls")).at(-1)?.name === "repo");
       await none.close();
     }
+
+    section("GitHub tab › Settings: who can see it (a Private / Public badge), making it public or private, deleting it on GitHub — the name typed, an approval asked for once, never a delete by itself");
+    {
+      const FACTS = {
+        id: 4242, owner: "acme", name: "app", full_name: "acme/app", owner_kind: "org", private: true, visibility: "private", fork: false, parent: null, archived: false,
+        admins: ["gh:work-me"], stars: 3, watchers: 2, forks: 0, has_pages: false, html_url: "https://github.com/acme/app", can_delete: false, missing_here: ["feat/x", "main"],
+      };
+      const dialog = (page, which) => page.evaluate((which) => document.querySelector(`[data-${which}-dialog]`)?.parentElement?.innerText ?? "", which);
+      const dialogState = (page, which) => page.evaluate((which) => document.querySelector(`[data-${which}-dialog]`)?.getAttribute(`data-${which}-dialog`) ?? null, which);
+      const inDialog = (page, which, label) =>
+        page.evaluate(
+          (which, label) => {
+            const d = document.querySelector(`[data-${which}-dialog]`)?.parentElement;
+            const b = d && [...d.querySelectorAll("button")].find((x) => x.innerText.trim() === label);
+            if (b && !b.disabled) b.click();
+            return b ? (b.disabled ? "disabled" : "clicked") : "missing";
+          },
+          which,
+          label
+        );
+      const badge = (page) => page.evaluate(() => document.querySelector("[data-visibility-badge]")?.getAttribute("data-visibility-badge") ?? null);
+      const card = (page, which) => page.evaluate((which) => document.querySelector(`[data-settings-card="${which}"]`)?.innerText ?? "", which);
+      const cardButton = (page, which, label) =>
+        page.evaluate(
+          (which, label) => {
+            const b = [...(document.querySelector(`[data-settings-card="${which}"]`)?.querySelectorAll("button") ?? [])].find((x) => x.innerText.trim() === label);
+            return b ? { disabled: b.disabled, title: b.title } : null;
+          },
+          which,
+          label
+        );
+      const clickCard = (page, which, label) =>
+        page.evaluate(
+          (which, label) => {
+            const b = [...(document.querySelector(`[data-settings-card="${which}"]`)?.querySelectorAll("button") ?? [])].find((x) => x.innerText.trim() === label);
+            b?.click();
+            return !!b;
+          },
+          which,
+          label
+        );
+      const focused = (page) => page.evaluate(() => document.activeElement?.getAttribute("aria-label") || document.activeElement?.innerText?.trim() || "");
+      const stateIs = (page, which, want) => page.waitForFunction((which, want) => document.querySelector(`[data-${which}-dialog]`)?.getAttribute(`data-${which}-dialog`) === want, { timeout: 4000 }, which, want).catch(() => null);
+      const closed = (page, which) => page.waitForFunction((which) => !document.querySelector(`[data-${which}-dialog]`), { timeout: 4000 }, which).catch(() => null);
+      /** What the make-again dialog says of the one deleted: its sentence, and its restore button's label (null: none). */
+      const againNew = (page) =>
+        page.evaluate(() => {
+          const el = document.querySelector("[data-again-new]");
+          const p = el && (el.tagName === "P" ? el : el.querySelector("p"));
+          return { text: p?.innerText.trim() ?? null, restore: el?.querySelector("[data-again-restore]")?.innerText.trim() ?? null };
+        });
+      /** Where the focus is: the Repository page's selected tab, by its address — else what has it. */
+      const focusedTab = (page) =>
+        page.evaluate(() => {
+          const a = document.activeElement;
+          return a?.matches('[role="tablist"][aria-label="Repository tabs"] [role="tab"][aria-selected="true"]') ? a.getAttribute("href") : (a?.outerHTML.slice(0, 120) ?? null);
+        });
+      const toTabs = (page) => page.waitForFunction(() => !!document.activeElement?.closest?.('[role="tablist"][aria-label="Repository tabs"]'), { timeout: 2000 }).catch(() => null);
+
+      {
+        // A code and an address of GitHub's own, not the defaults: what the dialog shows and opens is what GitHub gave.
+        const PROMPT = { user_code: "ABCD-EFGH", verification_uri: "https://github.com/login/device?t=1", expires_in: 899 };
+        // Both approval waits are held: each answer is given by the check itself, when it has looked (no race with a timer).
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": FACTS }, needsPermission: true, grantPrompt: PROMPT, grantWaits: ["hold", "hold"] } });
+        await openTab(page);
+        ok("the repository's name carries a Private badge, from the account's own access check (nothing more asked)", (await badge(page)) === "private" && (await gcalls(page, "github_repo_facts")).length === 0, String(await badge(page)));
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="visibility"]', { timeout: 4000 }).catch(() => null);
+        ok("a third section, Settings, reads the repository as the account acting", JSON.stringify((await gcalls(page, "github_repo_facts"))[0]) === JSON.stringify({ account: "gh:work-me", owner: "acme", name: "app", repoPath: null }), JSON.stringify(await gcalls(page, "github_repo_facts")));
+        let c = await card(page, "visibility");
+        ok("  Who can see it: private now, and Make public… offered to an admin", c.includes("Who can see it") && c.includes("acme/app is private now: only the people acme gives access to can see it.") && (await cardButton(page, "visibility", "Make public…"))?.disabled === false, c);
+        c = await card(page, "danger");
+        ok("  a red-bordered Danger zone with Delete on GitHub…, the folder untouched", c.includes("Danger zone") && c.includes("The folder on this computer is not touched.") && (await cardButton(page, "danger", "Delete on GitHub…"))?.disabled === false && (await page.$eval('[data-settings-card="danger"]', (e) => e.className.includes("border-red"))), c);
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-settings.png` });
+
+        // Make public: what changes, then the name typed.
+        await clickCard(page, "visibility", "Make public…");
+        await stateIs(page, "visibility", "public");
+        let d = await dialog(page, "visibility");
+        ok(
+          "Make public… reads GitHub again and says what changes, with its real numbers",
+          d.includes("Make this repository public?") &&
+            d.includes("Anyone on the internet will be able to see its code and its whole history, and copy it.") &&
+            d.includes("Make sure no commit holds passwords, keys or private files — even ones deleted later stay in the history.") &&
+            d.includes("Its 3 stars and 2 watchers are removed for good.") &&
+            d.includes("Its Actions logs become visible to everyone.") &&
+            !d.includes("split off") &&
+            (await gcalls(page, "github_repo_facts")).length === 2,
+          d
+        );
+        ok("  the focus starts in the name box, never on the button", (await focused(page)) === "Type acme/app to confirm", await focused(page));
+        ok("  Make public is red, and waits for the name", (await inDialog(page, "visibility", "Make public")) === "disabled" && (await page.$eval('[data-confirm="make-public"]', (b) => b.className.includes("bg-red"))));
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/ap");
+        ok("  a name not quite typed is not enough", (await inDialog(page, "visibility", "Make public")) === "disabled");
+        // GitHub is not asked to check the name when making it public: the dialog is the only guard.
+        await page.keyboard.press("Enter");
+        await sleep(200);
+        ok("  nor is Enter in the name box with it: nothing is sent", (await gcalls(page, "github_set_visibility")).length === 0 && (await dialogState(page, "visibility")) === "public", JSON.stringify(await gcalls(page, "github_set_visibility")));
+        await page.mouse.click(8, 8);
+        await sleep(150);
+        ok("  with a name typed, a click on the dimmed area around the dialog doesn't close it", (await dialogState(page, "visibility")) === "public");
+        await page.click('input[aria-label="Type acme/app to confirm"]', { clickCount: 3 });
+        await page.keyboard.type(" ACME/App ");
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-make-public.png` });
+        ok("  the name in another letter case, with spaces around it, is", (await inDialog(page, "visibility", "Make public")) === "clicked");
+        await closed(page, "visibility");
+        ok("  it sends the repository's id as the dialog read it, and only what was asked", JSON.stringify(await gcalls(page, "github_set_visibility")) === JSON.stringify([{ account: "gh:work-me", owner: "acme", name: "app", private: false, expectId: 4242 }]), JSON.stringify(await gcalls(page, "github_set_visibility")));
+        ok("  then says so; the badge and the card follow without a reload", (await text(page)).includes("acme/app is now public") && (await badge(page)) === "public" && (await card(page, "visibility")).includes("acme/app is public now") && !!(await cardButton(page, "visibility", "Make private…")), await card(page, "visibility"));
+        ok("  and the accounts were not read again for it", (await gcalls(page, "github_repo_context")).length === 1);
+        await page.waitForFunction(() => document.activeElement?.innerText?.trim() === "Make private…", { timeout: 2000 }).catch(() => null);
+        ok("  the dialog closed, the focus is back on the card's button that opened it", (await focused(page)) === "Make private…", await focused(page));
+
+        // Make private: losing stars and watchers needs a tick.
+        await clickCard(page, "visibility", "Make private…");
+        await stateIs(page, "visibility", "private");
+        d = await dialog(page, "visibility");
+        ok("Make private… says who will see it, and what it costs", d.includes("Make this repository private?") && d.includes("Only the people acme gives access to will be able to see it.") && d.includes("I understand its 3 stars and 2 watchers are removed for good") && !d.includes("GitHub Pages") && !d.includes("split off"), d);
+        await page.waitForFunction(() => document.activeElement?.type === "checkbox", { timeout: 2000 }).catch(() => null);
+        ok(
+          "  the focus starts on the tick it waits for (above Cancel, which would leave it behind), and Make private waits for it",
+          (await focused(page)) === "I understand its 3 stars and 2 watchers are removed for good" && (await inDialog(page, "visibility", "Make private")) === "disabled",
+          await focused(page)
+        );
+        ok("  stars and watchers lost for good: Make private is red", (await page.$eval('[data-confirm="make-private"]', (b) => b.className.includes("bg-red")).catch(() => false)) === true);
+        ok("  a dialog named by its title, its ✕ is Close dialog, the page behind hidden from screen readers", modalOk(await modalA11y(page), "Make this repository private?"), JSON.stringify(await modalA11y(page)));
+        // Ticked from the keyboard, where the focus is.
+        await page.keyboard.press("Space");
+        await sleep(100);
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-make-private.png` });
+        ok("  ticked: Make private is ready", (await inDialog(page, "visibility", "Make private")) === "clicked");
+        await closed(page, "visibility");
+        const back = (await gcalls(page, "github_set_visibility")).at(-1) ?? {};
+        ok("  private again, sent with the same id; the badge says so", back.private === true && back.expectId === 4242 && (await badge(page)) === "private" && (await text(page)).includes("acme/app is now private"), JSON.stringify(back));
+        await page.waitForFunction(() => document.activeElement?.innerText?.trim() === "Make public…", { timeout: 2000 }).catch(() => null);
+        ok("  the focus is back on the card's button", (await focused(page)) === "Make public…", await focused(page));
+
+        // Delete: the name typed, GitHub's approval asked for once, Delete pressed again.
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        d = await dialog(page, "delete");
+        ok("Delete on GitHub… compares the open folder with GitHub", (await gcalls(page, "github_repo_facts")).at(-1)?.repoPath === "/repos/gitswitch", JSON.stringify((await gcalls(page, "github_repo_facts")).at(-1)));
+        ok("  it says what goes with it and that the folder stays; it has no forks, so nothing is said of forks", d.includes("This deletes acme/app on GitHub: its code, issues, pull requests, wiki, releases and settings. The folder on this computer is not touched.") && !d.includes("fork") && !(await page.$("[data-forks-line]")), d);
+        ok("  the branches whose commits this folder lacks are named, prominently", d.includes("GitHub has commits on feat/x and main that this folder doesn't have. Fetch them first, or they are lost.") && !!(await page.$('[data-missing-here="feat/x,main"]')), d);
+        ok("  how long GitHub keeps it, and who can restore an organization's repository: an owner of the organization", d.includes("GitSwitch can't undo this. GitHub keeps it for 90 days: an owner of acme can restore it from acme's settings.") && !d.includes("your GitHub settings"), d);
+        ok("  the focus starts in the name box; Delete waits for the name; github.com is offered instead", (await focused(page)) === "Type acme/app to confirm" && (await inDialog(page, "delete", "Delete this repository")) === "disabled" && d.includes("Delete it on github.com instead"), await focused(page));
+        ok("  an account whose sign-in can't delete yet is told it will approve once", d.includes("GitHub asks you to approve deleting once, as @work-me"), d);
+        ok("  this folder was compared in full (fewer than 1,000 branches): no word of a limit", !(await page.$("[data-branches-capped]")) && !d.includes("1,000"), d);
+        ok("  a dialog named by its title", modalOk(await modalA11y(page), "Delete this repository on GitHub?"), JSON.stringify(await modalA11y(page)));
+        const opened = (await gcalls(page, "plugin:opener|open_url")).length;
+        ok("  Delete it on github.com instead opens exactly the repository's settings there", (await inDialog(page, "delete", "Delete it on github.com instead")) === "clicked");
+        await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "plugin:opener|open_url").length > n, { timeout: 2000 }, opened).catch(() => null);
+        ok("    https://github.com/acme/app/settings, and nothing else", JSON.stringify((await gcalls(page, "plugin:opener|open_url")).slice(opened).map((a) => a.url)) === JSON.stringify(["https://github.com/acme/app/settings"]) && (await dialogState(page, "delete")) === "confirm", JSON.stringify(await gcalls(page, "plugin:opener|open_url")));
+        await page.mouse.click(8, 8);
+        await closed(page, "delete");
+        ok("  with nothing typed yet, a click on the dimmed area closes it, as any dialog", !(await page.$("[data-delete-dialog]")) && (await gcalls(page, "github_delete_repo")).length === 0);
+        await page.waitForFunction(() => document.activeElement?.innerText?.trim() === "Delete on GitHub…", { timeout: 2000 }).catch(() => null);
+        ok("  the focus goes back to Delete on GitHub…, the button that opened it", (await focused(page)) === "Delete on GitHub…", await focused(page));
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/ap");
+        ok("  a name not quite typed is not enough to delete it", (await inDialog(page, "delete", "Delete this repository")) === "disabled");
+        await page.keyboard.press("Enter");
+        await sleep(200);
+        ok("  nor is Enter in the name box with it: nothing is sent", (await gcalls(page, "github_delete_repo")).length === 0 && (await dialogState(page, "delete")) === "confirm");
+        await page.mouse.click(8, 8);
+        await sleep(150);
+        ok("  with a name typed, a click on the dimmed area doesn't close it", (await dialogState(page, "delete")) === "confirm");
+        await page.click('input[aria-label="Type acme/app to confirm"]', { clickCount: 3 });
+        await page.keyboard.type(" ACME/App ");
+        ok("  the name in another letter case, with spaces around it, is", (await page.$eval('[data-confirm="delete"]', (b) => !b.disabled).catch(() => false)) === true);
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-delete-confirm.png` });
+        await inDialog(page, "delete", "Delete this repository");
+        await stateIs(page, "delete", "approve-explain");
+        d = await dialog(page, "delete");
+        ok(
+          "Delete sends exactly what was typed (GitHub's side checks it) and the id read; GitHub wants an approval first: the same dialog asks for it, nothing deleted",
+          JSON.stringify(await gcalls(page, "github_delete_repo")) === JSON.stringify([{ account: "gh:work-me", owner: "acme", name: "app", confirm: " ACME/App ", expectId: 4242 }]) &&
+            d.includes("Allow deleting as @work-me?") &&
+            d.includes("GitHub asks you to approve this once. GitSwitch keeps the permission in memory for 10 minutes and never saves it. Nothing is deleted yet.") &&
+            !(await page.$("[data-deleted-on-github]")),
+          d
+        );
+        ok("  the dialog's title says so, Approve deleting on GitHub", modalOk(await modalA11y(page), "Approve deleting on GitHub"), JSON.stringify(await modalA11y(page)));
+        await page.waitForFunction(() => document.activeElement?.innerText?.trim() === "Get a code", { timeout: 2000 }).catch(() => null);
+        const onStep = await focused(page);
+        await page.keyboard.down("Shift");
+        await page.keyboard.press("Tab");
+        await page.keyboard.up("Shift");
+        const oneTab = await focused(page);
+        await page.keyboard.press("Tab");
+        ok("  the focus is on Get a code, the step's own button; Cancel is one Tab away", onStep === "Get a code" && oneTab === "Cancel" && (await focused(page)) === "Get a code", JSON.stringify({ onStep, oneTab }));
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-delete-approve.png` });
+        await inDialog(page, "delete", "Get a code");
+        await page.waitForSelector('[data-device-code="ABCD-EFGH"]', { timeout: 4000 }).catch(() => null);
+        d = await dialog(page, "delete");
+        ok("  Get a code: GitHub's code, large, with Copy and Open GitHub, and a line saying it waits", JSON.stringify(await gcalls(page, "github_delete_grant_start")) === JSON.stringify([{ account: "gh:work-me" }]) && d.includes("ABCD-EFGH") && !d.includes("WDJB-MJHT") && d.includes("https://github.com/login/device?t=1") && d.includes("Waiting for you to approve it on GitHub") && !!(await page.$('button[aria-label="Copy the code"]')) && d.includes("Open GitHub"), d);
+        ok(
+          "  under it: come back and press Delete once more, and how long the code works (899 s: 15 minutes)",
+          (await page.evaluate(() => document.querySelector("[data-code-expiry]")?.innerText.trim() ?? "")) === "When you have approved it, come back here and press Delete once more. The code works for 15 minutes.",
+          await page.evaluate(() => document.querySelector("[data-code-expiry]")?.innerText ?? "")
+        );
+        await page.waitForFunction(() => document.activeElement?.innerText?.trim() === "Open GitHub", { timeout: 2000 }).catch(() => null);
+        ok("  as the code appears, the focus is on Open GitHub, the next step", (await focused(page)) === "Open GitHub", await focused(page));
+        ok("  Open GitHub opens exactly the address GitHub gave", (await inDialog(page, "delete", "Open GitHub")) === "clicked" && (await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url" && c.args?.url === "https://github.com/login/device?t=1"), { timeout: 2000 }).then(() => true, () => false)), JSON.stringify(await gcalls(page, "plugin:opener|open_url")));
+        // Back from the browser: the click that brings the window to the front lands on the dimmed area.
+        await page.mouse.click(8, 8);
+        await sleep(200);
+        ok("  while GitHub waits for the approval, a click on the dimmed area neither closes the dialog nor stops the wait", (await dialogState(page, "delete")) === "approve-code" && (await gcalls(page, "github_delete_grant_cancel")).length === 0);
+        // A clipboard that keeps what it is given: Copy must give it the code, exactly.
+        await page.evaluate(() => {
+          window.__COPIED__ = null;
+          Object.defineProperty(navigator, "clipboard", { value: { writeText: (s) => ((window.__COPIED__ = s), Promise.resolve()) }, configurable: true });
+        });
+        await page.evaluate(() => document.querySelector('button[aria-label="Copy the code"]')?.click());
+        const copiedSaid = await page.waitForFunction(() => (document.querySelector("[data-delete-dialog]")?.parentElement?.innerText ?? "").includes("Copied."), { timeout: 2000 }).then(() => true, () => false);
+        ok("  Copy puts exactly the code on the clipboard, and says Copied.", copiedSaid && (await page.evaluate(() => window.__COPIED__)) === "ABCD-EFGH", String(await page.evaluate(() => window.__COPIED__)));
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-delete-code.png` });
+        // GitHub answers the held wait: declined.
+        await page.evaluate(() => window.__GRANT__.decline("The approval was declined on GitHub. Nothing was deleted."));
+        await stateIs(page, "delete", "approve-failed");
+        d = await dialog(page, "delete");
+        await page.waitForFunction(() => document.activeElement?.innerText?.trim() === "Try again", { timeout: 2000 }).catch(() => null);
+        ok("  an approval GitHub didn't give: the reason, and Try again, with the focus on it", d.includes("The approval was declined on GitHub. Nothing was deleted.") && (await focused(page)) === "Try again", `${await focused(page)} | ${d}`);
+        ok("  Try again can be pressed", (await inDialog(page, "delete", "Try again")) === "clicked");
+        await page.waitForSelector('[data-device-code="ABCD-EFGH"]', { timeout: 4000 }).catch(() => null);
+        ok("  Try again asks GitHub for a new code and waits again", (await gcalls(page, "github_delete_grant_start")).length === 2 && (await gcalls(page, "github_delete_grant_wait")).length === 2);
+        await page.evaluate(() => window.__GRANT__.approve());
+        await page.waitForSelector("[data-approved]", { timeout: 4000 }).catch(() => null);
+        // Long enough for a delete that started by itself, a moment after the approval, to have been sent.
+        await sleep(1500);
+        d = await dialog(page, "delete");
+        ok(
+          "approved: back on the confirm step, the name still typed as it was — and nothing deleted by itself",
+          d.includes("Approved. Press Delete to delete acme/app.") && (await page.$eval('input[aria-label="Type acme/app to confirm"]', (i) => i.value).catch(() => "")) === " ACME/App " && (await gcalls(page, "github_delete_repo")).length === 1 && (await dialogState(page, "delete")) === "confirm",
+          d
+        );
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-delete-approved.png` });
+        ok("  Delete is the person's to press: it is there and pressed", (await gcalls(page, "github_delete_repo")).length === 1 && (await inDialog(page, "delete", "Delete this repository")) === "clicked");
+        await closed(page, "delete");
+        const sent = await gcalls(page, "github_delete_repo");
+        ok("  pressed again, it deletes it with the same name typed and the same id", sent.length === 2 && JSON.stringify(sent[1]) === JSON.stringify({ account: "gh:work-me", owner: "acme", name: "app", confirm: " ACME/App ", expectId: 4242 }), JSON.stringify(sent));
+        const said = await text(page);
+        ok(
+          "  the message is GitHub's answer as the backend words it, for an organization: an owner of acme restores it from acme's settings",
+          said.includes("Deleted acme/app on GitHub. Changed your mind? GitHub keeps it for 90 days: an owner of acme can restore it from acme's settings › Deleted repositories (it can take up to an hour to show there).") && !said.includes("your GitHub settings")
+        );
+        let gone = await page.evaluate(() => document.querySelector("[data-deleted-on-github]")?.innerText ?? "");
+        ok(
+          "  the tab says calmly that it was deleted on GitHub, that the folder stays, and that Push and Fetch fail until a repository is there again",
+          gone.includes("acme/app was deleted on GitHub.") &&
+            gone.includes("This folder and its commits are still here. Its address still points to acme/app, so Push and Fetch fail until a repository exists there again.") &&
+            !gone.includes("Publish") &&
+            !(await page.$("[data-settings-card]")) &&
+            !(await page.$("[data-visibility-badge]")),
+          gone
+        );
+        ok(
+          "  how to undo it, kept on screen: GitHub's own answer word for word — an owner of acme restores it from acme's settings — and that restoring brings back its issues and pull requests",
+          gone.includes(
+            "Changed your mind? GitHub keeps it for 90 days: an owner of acme can restore it from acme's settings › Deleted repositories (it can take up to an hour to show there). Restoring it brings back its issues and pull requests too."
+          ) &&
+            !gone.includes("Deleted acme/app on GitHub.") &&
+            (await page.$eval("[data-deleted-on-github] [data-restore-link]", (b) => b.innerText.trim()).catch(() => null)) === "Restore it on github.com",
+          gone
+        );
+        ok(
+          "  and offers to make it again here, under the same name — said to be a new, empty repository, no undo: a button (not the green one), not a link to github.com",
+          gone.includes(
+            "Or create it again under the same name: a new, empty repository that this folder publishes to as before. Its old issues and pull requests don't come back, and GitHub can't restore the old one while this one has its name."
+          ) &&
+            !!(await page.$('[data-deleted-on-github] button[data-create-again="acme/app"]')) &&
+            gone.includes("Create it again on GitHub…") &&
+            (await page.$eval('[data-create-again="acme/app"]', (b) => !b.className.includes("bg-emerald")).catch(() => false)),
+          gone
+        );
+        ok(
+          "  the dialog and the button that opened it went with the Settings section: the focus is on the note",
+          await page.evaluate(() => !!document.activeElement?.hasAttribute("data-deleted-on-github")),
+          await page.evaluate(() => document.activeElement?.outerHTML.slice(0, 120) ?? "")
+        );
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-deleted.png` });
+        const openedBefore = (await gcalls(page, "plugin:opener|open_url")).length;
+        await page.evaluate(() => document.querySelector("[data-deleted-on-github] [data-restore-link]")?.click());
+        await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "plugin:opener|open_url").length > n, { timeout: 2000 }, openedBefore).catch(() => null);
+        ok(
+          "  Restore it on github.com opens exactly acme's Deleted repositories page",
+          JSON.stringify((await gcalls(page, "plugin:opener|open_url")).slice(openedBefore).map((a) => a.url)) === JSON.stringify(["https://github.com/organizations/acme/settings/deleted_repositories"]),
+          JSON.stringify(await gcalls(page, "plugin:opener|open_url"))
+        );
+        // The page's Refresh: GitHub shows acme/app to no account now.
+        await page.evaluate(() => document.querySelector('button[title="Re-read this repository"]')?.click());
+        await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "github_repo_context").length >= 2, { timeout: 4000 }).catch(() => null);
+        await sleep(300);
+        gone = await page.evaluate(() => document.querySelector("[data-deleted-on-github]")?.innerText ?? "");
+        ok("  Refresh keeps saying it was deleted, not “pick an account that can see it”", (await gcalls(page, "github_repo_context")).length === 2 && gone.includes("acme/app was deleted on GitHub.") && !(await text(page)).includes("pick an account that can see it"), gone || (await text(page)).slice(0, 800));
+        // Away to another page and back: the tab is drawn anew, and still says so, from what was done in this session.
+        const navTo = (name) => page.evaluate((n) => [...document.querySelectorAll("nav a")].find((a) => a.textContent.trim() === n)?.click(), name);
+        await navTo("Pull requests");
+        await sleep(300);
+        await navTo("Repository");
+        await page.waitForFunction(() => location.pathname.startsWith("/repo/"), { timeout: 4000 }).catch(() => null);
+        await page.evaluate(() => [...document.querySelectorAll("[role=tab]")].find((t) => t.innerText.trim() === "GitHub")?.click());
+        await page.waitForSelector("[data-deleted-on-github]", { timeout: 4000 }).catch(() => null);
+        gone = await page.evaluate(() => document.querySelector("[data-deleted-on-github]")?.innerText ?? "");
+        ok(
+          "  away to another page and back: the tab still says it was deleted, with the way to restore it and Create it again on GitHub…",
+          gone.includes("acme/app was deleted on GitHub.") && gone.includes("Changed your mind?") && !!(await page.$('[data-deleted-on-github] button[data-create-again="acme/app"]')) && !(await text(page)).includes("pick an account that can see it"),
+          gone || (await text(page)).slice(0, 800)
+        );
+        await page.close();
+      }
+      {
+        // An account that isn't an admin: greyed, with the reasons. Then a fork, acting as its admin.
+        const FORK = {
+          id: 77, owner: "acme", name: "app", full_name: "acme/app", owner_kind: "org", private: true, visibility: "private", fork: true, parent: "upstream/app", archived: false,
+          admins: ["gh:work-me"], stars: 0, watchers: 0, forks: 0, has_pages: false, html_url: "https://github.com/acme/app", can_delete: false, missing_here: [],
+        };
+        const page = await open(SCENARIOS.clean, { gh: { ...GH, context: { ...GH.context, suggested: "gh:me-home", profile_login: "me-home" } }, admin: { facts: { "acme/app": FORK }, needsPermission: true } });
+        await openTab(page);
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="visibility"]', { timeout: 4000 }).catch(() => null);
+        const vis = await cardButton(page, "visibility", "Make public…");
+        const del = await cardButton(page, "danger", "Delete on GitHub…");
+        ok(
+          "an account that isn't an admin: Make public… and Delete on GitHub… are greyed, and the reasons are said",
+          vis?.disabled === true && del?.disabled === true && (await card(page, "visibility")).includes("Only an admin can change who can see it, and @me-home isn't one.") && (await card(page, "danger")).includes("Only an admin can delete it, and @me-home isn't one."),
+          JSON.stringify({ vis, del })
+        );
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-settings-not-admin.png` });
+        await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("me-home · can read"))?.click());
+        await sleep(100);
+        await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("work-me · admin"))?.click());
+        await page.waitForFunction(() => document.querySelector('[data-settings-card="danger"] button')?.disabled === false, { timeout: 4000 }).catch(() => null);
+        const forkVis = await cardButton(page, "visibility", "Make public…");
+        ok(
+          "  acting as the admin it is read again; a fork still can't be made public: it is a fork of upstream/app, and GitHub doesn't let a fork's visibility change",
+          forkVis?.disabled === true && (await card(page, "visibility")).includes("It is a fork of upstream/app, and GitHub doesn't let a fork's visibility change.") && !(await card(page, "visibility")).includes("follows") && (await gcalls(page, "github_repo_facts")).at(-1)?.account === "gh:work-me",
+          JSON.stringify(forkVis)
+        );
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        const d = await dialog(page, "delete");
+        ok("  deleting a fork: it can't be restored afterwards; no branch is missing here, so no warning", d.includes("You won't be able to restore it yourself afterwards.") && !d.includes("90 days") && !(await page.$("[data-missing-here]")), d);
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        await inDialog(page, "delete", "Delete this repository");
+        await stateIs(page, "delete", "approve-explain");
+        await inDialog(page, "delete", "Get a code");
+        await page.waitForSelector("[data-device-code]", { timeout: 4000 }).catch(() => null);
+        await inDialog(page, "delete", "Cancel");
+        await closed(page, "delete");
+        await sleep(200);
+        ok(
+          "Cancel while GitHub waits for the approval stops the wait, closes the dialog, and deletes nothing",
+          (await gcalls(page, "github_delete_grant_cancel")).length >= 1 && (await gcalls(page, "github_delete_repo")).length === 1 && !(await page.$("[data-delete-dialog]")) && !(await page.$("[data-deleted-on-github]")) && !!(await page.$('[data-settings-card="danger"]'))
+        );
+        // The parent made public, the fork with it: Make private… is greyed the same way, read again with the card's Refresh.
+        await page.evaluate(() => Object.assign(window.__ADMIN__.facts["acme/app"], { private: false, visibility: "public" }));
+        await page.evaluate(() => document.querySelector('button[title="Read the repository\'s settings again"]')?.click());
+        await page.waitForFunction(() => [...(document.querySelector('[data-settings-card="visibility"]')?.querySelectorAll("button") ?? [])].some((b) => b.innerText.trim() === "Make private…"), { timeout: 4000 }).catch(() => null);
+        const pubFork = await cardButton(page, "visibility", "Make private…");
+        ok(
+          "a public fork: Make private… is greyed with the same reason — GitHub doesn't let a fork change either way",
+          pubFork?.disabled === true && pubFork.title === "It is a fork of upstream/app, and GitHub doesn't let a fork's visibility change." && (await card(page, "visibility")).includes("It is a fork of upstream/app, and GitHub doesn't let a fork's visibility change."),
+          JSON.stringify(pubFork)
+        );
+        await page.close();
+      }
+      {
+        // While GitHub is asked, the dialog stays: Escape, its ✕ and the dimmed area do nothing, Cancel is greyed. A double click sends once.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, can_delete: true, missing_here: [] } }, setDelay: 900, deleteDelay: 900 } });
+        const tryToClose = async (which) => {
+          await page.keyboard.press("Escape");
+          await page.mouse.click(8, 8);
+          // The dialog's ✕, beside its title.
+          await page.evaluate((which) => document.querySelector(`[data-${which}-dialog]`)?.parentElement?.querySelector(":scope > div:first-child > button")?.click(), which);
+          await sleep(150);
+        };
+        await openTab(page);
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="visibility"]', { timeout: 4000 }).catch(() => null);
+        await clickCard(page, "visibility", "Make public…");
+        await stateIs(page, "visibility", "public");
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        await page.click('[data-confirm="make-public"]', { count: 2 });
+        await page.waitForFunction(() => (document.querySelector('[data-confirm="make-public"]')?.innerText ?? "").includes("Making it public…"), { timeout: 2000 }).catch(() => null);
+        await tryToClose("visibility");
+        ok(
+          "while GitHub makes it public, the dialog can't be closed: Escape, its ✕ and the dimmed area do nothing, and Cancel is greyed",
+          (await dialogState(page, "visibility")) === "public" &&
+            (await inDialog(page, "visibility", "Cancel")) === "disabled" &&
+            (await page.$eval('[data-confirm="make-public"]', (b) => b.disabled && b.innerText.includes("Making it public…")).catch(() => false)) === true
+        );
+        await closed(page, "visibility");
+        ok("  a double click on Make public sent it once; then the badge says public", (await gcalls(page, "github_set_visibility")).length === 1 && (await badge(page)) === "public", JSON.stringify(await gcalls(page, "github_set_visibility")));
+
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        await page.click('[data-confirm="delete"]', { count: 2 });
+        await page.waitForFunction(() => (document.querySelector('[data-confirm="delete"]')?.innerText ?? "").includes("Deleting…"), { timeout: 2000 }).catch(() => null);
+        await tryToClose("delete");
+        ok(
+          "while GitHub deletes it, the dialog can't be closed either",
+          (await dialogState(page, "delete")) === "confirm" &&
+            (await inDialog(page, "delete", "Cancel")) === "disabled" &&
+            (await page.$eval('[data-confirm="delete"]', (b) => b.disabled && b.innerText.includes("Deleting…")).catch(() => false)) === true
+        );
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-deleting.png` });
+        await closed(page, "delete");
+        ok("  a double click on Delete sent it once; then the tab says it was deleted", (await gcalls(page, "github_delete_repo")).length === 1 && !!(await page.$("[data-deleted-on-github]")), JSON.stringify(await gcalls(page, "github_delete_repo")));
+        await page.close();
+      }
+      {
+        // GitHub has moved on since the card read it; a repository made again under the same name; GitHub's refusals, in words.
+        const page = await open(SCENARIOS.clean, {
+          gh: GH,
+          admin: {
+            facts: { "acme/app": { ...FACTS, can_delete: true, missing_here: [] } },
+            setRefuse: "GitHub would not make acme/app private.",
+            deleteRefuse: "acme lets only its owners delete its repositories, so acme/app was not deleted. Ask an owner of acme.",
+          },
+        });
+        await openTab(page);
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="visibility"]', { timeout: 4000 }).catch(() => null);
+        // Made public on github.com after the card read it.
+        await page.evaluate(() => Object.assign(window.__ADMIN__.facts["acme/app"], { private: false, visibility: "public" }));
+        ok("a card read before a change on github.com still offers Make public…", !!(await cardButton(page, "visibility", "Make public…")) && (await badge(page)) === "private");
+        await clickCard(page, "visibility", "Make public…");
+        await stateIs(page, "visibility", "already");
+        let d = await dialog(page, "visibility");
+        ok(
+          "  the dialog reads GitHub, finds it public already and says so: no Make private in its place, nothing to type, only Close",
+          d.includes("acme/app is public now: anyone on the internet can see it.") &&
+            d.includes("It is already public on GitHub, so there is nothing to change.") &&
+            (await inDialog(page, "visibility", "Make private")) === "missing" &&
+            (await inDialog(page, "visibility", "Make public")) === "missing" &&
+            !(await page.$("[data-visibility-dialog] input")) &&
+            (await focused(page)) === "Close",
+          d
+        );
+        ok("  the card and the badge correct themselves from what GitHub said", (await badge(page)) === "public" && (await card(page, "visibility")).includes("acme/app is public now") && !!(await cardButton(page, "visibility", "Make private…")), await card(page, "visibility"));
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-visibility-already.png` });
+        await inDialog(page, "visibility", "Close");
+        await closed(page, "visibility");
+        ok("  nothing was sent", (await gcalls(page, "github_set_visibility")).length === 0);
+
+        // Deleted and made again on GitHub while the dialog is open: another id.
+        await clickCard(page, "visibility", "Make private…");
+        await stateIs(page, "visibility", "private");
+        await page.evaluate(() => {
+          window.__ADMIN__.facts["acme/app"].id = 9;
+        });
+        await page.evaluate(() => document.querySelector('[data-visibility-dialog] input[type="checkbox"]')?.click());
+        await sleep(100);
+        await inDialog(page, "visibility", "Make private");
+        await page.waitForFunction(() => !!document.querySelector("[data-visibility-dialog] [role=alert]"), { timeout: 3000 }).catch(() => null);
+        d = await dialog(page, "visibility");
+        ok(
+          "a repository made again under the same name since the dialog read it: the backend's sentence, the dialog stays open, nothing changes here",
+          d.includes("acme/app on GitHub is no longer the repository this page showed (it was deleted and made again). Nothing was changed. Refresh and try again.") &&
+            !d.includes("Command execution error") &&
+            JSON.stringify((await gcalls(page, "github_set_visibility")).map((a) => a.expectId)) === "[4242]" &&
+            (await badge(page)) === "public" &&
+            !(await text(page)).includes("acme/app is now private"),
+          d
+        );
+        await inDialog(page, "visibility", "Cancel");
+        await closed(page, "visibility");
+
+        // GitHub refuses the change: its reason, and nothing changed.
+        await clickCard(page, "visibility", "Make private…");
+        await stateIs(page, "visibility", "private");
+        await page.evaluate(() => document.querySelector('[data-visibility-dialog] input[type="checkbox"]')?.click());
+        await sleep(100);
+        await inDialog(page, "visibility", "Make private");
+        await page.waitForFunction(() => !!document.querySelector("[data-visibility-dialog] [role=alert]"), { timeout: 3000 }).catch(() => null);
+        d = await dialog(page, "visibility");
+        ok(
+          "GitHub refuses the change: its reason in words, the dialog stays open with Make private to try again, the badge and card unchanged, no success message",
+          d.includes("GitHub would not make acme/app private.") &&
+            !d.includes("Command execution error") &&
+            (await gcalls(page, "github_set_visibility")).at(-1)?.expectId === 9 &&
+            (await inDialog(page, "visibility", "Make private")) !== "missing" &&
+            (await badge(page)) === "public" &&
+            (await card(page, "visibility")).includes("acme/app is public now") &&
+            !(await text(page)).includes("acme/app is now private"),
+          d
+        );
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-visibility-refused.png` });
+        await inDialog(page, "visibility", "Cancel");
+        await closed(page, "visibility");
+
+        // GitHub refuses the delete.
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        await inDialog(page, "delete", "Delete this repository");
+        await page.waitForFunction(() => !!document.querySelector("[data-delete-dialog] [role=alert]"), { timeout: 3000 }).catch(() => null);
+        d = await dialog(page, "delete");
+        ok(
+          "GitHub refuses the delete: its reason in words, the dialog stays open, and the tab doesn't say it was deleted",
+          d.includes("acme lets only its owners delete its repositories, so acme/app was not deleted. Ask an owner of acme.") &&
+            !d.includes("Command execution error") &&
+            (await dialogState(page, "delete")) === "confirm" &&
+            (await gcalls(page, "github_delete_repo")).at(-1)?.expectId === 9 &&
+            !(await page.$("[data-deleted-on-github]")) &&
+            !(await text(page)).includes("Deleted acme/app on GitHub"),
+          d
+        );
+        await inDialog(page, "delete", "Cancel");
+        await closed(page, "delete");
+        ok("  closed: the Settings cards are still there", !!(await page.$('[data-settings-card="danger"]')) && !!(await page.$('[data-settings-card="visibility"]')));
+        await page.close();
+      }
+      {
+        // GitHub gives no code: the reason, Try again; Back keeps the name typed; nothing deleted.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, missing_here: [] } }, needsPermission: true, grantStartRefuse: "Couldn't reach GitHub to get a code. Check the connection and try again." } });
+        await openTab(page);
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="danger"]', { timeout: 4000 }).catch(() => null);
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        await inDialog(page, "delete", "Delete this repository");
+        await stateIs(page, "delete", "approve-explain");
+        await inDialog(page, "delete", "Get a code");
+        await stateIs(page, "delete", "approve-failed");
+        const d = await dialog(page, "delete");
+        ok(
+          "GitHub gives no code: the reason in words, and Try again; nothing waited for, nothing deleted",
+          d.includes("Couldn't reach GitHub to get a code. Check the connection and try again.") && !d.includes("Command execution error") && (await gcalls(page, "github_delete_grant_wait")).length === 0 && (await gcalls(page, "github_delete_repo")).length === 1,
+          d
+        );
+        ok("  Try again asks GitHub for a code again", (await inDialog(page, "delete", "Try again")) === "clicked" && (await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "github_delete_grant_start").length === 2, { timeout: 2000 }).then(() => true, () => false)));
+        await stateIs(page, "delete", "approve-failed");
+        await inDialog(page, "delete", "Back");
+        await stateIs(page, "delete", "confirm");
+        ok(
+          "  Back: the confirm step again, the name still typed, nothing deleted",
+          (await page.$eval('input[aria-label="Type acme/app to confirm"]', (i) => i.value).catch(() => "")) === "acme/app" && (await gcalls(page, "github_delete_repo")).length === 1 && !(await page.$("[data-deleted-on-github]"))
+        );
+        await page.close();
+      }
+      {
+        // Back while GitHub waits: the wait is stopped, and it ends LATE — the backend sees the stop at its next look,
+        // seconds later. Here each late end is held and released by the check itself, so neither case depends on
+        // how fast the steps run: (a) it ends while the person is still on the confirm step, the usual case; (b) it
+        // ends after a new wait has begun, which it must leave alone.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, missing_here: [] } }, needsPermission: true, cancelEnds: "hold" } });
+        await openTab(page);
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="danger"]', { timeout: 4000 }).catch(() => null);
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        const toCode = async () => {
+          await inDialog(page, "delete", "Delete this repository");
+          await stateIs(page, "delete", "approve-explain");
+          await inDialog(page, "delete", "Get a code");
+          await stateIs(page, "delete", "approve-code");
+        };
+        const typedNow = () => page.$eval('input[aria-label="Type acme/app to confirm"]', (i) => i.value).catch(() => "");
+        const held = () => page.evaluate(() => (window.__STOPPED__ ?? []).length);
+        await toCode();
+        await inDialog(page, "delete", "Back");
+        await stateIs(page, "delete", "confirm");
+        ok(
+          "Back while GitHub waits for the approval stops the wait: the confirm step again, the name still typed",
+          (await gcalls(page, "github_delete_grant_cancel")).length === 1 && (await typedNow()) === "acme/app" && (await gcalls(page, "github_delete_repo")).length === 1,
+          JSON.stringify(await gcalls(page, "github_delete_grant_cancel"))
+        );
+        // (a) Still on the confirm step when the stopped wait ends.
+        const heldA = await held();
+        await page.evaluate(() => window.__STOPPED__?.shift()?.());
+        await sleep(250);
+        let d = await dialog(page, "delete");
+        ok(
+          "  its late end, while the confirm step is still shown, changes nothing: no approval step, nothing said of stopping, the name still typed",
+          heldA === 1 && (await dialogState(page, "delete")) === "confirm" && !d.includes("Stopped waiting") && !(await page.$("[data-device-code]")) && (await typedNow()) === "acme/app",
+          d
+        );
+        // (b) To the code again, Back, and to the code once more: only then does the stopped wait end.
+        await toCode();
+        await inDialog(page, "delete", "Back");
+        await stateIs(page, "delete", "confirm");
+        await toCode();
+        const heldB = await held();
+        await page.evaluate(() => window.__STOPPED__?.shift()?.());
+        await sleep(250);
+        d = await dialog(page, "delete");
+        ok(
+          "  Delete, then Get a code again: the stopped wait's late end leaves the new one alone — still on the code, nothing said of stopping",
+          heldB === 1 &&
+            (await dialogState(page, "delete")) === "approve-code" &&
+            !d.includes("Stopped waiting") &&
+            (await gcalls(page, "github_delete_grant_wait")).length === 3 &&
+            (await gcalls(page, "github_delete_grant_cancel")).length === 2,
+          d
+        );
+        await page.evaluate(() => window.__GRANT__?.decline("The approval was declined on GitHub. Nothing was deleted."));
+        await stateIs(page, "delete", "approve-failed");
+        ok("  and it is the new wait that GitHub's answer ends", (await dialog(page, "delete")).includes("The approval was declined on GitHub. Nothing was deleted."));
+        await page.close();
+      }
+      {
+        // Another account picked while GitHub waits for the approval: the dialog was for the account before, so it
+        // closes, the wait is stopped once, and its late end changes nothing.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, missing_here: [] } }, needsPermission: true, cancelEnds: "hold" } });
+        await openTab(page);
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="danger"]', { timeout: 4000 }).catch(() => null);
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        await inDialog(page, "delete", "Delete this repository");
+        await stateIs(page, "delete", "approve-explain");
+        await inDialog(page, "delete", "Get a code");
+        await stateIs(page, "delete", "approve-code");
+        // Acting as me-home, picked in the tab's Select behind the dialog.
+        await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("work-me · admin"))?.click());
+        await sleep(100);
+        await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("me-home · can read"))?.click());
+        await closed(page, "delete");
+        await page.waitForFunction(() => (document.querySelector('[data-settings-card="danger"]')?.innerText ?? "").includes("@me-home"), { timeout: 4000 }).catch(() => null);
+        const cancels = (await gcalls(page, "github_delete_grant_cancel")).length;
+        const heldEnds = await page.evaluate(() => (window.__STOPPED__ ?? []).length);
+        await page.evaluate(() => (window.__STOPPED__ ?? []).splice(0).forEach((end) => end()));
+        await sleep(400);
+        ok(
+          "another account picked while GitHub waits for the approval: that dialog closes and the wait is stopped once; its late end changes nothing, nothing is deleted",
+          cancels === 1 && heldEnds === 1 && !(await page.$("[data-delete-dialog]")) && !(await text(page)).includes("Stopped waiting") && (await gcalls(page, "github_delete_repo")).length === 1,
+          JSON.stringify({ cancels, heldEnds })
+        );
+        ok(
+          "  the cards are @me-home's now, greyed with the reasons",
+          (await card(page, "danger")).includes("Only an admin can delete it, and @me-home isn't one.") && (await cardButton(page, "danger", "Delete on GitHub…"))?.disabled === true,
+          await card(page, "danger")
+        );
+        await page.close();
+      }
+      {
+        // GitHub answers a change only after another account was picked: said (it happened on GitHub), but that
+        // answer is not painted over the cards of the account now acting.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, can_delete: true, missing_here: [] } }, setDelay: 1200 } });
+        await openTab(page);
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="visibility"]', { timeout: 4000 }).catch(() => null);
+        await clickCard(page, "visibility", "Make public…");
+        await stateIs(page, "visibility", "public");
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        await inDialog(page, "visibility", "Make public");
+        await page.waitForFunction(() => (document.querySelector('[data-confirm="make-public"]')?.innerText ?? "").includes("Making it public…"), { timeout: 2000 }).catch(() => null);
+        await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.trim().startsWith("work-me · admin"))?.click());
+        await sleep(100);
+        await page.evaluate(() => [...document.querySelectorAll("button")].find((b) => b.innerText.includes("me-home · can read"))?.click());
+        await closed(page, "visibility");
+        await page.waitForFunction(() => document.body.innerText.includes("acme/app is now public"), { timeout: 4000 }).catch(() => null);
+        await sleep(300);
+        const vis = await cardButton(page, "visibility", "Make private…");
+        ok(
+          "a change GitHub answers after another account was picked: said, but the cards stay @me-home's — greyed with its reason, not painted with the admin's answer — and no dialog opens or closes by it",
+          (await text(page)).includes("acme/app is now public") &&
+            vis?.disabled === true &&
+            (await card(page, "visibility")).includes("Only an admin can change who can see it, and @me-home isn't one.") &&
+            !(await page.$("[data-visibility-dialog]")) &&
+            !(await page.$("[data-delete-dialog]")),
+          `${JSON.stringify(vis)} | ${await card(page, "visibility")}`
+        );
+        await page.close();
+      }
+      {
+        // What goes with it, by its forks, in numbers; an internal repository's forks split off; a capped comparison said.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, can_delete: true, missing_here: [], stars: 0, watchers: 0 } } } });
+        await openTab(page);
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="danger"]', { timeout: 4000 }).catch(() => null);
+        const set = (over) => page.evaluate((over) => Object.assign(window.__ADMIN__.facts["acme/app"], over), over);
+        const forksLine = async () => {
+          await clickCard(page, "danger", "Delete on GitHub…");
+          await stateIs(page, "delete", "confirm");
+          const line = await page.evaluate(() => document.querySelector("[data-forks-line]")?.innerText.trim() ?? null);
+          await inDialog(page, "delete", "Cancel");
+          await closed(page, "delete");
+          return line;
+        };
+        await set({ private: true, visibility: "private", forks: 2 });
+        const p2 = await forksLine();
+        await set({ forks: 1 });
+        const p1 = await forksLine();
+        await set({ private: false, visibility: "public", forks: 2 });
+        const u2 = await forksLine();
+        await set({ forks: 1 });
+        const u1 = await forksLine();
+        await set({ forks: 0 });
+        const none = await forksLine();
+        ok(
+          "Delete says what becomes of its forks, with their number: a private one's are deleted too, a public one's stay on GitHub; with none, nothing is said",
+          p2 === "Its 2 forks are deleted too." && p1 === "Its 1 fork is deleted too." && u2 === "Its 2 forks stay on GitHub." && u1 === "Its 1 fork stays on GitHub." && none === null,
+          JSON.stringify({ p2, p1, u2, u1, none })
+        );
+        // GitHub has more than 1,000 branches: only the first 1,000 were compared with the folder.
+        await set({ branches_capped: true, missing_here: ["main"] });
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        let d = await dialog(page, "delete");
+        ok(
+          "more than 1,000 branches on GitHub: said under the folder comparison, that only the first 1,000 were compared",
+          d.includes("GitHub has more than 1,000 branches: only the first 1,000 were compared with this folder.") &&
+            (await page.evaluate(() => {
+              const m = document.querySelector("[data-missing-here]");
+              const c = document.querySelector("[data-branches-capped]");
+              return !!m && !!c && !!(m.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING);
+            })),
+          d
+        );
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-delete-capped.png` });
+        await inDialog(page, "delete", "Cancel");
+        await closed(page, "delete");
+        // Internal, made private: GitHub detaches its current forks ("Setting repository visibility"): split off, as a
+        // public one's are, who can see them unsaid. No stars or watchers are lost, so Make private is the usual green.
+        await set({ branches_capped: false, missing_here: [], private: true, visibility: "internal", forks: 2 });
+        await page.evaluate(() => document.querySelector('button[title="Read the repository\'s settings again"]')?.click());
+        await page.waitForFunction(() => (document.querySelector('[data-settings-card="visibility"]')?.innerText ?? "").includes("is internal now"), { timeout: 4000 }).catch(() => null);
+        const makePrivateRed = () => page.$eval('[data-confirm="make-private"]', (b) => b.className.includes("bg-red")).catch(() => null);
+        await clickCard(page, "visibility", "Make private…");
+        await stateIs(page, "visibility", "private");
+        d = await dialog(page, "visibility");
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-make-private-internal.png` });
+        ok(
+          "an internal repository made private: its 2 forks are split off from it, who can see them unsaid, nothing said deleted — and with no stars or watchers lost, Make private is the usual green",
+          d.includes("Its 2 forks are split off from it.") &&
+            !d.includes("become private") &&
+            !d.includes("stay public") &&
+            !d.includes("are deleted") &&
+            (await makePrivateRed()) === false,
+          d
+        );
+        await inDialog(page, "visibility", "Cancel");
+        await closed(page, "visibility");
+        await set({ forks: 1 });
+        await clickCard(page, "visibility", "Make private…");
+        await stateIs(page, "visibility", "private");
+        d = await dialog(page, "visibility");
+        ok("  one fork: Its 1 fork is split off from it", d.includes("Its 1 fork is split off from it.") && !d.includes("deleted") && (await makePrivateRed()) === false, d);
+        await inDialog(page, "visibility", "Cancel");
+        await closed(page, "visibility");
+        await set({ forks: 0 });
+        await clickCard(page, "visibility", "Make private…");
+        await stateIs(page, "visibility", "private");
+        d = await dialog(page, "visibility");
+        ok("  no forks, no stars or watchers: nothing of forks said, and Make private is the usual green", !d.includes("fork") && (await makePrivateRed()) === false, d);
+        await inDialog(page, "visibility", "Cancel");
+        await closed(page, "visibility");
+        await page.close();
+      }
+      {
+        // Deleted here, then made again from the tab's note: the Publish dialog over the GitHub tab, the same
+        // name, the address kept, no browser; the note goes once GitHub has it again.
+        const ctx = { accounts: [{ account: "gh:work-me", login: "work-me", source: "GitHub CLI" }], suggested: "gh:work-me", push_login: "work-me", target: { kind: "none", remote: "origin", url: "git@github.com:acme/app.git", repo: "acme/app" }, default_name: "gitswitch", branch: "main", blocked: null };
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, can_delete: true, missing_here: [] } } }, publishContext: ctx });
+        await openTab(page);
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="danger"]', { timeout: 4000 }).catch(() => null);
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        await inDialog(page, "delete", "Delete this repository");
+        await page.waitForSelector("[data-deleted-on-github]", { timeout: 4000 }).catch(() => null);
+        await page.evaluate(() => document.querySelector("[data-deleted-on-github] button[data-create-again]")?.click());
+        await page.waitForSelector('[data-again-repo="acme/app"]', { timeout: 4000 }).catch(() => null);
+        await createReady(page, 4000);
+        const shown = await page.evaluate(() => {
+          const r = document.querySelector('[data-again-repo="acme/app"]');
+          return r && r.getClientRects().length > 0 && document.querySelector("[data-deleted-on-github]") ? location.pathname : null;
+        });
+        const d = await page.evaluate(() => document.querySelector("[data-create-mode]")?.closest("[role=dialog]")?.innerText ?? "");
+        ok(
+          "Create it again on GitHub… opens the Publish dialog right over the GitHub tab: acme/app fixed, the address kept, no tabs, no name to type",
+          shown === "/repo/github" &&
+            modalOk(await modalA11y(page), "Create it again on GitHub") &&
+            !(await page.$('[role="tablist"][aria-label="Where to publish"]')) &&
+            !(await page.$('input[aria-label="Repository name"]')) &&
+            d.includes("Creates acme/app on GitHub again as a private repository, then publishes main to it. This folder's address stays as it is."),
+          `${shown} | ${d}`
+        );
+        const again = await againNew(page);
+        ok(
+          "  deleted here, and GitHub's answer says it can be restored: the dialog says to restore it instead (kept 90 days, its issues and pull requests come back), with Restore it on github.com",
+          again.text === "It is a new, empty repository: only this folder's commits go to it. Deleted by mistake? Restore it instead (GitHub keeps it for 90 days): that brings back its issues and pull requests too." &&
+            again.restore === "Restore it on github.com",
+          JSON.stringify(again)
+        );
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-from-github-tab.png` });
+        await (await button(page, "Create and publish")).click();
+        await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 }).catch(() => null);
+        const c = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_github_repo")?.args ?? {});
+        ok(
+          "  Create makes acme/app again as @work-me, at the address origin has",
+          JSON.stringify(c.target) === JSON.stringify({ kind: "again", remote: "origin", from: "git@github.com:acme/app.git" }) && c.owner === "acme" && c.name === "app" && c.account === "gh:work-me" && c.private === true,
+          JSON.stringify(c)
+        );
+        await page.waitForFunction(() => !document.querySelector("[data-deleted-on-github]"), { timeout: 4000 }).catch(() => null);
+        await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_push"), { timeout: 4000 }).catch(() => null);
+        ok(
+          "  then the note is gone, the tab reads GitHub again, and the folder publishes as before",
+          !(await page.$("[data-deleted-on-github]")) &&
+            (await gcalls(page, "github_repo_context")).length >= 2 &&
+            (await gcalls(page, "changes_push")).at(-1)?.setUpstream === true &&
+            (await text(page)).includes("Created acme/app again on GitHub (private)."),
+          JSON.stringify(await gcalls(page, "changes_push"))
+        );
+        ok("  the browser was never opened", (await gcalls(page, "plugin:opener|open_url")).length === 0, JSON.stringify(await gcalls(page, "plugin:opener|open_url")));
+        await toTabs(page);
+        const tabFocused = await focusedTab(page);
+        ok("  the note went, and with it what opened the dialog: the focus is on the GitHub tab, the Repository page's tab the person is on", tabFocused === "/repo/github", String(tabFocused));
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-done-github-tab.png` });
+        await page.close();
+      }
+      // Making a deleted repository again from the tab, in the cases around the usual one.
+      const againCtx = { accounts: [{ account: "gh:work-me", login: "work-me", source: "GitHub CLI" }], suggested: "gh:work-me", push_login: "work-me", target: { kind: "none", remote: "origin", url: "git@github.com:acme/app.git", repo: "acme/app" }, default_name: "gitswitch", branch: "main", blocked: null };
+      /**
+       * Delete acme/app from the tab's Settings, until the tab's note shows. `beforeDelete` runs once the dialog has read
+       * it, before Delete is pressed (GitHub changing it meanwhile, say).
+       */
+      const deleteHere = async (page, beforeDelete = null) => {
+        await openTab(page);
+        await pill(page, "Settings");
+        await page.waitForSelector('[data-settings-card="danger"]', { timeout: 4000 }).catch(() => null);
+        await clickCard(page, "danger", "Delete on GitHub…");
+        await stateIs(page, "delete", "confirm");
+        if (beforeDelete) await beforeDelete();
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        await inDialog(page, "delete", "Delete this repository");
+        await page.waitForSelector("[data-deleted-on-github]", { timeout: 4000 }).catch(() => null);
+      };
+      /** Press the note's Create it again on GitHub…, until the dialog shows `ready`. */
+      const againFromNote = async (page, ready = "[data-again-repo]") => {
+        await page.evaluate(() => document.querySelector("[data-deleted-on-github] button[data-create-again]")?.click());
+        await page.waitForSelector(ready, { timeout: 4000 }).catch(() => null);
+        await createReady(page, 4000);
+      };
+      /** Delete acme/app from the tab's Settings, then press the note's Create it again on GitHub…, until the dialog shows `ready`. */
+      const deleteThenAgain = async (page, ready = "[data-again-repo]") => {
+        await deleteHere(page);
+        await againFromNote(page, ready);
+      };
+      /** The headlines of the Changes tab's red result cards. */
+      const redCards = (page) => page.evaluate(() => [...document.querySelectorAll('[role="tabpanel"][aria-label="Changes"] p.text-red-100')].map((p) => p.innerText.trim()));
+      const RESTORE_INSTEAD = "It is a new, empty repository: only this folder's commits go to it. Deleted by mistake? Restore it instead (GitHub keeps it for 90 days): that brings back its issues and pull requests too.";
+      const FORK_NETWORK = "It is a new, empty repository: only this folder's commits go to it. The one deleted can't be restored from settings: it was part of a fork network.";
+      const createdWith = async (page) => {
+        await (await button(page, "Create and publish"))?.click();
+        await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 }).catch(() => null);
+        return (await gcalls(page, "changes_create_github_repo"))[0] ?? {};
+      };
+      {
+        // Made again, but git can't reach it yet: the reason must show where the person is — over the GitHub tab, the
+        // Changes tab hidden — and nothing is pushed.
+        const problem = "acme/app was created on GitHub, but git can't reach it yet: the SSH key id_work isn't allowed to push to it. Then push again.";
+        const page = await open(SCENARIOS.clean, {
+          gh: GH,
+          admin: { facts: { "acme/app": { ...FACTS, can_delete: true, missing_here: [] } } },
+          publishContext: againCtx,
+          createResult: { saved: "kept", full_name: "acme/app", html_url: "https://github.com/acme/app", private: true, renamed: false, remote: "origin", url: "git@github.com:acme/app.git", problem },
+        });
+        await deleteThenAgain(page);
+        await createdWith(page);
+        await page.waitForFunction((p) => [...document.querySelectorAll('[data-toast="error"]')].some((t) => t.innerText.includes(p)), { timeout: 4000 }, problem).catch(() => null);
+        await sleep(300);
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-problem-github-tab.png` });
+        const shown = await page.evaluate((p) => [...document.querySelectorAll('[data-toast="error"]')].some((t) => t.innerText.includes(p) && t.getClientRects().length > 0), problem);
+        ok(
+          "made again from the tab, but git can't reach it yet: the reason (it says it was created) shows right over the GitHub tab — not only on the hidden Changes tab — and nothing is pushed",
+          shown && (await page.evaluate(() => location.pathname)) === "/repo/github" && (await gcalls(page, "changes_push")).length === 0 && !(await text(page)).includes("Created acme/app again on GitHub"),
+          JSON.stringify(await gcalls(page, "changes_push"))
+        );
+        await page.waitForFunction(() => !document.querySelector("[data-deleted-on-github]"), { timeout: 4000 }).catch(() => null);
+        await toTabs(page);
+        const tabFocused = await focusedTab(page);
+        ok(
+          "  GitHub has it now, so the note goes, and what opened the dialog with it: the focus is on the GitHub tab, the Repository page's tab the person is on",
+          !(await page.$("[data-deleted-on-github]")) && tabFocused === "/repo/github",
+          String(tabFocused)
+        );
+        // The Changes tab: the reason stays there, as a card a status read leaves as it is.
+        await page.evaluate(() => [...document.querySelectorAll('[role="tablist"][aria-label="Repository tabs"] [role="tab"]')].find((t) => t.innerText.trim().startsWith("Changes"))?.click());
+        await page.waitForFunction(() => location.pathname === "/repo/changes", { timeout: 4000 }).catch(() => null);
+        const onTab = await redCards(page);
+        const reads = (await gcalls(page, "changes_repo_status")).length;
+        await page.evaluate(() => document.querySelector('button[title="Re-read this repository"]')?.click());
+        await page.waitForFunction((n) => window.__CALLS__.filter((c) => c.cmd === "changes_repo_status").length > n, { timeout: 4000 }, reads).catch(() => null);
+        await sleep(300);
+        const afterRead = await redCards(page);
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-problem-changes-tab.png` });
+        ok(
+          "  on the Changes tab the reason is a red card, and Refresh (a status read) leaves it there; still nothing pushed",
+          JSON.stringify(onTab) === JSON.stringify([problem]) && (await gcalls(page, "changes_repo_status")).length > reads && JSON.stringify(afterRead) === JSON.stringify([problem]) && (await gcalls(page, "changes_push")).length === 0,
+          JSON.stringify({ onTab, afterRead })
+        );
+        await page.close();
+      }
+      {
+        // Deleted here, a personal repository GitHub's answer says it can restore: the make-again dialog says to restore it
+        // instead, and its Restore it on github.com opens exactly the address GitHub's answer gave. Cancel puts the focus
+        // back on the note's Create it again on GitHub…, which opened it and is still there.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, owner_kind: "user", can_delete: true, missing_here: [] } } }, publishContext: againCtx });
+        await deleteHere(page);
+        const note = await page.evaluate(() => document.querySelector("[data-deleted-on-github]")?.innerText ?? "");
+        // A click as a person's: the button takes the focus, so it is what the dialog gives it back to.
+        await page.click("[data-deleted-on-github] button[data-create-again]").catch(() => null);
+        await page.waitForSelector("[data-again-repo]", { timeout: 4000 }).catch(() => null);
+        await createReady(page, 4000);
+        const again = await againNew(page);
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-restorable.png` });
+        ok(
+          "deleted here, a personal repository GitHub can restore: the note has Restore it on github.com, and the make-again dialog says to restore it instead, with Restore it on github.com",
+          note.includes("restore it from @acme's settings on GitHub › Repositories › Deleted repositories") &&
+            !!(await page.$("[data-deleted-on-github] [data-restore-link]")) &&
+            again.text === RESTORE_INSTEAD &&
+            again.restore === "Restore it on github.com",
+          JSON.stringify({ again, note })
+        );
+        await page.evaluate(() => document.querySelector("[data-again-restore]")?.click());
+        await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"), { timeout: 2000 }).catch(() => null);
+        ok(
+          "  its Restore it on github.com opens exactly @acme's Deleted repositories page (GitHub's answer's address); the dialog stays, nothing created",
+          JSON.stringify((await gcalls(page, "plugin:opener|open_url")).map((a) => a.url)) === JSON.stringify(["https://github.com/settings/deleted_repositories"]) &&
+            !!(await page.$("[data-create-mode]")) &&
+            (await gcalls(page, "changes_create_github_repo")).length === 0,
+          JSON.stringify(await gcalls(page, "plugin:opener|open_url"))
+        );
+        await page.evaluate(() => document.querySelector("[data-create-cancel]")?.click());
+        await page.waitForFunction(() => !document.querySelector("[data-create-mode]"), { timeout: 4000 }).catch(() => null);
+        await page.waitForFunction(() => !!document.activeElement?.hasAttribute?.("data-create-again"), { timeout: 2000 }).catch(() => null);
+        ok(
+          "  Cancel: nothing created, the note still there, the focus back on its Create it again on GitHub…, the button that opened the dialog",
+          !(await page.$("[data-create-mode]")) &&
+            !!(await page.$("[data-deleted-on-github]")) &&
+            (await page.evaluate(() => document.activeElement?.getAttribute("data-create-again") ?? null)) === "acme/app" &&
+            (await gcalls(page, "changes_create_github_repo")).length === 0,
+          await page.evaluate(() => document.activeElement?.outerHTML.slice(0, 120) ?? "")
+        );
+        await page.close();
+      }
+      {
+        // Deleted here, part of a fork network: GitHub can't restore it from settings. The note says so in GitHub's words,
+        // with no restore link, and doesn't suggest GitHub could restore the old one otherwise; the dialog says the same.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, forks: 2, can_delete: true, missing_here: [] } } }, publishContext: againCtx });
+        await deleteHere(page);
+        const note = await page.evaluate(() => document.querySelector("[data-deleted-on-github]")?.innerText ?? "");
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/github-deleted-fork-network.png` });
+        ok(
+          "deleted here, part of a fork network: the note says it can't be restored from settings, no restore link — and making it again isn't said to keep GitHub from restoring the old one",
+          note.includes("It can't be restored from settings (it was part of a fork network): only GitHub Support can bring it back, on paid plans.") &&
+            !note.includes("Restoring it brings back") &&
+            !(await page.$("[data-deleted-on-github] [data-restore-link]")) &&
+            note.includes("Or create it again under the same name: a new, empty repository that this folder publishes to as before. Its old issues and pull requests don't come back.") &&
+            !note.includes("can't restore the old one"),
+          note
+        );
+        await againFromNote(page);
+        const again = await againNew(page);
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-fork-network.png` });
+        ok(
+          "  the make-again dialog says the one deleted can't be restored from settings (a fork network): no “restore it instead”, no restore link",
+          again.text === FORK_NETWORK && again.restore === null,
+          JSON.stringify(again)
+        );
+        await page.close();
+      }
+      {
+        // Forked by someone between the delete dialog's read (no forks) and Delete: GitHub's answer, read at delete time,
+        // is a fork network's. What the tab and the make-again dialog say of restoring it follows that answer, never the
+        // facts the dialog read when it opened.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, forks: 0, can_delete: true, missing_here: [] } } }, publishContext: againCtx });
+        let read = "";
+        await deleteHere(page, async () => {
+          read = await dialog(page, "delete");
+          await page.evaluate(() => Object.assign(window.__ADMIN__.facts["acme/app"], { forks: 1 }));
+        });
+        const note = await page.evaluate(() => document.querySelector("[data-deleted-on-github]")?.innerText ?? "");
+        ok(
+          "forked between the delete dialog's read (no forks: “GitHub keeps it for 90 days”) and Delete: the note follows GitHub's answer — a fork network's: no restore link, no “can't restore the old one”",
+          read.includes("GitHub keeps it for 90 days: an owner of acme can restore it from acme's settings.") &&
+            note.includes("It can't be restored from settings (it was part of a fork network)") &&
+            !note.includes("Restoring it brings back") &&
+            !(await page.$("[data-deleted-on-github] [data-restore-link]")) &&
+            !note.includes("can't restore the old one"),
+          JSON.stringify({ read, note })
+        );
+        await againFromNote(page);
+        const again = await againNew(page);
+        ok("  and the make-again dialog says the one deleted can't be restored from settings, with no restore link", again.text === FORK_NETWORK && again.restore === null, JSON.stringify(again));
+        await page.close();
+      }
+      {
+        // The other way: a fork network when the delete dialog read it (one fork), the fork gone by Delete: GitHub's answer
+        // says it can be restored, and both the note and the make-again dialog offer exactly acme's Deleted repositories.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, forks: 1, can_delete: true, missing_here: [] } } }, publishContext: againCtx });
+        let read = "";
+        await deleteHere(page, async () => {
+          read = await dialog(page, "delete");
+          await page.evaluate(() => Object.assign(window.__ADMIN__.facts["acme/app"], { forks: 0 }));
+        });
+        const note = await page.evaluate(() => document.querySelector("[data-deleted-on-github]")?.innerText ?? "");
+        ok(
+          "a fork network when the delete dialog read it (“You won't be able to restore it yourself”), its fork gone by Delete: the note follows GitHub's answer — restorable, with the restore link and “can't restore the old one”",
+          read.includes("You won't be able to restore it yourself afterwards.") &&
+            note.includes("Changed your mind? GitHub keeps it for 90 days: an owner of acme can restore it from acme's settings") &&
+            note.includes("Restoring it brings back its issues and pull requests too.") &&
+            !!(await page.$("[data-deleted-on-github] [data-restore-link]")) &&
+            note.includes("and GitHub can't restore the old one while this one has its name."),
+          JSON.stringify({ read, note })
+        );
+        await againFromNote(page);
+        const again = await againNew(page);
+        await page.evaluate(() => document.querySelector("[data-again-restore]")?.click());
+        await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"), { timeout: 2000 }).catch(() => null);
+        const urls = (await gcalls(page, "plugin:opener|open_url")).map((a) => a.url);
+        ok(
+          "  and the make-again dialog says to restore it instead; its Restore it on github.com opens exactly acme's Deleted repositories page",
+          again.text === RESTORE_INSTEAD && again.restore === "Restore it on github.com" && JSON.stringify(urls) === JSON.stringify(["https://github.com/organizations/acme/settings/deleted_repositories"]),
+          JSON.stringify({ again, urls })
+        );
+        await page.close();
+      }
+      {
+        // Deleted from the Repositories page's row menu, then this folder's GitHub tab: the tab didn't see the delete,
+        // the session did — it says so the same calm way, with the way back and Create it again on GitHub….
+        const ROW = (full) => ({ full_name: full, owner: full.split("/")[0], name: full.split("/")[1], owner_is_org: true, description: null, private: true, archived: false, fork: false, default_branch: "main", clone_url: `git@github.com:${full}.git`, pushed_at: "2026-11-01T00:00:00Z", permission: "admin", local_path: null, suggested_profile_id: null });
+        const page = await open(SCENARIOS.clean, {
+          gh: GH,
+          admin: { facts: { "acme/app": { ...FACTS, can_delete: true, missing_here: [] } } },
+          remoteRepos: [ROW("acme/app")],
+          storage: { "repos.account": "gh:work-me" },
+          find: { profiles: [] },
+        });
+        const navTo = (name) => page.evaluate((n) => [...document.querySelectorAll("nav a")].find((a) => a.textContent.trim() === n)?.click(), name);
+        await navTo("Repositories");
+        await page.waitForSelector('[data-repo-row="acme/app"]', { timeout: 5000 }).catch(() => null);
+        await page.evaluate(() => document.querySelector('button[aria-label="More actions for acme/app"]')?.click());
+        await page.waitForSelector('[role="menu"] [data-repo-action="delete"]', { timeout: 3000 }).catch(() => null);
+        await page.evaluate(() => document.querySelector('[role="menu"] [data-repo-action="delete"]')?.click());
+        await stateIs(page, "delete", "confirm");
+        await page.type('input[aria-label="Type acme/app to confirm"]', "acme/app");
+        await inDialog(page, "delete", "Delete this repository");
+        await page.waitForFunction(() => !document.querySelector('[data-repo-row="acme/app"]'), { timeout: 4000 }).catch(() => null);
+        const fromRow = (await gcalls(page, "github_delete_repo")).length === 1 && !(await page.$('[data-repo-row="acme/app"]'));
+        await navTo("Repository");
+        await page.waitForFunction(() => location.pathname.startsWith("/repo/"), { timeout: 4000 }).catch(() => null);
+        await page.evaluate(() => [...document.querySelectorAll("[role=tab]")].find((t) => t.innerText.trim() === "GitHub")?.click());
+        await page.waitForSelector("[data-deleted-on-github]", { timeout: 4000 }).catch(() => null);
+        const gone = await page.evaluate(() => document.querySelector("[data-deleted-on-github]")?.innerText ?? "");
+        ok(
+          "deleted from the Repositories page, then the folder's GitHub tab: said the same calm way, with the way to restore it and Create it again on GitHub…",
+          fromRow &&
+            gone.includes("acme/app was deleted on GitHub.") &&
+            gone.includes("an owner of acme can restore it from acme's settings") &&
+            !!(await page.$('[data-deleted-on-github] button[data-create-again="acme/app"]')) &&
+            !(await text(page)).includes("pick an account that can see it"),
+          gone || (await text(page)).slice(0, 600)
+        );
+        ok("  and the focus was left where it was: nothing was deleted from this tab", await page.evaluate(() => !document.activeElement?.hasAttribute("data-deleted-on-github")));
+        await page.close();
+      }
+      {
+        // Made again from the tab, but the folder turns out never to have reached its remote ("change"): the usual
+        // dialog, filled in with acme/app — with its tabs. A name taken there offers "Publish to it", as GitHub's words
+        // say, and "Use an address" corrects that remote's address: a change, never a remote added.
+        const taken = 'There\'s already a repository acme/app on GitHub. Pick another name, or publish to that one with "Use an address" (only if it\'s empty).';
+        const page = await open(SCENARIOS.clean, {
+          gh: GH,
+          admin: { facts: { "acme/app": { ...FACTS, can_delete: true, missing_here: [] } } },
+          publishContext: { ...againCtx, target: { kind: "change", remote: "origin", url: "git@github.com:acme/app.git", repo: null } },
+          createError: taken,
+        });
+        await deleteThenAgain(page, 'input[aria-label="Repository name"]');
+        const named = await page.$eval('input[aria-label="Repository name"]', (el) => el.value).catch(() => null);
+        let d = await page.evaluate(() => document.querySelector("[data-create-mode]")?.closest("[role=dialog]")?.innerText ?? "");
+        if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/again-change-tabs.png` });
+        ok(
+          "made again from the tab when the folder never reached its remote: the usual dialog filled in with acme/app, titled Publish this repository, with its tabs",
+          named === "app" &&
+            modalOk(await modalA11y(page), "Publish this repository") &&
+            !!(await page.$('[role="tablist"][aria-label="Where to publish"]')) &&
+            !(await page.$("[data-again-repo]")) &&
+            d.includes("Creates acme/app on GitHub as a private repository"),
+          d
+        );
+        const c = await createdWith(page);
+        await page.waitForFunction(() => !!document.querySelector("[data-create-mode] p[role=alert]"), { timeout: 4000 }).catch(() => null);
+        d = await page.evaluate(() => document.querySelector("[data-create-mode]")?.closest("[role=dialog]")?.innerText ?? "");
+        ok("  Create sends the address to correct, as the usual form does", JSON.stringify(c.target) === JSON.stringify({ kind: "change", remote: "origin", from: "git@github.com:acme/app.git" }) && c.owner === "acme" && c.name === "app", JSON.stringify(c));
+        ok("  a name taken: GitHub's words, and Publish to it — the address tab is there to finish it on", d.includes(taken) && !!(await button(page, "Publish to it")), d);
+        await (await button(page, "Publish to it"))?.click();
+        await page.waitForSelector('input[aria-label="Remote address"]', { timeout: 4000 }).catch(() => null);
+        const filled = await page.$eval('input[aria-label="Remote address"]', (el) => el.value).catch(() => null);
+        const onTab = await page.evaluate(() => [...document.querySelectorAll('[role="tablist"][aria-label="Where to publish"] [role="tab"]')].find((t) => t.getAttribute("aria-selected") === "true")?.innerText.trim() ?? null);
+        d = await page.evaluate(() => document.querySelector('input[aria-label="Remote address"]')?.closest("[role=dialog]")?.innerText ?? "");
+        // After the tabs' colour transition, so the picture shows the tab as it now is.
+        if (process.env.UI_SHOTS) await sleep(300).then(() => page.screenshot({ path: `${process.env.UI_SHOTS}/again-change-address.png` }));
+        ok(
+          "  Publish to it: the Use an address tab, with acme/app's address, worded as a change of the remote's address (Change and publish)",
+          filled === "git@github.com:acme/app.git" &&
+            onTab === "Use an address" &&
+            d.includes("Nothing has been fetched from or pushed to this address yet, so it can still be corrected.") &&
+            !!(await button(page, "Change and publish")) &&
+            !(await button(page, "Add and publish")),
+          JSON.stringify({ filled, onTab, d })
+        );
+        if (await page.$('input[aria-label="Remote address"]')) {
+          await page.click('input[aria-label="Remote address"]', { clickCount: 3 });
+          await page.keyboard.type("git@github.com:acme/app-2.git");
+        }
+        await (await button(page, "Change and publish"))?.click();
+        await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_change_remote" || c.cmd === "changes_add_remote"), { timeout: 4000 }).catch(() => null);
+        const changed = await gcalls(page, "changes_change_remote");
+        ok(
+          "  Use an address submits it as a change of origin, from the address the folder has — changes_change_remote, never a remote added",
+          JSON.stringify(changed) === JSON.stringify([{ repoPath: "/repos/gitswitch", remote: "origin", from: "git@github.com:acme/app.git", url: "git@github.com:acme/app-2.git", allowExisting: false }]) &&
+            (await gcalls(page, "changes_add_remote")).length === 0,
+          JSON.stringify({ changed, added: await gcalls(page, "changes_add_remote") })
+        );
+        await page.close();
+      }
+      {
+        // The page shows no remote (it is behind the folder): made again all the same — the folder is read for where it
+        // publishes, and origin's address is kept, not a new origin added.
+        const page = await open(SCENARIOS.noRemote, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, can_delete: true, missing_here: [] } } }, publishContext: againCtx });
+        await deleteThenAgain(page);
+        const c = await createdWith(page);
+        ok(
+          "a page that shows no remote: Create it again on GitHub… still reads the folder and makes acme/app again at origin's address",
+          (await gcalls(page, "github_publish_context")).length >= 1 && JSON.stringify(c.target) === JSON.stringify({ kind: "again", remote: "origin", from: "git@github.com:acme/app.git" }) && c.owner === "acme" && c.name === "app",
+          JSON.stringify(c)
+        );
+        await page.close();
+      }
+      {
+        // GitHub's own letter case (Acme/App) against the address's (acme/app): the same repository all through.
+        const page = await open(SCENARIOS.clean, { gh: GH, admin: { facts: { "acme/app": { ...FACTS, full_name: "Acme/App", can_delete: true, missing_here: [] } } }, publishContext: againCtx });
+        await deleteThenAgain(page);
+        const fixedAs = await page.evaluate(() => document.querySelector("[data-again-repo]")?.getAttribute("data-again-repo") ?? null);
+        const c = await createdWith(page);
+        await page.waitForFunction(() => !document.querySelector("[data-deleted-on-github]"), { timeout: 4000 }).catch(() => null);
+        await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_push"), { timeout: 4000 }).catch(() => null);
+        ok(
+          "GitHub's letter case (Acme/App) against the address's (acme/app): made again at that address, said as made again, and the note goes",
+          fixedAs === "Acme/App" &&
+            JSON.stringify(c.target) === JSON.stringify({ kind: "again", remote: "origin", from: "git@github.com:acme/app.git" }) &&
+            (await text(page)).includes("Created Acme/App again on GitHub (private).") &&
+            !(await page.$("[data-deleted-on-github]")) &&
+            (await gcalls(page, "changes_push")).length === 1,
+          JSON.stringify({ fixedAs, c })
+        );
+        await page.close();
+      }
+      {
+        // Created here (Publish): the Repositories and Pull requests pages keep their listings as they were — a new
+        // repository shows on their Refresh, and a row of the same name is not changed by it.
+        const ROW = (full) => ({ full_name: full, owner: full.split("/")[0], name: full.split("/")[1], owner_is_org: false, description: null, private: false, archived: false, fork: false, default_branch: "main", clone_url: `git@github.com:${full}.git`, pushed_at: "2026-11-01T00:00:00Z", permission: "admin", local_path: null, suggested_profile_id: null });
+        const PULL_ROW = (repo) => ({ repo, private: false, archived: false, fork: false, pushed_at: "2026-11-01T00:00:00Z", permission: "admin", open: 1, to_review: 0, mine: 0, affiliated: true });
+        const page = await open(SCENARIOS.noRemote, {
+          gh: { ...GH, pullRepos: { login: "me-home", truncated: false, notes: [], repos: [PULL_ROW("me/gitswitch"), PULL_ROW("me/other")] } },
+          remoteRepos: [ROW("me/gitswitch"), ROW("me/other")],
+          find: { profiles: [] },
+        });
+        const nav = (name) => page.evaluate((n) => [...document.querySelectorAll("nav a")].find((a) => a.textContent.trim() === n)?.click(), name);
+        const rowVisibility = (full) => page.evaluate((full) => document.querySelector(`[data-repo-row="${full}"] [data-visibility]`)?.getAttribute("data-visibility") ?? null, full);
+        await nav("Repositories");
+        await page.waitForSelector('[data-repo-row="me/gitswitch"]', { timeout: 5000 }).catch(() => null);
+        const before = await rowVisibility("me/gitswitch");
+        await nav("Pull requests");
+        await page.waitForSelector('[data-pull-repo="me/gitswitch"]', { timeout: 5000 }).catch(() => null);
+        await nav("Repository");
+        await page.waitForFunction(() => [...document.querySelectorAll("button")].some((b) => b.innerText.trim() === "Publish branch" && !b.disabled), { timeout: 5000 }).catch(() => null);
+        await (await button(page, "Publish branch")).click();
+        await createReady(page, 4000);
+        await (await button(page, "Create and publish")).click();
+        await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 }).catch(() => null);
+        const made = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_github_repo")?.args ?? {});
+        const listed = (await gcalls(page, "list_remote_repos_page")).length;
+        await nav("Repositories");
+        await page.waitForSelector('[data-repo-row="me/gitswitch"]', { timeout: 5000 }).catch(() => null);
+        const after = await rowVisibility("me/gitswitch");
+        ok(
+          "a repository created here (me/gitswitch, private) leaves the Repositories page's kept listing as it was: the row of that name unchanged, nothing asked again",
+          made.owner === "me" && made.name === "gitswitch" && made.private === true && listed > 0 && before === "public" && after === "public" && !!(await page.$('[data-repo-row="me/other"]')) && (await gcalls(page, "list_remote_repos_page")).length === listed,
+          JSON.stringify({ before, after, listed, made })
+        );
+        await nav("Pull requests");
+        await page.waitForSelector('[data-pull-repo="me/gitswitch"]', { timeout: 5000 }).catch(() => null);
+        ok(
+          "  and the Pull requests page's: both rows there, neither marked private, nothing asked again",
+          !!(await page.$('[data-pull-repo="me/gitswitch"]')) && !!(await page.$('[data-pull-repo="me/other"]')) && !(await page.$('[data-pull-repo="me/gitswitch"] [aria-label="private"]')) && (await gcalls(page, "github_pull_repos")).length === 1,
+          JSON.stringify(await gcalls(page, "github_pull_repos"))
+        );
+        await page.close();
+      }
+    }
   }
 
   section("Uninstall tab: the apps, one uninstalled step by step, then only its leftovers — ids sent, never paths");
@@ -6680,6 +9481,23 @@ try {
     ok("  Delete at the next restart sends that one, and says so", later.length === 1 && JSON.stringify(later[0]) === JSON.stringify({ scan: "scan-uv", ids: ["u0"] }) && (await text(held)).includes("Deleted at the next restart") && !(await held.$("[data-flow-in-use]")), JSON.stringify(later));
     await held.close();
 
+    // In use in the person's own AppData: closed and looked at again, never deleted at the next restart (step 7d).
+    const ownHeld = await openUninstallPage(browser, server, {
+      platform: "windows",
+      apps,
+      sessions: [{ session: "sess-own", name: "UltraViewer", state: "gone", started: 1760000000 }],
+      scan: { scan: "scan-own", notes: [], items: [{ id: "o0", path: "C:\\Users\\me\\AppData\\Roaming\\UltraViewer", place: "App data", kind: "folder", size: 2000, size_complete: true, confidence: "high", reason: "named like the app", admin: false, command: null, elevate: false }] },
+      deleteRounds: [{ o0: { outcome: "in-use", message: "In use by UltraViewer: one of its files is open or loaded in it. Close it or restart, then look again." } }],
+    });
+    await (await button(ownHeld, "Continue")).click();
+    await ownHeld.waitForFunction(() => document.querySelector('[data-flow-stage="gone"]'), { timeout: 5000 }).catch(() => null);
+    await ownHeld.evaluate(() => document.querySelector("[data-flow-scan]").click());
+    await ownHeld.waitForFunction(() => document.querySelector("[data-flow-delete]"), { timeout: 5000 }).catch(() => null);
+    await ownHeld.evaluate(() => document.querySelector("[data-flow-delete]").click());
+    await ownHeld.waitForFunction(() => document.querySelector('[data-flow-stage="done"]'), { timeout: 5000 }).catch(() => null);
+    ok("in use in your own folder: no delete at the next restart, close it and look again instead", !!(await ownHeld.$("[data-flow-in-use]")) && !(await ownHeld.$("[data-flow-at-restart]")) && (await text(ownHeld)).includes("close the program that holds it, then look again"));
+    await ownHeld.close();
+
     // Uninstalled with GitSwitch before: looked at again, long after.
     const again = await openUninstallPage(browser, server, { platform: "windows", apps, history: [{ key: "win:HKLM64:{DD}", name: "Disk Drill 6.3.1398.0", at: 1793912817 }, { key: "win:HKLM64:zoho", name: "Zoho Mail - Desktop 1.7.4", at: 1793901026 }] });
     await again.waitForFunction(() => document.querySelector("[data-past]"), { timeout: 5000 }).catch(() => null);
@@ -6763,6 +9581,48 @@ try {
     ok("Ubuntu: the top bar, with what it needs", (await text(lin)).includes("Show the speed in the top bar") && (await text(lin)).includes("AppIndicator"));
     await lin.close();
 
+    // Starting at sign-in, to show the speed.
+    const st = await openNetSpeedPage(browser, server);
+    ok("Windows: 'Start with Windows', off", (await text(st)).includes("Start with Windows") && !(await st.evaluate(() => document.querySelector('[aria-label="Start with Windows"]').checked)) && (await st.evaluate(() => document.querySelector("[data-startup]")?.getAttribute("data-startup"))) === "off");
+    await st.evaluate(() => document.querySelector('[aria-label="Start with Windows"]').click());
+    await sleep(200);
+    let ss = await calls(st, "netspeed_set_settings");
+    ok("  ticked with nothing shown: it is sent with the speed turned on too", ss.length === 1 && ss[0].settings.start_at_login === true && ss[0].settings.tray === true, JSON.stringify(ss));
+    ok("  the page says what happens at sign-in", (await st.evaluate(() => document.querySelector("[data-startup-tip]")?.innerText ?? "")).includes("starts in the background, without its window") && (await st.evaluate(() => document.querySelector('[aria-label="Show the speed in the taskbar"]').checked)));
+    await st.evaluate(() => document.querySelector('[aria-label="Show the speed in the taskbar"]').click());
+    await sleep(200);
+    ss = await calls(st, "netspeed_set_settings");
+    ok("  the speed turned off: starting at sign-in goes off with it, at once", ss.length === 2 && ss[1].settings.tray === false && ss[1].settings.start_at_login === false && !(await st.evaluate(() => document.querySelector('[aria-label="Start with Windows"]').checked)), JSON.stringify(ss[1]));
+    await st.close();
+
+    const blocked = await openNetSpeedPage(browser, server, { settings: { tray: true, start_at_login: true }, startup: { on: true, active: true, blocked: "Windows' Startup apps has GitSwitch turned off, so it won't start when you sign in.", error: null } });
+    ok("Startup apps has it off: said, with the way there", (await blocked.evaluate(() => document.querySelector("[data-startup-blocked]")?.innerText ?? "")).includes("Startup apps has GitSwitch turned off") && !(await blocked.$("[data-startup-tip]")));
+    await blocked.evaluate(() => document.querySelector("[data-startup-blocked] [data-startup-settings]").click());
+    await sleep(150);
+    ok("  Open Startup apps asks for exactly that", JSON.stringify(await calls(blocked, "netspeed_open_settings")) === JSON.stringify([{ which: "startupapps" }]));
+    await blocked.close();
+
+    const missing = await openNetSpeedPage(browser, server, { settings: { tray: true, start_at_login: true }, startup: { on: true, active: false, blocked: null, error: null } });
+    ok("the entry gone from the system: said, with a way to set it up again", !!(await missing.$("[data-startup-missing]")));
+    await missing.evaluate(() => document.querySelector("[data-startup-missing] button").click());
+    await sleep(150);
+    ok("  'Set it up again' saves the choice again", (await calls(missing, "netspeed_set_settings")).pop()?.settings.start_at_login === true);
+    await missing.close();
+
+    const failed = await openNetSpeedPage(browser, server, { settings: { tray: true, start_at_login: true }, startup: { on: true, active: false, blocked: null, error: "GitSwitch could not be set to start when you sign in: Access is denied." } });
+    ok("writing the entry failed: the error is shown, not the tip", (await failed.evaluate(() => document.querySelector("[data-startup-error]")?.innerText ?? "")).includes("Access is denied") && !(await failed.$("[data-startup-tip]")) && !(await failed.$("[data-startup-missing]")));
+    await failed.close();
+
+    const macStart = await openNetSpeedPage(browser, server, { platform: "macos", settings: { tray: false, bar: true, start_at_login: true } });
+    ok("macOS: 'Open at login', on with only the floating bar shown, with the way to Login Items", (await macStart.evaluate(() => document.querySelector('[aria-label="Open at login"]')?.checked)) === true && (await macStart.evaluate(() => document.querySelector("[data-startup-tip]")?.innerText ?? "")).includes("Login Items"));
+    await macStart.evaluate(() => document.querySelector("[data-startup-tip] [data-startup-settings]").click());
+    await sleep(150);
+    ok("  Open Login Items asks for exactly that", JSON.stringify(await calls(macStart, "netspeed_open_settings")) === JSON.stringify([{ which: "loginitems" }]));
+    await macStart.close();
+    const linStart = await openNetSpeedPage(browser, server, { platform: "linux" });
+    ok("Ubuntu: 'Start when I log in'", !!(await linStart.$('[aria-label="Start when I log in"]')));
+    await linStart.close();
+
     const bar = await openNetSpeedPage(browser, server, { path: "/?speedbar" });
     await bar.waitForFunction(() => document.querySelector("[data-speed-bar]")?.innerText.includes("MB/s"), { timeout: 5000 }).catch(() => null);
     const bt = await bar.evaluate(() => document.querySelector("[data-speed-bar]")?.innerText ?? "");
@@ -6776,12 +9636,13 @@ try {
   section("Settings › Uninstall GitSwitch: what is taken back and what is kept, the locks refused stops everything");
   {
     const calls = (page, cmd) => page.evaluate((c) => window.__CALLS__.filter((x) => x.cmd === c).map((x) => x.args), cmd);
-    const plan = { platform: "macos", app: { kind: "trash", bundle: "/Applications/GitSwitch.app", trash: "/Users/me/.Trash" }, how: "/Applications/GitSwitch.app is moved to the Trash once GitSwitch has quit.", gitconfig: "/Users/me/.gitconfig", signers: null, repos: ["/w/one", "/w/two"], lock_helper: true, locks: ["/w/two"], signins: ["me-home"], data: ["/Users/me/Library/Application Support/com.gitswitch.app"] };
+    const plan = { platform: "macos", app: { kind: "trash", bundle: "/Applications/GitSwitch.app", trash: "/Users/me/.Trash" }, how: "/Applications/GitSwitch.app is moved to the Trash once GitSwitch has quit.", gitconfig: "/Users/me/.gitconfig", signers: null, repos: ["/w/one", "/w/two"], lock_helper: true, locks: ["/w/two"], signins: ["me-home"], startup: true, data: ["/Users/me/Library/Application Support/com.gitswitch.app"] };
     const page = await openUninstallPage(browser, server, { path: "/settings", plan });
     await page.evaluate(() => document.querySelector("[data-uninstall-open]").click());
     await page.waitForFunction(() => document.querySelector("[data-uninstall-now]"), { timeout: 5000 }).catch(() => null);
     const t = await text(page);
     ok("the dialog lists what is taken back now", t.includes("The push locks (1) and the lock helper") && t.includes("in 2 repositories") && t.includes("/Users/me/.gitconfig") && t.includes("@me-home"));
+    ok("  including starting GitSwitch at sign-in", t.includes("Starting GitSwitch when you sign in"));
     ok("  what goes once GitSwitch has quit", t.includes("com.gitswitch.app") && t.includes("moved to the Trash once GitSwitch has quit"));
     ok("  and what is kept", t.includes("Your SSH keys") && t.includes("Your repositories and their files"));
     await page.evaluate(() => document.querySelector('[aria-label="Keep my profiles and sign-ins"]').click());

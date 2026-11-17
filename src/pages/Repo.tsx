@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, useNavigate, useParams } from "react-router-dom";
-import { GitBranch, Box, GitGraph, FileDiff, GitPullRequest, GitPullRequestArrow, ScanSearch, SquareTerminal } from "lucide-react";
+import { GitBranch, Box, GitGraph, FileDiff, GitPullRequest, GitPullRequestArrow, ScanSearch, SquareTerminal, Folder } from "lucide-react";
 import { GitHubIcon } from "../components/GitHubIcon";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { Select } from "../components/Select";
+import { useToast } from "../components/Toast";
+import { NotARepositoryCard, type FolderEntry } from "../components/repo/NotARepositoryCard";
 import { StatusStrip, type RepoActions, type StripActions } from "../components/repo/StatusStrip";
 import { WorkspaceLine } from "../components/repo/WorkspaceLine";
 import { ChangesTab } from "../components/repo/ChangesTab";
@@ -27,6 +29,11 @@ import type { PullMode, RepoRef, RepoStatus, SubmoduleInfo } from "../lib/api";
 type Tab = "changes" | "history" | "submodules" | "github";
 const TABS: Tab[] = ["changes", "history", "submodules", "github"];
 
+/** The first real repository of a list (folders that hold none come after), or the first entry. */
+function firstRepo(list: RepoRef[]): RepoRef | undefined {
+  return list.find((r) => r.kind !== "folder") ?? list[0];
+}
+
 /** "staging ↑2 ↓1" — the submodule's own branch against its own upstream. */
 function subLabel(m: SubmoduleInfo): string {
   const parts = [m.path];
@@ -47,11 +54,14 @@ export function Repo() {
   const { tab: tabParam } = useParams<{ tab: string }>();
   const tab: Tab = TABS.includes(tabParam as Tab) ? (tabParam as Tab) : "changes";
   const sel = useRepoSelection();
+  const toast = useToast();
 
   const [repos, setRepos] = useState<RepoRef[]>([]);
   const [loadingRepos, setLoadingRepos] = useState(true);
   /** Folders opened by hand, outside every profile's folders. */
   const [extraRepos, setExtraRepos] = useState<string[]>([]);
+  /** What each folder opened by hand is to git, once asked: one that holds no repository gets the card, not the tabs. */
+  const [extraStates, setExtraStates] = useState<Record<string, api.FolderState>>({});
   /** Find repositories: clones no profile's folders hold, added to the right profile. */
   const [findOpen, setFindOpen] = useState(false);
   const [subs, setSubs] = useState<SubmoduleInfo[]>([]);
@@ -72,6 +82,11 @@ export function Repo() {
   const [error, setError] = useState<string | null>(null);
   /** Bumped when the repository visibly moved, so the History tab re-reads. */
   const [reloadKey, setReloadKey] = useState(0);
+  /** Bumped by Refresh only (with reloadKey): a hidden tab reads again at once rather than when shown. */
+  const [refreshKey, setRefreshKey] = useState(0);
+  // The ports listing is read again on Refresh, not on every commit: what
+  // listens doesn't move with HEAD, and on Windows each read starts PowerShell.
+  const [portsKey, setPortsKey] = useState(0);
   const lastMoveKey = useRef("");
   /** Whether the last status read came within ten seconds of a fetch. */
   const lastFresh = useRef(false);
@@ -137,7 +152,7 @@ export function Repo() {
       .then((exists) => {
         if (stale) return;
         if (exists === false) {
-          const next = visibleRepos[0]?.path ?? repos[0]?.path;
+          const next = firstRepo(visibleRepos)?.path ?? firstRepo(repos)?.path;
           if (next) sel.setPath(next);
           return;
         }
@@ -152,10 +167,12 @@ export function Repo() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadingRepos, repos, sel.path]);
 
-  // No repository yet: take the first one the scan finds.
+  // No repository yet: take the first one the scan finds — a real repository
+  // before a folder that holds none.
   useEffect(() => {
     if (loadingRepos || sel.path || repos.length === 0) return;
-    sel.setPath(repos[0].path);
+    const first = firstRepo(repos);
+    if (first) sel.setPath(first.path);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadingRepos, repos, sel.path]);
 
@@ -164,10 +181,64 @@ export function Repo() {
     if (!sel.account || !repos.length) return;
     const owned = repos.filter((r) => r.profile_id === sel.account);
     if (owned.length && !owned.some((r) => r.path === sel.path) && !extraRepos.includes(sel.path)) {
-      sel.setPath(owned[0].path);
+      const first = firstRepo(owned);
+      if (first) sel.setPath(first.path);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sel.account, repos, sel.path]);
+
+  // Folders opened by hand: asked once each what they are to git.
+  useEffect(() => {
+    const unknown = extraRepos.filter((p) => !(p in extraStates));
+    if (!unknown.length) return;
+    let cancelled = false;
+    void Promise.all(
+      unknown.map((p) =>
+        api
+          .folderState(p)
+          .then((s) => [p, s] as const)
+          // Unanswerable: treated as a repository, as before (the tabs say what is wrong).
+          .catch(() => [p, { kind: "repo" } as api.FolderState] as const)
+      )
+    ).then((pairs) => {
+      if (!cancelled) setExtraStates((m) => ({ ...m, ...Object.fromEntries(pairs) }));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [extraRepos, extraStates]);
+
+  /**
+   * The folder on screen when it is no repository: a profile folder that holds
+   * none (listed as `folder`), or a folder opened by hand that holds none. A
+   * subfolder of a repository opened by hand is not one — git works there.
+   */
+  const folder = useMemo<FolderEntry | null>(() => {
+    if (!sel.path || sel.sub) return null;
+    // Made a repository here a moment ago: the listing still says "folder"
+    // until the profiles' folders are scanned again.
+    if (extraStates[sel.path]?.kind === "repo") return null;
+    const listed = repos.find((r) => r.path === sel.path);
+    if (listed) {
+      return listed.kind === "folder"
+        ? { path: listed.path, name: listed.name, profileId: listed.profile_id, profileName: listed.profile_name, profileEmail: listed.profile_email, inside: listed.inside ?? null }
+        : null;
+    }
+    return extraStates[sel.path]?.kind === "no-repo" ? { path: sel.path, name: baseName(sel.path), profileId: null, profileName: null, profileEmail: null, inside: null } : null;
+  }, [repos, extraStates, sel.path, sel.sub]);
+
+  /** Make the folder on screen a repository, then show it as one. */
+  const makeRepository = async (entry: FolderEntry) => {
+    const made = await api.repoInit(entry.path);
+    toast.success(`${entry.name} is now a git repository`, [
+      `Branch ${made.branch}, with no commits yet`,
+      entry.profileName ? `Commits here use ${entry.profileName}'s identity (${entry.profileEmail})` : "",
+      "Next: make the first commit on the Changes tab",
+    ]);
+    setExtraStates((m) => ({ ...m, [entry.path]: { kind: "repo" } }));
+    loadRepos();
+    go("changes");
+  };
 
   // The repository's populated, mapped submodules — each can be the scope. A
   // remembered submodule that no longer exists falls back to the repository.
@@ -244,7 +315,7 @@ export function Repo() {
     return () => {
       cancelled = true;
     };
-  }, [sel.path, reloadKey]);
+  }, [sel.path, portsKey]);
 
   // The Changes tab reads the status; the strip shows it, and the History tab
   // re-reads when the repository actually moved — not on every status refresh.
@@ -291,6 +362,8 @@ export function Repo() {
         // the history (reloadKey), and the list of repositories to pick from.
         actionsRef.current?.refresh();
         setReloadKey((k) => k + 1);
+        setRefreshKey((k) => k + 1);
+        setPortsKey((k) => k + 1);
         loadRepos();
       },
     }),
@@ -476,8 +549,15 @@ export function Repo() {
                 ...visibleRepos.map((r) => ({
                   value: r.path,
                   label: sel.account ? r.name : `${r.name}  ·  ${r.profile_name}`,
+                  ...(r.kind === "folder" ? { note: r.inside ? "inside a repository" : "not a repository yet", icon: <Folder size={14} /> } : {}),
                 })),
-                ...extraRepos.filter((p) => !visibleRepos.some((r) => r.path === p)).map((p) => ({ value: p, label: baseName(p) })),
+                ...extraRepos
+                  .filter((p) => !visibleRepos.some((r) => r.path === p))
+                  .map((p) => ({
+                    value: p,
+                    label: baseName(p),
+                    ...(extraStates[p]?.kind === "no-repo" ? { note: "not a repository yet", icon: <Folder size={14} /> } : {}),
+                  })),
               ]}
             />
           </div>
@@ -582,6 +662,18 @@ export function Repo() {
         </Card>
       )}
 
+      {folder ? (
+        <NotARepositoryCard
+          entry={folder}
+          onMake={() => makeRepository(folder)}
+          onOpenRepo={(top) => {
+            setExtraRepos((l) => (l.includes(top) ? l : [...l, top]));
+            sel.openFolder(top, gitlinkPaths);
+          }}
+          onEditProfile={(id) => navigate(`/profile/${id}/edit`)}
+        />
+      ) : (
+      <>
       <StatusStrip
         repoPath={sel.effectivePath}
         sub={sel.sub}
@@ -677,6 +769,7 @@ export function Repo() {
         accountsReady={!loadingRepos}
         visible={tab === "history"}
         reloadKey={reloadKey}
+        refreshKey={refreshKey}
         onOpenChanges={() => go("changes")}
         onRepoChanged={() => actionsRef.current?.refresh()}
         hasSubmodules={gitlinks > 0}
@@ -715,7 +808,15 @@ export function Repo() {
         }}
       />
 
-      {sel.effectivePath && <GitHubTab repoPath={sel.effectivePath} visible={tab === "github"} reloadKey={reloadKey} />}
+      {sel.effectivePath && (
+        <GitHubTab
+          repoPath={sel.effectivePath}
+          visible={tab === "github"}
+          reloadKey={reloadKey}
+          // Made again from the Changes tab's Publish dialog, which shows over this tab.
+          onCreateAgain={(fullName) => actionsRef.current?.publishAgain?.(fullName)}
+        />
+      )}
 
       {/* Only with the status of the repository the drawer is for: right
           after a scope change the page still holds the previous one's. */}
@@ -728,6 +829,8 @@ export function Repo() {
           onRun={runUpdate}
           onRemedy={remedy}
         />
+      )}
+      </>
       )}
 
       <FindReposDialog open={findOpen} onClose={() => setFindOpen(false)} onAdded={() => void loadRepos()} />

@@ -1102,62 +1102,7 @@ mod tests {
 #[cfg(test)]
 mod http_tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::sync::{Arc, Mutex};
-
-    /// A local GitHub answering each connection with the next canned reply
-    /// (made knowing its own address, so paging links can point at it);
-    /// every request recorded as it arrived.
-    fn github_with(make: impl FnOnce(&str) -> Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let answers = make(&base);
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let log = seen.clone();
-        std::thread::spawn(move || {
-            for answer in answers {
-                let Ok((mut s, _)) = listener.accept() else { return };
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 4096];
-                loop {
-                    let n = s.read(&mut chunk).unwrap_or(0);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    let text = String::from_utf8_lossy(&buf).to_string();
-                    if let Some(end) = text.find("\r\n\r\n") {
-                        let len = text[..end]
-                            .lines()
-                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
-                            .unwrap_or(0);
-                        if buf.len() >= end + 4 + len {
-                            break;
-                        }
-                    }
-                }
-                log.lock().unwrap().push(String::from_utf8_lossy(&buf).to_string());
-                let _ = s.write_all(answer.as_bytes());
-            }
-        });
-        (base, seen)
-    }
-
-    fn github(answers: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
-        github_with(|_| answers)
-    }
-
-    fn reply(status: &str, headers: &[(&str, &str)], body: &str) -> String {
-        let mut head = format!("HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n", status, body.len());
-        for (k, v) in headers {
-            head.push_str(&format!("{}: {}\r\n", k, v));
-        }
-        format!("{}\r\n{}", head, body)
-    }
-
-    fn first_line(req: &str) -> String {
-        req.lines().next().unwrap_or("").to_string()
-    }
+    use crate::gh_api::fake_github::{first_line, github, github_with, reply};
 
     fn closed_pages() -> (String, String) {
         let pull = |n: u64, merged: bool| json!({"number": n, "state": "closed", "merged_at": if merged { json!("2026-01-01T00:00:00Z") } else { Value::Null }, "user": {"login": "x"}});

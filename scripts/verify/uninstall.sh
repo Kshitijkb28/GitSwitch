@@ -53,8 +53,11 @@ GITSWITCH_ELEVATE=direct probe push_mode "$C" "locked" >/dev/null
 ok "(repo C: locked)" "$(probe lock_helper_status "$C" | v "len(v['locks'])")" "1"
 mkdir -p "$SB/tokens"; printf 'tok' > "$SB/tokens/github_tok-me"; printf '[{"login":"tok-me","id":1}]' > "$SB/tokens/github-signins.json"
 B_BEFORE="$(cd "$B" && find .git -type f ! -name index -exec sha256sum {} + 2>/dev/null || find .git -type f ! -name index -exec shasum -a 256 {} +)"
+pinvoke netspeed_set_settings '{"settings":{"tray":true,"start_at_login":true}}' >/dev/null
+ok "(GitSwitch starts at sign-in: its entry, in the sandbox's place)" "$(ls "$GITSWITCH_AUTOSTART_DIR" 2>/dev/null | wc -l | tr -d ' ')" "1"
 
 PLAN=$(pinvoke uninstall_plan '{}')
+ok "starting at sign-in" "$(printf '%s' "$PLAN" | v "v['startup']")" "True"
 ok "the repositories holding GitSwitch's pieces: A and C, never B" "$(printf '%s' "$PLAN" | v "sorted(p.rsplit('/',1)[-1] for p in v['repos'])")" "['guarded', 'locked']"
 ok "the lock and its helper" "$(printf '%s' "$PLAN" | v "(v['lock_helper'], len(v['locks']))")" "(True, 1)"
 ok "~/.gitconfig and allowed_signers" "$(printf '%s' "$PLAN" | v "(v['gitconfig'].endswith('/.gitconfig'), v['signers'].endswith('/.ssh/allowed_signers'))")" "(True, True)"
@@ -69,12 +72,13 @@ ok "stopped" "$(printf '%s' "$OUT" | v "v['outcome']")" "stopped"
 ok "  saying the locks were not removed" "$(printf '%s' "$OUT" | v "v['message']")" "push locks were not removed"
 ok "  ~/.gitconfig, repo A and the sign-in untouched" "$(grep -c 'GitSwitch managed' "$H/.gitconfig") $(gcfg "$A") $([ -f "$SB/tokens/github_tok-me" ] && echo kept)" "2 "
 ok "  (the token still there)" "$([ -f "$SB/tokens/github_tok-me" ] && echo kept)" "kept"
+ok "  (and the start-up entry)" "$(ls "$GITSWITCH_AUTOSTART_DIR" 2>/dev/null | wc -l | tr -d ' ')" "1"
 
 section "Allowed: everything GitSwitch wrote is taken back, and nothing else"
 BACKUPS=$(ls -a "$H" | grep -c '^\.gitconfig\.backup\.')
 OUT=$(GITSWITCH_ELEVATE=direct pinvoke uninstall_prepare '{"keepData":false}')
 ok "done, no problems" "$(printf '%s' "$OUT" | v "(v['outcome'], v['problems'])")" "('done', [])"
-ok "  the report names the locks, the repositories, the gitconfig, the signers and the sign-in" "$(printf '%s' "$OUT" | v "len(v['done'])")" "5"
+ok "  the report names the locks, the repositories, the gitconfig, the signers, starting at sign-in and the sign-in" "$(printf '%s' "$OUT" | v "len(v['done'])")" "6"
 ok "the lock is gone" "$(probe lock_helper_status "$C" | v "(len(v['locks']), v['installed'])")" "(0, False)"
 ok "repo A: no gitswitch keys or rewrite left" "$(gcfg "$A")" "0"
 ok "  its own pre-push hook is back, exactly" "$(cat "$A/.git/hooks/pre-push"; [ -e "$A/.git/hooks/pre-push.gitswitch-saved" ] && echo LEFTOVER)" 'echo "the LFS hook ran"'
@@ -88,13 +92,14 @@ ok "allowed_signers: only the person's own line" "$(cat "$H/.ssh/allowed_signers
 ok "  (and nothing else)" "$(wc -l < "$H/.ssh/allowed_signers" | tr -d ' ')" "1"
 ok "the sign-in's token is gone" "$([ -e "$SB/tokens/github_tok-me" ] && echo there || echo gone) $(cat "$SB/tokens/github-signins.json")" "gone []"
 ok "the SSH key stays" "$([ -f "$H/.ssh/id_work" ] && [ -f "$H/.ssh/id_work.pub" ] && echo kept)" "kept"
+ok "GitSwitch no longer starts at sign-in" "$(ls "$GITSWITCH_AUTOSTART_DIR" 2>/dev/null | wc -l | tr -d ' ') $(printf '%s' "$OUT" | v "'Removed GitSwitch from the apps that start when you sign in' in v['done']")" "0 True"
 ok "git in repo A still works as the person's own" "$(git -C "$A" config user.email)" "un@example.test"
 
 section "Twice: nothing left to do"
 OUT=$(pinvoke uninstall_prepare '{"keepData":false}')
 ok "done with nothing to report" "$(printf '%s' "$OUT" | v "(v['outcome'], v['done'], v['problems'])")" "('done', [], [])"
 PLAN=$(pinvoke uninstall_plan '{}')
-ok "the plan lists nothing more to take back" "$(printf '%s' "$PLAN" | v "(v['repos'], v['gitconfig'], v['signers'], v['lock_helper'], v['locks'], v['signins'])")" "([], None, None, False, [], [])"
+ok "the plan lists nothing more to take back" "$(printf '%s' "$PLAN" | v "(v['repos'], v['gitconfig'], v['signers'], v['lock_helper'], v['locks'], v['signins'], v['startup'])")" "([], None, None, False, [], [], False)"
 
 section "The removal script, after the app has quit"
 ended() { sh -c 'echo $$'; }

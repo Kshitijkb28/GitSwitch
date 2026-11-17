@@ -49,10 +49,44 @@ pub async fn request_device_code(client_id: Option<&str>) -> Result<DeviceCodeRe
     request_device_code_at(GITHUB_WEB, client_id).await
 }
 
+/// The sign-in's scopes. A narrower approval asks for its own (`SCOPED`).
+const SIGN_IN_SCOPE: &str = "read:user user:email admin:public_key repo read:org";
+
+/// The only other scopes the device flow may ask for: deleting a repository
+/// (repo_admin's approval, kept in memory, never stored).
+const SCOPED: &[&str] = &["repo delete_repo"];
+
+/// github.com, or in a debug build GITSWITCH_GITHUB_WEB (the suites' fake).
+fn web_base() -> String {
+    #[cfg(debug_assertions)]
+    if let Some(s) = std::env::var("GITSWITCH_GITHUB_WEB").ok().filter(|s| !s.trim().is_empty()) {
+        return s.trim_end_matches('/').to_string();
+    }
+    GITHUB_WEB.to_string()
+}
+
+/// A device code for one of the allowed narrower approvals, never the
+/// frontend's to choose.
+pub(crate) async fn request_device_code_scoped(scope: &str) -> Result<DeviceCodeResponse, AppError> {
+    if !SCOPED.contains(&scope) {
+        return Err(AppError::Config(format!("GitSwitch doesn't ask GitHub for \"{}\"", scope)));
+    }
+    request_device_code_with(&web_base(), None, scope).await
+}
+
+/// One poll for a scoped approval's token (kept by the backend).
+pub(crate) async fn poll_for_token_web(device_code: &str) -> Result<OAuthTokenResponse, AppError> {
+    poll_for_token_at(&web_base(), device_code, None).await
+}
+
 /// The shared client gives every request a time limit: a GitHub that accepts
 /// the connection and never answers ends the request instead of leaving the
 /// page waiting for ever.
 async fn request_device_code_at(base: &str, client_id: Option<&str>) -> Result<DeviceCodeResponse, AppError> {
+    request_device_code_with(base, client_id, SIGN_IN_SCOPE).await
+}
+
+async fn request_device_code_with(base: &str, client_id: Option<&str>, scope: &str) -> Result<DeviceCodeResponse, AppError> {
     let cid = client_id.unwrap_or(GITHUB_CLIENT_ID);
     let client = crate::github::http_client()?;
 
@@ -62,7 +96,7 @@ async fn request_device_code_at(base: &str, client_id: Option<&str>) -> Result<D
         .header("User-Agent", "GitSwitch/0.1.0")
         .form(&[
             ("client_id", cid),
-            ("scope", "read:user user:email admin:public_key repo read:org"),
+            ("scope", scope),
         ])
         .send()
         .await

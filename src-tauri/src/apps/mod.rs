@@ -789,11 +789,11 @@ pub async fn list(kind: String) -> Result<AppList, AppError> {
 pub async fn size(id: String) -> Result<(u64, bool), AppError> {
     let path = {
         let st = lock();
-        let (_, rec) = st.list.get(&id).ok_or_else(|| AppError::Config("List the apps again.".into()))?;
+        let (app, rec) = st.list.get(&id).ok_or_else(|| AppError::Config("List the apps again.".into()))?;
         match rec {
             Record::MacBundle { bundle, .. } => Some(bundle.clone()),
             Record::AppImage { file, .. } => Some(file.clone()),
-            Record::WinEntry { install_dir, .. } => install_dir.clone().filter(|d| windows::safe_install_dir(d)),
+            Record::WinEntry { .. } => windows::gated_install_dir(&app.name, rec),
             _ => None,
         }
     };
@@ -982,6 +982,9 @@ fn scan_blocking(mut s: Session, registry: bool) -> Result<LeftoverScan, AppErro
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut items = Vec::new();
     let mut held = HashMap::new();
+    // Installed for one person: nothing of it gets the administrator (step 7b).
+    let per_user = matches!(&s.record, Record::WinEntry { view, .. } if view == "HKCU");
+    let mut said_per_user = false;
     for (i, c) in cands.into_iter().enumerate() {
         let file_backed = file_backed(c.kind);
         if file_backed && link_on_the_way(&c.root, &c.path) {
@@ -997,7 +1000,11 @@ fn scan_blocking(mut s: Session, registry: bool) -> Result<LeftoverScan, AppErro
             (None, false)
         };
         // Windows: GitSwitch does what needs the administrator after its prompt.
-        let elevate = c.admin && cfg!(windows) && c.action != Action::None;
+        let elevate = c.admin && cfg!(windows) && c.action != Action::None && !per_user;
+        if per_user && c.admin && !said_per_user {
+            notes.push(format!("{} was installed for you only, so nothing of it is deleted with the administrator's rights: what needs them shows its command instead.", s.app.name));
+            said_per_user = true;
+        }
         held.insert(
             id.clone(),
             ScanItem { path: c.path.clone(), root: c.root.clone(), ident: if file_backed { ident(&c.path) } else { None }, action: c.action.clone(), admin: c.admin, elevate, entry: c.entry.clone() },
@@ -1167,7 +1174,8 @@ fn delete_one(s: &Session, others: &Others, item: &ScanItem) -> Step {
             format!("The system protects it ({}). Allow GitSwitch in System Settings › Privacy & Security, or move it to the Trash yourself.", m),
         ),
         TrashOutcome::Failed(m) => {
-            let (o, why) = failed_move(&item.path, &m);
+            // A delete at restart is offered only for what needs the administrator (7d).
+            let (o, why) = failed_move(&item.path, &m, item.admin);
             Done(o, why)
         }
     }
@@ -1194,6 +1202,28 @@ pub(crate) fn file_backed(kind: &str) -> bool {
 
 /// The argument GitSwitch is started with, elevated, to carry out a job.
 pub const ELEVATED_FLAG: &str = "--gitswitch-elevated-cleanup";
+
+/// GitSwitch's own form of the administrator's command line, exactly:
+/// `[exe, FLAG, job, "--sha256", <64 hex>]`, the job a `<uuid>.json` in a
+/// `com.gitswitch.app\uninstall-jobs` folder, written plainly. Pure: nothing
+/// is read. (SHELL-A-H1: the flag used to count anywhere in the list.)
+pub(crate) fn entry_args(args: &[String]) -> Result<(PathBuf, String), String> {
+    let [_, flag, job, hash_flag, sha] = args else { return Err("Not GitSwitch's command line.".into()) };
+    if flag != ELEVATED_FLAG || hash_flag != "--sha256" {
+        return Err("Not GitSwitch's command line.".into());
+    }
+    if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("The job's hash isn't one.".into());
+    }
+    windows::plain_windows_path(job)?;
+    let parts: Vec<&str> = job.split(['\\', '/']).collect();
+    let n = parts.len();
+    let uuid_json = parts[n - 1].strip_suffix(".json").is_some_and(|s| uuid::Uuid::parse_str(s).is_ok());
+    if n < 4 || !uuid_json || !parts[n - 2].eq_ignore_ascii_case("uninstall-jobs") || !parts[n - 3].eq_ignore_ascii_case("com.gitswitch.app") {
+        return Err("The job isn't where GitSwitch writes jobs.".into());
+    }
+    Ok((PathBuf::from(job), sha.to_lowercase()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct JobItem {
@@ -1237,7 +1267,18 @@ fn result_path_of(job: &Path) -> PathBuf {
 /// One file or folder to the Recycle Bin, checked again first. `elevated`:
 /// the administrator's run, which refuses anything outside the places
 /// programs live in.
-fn trash_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: bool) -> (&'static str, String) {
+fn trash_checked(path: &Path, root: &Path, want: Option<&Ident>, el: Option<&Elevation>) -> (&'static str, String) {
+    // The administrator's run decides on the folder Windows opens: held still
+    // from here until the move is over.
+    #[cfg(windows)]
+    let pinned = if el.is_some() {
+        match pin_elevated(path, root) {
+            Ok(p) => Some(p),
+            Err(why) => return ("refused", format!("{} It was kept.", why)),
+        }
+    } else {
+        None
+    };
     if std::fs::symlink_metadata(path).is_err() {
         return ("gone", "Already gone.".into());
     }
@@ -1250,8 +1291,8 @@ fn trash_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: bool)
     }
     #[cfg(windows)]
     {
-        if elevated {
-            if let Err(why) = windows::elevated_path_ok(path) {
+        if let Some(p) = &pinned {
+            if let Err(why) = elevated_place_ok(&p.final_parent.join(path.file_name().unwrap_or_default()), el) {
                 return ("refused", format!("{} It was kept.", why));
             }
         }
@@ -1260,13 +1301,13 @@ fn trash_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: bool)
         }
     }
     #[cfg(not(windows))]
-    let _ = elevated;
+    let _ = el;
     match to_trash(path) {
         TrashOutcome::Trashed => ("trashed", format!("Moved to the {}.", trash_word())),
         TrashOutcome::Gone => ("gone", "Already gone.".into()),
         TrashOutcome::NeedsAdmin(m) => ("needs-admin", format!("It needs the administrator: {}", m)),
         TrashOutcome::Protected(m) => ("protected", m),
-        TrashOutcome::Failed(m) => failed_move(path, &m),
+        TrashOutcome::Failed(m) => failed_move(path, &m, el.is_some()),
     }
 }
 
@@ -1296,7 +1337,7 @@ pub(crate) fn name_list(names: &[String]) -> String {
 /// A move to the Trash that failed, explained. On Windows the system only
 /// says "some operations were aborted": the running programs that still
 /// have its files open or loaded are asked for, and named.
-fn failed_move(path: &Path, m: &str) -> (&'static str, String) {
+fn failed_move(path: &Path, m: &str, elevated: bool) -> (&'static str, String) {
     #[cfg(windows)]
     {
         let users = windows::users_of(path);
@@ -1304,7 +1345,12 @@ fn failed_move(path: &Path, m: &str) -> (&'static str, String) {
             let them = if users.len() == 1 { "it" } else { "them" };
             return (
                 "in-use",
-                format!("In use by {}: one of its files is open or loaded in {}. Close {} or restart, then look again — or delete it at the next restart.", name_list(&users), them, them),
+                if elevated {
+                    format!("In use by {}: one of its files is open or loaded in {}. Close {} or restart, then look again — or delete it at the next restart.", name_list(&users), them, them)
+                } else {
+                    // The person's own folders are never deleted at restart (7d).
+                    format!("In use by {}: one of its files is open or loaded in {}. Close {} or restart, then look again.", name_list(&users), them, them)
+                },
             );
         }
         if m.contains("Some operations were aborted") {
@@ -1312,7 +1358,7 @@ fn failed_move(path: &Path, m: &str) -> (&'static str, String) {
         }
     }
     #[cfg(not(windows))]
-    let _ = path;
+    let _ = (path, elevated);
     ("failed", format!("Couldn't move it to the {}: {}", trash_word(), m))
 }
 
@@ -1323,13 +1369,22 @@ pub(crate) fn users_of(path: &Path) -> Vec<String> {
 }
 
 #[cfg(all(test, windows))]
-pub(crate) fn failed_move_for_test(path: &Path, m: &str) -> (&'static str, String) {
-    failed_move(path, m)
+pub(crate) fn failed_move_for_test(path: &Path, m: &str, elevated: bool) -> (&'static str, String) {
+    failed_move(path, m, elevated)
 }
 
 /// What may be deleted at the next restart: the item that was looked at, in
 /// a place programs live in (the administrator's run) — then scheduled.
-fn at_restart_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: bool) -> (&'static str, String) {
+fn at_restart_checked(path: &Path, root: &Path, want: Option<&Ident>, el: Option<&Elevation>) -> (&'static str, String) {
+    #[cfg(windows)]
+    let pinned = if el.is_some() {
+        match pin_elevated(path, root) {
+            Ok(p) => Some(p),
+            Err(why) => return ("refused", format!("{} It was kept.", why)),
+        }
+    } else {
+        None
+    };
     if std::fs::symlink_metadata(path).is_err() {
         return ("gone", "Already gone.".into());
     }
@@ -1341,18 +1396,77 @@ fn at_restart_checked(path: &Path, root: &Path, want: Option<&Ident>, elevated: 
         _ => return ("changed", "It changed since it was looked at, so it was kept. Look again.".into()),
     }
     #[cfg(windows)]
-    if elevated {
-        if let Err(why) = windows::elevated_path_ok(path) {
+    if let Some(p) = &pinned {
+        if let Err(why) = elevated_place_ok(&p.final_parent.join(path.file_name().unwrap_or_default()), el) {
             return ("refused", format!("{} It was kept.", why));
         }
+        // What the person can change themselves is never queued for the next
+        // boot, when nothing checks it again (DEST-A-03): no folder from the
+        // drive down to it, and no name the walk queues. Then exactly those
+        // names are queued.
+        let names = windows::restart_names(path);
+        let person = el.and_then(|e| e.person.as_ref());
+        let theirs = |q: &Path| person.is_none_or(|t| windows::person_can_change(q, t));
+        if path.ancestors().skip(1).any(theirs) || names.iter().any(|n| theirs(n)) {
+            return ("refused", "It is in a folder you can change, so Windows is not asked to delete it at restart. Close the program that holds it, then delete it again.".into());
+        }
+        return windows::schedule_at_restart(&names);
     }
     #[cfg(not(windows))]
-    let _ = elevated;
+    let _ = el;
     windows::delete_at_restart(path)
 }
 
-/// Carry out cleanup items in order, each checked again first.
+/// The administrator's own checks on where an item really is: a place
+/// programs live in and, under X:\Users\, only the asking person's AppData.
+#[cfg(windows)]
+fn elevated_place_ok(at: &Path, el: Option<&Elevation>) -> Result<(), String> {
+    windows::elevated_path_ok(at)?;
+    windows::profile_ok(at, el.and_then(|e| e.profile.as_deref()))
+}
+
+/// The administrator's run, before it reads an item: its place written
+/// plainly (`link_on_the_way` trusts that text), and every folder above the
+/// item held still and checked (`windows::pin_for_elevated`).
+#[cfg(windows)]
+fn pin_elevated(path: &Path, root: &Path) -> Result<windows::Pinned, String> {
+    windows::plain_windows_path(&root.to_string_lossy())?;
+    windows::pin_for_elevated(path)
+}
+
+/// Carry out cleanup items in order, each checked again first. `elevated`:
+/// as the administrator's run for this process's own person (the test mode
+/// and the tests); the real one names whose it is (`run_items_in`).
 pub(crate) fn run_items(items: &[JobItem], registry_needs_files: bool, backups: &Path, elevated: bool) -> Vec<Deleted> {
+    let el = elevated.then(Elevation::own);
+    run_items_in(items, registry_needs_files, backups, el.as_ref())
+}
+
+/// Who the administrator's run acts for: the person whose GitSwitch asked
+/// (their profile folder), so AppData items are judged against theirs, not
+/// the approving administrator's.
+#[derive(Debug, Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct Elevation {
+    pub profile: Option<PathBuf>,
+    /// Their token: what they can change themselves is never deleted at restart.
+    #[cfg(windows)]
+    pub person: Option<windows::ParentToken>,
+}
+
+impl Elevation {
+    /// This process's own person: the test mode's, and the tests'.
+    pub(crate) fn own() -> Elevation {
+        Elevation {
+            profile: crate::paths::home_dir(),
+            #[cfg(windows)]
+            person: windows::own_token().ok(),
+        }
+    }
+}
+
+/// `run_items`, as the administrator's run for `el`'s person when given.
+pub(crate) fn run_items_in(items: &[JobItem], registry_needs_files: bool, backups: &Path, el: Option<&Elevation>) -> Vec<Deleted> {
     let mut out = Vec::new();
     let mut files_ok = true;
     for it in items {
@@ -1360,7 +1474,7 @@ pub(crate) fn run_items(items: &[JobItem], registry_needs_files: bool, backups: 
             // Deleting files directly stops at the first folder that can't go.
             JobWhat::Trash { .. } if registry_needs_files && !files_ok => ("refused", "Kept: an earlier folder could not be moved, so this one was left as it was.".into()),
             JobWhat::Trash { path, root, ident: want } => {
-                let r = trash_checked(path, root, want.as_ref(), elevated);
+                let r = trash_checked(path, root, want.as_ref(), el);
                 if r.0 != "trashed" && r.0 != "gone" {
                     files_ok = false;
                 }
@@ -1369,9 +1483,16 @@ pub(crate) fn run_items(items: &[JobItem], registry_needs_files: bool, backups: 
             JobWhat::UninstallEntry { .. } | JobWhat::RunValue { .. } if registry_needs_files && !files_ok => {
                 ("refused", "Kept: its folder could not be moved, so the rest was left as it was.".into())
             }
+            // The administrator's run changes only the machine's own entries:
+            // an HKCU there would be the approving administrator's (ELEV-B-NH-04).
+            JobWhat::UninstallEntry { view, .. } | JobWhat::RunValue { view, .. } if el.is_some() && !view.starts_with("HKLM") => {
+                ("refused", "The administrator's run changes only the machine's own entries, so this one was kept.".into())
+            }
+            // An entry with no name has nothing to be checked against (ELEV-B-09).
+            JobWhat::UninstallEntry { name, .. } if el.is_some() && name.trim().is_empty() => ("refused", "The entry has no name to check it against, so it was kept.".into()),
             JobWhat::UninstallEntry { view, key, name } => windows::delete_uninstall_entry(view, key, name, backups),
             JobWhat::RunValue { view, name, data } => windows::delete_run_value(view, name, data, backups),
-            JobWhat::AtRestart { path, root, ident: want } => at_restart_checked(path, root, want.as_ref(), elevated),
+            JobWhat::AtRestart { path, root, ident: want } => at_restart_checked(path, root, want.as_ref(), el),
         };
         out.push(Deleted { id: it.id.clone(), outcome: o.into(), message: m });
     }
@@ -1387,11 +1508,16 @@ fn no_link_on_the_path(p: &Path) -> bool {
 /// The elevated side: check the job against the hash it was approved with,
 /// carry it out, write what happened next to it — never through a link.
 pub(crate) fn run_job_file(job: &Path, sha: &str) -> i32 {
+    run_job_as(job, sha, &Elevation::own(), |job| std::fs::read(job).map_err(|e| format!("The job could not be read: {}", e)))
+}
+
+/// `run_job_file` for `el`'s person, the job's bytes read by `read`.
+fn run_job_as(job: &Path, sha: &str, el: &Elevation, read: impl FnOnce(&Path) -> Result<Vec<u8>, String>) -> i32 {
     let result = (|| -> Result<Vec<Deleted>, String> {
         if !no_link_on_the_path(job.parent().unwrap_or(job)) {
             return Err("GitSwitch's data folder is reached through a link, so the administrator's step did nothing.".into());
         }
-        let bytes = std::fs::read(job).map_err(|e| format!("The job could not be read: {}", e))?;
+        let bytes = read(job)?;
         if !gitswitch_lock_core::sha256_hex(&bytes).eq_ignore_ascii_case(sha.trim()) {
             return Err("The job does not match what was approved, so nothing was done.".into());
         }
@@ -1402,7 +1528,7 @@ pub(crate) fn run_job_file(job: &Path, sha: &str) -> i32 {
         if !no_link_on_the_path(&j.backups) {
             return Err("The backup folder is reached through a link, so the administrator's step did nothing.".into());
         }
-        Ok(run_items(&j.items, j.registry_needs_files, &j.backups, true))
+        Ok(run_items_in(&j.items, j.registry_needs_files, &j.backups, Some(el)))
     })();
     let (code, body) = match result {
         Ok(d) => (0, serde_json::json!({ "ok": true, "results": d })),
@@ -1420,13 +1546,43 @@ pub(crate) fn run_job_file(job: &Path, sha: &str) -> i32 {
 /// an ordinary start; with the flag, always Some — never the app itself.
 pub fn elevated_cleanup_from_args() -> Option<i32> {
     let args: Vec<String> = std::env::args().collect();
-    let i = args.iter().position(|a| a == ELEVATED_FLAG)?;
-    let job = args.get(i + 1);
-    let sha = args.iter().position(|a| a == "--sha256").and_then(|j| args.get(j + 1));
-    Some(match (job, sha) {
-        (Some(job), Some(sha)) => run_job_file(Path::new(job), sha),
-        _ => 2,
-    })
+    args.iter().any(|a| a == ELEVATED_FLAG).then(|| elevated_cleanup_from(&args))
+}
+
+/// The administrator's run, from its command line. It does anything only in
+/// GitSwitch's exact form, on Windows, elevated, started by GitSwitch itself
+/// (the same program file: "runas" makes the asking process the parent, and
+/// GitSwitch waits for it, so its id can't be reused), for a job that is a
+/// plain file belonging to the parent's person — then for that person's
+/// profile. Otherwise 2, with nothing read past the arguments and nothing
+/// written. (DEST-B-02, DEST-A-06.)
+pub(crate) fn elevated_cleanup_from(args: &[String]) -> i32 {
+    let Ok((job, sha)) = entry_args(args) else { return 2 };
+    #[cfg(windows)]
+    {
+        if !windows::is_elevated() {
+            return 2;
+        }
+        let Ok(parent) = windows::gitswitch_parent() else { return 2 };
+        let Ok(bytes) = own_job_bytes(&job, &parent) else { return 2 };
+        let el = Elevation { profile: windows::profile_of(&parent), person: Some(parent) };
+        run_job_as(&job, &sha, &el, move |_| Ok(bytes))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (job, sha);
+        2
+    }
+}
+
+/// The job, read once through one handle: no link on the way to it, a plain
+/// file (not a link itself), owned by `who`'s account.
+#[cfg(windows)]
+fn own_job_bytes(job: &Path, who: &windows::ParentToken) -> Result<Vec<u8>, String> {
+    if !no_link_on_the_path(job.parent().unwrap_or(job)) {
+        return Err("A folder on the way to the job is a link.".into());
+    }
+    windows::read_own_job(job, who)
 }
 
 async fn launch_elevated(job: &Path, sha: &str) -> crate::elevate::Elevated {
@@ -1509,6 +1665,9 @@ pub async fn delete_at_restart(scan: String, ids: Vec<String>) -> Result<Vec<Del
     let s2 = s.clone();
     if let Err(why) = tokio::task::spawn_blocking(move || platform_gone(&s2)).await.map_err(|e| AppError::Command(e.to_string()))? {
         return Err(AppError::Config(format!("{} is installed again, so nothing was deleted: {}", s.app.name, why)));
+    }
+    if matches!(&s.record, Record::WinEntry { view, .. } if view == "HKCU") {
+        return Err(AppError::Config(format!("{} was installed for you only, so nothing of it is deleted with the administrator's rights at the next restart.", s.app.name)));
     }
     let ids: Vec<String> = items.iter().map(|j| j.id.clone()).collect();
     let out = match Box::pin(elevated_run(items, false)).await {
@@ -2037,6 +2196,197 @@ mod tests {
         for v in ["GITSWITCH_ELEVATE", "GITSWITCH_DATA_DIR", "GITSWITCH_TRASH_DIR"] {
             std::env::remove_var(v);
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_gitswitchs_own_command_line_reaches_the_administrators_run() {
+        let job = r"C:\Users\me\AppData\Roaming\com.gitswitch.app\uninstall-jobs\0f8fad5b-d9cb-469f-a165-70867728950e.json";
+        let sha = "a".repeat(64);
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(entry_args(&a(&["gs.exe", ELEVATED_FLAG, job, "--sha256", &sha])).is_ok());
+        for bad in [
+            a(&["gs.exe", job, ELEVATED_FLAG, "--sha256", &sha]),
+            a(&["gs.exe", ELEVATED_FLAG, job, "--sha256", &sha, "extra"]),
+            a(&["gs.exe", ELEVATED_FLAG, job, "--sha256"]),
+            a(&["gs.exe", ELEVATED_FLAG, job, "--sha256", "abc"]),
+            a(&["gs.exe", ELEVATED_FLAG, job, "--sha256", &"g".repeat(64)]),
+            a(&["gs.exe", ELEVATED_FLAG, r"com.gitswitch.app\uninstall-jobs\0f8fad5b-d9cb-469f-a165-70867728950e.json", "--sha256", &sha]),
+            a(&["gs.exe", ELEVATED_FLAG, r"C:\Users\me\AppData\Roaming\com.gitswitch.app\uninstall-jobs\..\0f8fad5b-d9cb-469f-a165-70867728950e.json", "--sha256", &sha]),
+            a(&["gs.exe", ELEVATED_FLAG, r"C:\Users\me\AppData\Roaming\com.gitswitch.app\uninstall-jobs\job.json", "--sha256", &sha]),
+            a(&["gs.exe", ELEVATED_FLAG, r"C:\Temp\uninstall-jobs\0f8fad5b-d9cb-469f-a165-70867728950e.json", "--sha256", &sha]),
+        ] {
+            assert!(entry_args(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// DEST-B-02: the flag used to run a job with whatever rights it was
+    /// started with. Unelevated, it does nothing and writes nothing; elevated
+    /// under cargo, the parent check refuses. Either way the item stays.
+    #[cfg(windows)]
+    #[test]
+    fn the_cleanup_flag_does_nothing_when_not_started_by_gitswitch_as_administrator() {
+        let _g = env_lock();
+        let root = plain_tmp("flag");
+        std::env::set_var("GITSWITCH_TRASH_DIR", root.join("trash"));
+        std::fs::create_dir_all(root.join("place").join("keep")).unwrap();
+        let place = root.join("place");
+        let jobs = root.join("com.gitswitch.app").join("uninstall-jobs");
+        std::fs::create_dir_all(&jobs).unwrap();
+        let job = jobs.join(format!("{}.json", uuid::Uuid::new_v4()));
+        let body = Job { version: 1, items: vec![JobItem { id: "k".into(), what: JobWhat::Trash { path: place.join("keep"), root: place.clone(), ident: ident(&place.join("keep")) } }], registry_needs_files: false, backups: root.join("b") };
+        let bytes = serde_json::to_vec(&body).unwrap();
+        std::fs::write(&job, &bytes).unwrap();
+        let sha = gitswitch_lock_core::sha256_hex(&bytes);
+        let code = elevated_cleanup_from(&["gs.exe".to_string(), ELEVATED_FLAG.to_string(), job.to_string_lossy().to_string(), "--sha256".to_string(), sha]);
+        std::env::remove_var("GITSWITCH_TRASH_DIR");
+        assert_eq!(code, 2);
+        assert!(place.join("keep").exists(), "nothing moved");
+        assert!(!result_path_of(&job).exists(), "nothing written");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The parent check: false under cargo (another program), true in a child
+    /// of this very test binary (the same program file, started first).
+    #[cfg(windows)]
+    #[test]
+    fn only_gitswitch_itself_counts_as_the_parent() {
+        if std::env::var_os("GITSWITCH_PARENT_PROBE").is_some() {
+            println!("PARENT_IS_GITSWITCH={}", windows::gitswitch_parent().is_ok());
+            return;
+        }
+        assert!(windows::gitswitch_parent().is_err(), "the test's parent is cargo, another program");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "apps::tests::only_gitswitch_itself_counts_as_the_parent", "--nocapture"])
+            .env("GITSWITCH_PARENT_PROBE", "1")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(said.contains("PARENT_IS_GITSWITCH=true"), "{said}");
+    }
+
+    /// The job is read only as a plain file belonging to the asking account,
+    /// with no link on the way.
+    #[cfg(windows)]
+    #[test]
+    fn the_job_must_be_the_asking_persons_own_plain_file() {
+        let root = plain_tmp("own-job");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        let job = root.join("real").join("job.json");
+        std::fs::write(&job, b"{}").unwrap();
+        let me = windows::own_token().unwrap();
+        // An elevated runner's new files belong to the Administrators group,
+        // not to its user: there the owner check rightly says "another account".
+        if !windows::is_elevated() {
+            assert_eq!(own_job_bytes(&job, &me).unwrap(), b"{}");
+        }
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(root.join("j")).arg(root.join("real")).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        assert!(own_job_bytes(&root.join("j").join("job.json"), &me).is_err(), "through a junction");
+        assert!(windows::profile_of(&me).is_some_and(|p| p.is_dir()), "the person's profile, from ProfileList");
+        let _ = std::fs::remove_dir(root.join("j"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Registry items in the administrator's run: the machine's own only,
+    /// refused before the registry is touched.
+    #[test]
+    fn the_administrators_run_changes_only_named_machine_entries() {
+        let items = vec![
+            JobItem { id: "u".into(), what: JobWhat::UninstallEntry { view: "HKCU".into(), key: "GitSwitchNoSuchKey".into(), name: "X".into() } },
+            JobItem { id: "r".into(), what: JobWhat::RunValue { view: "HKCU".into(), name: "GitSwitchNoSuchValue".into(), data: "x".into() } },
+            JobItem { id: "n".into(), what: JobWhat::UninstallEntry { view: "HKLM64".into(), key: "GitSwitchNoSuchKey".into(), name: " ".into() } },
+        ];
+        let out = run_items(&items, false, &std::env::temp_dir(), true);
+        assert!(out.iter().all(|d| d.outcome == "refused"), "{out:?}");
+    }
+
+    /// DEST-A-03: the administrator's run never queues for the next boot a
+    /// folder the person can change (here: their own temp folder).
+    #[cfg(windows)]
+    #[test]
+    fn the_administrators_run_never_queues_the_persons_own_folder_for_restart() {
+        let _g = env_lock();
+        let root = plain_tmp("held");
+        std::fs::create_dir_all(root.join("held")).unwrap();
+        std::fs::write(root.join("held").join("f"), "x").unwrap();
+        let el = Elevation::own();
+        let (o, m) = at_restart_checked(&root.join("held"), &root, ident(&root.join("held")).as_ref(), Some(&el));
+        assert_eq!(o, "refused", "{m}");
+        assert!(m.contains("a folder you can change"), "{m}");
+        assert!(!windows::pending_renames().iter().any(|p| p.to_lowercase().contains("gitswitch-apps-held")), "nothing was queued");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Windows' own AccessCheck decides what the person can change.
+    #[cfg(windows)]
+    #[test]
+    fn what_the_person_can_change_is_asked_of_windows() {
+        let me = windows::own_token().unwrap();
+        let t = plain_tmp("can-change");
+        assert!(windows::person_can_change(&t, &me), "a temp folder of theirs");
+        // SAFETY: no arguments. (CI's Windows runner runs elevated.)
+        if unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } == 0 {
+            let system32 = PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32");
+            assert!(!windows::person_can_change(&system32, &me), "System32");
+            assert!(!windows::person_can_change(Path::new(&std::env::var("ProgramFiles").unwrap()), &me), "Program Files");
+            assert!(!windows::person_can_change(Path::new(r"C:\"), &me), "C:\\ itself: its entries for children don't count");
+        }
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
+    /// ELEV-B-01: an item named through `..` passed every check on its text
+    /// (Temp is under AppData\Local), so the administrator moved another folder.
+    #[cfg(windows)]
+    #[test]
+    fn the_administrators_run_refuses_an_item_reached_through_dot_dot() {
+        let _g = env_lock();
+        let root = plain_tmp("dotdot");
+        std::env::set_var("GITSWITCH_TRASH_DIR", root.join("trash"));
+        std::fs::create_dir_all(root.join("place")).unwrap();
+        std::fs::create_dir_all(root.join("victim")).unwrap();
+        std::fs::write(root.join("victim").join("keep.txt"), "keep").unwrap();
+        let via = root.join("place").join("..");
+        let items = vec![JobItem { id: "v".into(), what: JobWhat::Trash { path: via.join("victim"), root: via.clone(), ident: ident(&root.join("victim")) } }];
+        let out = run_items(&items, false, &root.join("b"), true);
+        std::env::remove_var("GITSWITCH_TRASH_DIR");
+        assert_eq!(out[0].outcome, "refused", "{out:?}");
+        assert!(root.join("victim").join("keep.txt").exists(), "the other folder stays");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// DEST-A-02: a junction above the job's place was never looked at.
+    #[cfg(windows)]
+    #[test]
+    fn the_administrators_run_refuses_an_item_under_a_junction_above_its_place() {
+        let _g = env_lock();
+        let root = plain_tmp("junction-up");
+        std::env::set_var("GITSWITCH_TRASH_DIR", root.join("trash"));
+        std::fs::create_dir_all(root.join("real").join("inner").join("x")).unwrap();
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(root.join("j")).arg(root.join("real")).output().unwrap();
+        assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+        let place = root.join("j").join("inner");
+        let items = vec![JobItem { id: "x".into(), what: JobWhat::Trash { path: place.join("x"), root: place.clone(), ident: ident(&place.join("x")) } }];
+        let out = run_items(&items, false, &root.join("b"), true);
+        std::env::remove_var("GITSWITCH_TRASH_DIR");
+        assert_eq!(out[0].outcome, "refused", "{out:?}");
+        assert!(root.join("real").join("inner").join("x").exists(), "the folder behind the junction stays");
+        let _ = std::fs::remove_dir(root.join("j"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The folders above a pinned item can't be renamed until the pin goes.
+    #[cfg(windows)]
+    #[test]
+    fn the_folders_above_a_pinned_item_stay_where_they_are() {
+        let root = plain_tmp("pinned");
+        std::fs::create_dir_all(root.join("real").join("inner")).unwrap();
+        std::fs::write(root.join("real").join("inner").join("x"), "x").unwrap();
+        let p = windows::pin_for_elevated(&root.join("real").join("inner").join("x")).unwrap();
+        assert!(p.final_parent.ends_with("inner"), "{:?}", p.final_parent);
+        assert!(std::fs::rename(root.join("real"), root.join("moved")).is_err(), "pinned: it can't be renamed");
+        drop(p);
+        assert!(std::fs::rename(root.join("real"), root.join("moved")).is_ok(), "the pin is gone");
         let _ = std::fs::remove_dir_all(&root);
     }
 

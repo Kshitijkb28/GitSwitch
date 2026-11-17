@@ -37,18 +37,25 @@ pub(crate) fn https_to_ssh(url: &str) -> Option<String> {
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> Option<std::process::Output> {
-    let started = std::time::Instant::now();
-    let d = dir.to_string_lossy().to_string();
-    let out = crate::spawn::command("git").arg("-C").arg(&d).args(args).output().ok()?;
-    crate::cmdlog::record(
-        dir,
-        ["git", "-C", &d].iter().map(|a| a.to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
-        out.status.code().unwrap_or(-1),
-        started.elapsed(),
-        &String::from_utf8_lossy(&out.stdout),
-        &String::from_utf8_lossy(&out.stderr),
-    );
-    Some(out)
+    // The one runner, on the local clock (this writes config). A command
+    // that could not run or was stopped is `None`, as one that could not
+    // start always was; the exit code comes back as the status it was.
+    let out = crate::git_exec::GitCmd::at(dir)
+        .args(args.iter().copied())
+        .timeout(crate::git_exec::LOCAL_TIMEOUT)
+        .run_blocking()
+        .ok()?;
+    #[cfg(unix)]
+    let status = {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw((out.code & 0xff) << 8)
+    };
+    #[cfg(windows)]
+    let status = {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(out.code as u32)
+    };
+    Some(std::process::Output { status, stdout: out.stdout, stderr: out.stderr.into_bytes() })
 }
 
 /// Every value of one local config key, converted where it can be: Ok(Some)
@@ -205,6 +212,19 @@ pub fn convert_repos_in_dir(root: &str) -> Result<Vec<RemoteChange>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The conversion's runner is the one runner, and an exit code comes
+    /// back as the status git ended with.
+    #[test]
+    fn the_remote_runner_goes_through_gitcmd() {
+        let dir = std::env::temp_dir();
+        let out = git_out(&dir, &crate::git_exec::test_support::SHOW_ENV).expect("git runs");
+        assert!(out.status.success());
+        crate::git_exec::test_support::assert_hardened(&String::from_utf8_lossy(&out.stdout));
+        let five = git_out(&dir, &["-c", "alias.gitswitch-five=!exit 5", "gitswitch-five"]).expect("git runs");
+        assert!(!five.status.success());
+        assert_eq!(five.status.code(), Some(5));
+    }
 
     #[test]
     fn converts_plain_https() {

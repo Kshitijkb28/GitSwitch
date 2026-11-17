@@ -23,10 +23,15 @@ import { ResultCard } from "../changes/ResultCard";
 import { DiscardConfirmModal } from "../changes/DiscardConfirmModal";
 import { ResetConfirmModal } from "../changes/ResetConfirmModal";
 import { DiscardAllModal } from "../changes/DiscardAllModal";
+import { AddRemoteModal } from "../changes/AddRemoteModal";
+import { prefetchPublish } from "../changes/publishCache";
+import { cleanError } from "../github/shared";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { usePersistedState } from "../../lib/persist";
 import { canonicalJoin } from "../../lib/paths";
 import { useRefreshOnFocus } from "../../lib/focus";
 import { notePushChanged } from "../../lib/console";
+import { sameRepo } from "../../lib/repoChanges";
 import { elapsedLabel, runJob, useGitJob, clearJob, jobWritingFiles, type GitJobKind } from "../../lib/gitJobs";
 import * as api from "../../lib/api";
 import type { ChangeEntry, OpResult, PullMode, RepoStatus, SubmoduleInfo, SubmoduleStatus } from "../../lib/api";
@@ -103,6 +108,23 @@ export function ChangesTab({
   const [stashOpen, setStashOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const [discardAllOpen, setDiscardAllOpen] = useState(false);
+  /** Publish was refused for want of any remote: the address to add as origin. */
+  // "Publish this repository": which tab opens, whether its address tab adds
+  // origin or corrects a remote never reached, the repository the create
+  // form starts from, and — "again" — the one GitHub lost, to make again
+  // under the same name at the address the folder already has. Null: closed.
+  const [publishDialog, setPublishDialog] = useState<{
+    tab: "create" | "address";
+    change?: { remote: string; from: string };
+    prefill?: string | null;
+    again?: string;
+  } | null>(null);
+  // A branch with nowhere to publish to: the dialog's accounts are read now
+  // (local files only), so it opens with them in place.
+  const unpublished = !!status && status.push.remotes.length === 0 && !!status.branch;
+  useEffect(() => {
+    if (unpublished && repoPath) prefetchPublish(repoPath);
+  }, [unpublished, repoPath]);
   const [tick, setTick] = useState(0);
   const [subRefresh, setSubRefresh] = useState(0);
   // Bumped by Refresh only: the pushing identity may ask github.com, which
@@ -177,6 +199,11 @@ export function ChangesTab({
     setAmend(false);
     loadStatus(repoPath);
   }, [repoPath, loadStatus]);
+
+  // A Publish dialog open for the folder left behind closes: it never acts on another one.
+  useEffect(() => {
+    setPublishDialog(null);
+  }, [repoPath]);
 
   // After any operation the submodules may have moved too.
   useEffect(() => {
@@ -468,7 +495,15 @@ export function ChangesTab({
               () => api.changesPull(repoPath, pullMode, status.uses_lfs && pullLfs, pullMode === "rebase" && pullAutostash)
             )
           : undefined,
-      push: () => (status ? runLong("push", "Pushing…", () => api.changesPush(repoPath, !status.upstream)) : undefined),
+      push: () => {
+        if (!status) return undefined;
+        // A repository with no remote yet: where to publish comes first, here in the app.
+        if (status.push.remotes.length === 0 && status.branch && !status.unborn && !status.push.blocked) {
+          setPublishDialog({ tab: "create" });
+          return undefined;
+        }
+        return runLong("push", "Pushing…", () => api.changesPush(repoPath, !status.upstream));
+      },
       branches: () => setBranchesFor(repoPath),
       // Everything a fresh visit reads: the status, the submodules, the
       // stashes and the pushing identity.
@@ -497,6 +532,8 @@ export function ChangesTab({
           () => api.changesSyncRun(repo, stash, bundles, fingerprint, pullLfs)
         ),
       stashNow: (repo) => apply("stash", () => api.changesStashPush(repo, "Before update", false)),
+      // The GitHub tab's "Create it again on GitHub…": the dialog shows over it (Modal draws into <body>).
+      publishAgain: (fullName) => setPublishDialog({ tab: "create", again: fullName }),
     });
   });
 
@@ -621,6 +658,48 @@ export function ChangesTab({
           onClick: () => runLong("push", "Publishing…", () => api.changesPush(repoPath, true)),
         }
       : undefined;
+  // No remote at all (a repository made here, say): create it on GitHub, or an address.
+  const noRemoteActions =
+    refusalCode === "no-remote" && status?.branch
+      ? [
+          { label: "Create it on GitHub…", primary: true, onClick: () => setPublishDialog({ tab: "create" }) },
+          { label: "Use an address…", onClick: () => setPublishDialog({ tab: "address" }) },
+        ]
+      : undefined;
+  // A push or fetch that found no repository at the address: created here —
+  // under the account's own name — and, while nothing was ever fetched from or
+  // pushed to that remote, a corrected address.
+  const createRepoUrl = result && !result.inside ? (result.advice?.link ?? null) : null;
+  const changeFrom =
+    result && !result.inside && result.advice?.action === "change-remote" && result.advice.remote
+      ? status?.push.remotes.find((r) => r.name === result.advice?.remote)
+      : undefined;
+  // A remote reached before: GitHub lost the repository its address names
+  // (deleted, say). It is made again under that same name, the address kept.
+  const againRepo = createRepoUrl && !changeFrom ? (result?.advice?.repo ?? null) : null;
+  // Created here: when the remote was never reached the form corrects its
+  // address if the name differs; when it was, it is made again where the
+  // address points. The browser only when GitSwitch can't tell which it is.
+  // Each named for what it opens, as the GitHub tab's "Create it again on GitHub…" is.
+  const missingRepoActions = [
+    ...(createRepoUrl
+      ? [
+          {
+            label: againRepo ? "Create it again on GitHub…" : changeFrom ? "Create it on GitHub…" : "Create it on github.com",
+            primary: true,
+            onClick: () =>
+              changeFrom
+                ? setPublishDialog({ tab: "create", change: { remote: changeFrom.name, from: changeFrom.fetch_url }, prefill: result?.advice?.repo ?? null })
+                : againRepo
+                  ? setPublishDialog({ tab: "create", again: againRepo })
+                  : void openUrl(createRepoUrl).catch(() => toast.error(`Couldn't open the browser: open ${createRepoUrl} yourself.`)),
+          },
+        ]
+      : []),
+    ...(changeFrom
+      ? [{ label: "Change the address…", primary: !createRepoUrl, onClick: () => setPublishDialog({ tab: "address", change: { remote: changeFrom.name, from: changeFrom.fetch_url } }) }]
+      : []),
+  ];
 
   return (
     <>
@@ -748,7 +827,7 @@ export function ChangesTab({
                 else void runLong("submodules", `Checking out the recorded commit${paths.length === 1 ? "" : "s"}…`, () => api.changesSubmoduleAlign(repoPath, paths));
               }}
               extraAction={markersAction ?? syncHandOff ?? movedAction ?? historyAction ?? publishAction}
-              extraActions={subPushActions}
+              extraActions={subPushActions ?? noRemoteActions ?? (missingRepoActions.length > 0 ? missingRepoActions : undefined)}
             />
           )}
 
@@ -940,6 +1019,65 @@ export function ChangesTab({
           />
         </>
       )}
+
+      {/* Not only once the status is read: the GitHub tab's "Create it again
+          on GitHub…" opens it too, and must never do nothing. */}
+      <AddRemoteModal
+        open={publishDialog !== null}
+        mode={publishDialog?.change ? "change" : "add"}
+        initialUrl={publishDialog?.change?.from ?? ""}
+        initialTab={publishDialog?.tab ?? "create"}
+        repoPath={repoPath}
+        prefill={publishDialog?.prefill ?? null}
+        again={publishDialog?.again ?? null}
+        status={status}
+        onCancel={() => setPublishDialog(null)}
+        onAlreadyConnected={() => {
+          setPublishDialog(null);
+          void runLong("push", "Pushing…", () => api.changesPush(repoPath, !status?.upstream));
+        }}
+        onConfirm={async (url, allowExisting, againChange) => {
+          // Changing a never-reached remote: the one the page offered, or the one a
+          // folder made again turned out to have.
+          const change = publishDialog?.change ?? againChange ?? undefined;
+          let check: api.RemoteCheck;
+          try {
+            check = change
+              ? await api.changesChangeRemote(repoPath, change.remote, change.from, url, allowExisting)
+              : await api.changesAddRemote(repoPath, url, allowExisting);
+          } catch (e) {
+            return { text: cleanError(e) };
+          }
+          if (!check.saved) return { text: check.problem, createUrl: check.create_url, existingBranches: check.existing_branches, repo: check.repo };
+          setPublishDialog(null);
+          void runLong("push", "Publishing…", () => api.changesPush(repoPath, true));
+          return null;
+        }}
+        onCreated={(p) => {
+          // Made again under the name GitHub had lost: said as such.
+          const again = publishDialog?.again;
+          const kind = p.private ? "private" : "public";
+          setPublishDialog(null);
+          if (p.problem) {
+            // Created, but not published: the reason (it says what was created) shows where
+            // the person is — the dialog may have been opened over the GitHub tab, with this
+            // tab hidden — and stays on this tab as a card in place of the earlier outcome
+            // (GitHub had no repository there, with its Create button: not so any more). A
+            // status read leaves the card as it is. Nothing is pushed.
+            toast.error(p.problem);
+            clearJob(repoPath);
+            setResult({ ok: false, headline: p.problem, detail: "" });
+            loadStatus(repoPath);
+            return;
+          }
+          toast.success(
+            again && sameRepo(again, p.full_name)
+              ? `Created ${p.full_name} again on GitHub (${kind}).`
+              : `Created ${p.full_name} on GitHub (${kind})${p.renamed ? ": GitHub changed the name" : ""}.`
+          );
+          void runLong("push", "Publishing…", () => api.changesPush(repoPath, true));
+        }}
+      />
 
       {/* tick keeps the elapsed timer honest without re-rendering anything else */}
       <span className="hidden">{tick}</span>

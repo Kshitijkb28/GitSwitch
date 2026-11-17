@@ -11,6 +11,9 @@
 - In-app updates: a tag must be the app's version and have the signing key;
   every OS attaches its signed installers, and latest.json is written with an
   entry per installer once all are in.
+- CI holds no more than it needs: a read-only token except in the jobs that
+  publish, every action pinned to a commit, a time limit on every job, and
+  the harness and the extension's packager installed from their lockfiles.
 
 Static on purpose: node and npm do not run everywhere this gate does, and a
 release build takes many minutes. CI runs the real packaging.
@@ -162,6 +165,59 @@ ok("  for every installer the bundle makes on each OS", conf.get("bundle", {}).g
 readme = read(f"{ROOT}/README.md")
 ok("README points to the first-open steps", "BUILD.md#first-open-on-macos" in readme)
 ok("  and to the extension's .vsix on the release", "gitswitch-<version>.vsix" in readme)
+
+# --- CI holds no more than it needs ---------------------------------------------
+# Every push and pull request runs third-party actions and packages. Each gets
+# a read-only token unless it publishes, runs code its owner cannot move under
+# it, cannot run (and bill) for GitHub's six-hour default, and installs exactly
+# what a lockfile names.
+jobs_text = wf.split("\njobs:\n", 1)[1] if "\njobs:\n" in wf else ""
+heads = list(re.finditer(r"^  ([a-z][\w-]*):\n", jobs_text, re.M))
+jobs = {h.group(1): jobs_text[h.end():(heads[i + 1].start() if i + 1 < len(heads) else len(jobs_text))] for i, h in enumerate(heads)}
+
+
+def perms(block, indent):
+    m = re.search(rf"^{indent}permissions:[ \t]*\n((?:{indent}  .*\n?)+)", block, re.M)
+    # A permission's reason is a comment on its own line (zizmor reads it there).
+    return sorted(l.split("#")[0].strip() for l in m.group(1).splitlines() if l.split("#")[0].strip()) if m else None
+
+
+top = perms(wf.split("\njobs:\n", 1)[0] + "\n", "")
+ok("the workflow's token is read-only by default", top == ["contents: read"], f"top-level permissions: {top}")
+PUBLISH = {"build", "release-extension", "release-updater"}
+writers = {n for n, b in jobs.items() if "contents: write" in (perms(b, "    ") or [])}
+ok("  only the jobs that publish to the release can write", bool(jobs) and writers == PUBLISH, f"jobs with contents: write: {sorted(writers)}")
+uses = re.findall(r"^\s*(?:-\s+)?uses:\s*(\S+)(.*)$", wf, re.M)
+loose = [u + c for u, c in uses if not (re.fullmatch(r"[\w.-]+/[\w.-]+(?:/[\w./-]+)?@[0-9a-f]{40}", u) and re.match(r"\s+#\s*\S", c))]
+ok("every action is pinned to a full commit, with its version in a comment", bool(uses) and not loose, f"not pinned: {loose}")
+checkouts = len(re.findall(r"uses:\s*actions/checkout@", wf))
+kept = len(re.findall(r"uses:\s*actions/checkout@\S+.*\n\s+with:\n(?:\s+\w[\w-]*:.*\n)*?\s+persist-credentials: false", wf))
+ok("  and no checkout leaves the token in .git/config for the rest of the job", checkouts > 0 and kept == checkouts, f"{kept} of {checkouts} checkouts set persist-credentials: false")
+untimed = [n for n, b in jobs.items() if not re.search(r"^    timeout-minutes: \d+\s*$", b, re.M)]
+ok("every job stops at its own time limit", bool(jobs) and not untimed, f"no timeout-minutes: {untimed}")
+HARNESS = f"{ROOT}/scripts/verify/harness"
+lock_ok = False
+if os.path.isfile(f"{HARNESS}/package-lock.json"):
+    hlock = json.loads(read(f"{HARNESS}/package-lock.json"))
+    hpkg = json.loads(read(f"{HARNESS}/package.json"))
+    lock_ok = hlock.get("packages", {}).get("", {}).get("devDependencies") == hpkg.get("devDependencies")
+fe = jobs.get("verify-frontend", "")
+ok(
+    "  the browser suites install the harness from its lockfile",
+    lock_ok and bool(re.search(r"working-directory: scripts/verify/harness\n\s+run: \|\n\s+npm ci\n", fe)) and "npm install" not in fe,
+    "scripts/verify/harness needs a package-lock.json matching package.json, and CI must run npm ci there",
+)
+pack = pkg.get("scripts", {}).get("package", "")
+vsce = pkg.get("devDependencies", {}).get("@vscode/vsce", "")
+ext_lock = json.loads(read(f"{EXT}/package-lock.json")).get("packages", {})
+ok(
+    "  the extension is packed by the vsce its lockfile names, not one fetched at build time",
+    "npx" not in pack and re.match(r"vsce package\b", pack) is not None
+    and re.fullmatch(r"\d+\.\d+\.\d+", vsce) is not None
+    and ext_lock.get("node_modules/@vscode/vsce", {}).get("version") == vsce
+    and ext_lock.get("", {}).get("devDependencies", {}).get("@vscode/vsce") == vsce,
+    f"package = {pack!r}, @vscode/vsce = {vsce!r}",
+)
 
 print(f"\nRESULT  {'all passed' if not failed else f'{failed} failed'}")
 sys.exit(1 if failed else 0)

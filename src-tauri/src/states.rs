@@ -31,7 +31,7 @@
 
 use crate::error::AppError;
 use crate::git_advice::{self, GitOp};
-use crate::git_exec::{validate_branch_name, GitCmd, LFS_TIMEOUT, LOCAL_TIMEOUT};
+use crate::git_exec::{is_object_id, validate_branch_name, GitCmd, LFS_TIMEOUT, LOCAL_TIMEOUT};
 use crate::git_ops::{advice_ctx, busy, refuse, snapshot, OpResult, Refusal, StatusFacts};
 use crate::git_status::RepoStatus;
 use serde::{Deserialize, Serialize};
@@ -199,12 +199,14 @@ pub fn parse_ls_tree(raw: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// A Git LFS pointer's object id.
+/// A Git LFS pointer's object id: 64 ASCII hex digits, nothing else. The
+/// caller slices it by bytes into the store's folder names, which a
+/// multi-byte character there would make panic midway through a restore.
 pub fn lfs_pointer_oid(content: &str) -> Option<String> {
     if !content.starts_with("version https://git-lfs.github.com/spec/") {
         return None;
     }
-    content.lines().find_map(|l| l.strip_prefix("oid sha256:")).map(|o| o.trim().to_string()).filter(|o| o.len() == 64)
+    content.lines().find_map(|l| l.strip_prefix("oid sha256:")).map(|o| o.trim().to_string()).filter(|o| o.len() == 64 && o.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A saved state, read back from its commit.
@@ -534,7 +536,7 @@ async fn run(cmd: GitCmd) -> Result<String, String> {
 }
 
 async fn read_ref(repo: &Path, r: &str) -> Option<String> {
-    run(g(repo).args(["rev-parse", "-q", "--verify", &format!("{}^{{commit}}", r)])).await.ok().filter(|s| !s.is_empty())
+    run(g(repo).args(["rev-parse", "-q", "--verify", "--end-of-options", &format!("{}^{{commit}}", r)])).await.ok().filter(|s| !s.is_empty())
 }
 
 async fn head_commit(repo: &Path) -> Option<String> {
@@ -575,20 +577,27 @@ async fn ignore_case(repo: &Path) -> bool {
     run(g(repo).args(["config", "--bool", "core.ignorecase"])).await.is_ok_and(|s| s == "true")
 }
 
-async fn count(repo: &Path, args: &[&str]) -> usize {
+/// `git rev-list --count <opts> --end-of-options <revs>`: a revision is never
+/// read as an option, whatever text a saved state put there.
+async fn count(repo: &Path, opts: &[&str], revs: &[&str]) -> usize {
     let mut a = vec!["rev-list", "--count"];
-    a.extend_from_slice(args);
+    a.extend_from_slice(opts);
+    a.push("--end-of-options");
+    a.extend_from_slice(revs);
     run(g(repo).args(a)).await.ok().and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
 /// Commits on `tip` that aren't in `head`, and how many of them are on a remote.
 async fn since(repo: &Path, head: &str, tip: &str) -> (usize, usize) {
     let not_head = format!("^{}", head);
-    let total = count(repo, &[tip, &not_head]).await;
+    let total = count(repo, &[], &[tip, &not_head]).await;
     if total == 0 {
         return (0, 0);
     }
-    let unpushed = count(repo, &[tip, &not_head, "--not", "--remotes"]).await;
+    // `tip ^head --not --remotes`, with the options first: the first `--not`
+    // makes `--remotes` exclusions, the second turns that off again for the
+    // revisions after `--end-of-options`.
+    let unpushed = count(repo, &["--not", "--remotes", "--not"], &[tip, &not_head]).await;
     (total, total.saturating_sub(unpushed))
 }
 
@@ -795,10 +804,28 @@ async fn write_inner_refs(c: &Captured) -> Result<(), String> {
     Ok(())
 }
 
+/// A state commit's tree and parents go to git as revisions (the counts, the
+/// Changes tab's list, going back). `git cat-file` prints a commit's header
+/// lines as they are stored, and a commit written by hand can say anything
+/// there — `parent --output=<file>` made `git log` overwrite a file when the
+/// Changes tab listed the states. Only object ids pass.
+fn check_state_ids(tree: &str, parents: &[String]) -> Result<(), String> {
+    if is_object_id(tree) && parents.iter().all(|p| is_object_id(p)) {
+        Ok(())
+    } else {
+        Err("this isn't a state GitSwitch saved: its commit names something other than a commit id where git expects one, so it was left alone".into())
+    }
+}
+
 /// Read a state commit back.
 async fn read_saved(repo: &Path, oid: &str) -> Result<Saved, String> {
+    // From a ref, or from an outer state's message (an inner repository's part).
+    if !is_object_id(oid) {
+        return Err("this isn't a state GitSwitch saved: it names something other than a commit id, so it was left alone".into());
+    }
     let raw = run(g(repo).args(["cat-file", "commit", oid])).await?;
     let (tree, parents, msg) = parse_commit(&raw).ok_or("not a state commit")?;
+    check_state_ids(&tree, &parents)?;
     let meta = parse_message(&msg).ok_or("not a GitSwitch state")?;
     if meta.format > FORMAT {
         return Err("saved by a newer GitSwitch".into());
@@ -806,7 +833,10 @@ async fn read_saved(repo: &Path, oid: &str) -> Result<Saved, String> {
     let (Some(head), Some(index_commit)) = (parents.first(), parents.get(1)) else {
         return Err("not a GitSwitch state".into());
     };
-    let index_tree = run(g(repo).args(["rev-parse", &format!("{}^{{tree}}", index_commit)])).await?;
+    let index_tree = run(g(repo).args(["rev-parse", "--verify", "--end-of-options", &format!("{}^{{tree}}", index_commit)])).await?;
+    if !is_object_id(&index_tree) {
+        return Err("not a GitSwitch state".into());
+    }
     Ok(Saved { oid: oid.to_string(), head: head.clone(), index_tree, worktree_tree: tree, meta })
 }
 
@@ -819,6 +849,7 @@ async fn names(repo: &Path, a: &str, b: &str, filter: Option<&str>) -> usize {
     if let Some(f) = filter {
         args.push(format!("--diff-filter={}", f));
     }
+    args.push("--end-of-options".into());
     args.push(a.to_string());
     args.push(b.to_string());
     g(repo).args(args).run().await.map(|o| o.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()).count()).unwrap_or(0)
@@ -880,7 +911,7 @@ async fn tree_entries(repo: &Path, tree: &str) -> Result<Vec<(String, String)>, 
 /// Files a restore from `from` to `to` would write that are Git LFS
 /// pointers whose content isn't in this repository's LFS store.
 async fn lfs_missing(repo: &Path, from: &str, to: &str) -> Vec<String> {
-    let Ok(o) = g(repo).args(["diff-tree", "-r", "-z", "--no-renames", "--diff-filter=AMT", from, to]).run().await else { return Vec::new() };
+    let Ok(o) = g(repo).args(["diff-tree", "-r", "-z", "--no-renames", "--diff-filter=AMT", "--end-of-options", from, to]).run().await else { return Vec::new() };
     // ":<mode> <mode> <sha> <sha> <status>\0<path>\0"
     let parts: Vec<&[u8]> = o.stdout.split(|b| *b == 0).collect();
     let mut blobs: Vec<(String, String)> = Vec::new();
@@ -970,7 +1001,7 @@ async fn move_head(repo: &Path, s: &Saved, mv: &Move, reason: &str) -> Result<Op
         Move::Branch { name, tip } => {
             let r = format!("refs/heads/{}", name);
             if let Some(t) = tip.as_deref().filter(|t| *t != s.head) {
-                if count(repo, &[t, &format!("^{}", s.head)]).await > 0 {
+                if count(repo, &[], &[t, &format!("^{}", s.head)]).await > 0 {
                     let b = crate::tree::free_backup_name(&repo.to_string_lossy(), STATE_BACKUP_PREFIX).await;
                     run(g(repo).args(["update-ref", "-m", reason, &format!("refs/heads/{}", b), t, ""])).await?;
                     backup = Some(b);
@@ -1020,7 +1051,7 @@ async fn compare(repo: &Path, s: &Saved, branch: Option<&str>, before_tree: &str
     if now == s.worktree_tree {
         return Ok(Vec::new());
     }
-    let o = g(repo).args(["diff-tree", "-r", "-z", "--no-renames", "--name-status", &s.worktree_tree, &now]).run().await.map_err(|e| e.to_string())?;
+    let o = g(repo).args(["diff-tree", "-r", "-z", "--no-renames", "--name-status", "--end-of-options", &s.worktree_tree, &now]).run().await.map_err(|e| e.to_string())?;
     let parts: Vec<String> = o.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()).map(|r| String::from_utf8_lossy(r).to_string()).collect();
     let known: HashSet<String> = tree_entries(repo, before_tree).await?.into_iter().map(|(_, p)| p).collect();
     let mut extra = Vec::new();
@@ -1049,6 +1080,19 @@ fn restore_inner<'a>(
     Box::pin(async move {
         for sub in subs {
             let shown = format!("{}{}", prefix, sub.path);
+            // The path is the state message's text, joined onto the repository:
+            // one that is not plain folder names could name a folder outside it.
+            if !crate::paths::is_plain_relative(&sub.path) {
+                notes.push(format!("{}: its part of the state names a folder outside the repository, so it was left alone.", shown));
+                continue;
+            }
+            // Plain names can still lead out through a link (a junction on
+            // Windows) to another repository: no name of it that exists may
+            // be one (`paths::lies_inside`).
+            if !crate::paths::lies_inside(&repo.join(&sub.path), repo) {
+                notes.push(format!("{}: its folder leads outside the repository (a link), so it was left alone.", shown));
+                continue;
+            }
             let Some(oid) = &sub.oid else {
                 notes.push(format!("{} had no commit yet when the state was saved; it was left as it is.", shown));
                 continue;
@@ -1057,7 +1101,10 @@ fn restore_inner<'a>(
             if !dir.join(".git").exists() {
                 // A submodule removed or never downloaded here: checked out again
                 // from what this repository already has (never from the network).
-                let _ = run(g(repo).args(["submodule", "update", "--init", "--no-fetch", "--", &sub.path])).await;
+                // `--checkout`: the saved commit, whatever the repository's
+                // `submodule.<name>.update` says (an `!command` there would
+                // otherwise run).
+                let _ = run(g(repo).args(["submodule", "update", "--init", "--no-fetch", "--checkout", "--", &sub.path])).await;
             }
             if !dir.join(".git").exists() {
                 notes.push(format!("{} isn't downloaded, so its part couldn't come back. Download it (Submodules), then go back again.", shown));
@@ -1464,6 +1511,11 @@ pub async fn delete(repo_path: &str, slot: &str, oid: &str) -> Result<OpResult, 
 fn forget_inner<'a>(repo: &'a Path, subs: &'a [SubState], slot: &'a Slot) -> BoxFut<'a, ()> {
     Box::pin(async move {
         for sub in subs {
+            // Text from the state's message: never a folder outside the
+            // repository, by its names or through a link.
+            if !crate::paths::is_plain_relative(&sub.path) || !crate::paths::lies_inside(&repo.join(&sub.path), repo) {
+                continue;
+            }
             let dir = repo.join(&sub.path);
             let (Some(oid), true) = (&sub.oid, dir.join(".git").exists()) else { continue };
             if let Ok(s) = read_saved(&dir, oid).await {
@@ -1530,7 +1582,7 @@ pub async fn set_max(repo_path: &str, max: usize) -> Result<StatesList, AppError
 
 async fn describe(repo: &Path, slot: &Slot, s: &Saved, upstream: Option<String>) -> RepoState {
     let (changed, staged, new_files) = counts(repo, s).await;
-    let (head_short, head_subject) = run(g(repo).args(["log", "-1", "--format=%h%x00%s", &s.head]))
+    let (head_short, head_subject) = run(g(repo).args(["log", "-1", "--format=%h%x00%s", "--end-of-options", &s.head]))
         .await
         .ok()
         .and_then(|t| t.split_once('\0').map(|(a, b)| (a.to_string(), b.to_string())))
@@ -1569,6 +1621,11 @@ async fn describe(repo: &Path, slot: &Slot, s: &Saved, upstream: Option<String>)
 fn describe_inner<'a>(repo: &'a Path, subs: &'a [SubState], prefix: &'a str, out: &'a mut Vec<StateSub>) -> BoxFut<'a, ()> {
     Box::pin(async move {
         for sub in subs {
+            // Text from the state's message: never a folder outside the
+            // repository, by its names or through a link.
+            if !crate::paths::is_plain_relative(&sub.path) || !crate::paths::lies_inside(&repo.join(&sub.path), repo) {
+                continue;
+            }
             let path = format!("{}{}", prefix, sub.path);
             let dir = repo.join(&sub.path);
             let downloaded = dir.join(".git").exists();
@@ -1676,6 +1733,36 @@ mod tests {
         assert_eq!(lfs_pointer_oid("just text"), None);
     }
 
+    #[test]
+    fn an_lfs_pointer_oid_is_64_ascii_hex_digits_or_nothing() {
+        let pointer = |oid: &str| format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1\n", oid);
+        // 64 bytes with a two-byte character across the slice at byte 2: this
+        // used to panic in lfs_missing (`&oid[..2]`).
+        let straddling = format!("a\u{e9}{}", "a".repeat(61));
+        assert_eq!(straddling.len(), 64);
+        assert_eq!(lfs_pointer_oid(&pointer(&straddling)), None);
+        assert_eq!(lfs_pointer_oid(&pointer(&format!("a\u{fffd}{}", "a".repeat(60)))), None, "a byte from_utf8_lossy replaced");
+        assert_eq!(lfs_pointer_oid(&pointer(&"g".repeat(64))), None);
+        assert_eq!(lfs_pointer_oid(&pointer(&"0123456789abcdef".repeat(4))), Some("0123456789abcdef".repeat(4)));
+    }
+
+    #[test]
+    fn a_state_names_only_object_ids_for_git_to_read() {
+        let (c, t) = ("c".repeat(40), "e".repeat(40));
+        assert!(check_state_ids(&t, &[c.clone(), c.clone()]).is_ok());
+        assert!(check_state_ids(&"e".repeat(64), &["c".repeat(64), "d".repeat(64)]).is_ok(), "SHA-256 repositories");
+        for (tree, parents) in [
+            (t.clone(), vec!["--output=canary.txt".to_string(), c.clone()]),
+            (t.clone(), vec![c.clone(), "--output=canary.txt".to_string()]),
+            ("--output=x".to_string(), vec![c.clone(), c.clone()]),
+            (t.clone(), vec![c.clone(), "HEAD".to_string()]),
+            (t.clone(), vec![c[..39].to_string(), c.clone()]),
+        ] {
+            let e = check_state_ids(&tree, &parents).unwrap_err();
+            assert!(e.contains("isn't a state GitSwitch saved") && !e.contains("canary"), "{e}");
+        }
+    }
+
     fn save(taken: bool, stale: bool, files: usize, bytes: u64) -> StateIntent {
         StateIntent::Save { taken, stale, sparse: false, index_locked: false, new_files: files, new_bytes: bytes }
     }
@@ -1769,6 +1856,68 @@ mod tests {
         let mut got = in_the_way(&dir, &target, &known, true);
         got.sort();
         assert_eq!(got, vec!["build", "cache", "notes.local"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_state_never_names_a_folder_outside_the_repository() {
+        // `outside` is a repository next to `repo`; a state's message names it
+        // as `../outside`. Nothing may treat it as one of the repository's parts.
+        let base = std::env::temp_dir().join(format!("gitswitch-states-outside-{}", std::process::id()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(base.join("outside").join(".git")).unwrap();
+        // Plain names, but a link (a junction on Windows) to `outside`.
+        crate::paths::test_link_dir(&base.join("outside"), &repo.join("linked"));
+        let subs = vec![SubState { path: "../outside".into(), oid: None }, SubState { path: "linked".into(), oid: None }, SubState { path: "lib".into(), oid: None }];
+
+        let mut out = Vec::new();
+        describe_inner(&repo, &subs, "", &mut out).await;
+        assert_eq!(out.iter().map(|s| s.path.as_str()).collect::<Vec<_>>(), vec!["lib"], "only the plain path inside is described");
+
+        let (mut notes, mut backups) = (Vec::new(), Vec::new());
+        restore_inner(&repo, &subs, &HashMap::new(), "", false, &mut notes, &mut backups).await.unwrap();
+        assert_eq!(notes.len(), 3, "{:?}", notes);
+        assert!(notes[0].starts_with("../outside: ") && notes[0].contains("outside the repository"), "{:?}", notes);
+        assert!(notes[1].starts_with("linked: ") && notes[1].contains("leads outside the repository"), "{:?}", notes);
+        assert!(notes[2].starts_with("lib had no commit yet"), "{:?}", notes);
+        assert!(backups.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Text a saved state carries (its HEAD, its trees) that reaches git as
+    /// a revision is never an option: each runner puts `--end-of-options`
+    /// (git 2.24) right before it, and the file `--output=` names is not
+    /// written. Reached here directly: `check_state_ids` refuses such a
+    /// state before any of them runs.
+    #[tokio::test]
+    async fn a_dash_led_revision_from_a_state_is_never_an_option() {
+        let dir = std::env::temp_dir().join(format!("gitswitch-states-eoo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        run(g(&dir).args(["init", "-q", "-b", "main"])).await.unwrap();
+        run(g(&dir).args(["-c", "user.name=x", "-c", "user.email=x@x.test", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "--no-verify", "-m", "one"])).await.unwrap();
+        std::fs::write(dir.join("canary.txt"), "precious\n").unwrap();
+        let rev = "--output=canary.txt";
+
+        assert_eq!(count(&dir, &[], &[rev]).await, 0);
+        assert_eq!(names(&dir, rev, "HEAD", None).await, 0);
+        assert!(lfs_missing(&dir, rev, "HEAD").await.is_empty());
+        let odd = Saved { oid: format!("eoo-{}", std::process::id()), head: rev.into(), index_tree: rev.into(), worktree_tree: rev.into(), meta: Meta::default() };
+        let _ = describe(&dir, &Slot::parse("1", false, 4).unwrap(), &odd, None).await;
+        // compare's diff-tree runs once HEAD and the index are as saved.
+        let at_head = Saved { head: head_commit(&dir).await.unwrap(), index_tree: run(g(&dir).args(["write-tree"])).await.unwrap(), ..odd.clone() };
+        assert!(compare(&dir, &at_head, Some("main"), "").await.is_err());
+
+        assert_eq!(std::fs::read_to_string(dir.join("canary.txt")).unwrap(), "precious\n", "nothing was written to the file the text names");
+        let ran: Vec<Vec<String>> = crate::git_exec::test_support::ran_under(&dir).into_iter().map(|r| r.args).filter(|a| a.iter().any(|x| x.starts_with(rev))).collect();
+        let subs: Vec<&str> = ran.iter().map(|a| a[0].as_str()).collect();
+        // count, names, lfs_missing; describe: its counts (three) and its log; compare.
+        assert_eq!(subs, vec!["rev-list", "diff-tree", "diff-tree", "diff-tree", "diff-tree", "diff-tree", "log", "diff-tree"], "{:?}", ran);
+        for a in &ran {
+            let at = a.iter().position(|x| x.starts_with(rev)).unwrap();
+            assert_eq!(a[at - 1], "--end-of-options", "{:?}", a);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

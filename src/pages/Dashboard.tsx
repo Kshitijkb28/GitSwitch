@@ -20,9 +20,11 @@ import { Modal } from "../components/Modal";
 import { useProfiles } from "../hooks/useProfiles";
 import { useRefreshOnFocus } from "../lib/focus";
 import * as api from "../lib/api";
+import { useToast } from "../components/Toast";
 
 export function Dashboard() {
   const navigate = useNavigate();
+  const toast = useToast();
   const { profiles, loading, error, refresh } = useProfiles();
   const [deleteTarget, setDeleteTarget] = useState<Profile | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -41,9 +43,14 @@ export function Dashboard() {
   }
 
   async function handleSetDefault(id: string) {
+    const was = profiles.find((p) => p.is_default);
     try {
       setActionError(null);
-      await api.setDefaultProfile(id);
+      const now = await api.setDefaultProfile(id);
+      toast.success(`“${now.name}” is now the default profile`, [
+        was && was.id !== now.id ? `Was “${was.name}”` : "",
+        `Repositories outside every profile's folders commit as ${now.git_name} <${now.git_email}>`,
+      ]);
       await refresh();
     } catch (e) {
       setActionError(String(e));
@@ -52,10 +59,17 @@ export function Dashboard() {
 
   async function handleDelete() {
     if (!deleteTarget) return;
+    const gone = deleteTarget;
     try {
       setActionError(null);
-      await api.deleteProfile(deleteTarget.id);
+      await api.deleteProfile(gone.id);
       setDeleteTarget(null);
+      const left = await api.getProfiles().catch(() => [] as Profile[]);
+      const newDefault = gone.is_default ? left.find((p) => p.is_default) : undefined;
+      toast.success(`Profile “${gone.name}” deleted`, [
+        ...gone.directories.map((d) => `${d} no longer has a profile`),
+        newDefault ? `“${newDefault.name}” is the default profile now` : "",
+      ]);
       await refresh();
     } catch (e) {
       setActionError(String(e));

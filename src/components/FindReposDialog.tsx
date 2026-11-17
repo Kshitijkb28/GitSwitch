@@ -140,7 +140,10 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
         lastAdded = { items: [...(lastAdded?.items ?? []), ...res.added], labels };
         setAdded(lastAdded);
         onAdded();
-        toast.success(`Added ${plural(res.added.length, "repository", "repositories")} to ${res.added.length === 1 ? "its profile" : "their profiles"}`);
+        toast.success(
+          `Added ${plural(res.added.length, "repository", "repositories")} to ${res.added.length === 1 ? "its profile" : "their profiles"}`,
+          res.added.map((a) => `${baseName(a.path)} → ${profileName(profs, a.profile_id)}`)
+        );
       }
       if (res.failed.length) setError(res.failed.map((f) => `${baseName(f.path)}: ${f.why}`).join("\n"));
       const failed = new Set(res.failed.map((f) => f.path));
@@ -268,7 +271,10 @@ export function FindReposDialog({ open, onClose, onAdded }: { open: boolean; onC
       lastAdded = null;
       setAdded(null);
       onAdded();
-      toast.success(`Took ${plural(removed.length, "repository", "repositories")} off again`);
+      toast.success(
+        `Took ${plural(removed.length, "repository", "repositories")} off again`,
+        removed.map((r) => baseName(r.path))
+      );
     } catch (e) {
       setError(clean(e));
     } finally {

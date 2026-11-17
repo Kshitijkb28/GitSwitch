@@ -148,6 +148,33 @@ pub(crate) mod tests {
     /// job's last step, a Repair), `rounds` times, in one process as in the
     /// app: the readings that called a sound lock or block broken, and what the
     /// re-applying could not write.
+    /// The delete approval and the delete, in one process as in the app (the
+    /// approval is kept in this process's memory): the code shown, how the
+    /// wait ended, and what the delete then did (null when it wasn't tried).
+    async fn delete_grant_flow(args: serde_json::Value) {
+        use crate::commands as c;
+        let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (account, owner, name, confirm) = (get("account"), get("owner"), get("name"), get("confirm"));
+        let expect_id = args.get("expectId").and_then(|v| v.as_u64()).unwrap_or(0);
+        let prompt = match c::github_delete_grant_start(account.clone()).await {
+            Ok(p) => p,
+            Err(e) => return reply_err(e.to_string()),
+        };
+        let waited = Box::pin(c::github_delete_grant_wait()).await;
+        let outcome = match &waited {
+            Ok(_) => Some(Box::pin(c::github_delete_repo(account, owner, name, confirm, expect_id)).await.map_err(|e| e.to_string())),
+            Err(_) => None,
+        };
+        emit(&serde_json::json!({
+            "ok": true,
+            "value": {
+                "user_code": prompt.user_code,
+                "waited": waited.map_err(|e| e.to_string()),
+                "outcome": outcome,
+            }
+        }));
+    }
+
     async fn coverage_while_covering(rounds: usize) {
         let path = repo();
         let mut flagged: Vec<String> = Vec::new();
@@ -178,6 +205,7 @@ pub(crate) mod tests {
             Err(e) => return reply_err(format!("PROBE_JSON is not JSON: {}", e)),
         };
         match cmd.as_str() {
+            "github_delete_grant_flow" => Box::pin(delete_grant_flow(args)).await,
             // profiles / repositories
             "get_profiles" => reply(c::get_profiles()),
             "doctor_apply_fix" => forward!(c::doctor_apply_fix, args, fix),
@@ -202,6 +230,8 @@ pub(crate) mod tests {
             "gh_auth_login_cancel" => forward!(c::gh_auth_login_cancel, args),
             "apply_git_config" => reply(c::apply_git_config()),
             "history_list_repos" => forward!(c::history_list_repos, args),
+            "folder_state" => forward!(c::folder_state, args, path),
+            "repo_init" => forward!(c::repo_init, args, path),
             "path_exists" => {
                 let path: String = match arg(&args, "path") { Ok(v) => v, Err(e) => return reply_err(e) };
                 reply(Ok::<_, crate::error::AppError>(c::path_exists(path)))
@@ -221,6 +251,18 @@ pub(crate) mod tests {
             "changes_discard" => forward!(c::changes_discard, args, repo_path, paths),
             "changes_commit" => forward!(c::changes_commit, args, repo_path, message, amend),
             "changes_push" => forward!(c::changes_push, args, repo_path, set_upstream, allow_unpushed_submodules),
+            "changes_add_remote" => forward!(c::changes_add_remote, args, repo_path, url, allow_existing),
+            "changes_change_remote" => forward!(c::changes_change_remote, args, repo_path, remote, from, url, allow_existing),
+            "changes_create_github_repo" => forward!(c::changes_create_github_repo, args, repo_path, account, owner, name, description, private, target),
+            "github_publish_accounts" => forward!(c::github_publish_accounts, args, repo_path),
+            "github_repo_facts" => forward!(c::github_repo_facts, args, account, owner, name, repo_path),
+            "github_set_visibility" => forward!(c::github_set_visibility, args, account, owner, name, private, expect_id),
+            "github_delete_repo" => forward!(c::github_delete_repo, args, account, owner, name, confirm, expect_id),
+            "github_delete_grant_start" => forward!(c::github_delete_grant_start, args, account),
+            "github_delete_grant_wait" => forward!(c::github_delete_grant_wait, args),
+            "github_publish_push_login" => forward!(c::github_publish_push_login, args, repo_path),
+            "github_publish_context" => forward!(c::github_publish_context, args, repo_path),
+            "github_owners" => forward!(c::github_owners, args, account),
             "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash, source),
             "changes_submodule_update" => forward!(c::changes_submodule_update, args, repo_path, paths),
             "changes_submodule_align" => forward!(c::changes_submodule_align, args, repo_path, paths),
@@ -278,6 +320,34 @@ pub(crate) mod tests {
                 let wifi = crate::netspeed::wifi_for_probe();
                 reply(Ok::<_, crate::error::AppError>(serde_json::json!({ "interfaces": b, "rates": rates, "wifi": wifi })))
             }
+            // Read only: the speed as the app works it out, once a second for
+            // `seconds` (at most 60), with what moved through the connection in use.
+            "netspeed_watch" => {
+                let secs = arg::<Option<u64>>(&args, "seconds").ok().flatten().unwrap_or(10).clamp(1, 60);
+                reply(Ok::<_, crate::error::AppError>(crate::netspeed::watch_for_probe(secs)))
+            }
+            // The tab's two calls. Saving without the tray menu's tick, which needs the app.
+            "netspeed_snapshot" => {
+                crate::netspeed::load_for_probe();
+                reply(Ok::<_, crate::error::AppError>(crate::netspeed::snapshot()))
+            }
+            "netspeed_set_settings" => match arg::<crate::netspeed::Settings>(&args, "settings") {
+                Ok(s) => {
+                    crate::netspeed::load_for_probe();
+                    reply(Ok::<_, crate::error::AppError>(crate::netspeed::set_settings_core(s)))
+                }
+                Err(e) => reply_err(e),
+            },
+            // What a start at sign-in decides about the window, for these arguments.
+            "netspeed_start_hidden" => {
+                crate::netspeed::load_for_probe();
+                let argv = arg::<Vec<String>>(&args, "argv").unwrap_or_default();
+                let at_login = crate::netspeed::autostart::launched_at_login(&argv);
+                reply(Ok::<_, crate::error::AppError>(serde_json::json!({
+                    "at_login": at_login,
+                    "hidden": crate::netspeed::autostart::start_hidden(at_login, crate::netspeed::keeps_running()),
+                })))
+            }
             // Read only: this computer's taskbar, its buttons (UI Automation),
             // the free stretches, and where the speed bar would go.
             #[cfg(windows)]
@@ -289,6 +359,10 @@ pub(crate) mod tests {
                 let light = arg::<bool>(&args, "light").unwrap_or(false);
                 reply(Ok::<_, crate::error::AppError>(crate::netspeed::taskbar_show_for(secs, "300 KB/s", "12.4 MB/s", light)))
             }
+            // The real taskbar speed bar, hidden and then moved from outside it
+            // (as Explorer or a display change might): whether it put itself right.
+            #[cfg(windows)]
+            "netspeed_taskbar_heal" => reply(Ok::<_, crate::error::AppError>(crate::netspeed::taskbar_heal_check())),
             "apps_users_of" => match arg::<String>(&args, "path") {
                 Ok(p) => reply(Ok::<_, crate::error::AppError>(crate::apps::users_of(std::path::Path::new(&p)))),
                 Err(e) => reply_err(e),
@@ -436,6 +510,13 @@ pub(crate) mod tests {
             let trace = crate::sparse::progress_trace().lock().map(|t| t.clone()).unwrap_or_default();
             let _ = std::fs::write(path, serde_json::to_string(&trace).unwrap_or_else(|_| "[]".into()));
         }
+        // Every git command the op ran, with the class the runner gave it
+        // (scripts/verify/hostile.sh: a passive entry point runs passive
+        // commands only).
+        if let Ok(path) = std::env::var("PROBE_CLASS_FILE") {
+            let ran = crate::git_exec::test_support::ran_all();
+            let _ = std::fs::write(path, serde_json::to_string(&ran).unwrap_or_else(|_| "[]".into()));
+        }
         // What a poll for this path would read now that the op is over: an
         // entry left behind would open the next download on this one's line.
         if let (Ok(file), Ok(path)) = (std::env::var("PROBE_LEFT_FILE"), std::env::var("PROBE_LEFT_FOR")) {
@@ -488,7 +569,10 @@ pub(crate) mod tests {
                 let url = a.get(1).cloned().unwrap_or_default();
                 let guard = crate::sparse::CloneGuard::hold(std::path::Path::new(&dest), &url);
                 let during = crate::remote_repos::local_clones().await.ok();
-                let picker: Vec<String> = crate::git_history::list_repos().await.map(|v| v.into_iter().map(|r| r.path).collect()).unwrap_or_default();
+                let picker: Vec<String> = crate::git_history::list_repos()
+                    .await
+                    .map(|v| v.into_iter().filter(|r| r.kind == crate::git_history::RepoKind::Repo).map(|r| r.path).collect())
+                    .unwrap_or_default();
                 drop(guard);
                 let after = crate::remote_repos::local_clones().await.ok();
                 emit(&serde_json::json!({ "during": during, "picker": picker, "after": after }));

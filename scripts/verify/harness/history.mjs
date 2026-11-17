@@ -65,10 +65,14 @@ async function openHistoryPage(browser, server, opts = {}) {
     repos: opts.repos ?? null,
     /** changes_repo_status answers with the path it was asked about, as the backend does. */
     statusEchoesPath: opts.statusEchoesPath ?? false,
+    /** What changes_repo_status answers once a test sets window.__STATUS_MODE__ = "later". */
+    statusLater: opts.statusLater ?? null,
     /** changes_submodules per repository: { "/repos/gitswitch": [...], "/repos/gitswitch/trinity": [...] }. */
     submodulesByPath: opts.submodulesByPath ?? null,
     /** What a clone made from the Clone page returns, for a hand-off test. */
     cloneResult: opts.cloneResult ?? null,
+    /** history_page rejects with this text (a refusal of the backend's), when set. */
+    historyPageError: opts.historyPageError ?? null,
     /** The Repositories page's listing: { repos, clones, pathExists }. */
     remote: opts.remote ?? null,
     peek: opts.peek ?? { branch: "main", upstream: "origin/main", remote: "origin", remote_tip: "440d0af1234567890abcdef1234567890abcdef12", known_tip: "e81d1c51234567890abcdef1234567890abcdef12", changed: true, branch_gone: false, new_commits: 3, counted_by: "github", message: "3 new commits on origin/main since your last fetch (440d0af). Nothing was downloaded — Fetch to see them." },
@@ -140,6 +144,7 @@ async function openHistoryPage(browser, server, opts = {}) {
             case "history_branches":
               return Promise.resolve(cfg.branches);
             case "history_page":
+              if (cfg.historyPageError) return Promise.reject(cfg.historyPageError);
               // A test changes what a given page holds by setting window.__PAGES__[offset].
               return Promise.resolve(window.__PAGES__?.[args.offset] ?? cfg.historyPage ?? fx.historyPage);
             case "history_authors":
@@ -159,6 +164,10 @@ async function openHistoryPage(browser, server, opts = {}) {
             case "history_fetch":
               return Promise.resolve({ message: "fetched", head_unchanged: true, worktree_unchanged: true, local_branches_unchanged: true, updated_remote_refs: 0 });
             case "changes_repo_status":
+              // A test turns the working tree's status slow, broken or changed from here on.
+              if (window.__STATUS_MODE__ === "hang") return new Promise(() => {});
+              if (window.__STATUS_MODE__ === "fail") return Promise.reject("git status timed out");
+              if (window.__STATUS_MODE__ === "later") return Promise.resolve(cfg.statusLater);
               return Promise.resolve(cfg.statusEchoesPath ? { ...cfg.status, path: args.repoPath } : cfg.status);
             case "history_head":
               return Promise.resolve({ branch: cfg.status.branch, detached: cfg.status.detached, unborn: cfg.status.unborn });
@@ -561,12 +570,17 @@ try {
 
   // -----------------------------------------------------------------
   section("Go back: drop everything after it asks first");
+  // The confirmation reads the tree when it opens; until that answer is in it
+  // shows the loading state, so a check made before it would see that instead.
+  const waitStatusRead = (page) =>
+    page.waitForFunction(() => !document.body.innerText.includes("Checking for uncommitted changes"), { timeout: 4000 });
   {
     const page = await open({ status: STATUS_DIRTY });
     await openPanel(page, C2);
     await openChooser(page);
     ok("Do it on the hard row", await clickInRow(page, "drop everything after it", { text: "Do it" }));
     await page.waitForFunction(() => document.body.innerText.includes("Move main back to"), { timeout: 4000 });
+    await waitStatusRead(page);
     let s = await text(page);
     ok(`it asks "Move main back to ${SHORT}?"`, s.includes(`Move main back to ${SHORT}?`));
     ok("  naming the 4 commits that would leave", s.includes("The 4 commits after it leave the branch."));
@@ -587,6 +601,13 @@ try {
 
     await clickInRow(page, "drop everything after it", { text: "Do it" });
     await page.waitForFunction(() => document.body.innerText.includes("Move main back to"), { timeout: 4000 });
+    await waitStatusRead(page);
+    await sleep(50);
+    // The tree is read again for every confirmation, and a cancelled one's choice is not kept.
+    const again = await page.$('input[aria-label="Stash uncommitted changes first"]');
+    ok("opened again, the stash checkbox is ticked again", again !== null && (await again.evaluate((el) => el.checked)));
+    await again?.click();
+    await sleep(50);
     await (await button(page, "Move main back")).click();
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_reset"), { timeout: 4000 });
     const r = await lastCall(page, "changes_reset");
@@ -597,13 +618,71 @@ try {
   {
     const page = await open({ status: STATUS_CLEAN });
     await openPanel(page, C2);
+    const readsBefore = (await calls(page, "changes_repo_status")).length;
     await openChooser(page);
+    await sleep(100);
+    ok("Go back alone reads no status: only the confirmation needs it", (await calls(page, "changes_repo_status")).length === readsBefore);
     await clickInRow(page, "drop everything after it", { text: "Do it" });
     await page.waitForFunction(() => document.body.innerText.includes("Move main back to"), { timeout: 4000 });
+    await waitStatusRead(page);
+    ok("  the confirmation reads it once", (await calls(page, "changes_repo_status")).length === readsBefore + 1);
     ok("a clean tree has no stash checkbox", (await page.$('input[aria-label="Stash uncommitted changes first"]')) === null);
     await (await button(page, "Move main back")).click();
     await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_reset"), { timeout: 4000 });
     ok("  and resets without a stash", (await lastCall(page, "changes_reset"))?.args.stashFirst === false);
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Go back: a working tree not read yet, or not readable, may hold changes");
+  const STASH_BOX = 'input[aria-label="Stash uncommitted changes first"]';
+  const openHardConfirmWith = async (page, mode) => {
+    await openPanel(page, C2);
+    await openChooser(page);
+    await page.evaluate((m) => { window.__STATUS_MODE__ = m; }, mode);
+    await clickInRow(page, "drop everything after it", { text: "Do it" });
+    await page.waitForFunction(() => document.body.innerText.includes("Move main back to"), { timeout: 4000 });
+    await sleep(100);
+  };
+  {
+    const page = await open({ status: STATUS_DIRTY });
+    await openHardConfirmWith(page, "hang");
+    const s = await text(page);
+    ok("while the status is on its way, the dialog says it is checking", s.includes("Checking for uncommitted changes"));
+    const cb = await page.$(STASH_BOX);
+    ok("  the stash checkbox is there, ticked", cb !== null && (await cb.evaluate((el) => el.checked)));
+    ok("  and Move main back waits for the answer", await (await button(page, "Move main back")).evaluate((b) => b.disabled));
+    await page.close();
+  }
+  {
+    // Clean until the confirmation opens; the read it makes fails.
+    const page = await open({ status: STATUS_CLEAN });
+    await openHardConfirmWith(page, "fail");
+    await page.waitForFunction(() => document.body.innerText.includes("could not read the working tree"), { timeout: 4000 }).catch(() => null);
+    let s = await text(page);
+    ok("a status that could not be read is said so", s.includes("GitSwitch could not read the working tree, so it may hold uncommitted changes."));
+    const cb = await page.$(STASH_BOX);
+    ok("  the stash checkbox is there, ticked", cb !== null && (await cb.evaluate((el) => el.checked)));
+    ok("  and Move main back can still be chosen", !(await (await button(page, "Move main back")).evaluate((b) => b.disabled)));
+    await cb?.click();
+    await sleep(50);
+    s = await text(page);
+    ok("  unticking it warns that any changes are thrown away", s.includes("Without stashing, any uncommitted changes are thrown away. That cannot be undone."));
+    await (await page.$(STASH_BOX))?.click();
+    await sleep(50);
+    await (await button(page, "Move main back")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_reset"), { timeout: 4000 });
+    ok("  ticked again, the reset is sent with the stash", (await lastCall(page, "changes_reset"))?.args.stashFirst === true);
+    await page.close();
+  }
+  {
+    // Clean when the page loaded; edited before the confirmation.
+    const page = await open({ status: STATUS_CLEAN, statusLater: STATUS_DIRTY });
+    await openHardConfirmWith(page, "later");
+    await waitStatusRead(page);
+    const cb = await page.$(STASH_BOX);
+    ok("edits made after Go back are seen: the confirmation re-reads the tree and offers the stash", cb !== null && (await cb.evaluate((el) => el.checked)));
+    ok("  from a status it read, not one still on its way", !(await (await button(page, "Move main back")).evaluate((b) => b.disabled)));
     await page.close();
   }
 
@@ -1108,6 +1187,17 @@ try {
       state.where === "/repo/history" && state.path === "/repos/argos" && state.account === "", JSON.stringify(state));
     ok("  and reads it on all branches, not on a branch remembered from another repository",
       state.pages.length > 0 && state.pages.every((p) => p === "/repos/argos --all"), JSON.stringify(state.pages));
+    await page.close();
+  }
+
+  section("A page the backend refused to read says why, never an empty history");
+  {
+    const refusal = "GitSwitch did not run git rev-list: this repository is a partial clone whose own settings name core.sshCommand, which git would run to fetch a missing object on its own, and a command the app makes on its own never runs a program a repository names. Run it from a terminal, or move the setting into your profile.";
+    const page = await open({ historyPageError: refusal });
+    await page.waitForFunction(() => document.body.innerText.includes("core.sshCommand"), { timeout: 4000 }).catch(() => {});
+    const s = await text(page);
+    ok("the refusal is on the page, naming the setting", s.includes("partial clone whose own settings name core.sshCommand"), s.slice(0, 400));
+    ok("  and the page does not claim there are no commits", !s.includes("No commits"), s.slice(0, 400));
     await page.close();
   }
 

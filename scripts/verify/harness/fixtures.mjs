@@ -400,6 +400,18 @@ export const SCENARIOS = {
     untracked_count: 1,
   }),
 
+  // `git mv src/old.ts src/new.ts`, then an edit to src/new.ts: one entry under
+  // the new name, staged as a rename and listed as not staged too (where the
+  // Discard button is).
+  renamed: status({
+    entries: [
+      entry({ path: "src/new.ts", orig_path: "src/old.ts", staged: "R", unstaged: "M", rename_score: 100, staged_added: 0, staged_removed: 0 }),
+      entry({ path: "src/mod.ts" }),
+    ],
+    staged_count: 1,
+    unstaged_count: 2,
+  }),
+
   diverged: status({ ahead: 2, behind: 3 }),
   behindOnly: status({ behind: 4 }),
 
@@ -532,6 +544,8 @@ export const SCENARIOS = {
   }),
 
   unpublished: status({ upstream: null, ahead: 2, last_fetch_secs: null }),
+  // A repository made here: no remote at all, so Publish asks for an address.
+  noRemote: status({ upstream: null, ahead: 0, last_fetch_secs: null, push: push({ remotes: [] }) }),
 
   truncated: status({
     entries: [entry({ path: "junk.txt", kind: "untracked", staged: ".", unstaged: "?" })],

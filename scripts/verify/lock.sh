@@ -371,7 +371,9 @@ if [ "$PLAT" = windows ]; then
 else
   # A dangling symlink: the refusal comes from the system-scope rewrite and
   # needs no program at all; only the wording is git's.
-  ok "  the lock itself still holds" "$P" "remote helper 'gitswitch-push-blocked' aborted session"
+  # git's words for a helper that is gone: "remote helper … aborted session",
+  # or from an older git (2.34) "'remote-…' is not a git command".
+  ok "  the lock itself still holds" "$(printf '%s' "$P" | grep -qE "remote helper 'gitswitch-push-blocked' aborted session|'remote-gitswitch-push-blocked' is not a git command" && echo refused)" "refused"
   ok "  (with git's wording, since the explaining program is gone)" "$P" "rc=128"
   ok "  the state reports the explanation as missing too" "$(printf '%s' "$OUT" | jqf lock.remote_helper)" "missing"
 fi

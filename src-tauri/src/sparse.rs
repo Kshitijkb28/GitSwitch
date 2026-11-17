@@ -377,34 +377,21 @@ async fn run_git_streaming(
     on_progress: &(dyn Fn(CloneProgress) + Sync),
 ) -> Result<String, AppError> {
     use tokio::io::AsyncReadExt;
-    let mut cmd = crate::spawn::async_command("git");
-    if let Some(dir) = repo {
-        cmd.current_dir(dir);
-    }
-    for (key, value) in crate::git_exec::hardened_env() {
-        match value {
-            Some(v) => {
-                cmd.env(key, v);
-            }
-            None => {
-                cmd.env_remove(key);
-            }
-        }
-    }
-    for key in crate::git_exec::inherited_git_env_to_strip() {
-        cmd.env_remove(key);
-    }
+    // The one runner's arguments and environment, its whole process tree
+    // killable (a stalled download's helpers go with it); only the clock and
+    // the reading of progress are this function's own.
+    let mut git = match repo {
+        Some(dir) => crate::git_exec::GitCmd::at(dir),
+        None => crate::git_exec::GitCmd::without_repo(),
+    };
     for kv in cfg {
-        cmd.arg("-c").arg(kv);
+        git = git.cfg_raw(kv);
     }
-    cmd.args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    // Its own process group, so a stalled download's helpers go with it.
-    #[cfg(unix)]
-    cmd.process_group(0);
+    let git = git.args(args.iter().copied()).settled().await?;
+    // As `run` does: what was read of this folder while a write ran (a
+    // half-downloaded submodule) is forgotten once it is over.
+    let _forget = git.forget_when_done();
+    let (mut cmd, argv) = git.prepare();
     let started = std::time::Instant::now();
     let mut child = cmd.spawn().map_err(|e| AppError::Command(format!("Failed to run git: {}", e)))?;
     #[cfg(windows)]
@@ -502,7 +489,7 @@ async fn run_git_streaming(
         let secs = stall.unwrap_or_default().as_secs();
         crate::cmdlog::record(
             repo.unwrap_or(Path::new(".")),
-            std::iter::once("git".to_string()).chain(cfg.iter().flat_map(|kv| ["-c".to_string(), kv.clone()])).chain(args.iter().map(|a| a.to_string())).collect(),
+            argv,
             -9,
             started.elapsed(),
             "",
@@ -520,7 +507,7 @@ async fn run_git_streaming(
     let stdout_text = out_task.await.unwrap_or_default();
     crate::cmdlog::record(
         repo.unwrap_or(Path::new(".")),
-        std::iter::once("git".to_string()).chain(cfg.iter().flat_map(|kv| ["-c".to_string(), kv.clone()])).chain(args.iter().map(|a| a.to_string())).collect(),
+        argv,
         status.code().unwrap_or(-1),
         started.elapsed(),
         &stdout_text,
@@ -615,39 +602,27 @@ async fn size_estimate(url: &str, accounts: Option<&[String]>) -> Option<CloneSi
 }
 
 async fn run_git(repo: Option<&Path>, args: &[&str]) -> Result<String, AppError> {
-    let mut cmd = crate::spawn::async_command("git");
-    if let Some(dir) = repo {
-        cmd.current_dir(dir);
+    // The one runner: no prompt can hang it (no terminal exists for a GUI
+    // app), and it has a clock. Materialising a work tree can be a download
+    // — a partial clone fetches the blobs it now needs, Git LFS's smudge
+    // filter the large files — so `sparse-checkout` and `checkout` get the
+    // large-file ceiling, like the clone they finish; the rest is local.
+    let cmd = match repo {
+        Some(dir) => crate::git_exec::GitCmd::at(dir),
+        None => crate::git_exec::GitCmd::without_repo(),
+    };
+    let timeout = match args.first() {
+        Some(&"sparse-checkout") | Some(&"checkout") => crate::git_exec::LFS_TIMEOUT,
+        _ => crate::git_exec::LOCAL_TIMEOUT,
+    };
+    // Boxed: this is awaited deep in the submodule download chain, and the
+    // runner's state (child, pipes, clock, tree kill) inline in that chain
+    // is the shape that has overflowed a 2 MiB stack before.
+    let out = Box::pin(cmd.args(args.iter().copied()).timeout(timeout).run()).await?;
+    if !out.ok() {
+        return Err(AppError::Command(format!("git {} failed: {}", args.first().unwrap_or(&""), out.stderr)));
     }
-    // No terminal exists for a GUI app, so an HTTPS credential prompt would
-    // hang forever — make git fail fast with a readable error instead.
-    let started = std::time::Instant::now();
-    let output = cmd
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| AppError::Command(format!("Failed to run git: {}", e)))?;
-    // This runner takes its repository through `current_dir` rather than `-C`,
-    // so the log is told where it ran separately from the argv.
-    crate::cmdlog::record(
-        repo.unwrap_or(Path::new(".")),
-        std::iter::once("git".to_string()).chain(args.iter().map(|a| a.to_string())).collect(),
-        output.status.code().unwrap_or(-1),
-        started.elapsed(),
-        &String::from_utf8_lossy(&output.stdout),
-        &String::from_utf8_lossy(&output.stderr),
-    );
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::Command(format!(
-            "git {} failed: {}",
-            args.first().unwrap_or(&""),
-            stderr.trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(out.trimmed())
 }
 
 /// Derive the repo folder name from a clone URL (strip .git, take last segment).
@@ -1027,12 +1002,20 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
         Some(want) => listed.into_iter().filter(|(_, p)| want.iter().any(|w| crate::paths::norm(w) == crate::paths::norm(p))).collect(),
         None => listed,
     };
+    // The name and path are the repository author's text, and both are joined
+    // onto the repository below, to find a module directory and to clear an
+    // interrupted download's leftovers: a name like `../../..` put that delete
+    // outside the repository. Such an entry is refused, never downloaded
+    // (git itself ignores a submodule name with `..` in it), and the report
+    // says so.
+    let (listed, refused): (Vec<_>, Vec<_>) =
+        listed.into_iter().partition(|(n, p)| crate::paths::is_plain_relative(n) && crate::paths::is_plain_relative(p));
     let mut report = SubmoduleReport {
-        listed: listed.len(),
+        listed: listed.len() + refused.len(),
         downloaded: 0,
         unlisted,
-        failed_paths: Vec::new(),
-        error: None,
+        failed_paths: refused.iter().map(|(_, p)| p.clone()).collect(),
+        error: (!refused.is_empty()).then(|| refused_entries(&refused)),
         cleared: Vec::new(),
     };
     // Leave the repo exactly as `git clone --recurse-submodules` does: every
@@ -1042,6 +1025,27 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
     let _ = run_git(Some(repo), &["config", "submodule.active", "."]).await;
     if listed.is_empty() {
         return report;
+    }
+    // A modules folder that is there but leads out of the repository's git
+    // directory (`.git/modules` a link or a junction; an archive can carry
+    // one): git's own `submodule update` would write through it — it removes
+    // `index` and writes `core.worktree` into a module directory it finds
+    // there — and clear_incomplete clears nothing below it. Nothing is
+    // downloaded, and the report says why. One not made yet is git's to make.
+    if let Some((base, false)) = modules_folder(repo).await {
+        if std::fs::symlink_metadata(&base).is_ok() {
+            let paths: Vec<String> = listed.iter().map(|(_, p)| p.clone()).collect();
+            let said = format!(
+                "Not downloaded: {}. This repository's .git/modules leads outside its git folder (a link or a junction), so GitSwitch will not let git write there. Replace the link with a folder of its own, then Download again.",
+                paths.join(", ")
+            );
+            report.failed_paths.extend(paths);
+            report.error = Some(match report.error.take() {
+                Some(refusal) => format!("{}\n\n{}", refusal, said),
+                None => said,
+            });
+            return report;
+        }
     }
 
     // One submodule per git call. In a single batch, one refused submodule
@@ -1155,14 +1159,15 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
                     Some(sha) => have_recorded(sha.clone()).await,
                     None => false,
                 };
-                // Already here: what is recorded is checked out whatever
-                // `submodule.<name>.update` says — merge, rebase or none
-                // would make "Update to" a merge commit inside it, a rebase,
-                // or nothing at all.
-                let mut update = vec!["submodule", "update", "--init", "--recursive", "--progress"];
+                // What is recorded is checked out whatever
+                // `submodule.<name>.update` says. Already here, merge, rebase
+                // or none would make "Update to" a merge commit inside it, a
+                // rebase, or nothing at all; on a first download git turns
+                // those into a checkout by itself but would still run an
+                // `update = !command` from the repository's own config.
+                let mut update = vec!["submodule", "update", "--init", "--recursive", "--progress", "--checkout"];
                 let mut update_cfg = cfg.clone();
                 if downloaded {
-                    update.push("--checkout");
                     // And a nested one set to `update = merge` can only
                     // fast-forward: one with commits of its own fails with
                     // git's words instead of getting a merge commit.
@@ -1215,14 +1220,19 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
     if let Some(dest) = progress_for {
         set_progress(dest, CloneProgress::submodules(listed.len(), listed.len(), None));
     }
-    report.failed_paths = failed.clone();
+    report.failed_paths.extend(failed.iter().cloned());
     if let Some(err) = first_error {
-        report.error = Some(format!(
+        let said = format!(
             "Couldn't download: {}.\n\n{}\n\nOnce that's sorted, Download on the repository's Submodules tab fetches {} — what already arrived is kept (in a terminal: `git submodule update --init --recursive`).",
             failed.join(", "),
             err,
             if failed.len() == 1 { "it" } else { "them" }
-        ));
+        );
+        // After the refusal of an entry that is not plain, when there was one.
+        report.error = Some(match report.error.take() {
+            Some(refusal) => format!("{}\n\n{}", refusal, said),
+            None => said,
+        });
     }
     let mut downloaded = 0;
     for (_, path) in &listed {
@@ -1234,6 +1244,40 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
     report
 }
 
+/// What the report says of `.gitmodules` entries whose name or path is not
+/// plain folder names: (name, path) each.
+fn refused_entries(refused: &[(String, String)]) -> String {
+    let each: Vec<String> = refused.iter().map(|(n, p)| if n == p { format!("`{}`", p) } else { format!("`{}` (named `{}`)", p, n) }).collect();
+    let (entry, is) = if refused.len() == 1 { ("Its name or path", "is") } else { ("Their names or paths", "are") };
+    format!(
+        "Not downloaded: {}. {} in .gitmodules {} not plain folder names (it has `..`, `.`, an empty part, a leading `/`, a drive or a backslash), so GitSwitch will not use it as a folder; git itself refuses a name with `..`. Ask whoever maintains the repository to fix .gitmodules.",
+        each.join(", "),
+        entry,
+        is
+    )
+}
+
+/// The repository's modules folder as git names it (`rev-parse --git-path
+/// modules`), and whether it lies strictly inside the repository's common git
+/// directory (`rev-parse --git-common-dir`, git 2.5; resolved against the
+/// repository when relative), as the disk resolves both. False when either
+/// cannot be resolved (a folder not made yet, a link that leads nowhere).
+/// `None` when git cannot say.
+async fn modules_folder(repo: &Path) -> Option<(PathBuf, bool)> {
+    let resolve = |m: String| {
+        let m = m.trim().to_string();
+        if Path::new(&m).is_absolute() {
+            PathBuf::from(m)
+        } else {
+            repo.join(m)
+        }
+    };
+    let base = resolve(run_git(Some(repo), &["rev-parse", "--git-path", "modules"]).await.ok()?);
+    let common = resolve(run_git(Some(repo), &["rev-parse", "--git-common-dir"]).await.ok()?);
+    let inside = crate::paths::strictly_inside(&base, &common);
+    Some((base, inside))
+}
+
 /// A submodule counts as downloaded only if its files are actually there:
 /// cloned-but-never-checked-out leaves `.git` with an empty folder.
 /// An interrupted download leaves a `.git` entry in the folder and a module
@@ -1241,9 +1285,20 @@ pub(crate) async fn update_submodules(repo: &Path, ssh_override: Option<&str>, k
 /// a folder. When nothing of it holds a commit — nothing to lose — the
 /// leftovers are removed so the download starts afresh. The path, when it did.
 async fn clear_incomplete(repo: &Path, name: &str, path: &str) -> Option<String> {
+    // Both from .gitmodules: update_submodules refuses an entry that is not
+    // plain names before it gets here; checked again because what follows
+    // deletes, and only ever inside the repository.
+    if !crate::paths::is_plain_relative(name) || !crate::paths::is_plain_relative(path) {
+        return None;
+    }
     let dir = repo.join(path);
     let gitfile = dir.join(".git");
     if !gitfile.exists() {
+        return None;
+    }
+    // A folder (or a `.git` in it) that is a link to somewhere else resolves
+    // outside the work tree: nothing there is ours to clear.
+    if !crate::paths::strictly_inside(&gitfile, repo) {
         return None;
     }
     if run_git(Some(&dir), &["rev-parse", "--verify", "--quiet", "HEAD"]).await.is_ok() {
@@ -1284,11 +1339,27 @@ async fn clear_incomplete(repo: &Path, name: &str, path: &str) -> Option<String>
                 .unwrap_or(false);
         !has_refs && !has_objects
     };
-    let modules = run_git(Some(repo), &["rev-parse", "--git-path", &format!("modules/{}", name)]).await.ok().map(|s| s.trim().to_string());
-    if let Some(m) = modules {
-        let mp = if Path::new(&m).is_absolute() { PathBuf::from(&m) } else { repo.join(&m) };
+    let git_path = |rel: String| async move {
+        let m = run_git(Some(repo), &["rev-parse", "--git-path", &rel]).await.ok()?.trim().to_string();
+        Some(if Path::new(&m).is_absolute() { PathBuf::from(&m) } else { repo.join(&m) })
+    };
+    if let Some(mp) = git_path(format!("modules/{}", name)).await {
         if mp.exists() {
-            if !commitless(mp.clone()).await {
+            // git prints `modules/<name>` as given, `..` and all: the module
+            // directory is cleared only when the disk puts it inside the
+            // repository's own modules folder, and that folder inside the
+            // repository's git directory. The repository decides what
+            // `.git/modules` is: a link there resolves both paths through the
+            // same link, so the first check alone holds wherever it points.
+            // The common git directory (`--git-common-dir`, git 2.5) holds the
+            // modules folder of a linked worktree, of a superproject that is
+            // itself a submodule (under its parent's `.git/modules`) and of a
+            // `.git` file naming a separate git directory alike.
+            let inside = match modules_folder(repo).await {
+                Some((base, true)) => crate::paths::strictly_inside(&mp, &base),
+                _ => false,
+            };
+            if !inside || !commitless(mp.clone()).await {
                 return None;
             }
             let _ = std::fs::remove_dir_all(&mp);
@@ -1462,15 +1533,30 @@ pub(crate) fn network_failure(stderr: &str) -> Option<String> {
 }
 
 /// Turn git/ssh's terse failures into something that says what to do — for
-/// the Clone page, where "Clone as" chooses the account.
+/// the Clone page, where "Clone as" chooses the account. The clone itself
+/// calls `explain_clone_error_as`, which can name the account; this is the
+/// tests' shorthand for it without one.
+#[cfg(test)]
 pub(crate) fn explain_clone_error(stderr: &str, key: Option<&str>, url: &str) -> String {
     explain_transport_error(stderr, key, url, true)
+}
+
+/// `explain_clone_error`, naming the GitHub account the key signs in as.
+pub(crate) fn explain_clone_error_as(stderr: &str, key: Option<&str>, url: &str, login: Option<&str>) -> String {
+    explain_transport_error_as(stderr, key, url, true, login)
 }
 
 /// The same for any operation on the network. `for_clone`: the advice may
 /// point at the Clone page's "Clone as"; otherwise the folder's own profile
 /// decides the account, and the advice says so.
 pub(crate) fn explain_transport_error(stderr: &str, key: Option<&str>, url: &str, for_clone: bool) -> String {
+    explain_transport_error_as(stderr, key, url, for_clone, None)
+}
+
+/// `explain_transport_error`, naming the GitHub account the key signs in as
+/// (`login`, when known) where that is the point: an account that cannot see
+/// the repository.
+pub(crate) fn explain_transport_error_as(stderr: &str, key: Option<&str>, url: &str, for_clone: bool, login: Option<&str>) -> String {
     let key_name = key.map(crate::paths::base_name);
     let the_key = match &key_name {
         Some(k) => format!("the SSH key {}", k),
@@ -1503,11 +1589,46 @@ pub(crate) fn explain_transport_error(stderr: &str, key: Option<&str>, url: &str
         } else {
             format!("GitHub refused {}. Either it isn't registered on the GitHub account, or the organization doesn't accept it (see below). Register it from SSH Keys, or check in Profiles which profile this folder belongs to — its key is the one used here.", the_key)
         }
-    } else if stderr.contains("Repository not found") || stderr.contains("Could not read from remote repository") {
+    } else if stderr.contains("does not appear to be a git repository") {
+        format!("There's no repository at this address. Check it for a typo; for a folder, it must be the repository's own folder. Then {}.", then)
+    } else if missing_own_repository(stderr, url, login) {
+        // An account sees its own repositories, private ones included, and no
+        // organization's app restriction applies to them: GitHub saying one
+        // isn't there for its owner means it doesn't exist (not yet, or not
+        // any more), not that access is missing.
+        let full = crate::repo_scan::parse_github_owner_name(url).map(|(o, n)| format!("{}/{}", o, n)).unwrap_or_default();
+        let l = login.unwrap_or_default();
         if for_clone {
-            format!("GitHub accepted {}, but that account can't see this repository. Check the URL, or under \"Clone as\" pick the profile whose account has access (e.g. your company profile for a company repo).", the_key)
+            format!("There's no repository {} on GitHub: {} signs in as {}, who would see it even if it were private. The address is wrong, or the repository was deleted: copy the address again from its page (the green Code button).", full, the_key, l)
         } else {
-            format!("GitHub accepted {}, but that account can't see this repository. Check the remote's address, or check in Profiles that this folder belongs to the profile whose account has access.", the_key)
+            format!("There's no repository {} on GitHub: {} signs in as {}, who would see it even if it were private. If it's new, create it on GitHub (empty: no README, licence or .gitignore), then {}; otherwise the address is wrong, or the repository was deleted.", full, the_key, l, then)
+        }
+    } else if stderr.contains("Repository not found") || stderr.contains("Could not read from remote repository") {
+        // Not the account's own: the address, the access, or (on GitHub) an
+        // organization that hides its private repositories from keys an app
+        // added. The address comes first: GitHub says the same words for a
+        // repository that doesn't exist.
+        let on_github = crate::repo_scan::parse_github_owner_name(url).is_some();
+        let server = if on_github { "GitHub" } else { "The server" };
+        let who = match login {
+            Some(l) => format!("{} accepted {}, which signs in as {}, but said this repository isn't there for it.", server, the_key, l),
+            None => format!("{} accepted {}, but said this repository isn't there for its account.", server, the_key),
+        };
+        let account = login.map(String::from).unwrap_or_else(|| "the account".to_string());
+        let invitation = match login {
+            Some(l) => format!("the invitation was never accepted (accept it while signed in as {})", l),
+            None => "the invitation was never accepted".to_string(),
+        };
+        let apps = if on_github {
+            ", or the repository belongs to an organization that restricts third-party apps (GitHub's default for new organizations), which hides its private repositories from keys an app added to the account (GitSwitch used to, when it registered a key with its own sign-in). For that one, on GitHub: in Settings → SSH and GPG keys, delete this key and add it again by hand (New SSH key, paste the .pub file), or ask the organization to approve GitSwitch."
+        } else {
+            "."
+        };
+        let why = format!("Either it doesn't exist (check the address), or {} has no access to it: {}{}", account, invitation, apps);
+        if for_clone {
+            format!("{} {} If your access is on another GitHub account, add a profile for that account (with an SSH key registered on it), then pick it under \"Clone as\".", who, why)
+        } else {
+            format!("{} {} Or check in Profiles that this folder belongs to the profile whose account has access.", who, why)
         }
     } else if stderr.contains("could not read Username") || stderr.contains("terminal prompts disabled") {
         "This HTTPS URL needs a username and password, which GitSwitch can't type in for you. Use the SSH URL (git@github.com:owner/repo.git) instead.".to_string()
@@ -1535,6 +1656,36 @@ pub(crate) fn explain_transport_error(stderr: &str, key: Option<&str>, url: &str
     } else {
         format!("{}\n\ngit said: {}", hint.trim_start(), stderr.trim())
     }
+}
+
+/// GitHub said a repository under `login`'s own account isn't there: it
+/// doesn't exist. An account sees its own repositories, private ones
+/// included, and no organization's app restriction applies to them.
+pub(crate) fn missing_own_repository(stderr: &str, url: &str, login: Option<&str>) -> bool {
+    stderr.contains("Repository not found")
+        && match (crate::repo_scan::parse_github_owner_name(url), login) {
+            (Some((owner, _)), Some(l)) => owner.eq_ignore_ascii_case(l),
+            _ => false,
+        }
+}
+
+/// GitHub's new-repository form, filled in with `url`'s owner and name and
+/// set to private (the person can change both there), or None when `url`
+/// isn't a GitHub address with a plain owner and name.
+pub(crate) fn github_create_url(url: &str) -> Option<String> {
+    let (owner, name) = crate::repo_scan::parse_github_owner_name(url)?;
+    let plain = |s: &str| !s.is_empty() && s.len() <= 100 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    (plain(&owner) && plain(&name)).then(|| format!("https://github.com/new?owner={}&name={}&visibility=private", owner, name))
+}
+
+/// A failure that can mean the address itself is wrong: no repository
+/// there, or no such server.
+pub(crate) fn address_may_be_wrong(stderr: &str) -> bool {
+    stderr.contains("Repository not found")
+        || stderr.contains("does not appear to be a git repository")
+        || stderr.contains("Could not resolve hostname")
+        || stderr.contains("Could not resolve host:")
+        || (stderr.contains("fatal: repository '") && stderr.contains("' not found"))
 }
 
 #[derive(Debug, Serialize)]
@@ -1665,10 +1816,21 @@ async fn clone_as_profile(
     if let Some(t) = asking {
         t.abort();
     }
-    cloned.map_err(|e| match e {
-        AppError::Command(msg) => AppError::Command(explain_clone_error(&msg, key.as_deref(), url)),
-        other => other,
-    })?;
+    if let Err(e) = cloned {
+        return Err(match e {
+            AppError::Command(msg) => {
+                // An account that can't see the repository: which account it
+                // is, asked of GitHub with the same key (a few seconds, and
+                // only now that the clone has failed).
+                let login = match key.as_deref() {
+                    Some(k) if msg.contains("Repository not found") && url.contains("github.com") => Box::pin(crate::ssh_keys::github_login_of_key(k)).await,
+                    _ => None,
+                };
+                AppError::Command(explain_clone_error_as(&msg, key.as_deref(), url, login.as_deref()))
+            }
+            other => other,
+        });
+    }
 
     // The main clone succeeded; submodule trouble is reported, not fatal —
     // the repo is usable and `git submodule update` can be retried.
@@ -1880,6 +2042,18 @@ pub async fn sparse_add(repo_path: &str, dirs: Vec<String>) -> Result<(), AppErr
 mod tests {
     use super::*;
 
+    /// Both clone-side runners are the one runner: the plain one entirely,
+    /// the progress reader through its arguments and environment.
+    #[tokio::test]
+    async fn the_clone_runners_go_through_gitcmd() {
+        use crate::git_exec::test_support::{assert_hardened, SHOW_ENV};
+        let dir = std::env::temp_dir();
+        assert_hardened(&run_git(Some(&dir), &SHOW_ENV).await.expect("git runs"));
+        let cfg = [SHOW_ENV[1].to_string()];
+        let env = run_git_streaming(Some(&dir), &cfg, &[SHOW_ENV[2]], None, true, &|_| {}).await.expect("git runs");
+        assert_hardened(&env);
+    }
+
     #[test]
     fn progress_counts_are_the_finished_share() {
         assert_eq!(percent_of(0, 8), Some(0));
@@ -2021,6 +2195,63 @@ mod tests {
                 "{bad} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn an_account_that_cannot_see_the_repository_is_named_with_the_ways_out() {
+        let stderr = "ERROR: Repository not found.\nfatal: Could not read from remote repository.";
+        let key = Some("C:/Users/me/.ssh/id_ed25519_me");
+        let e = explain_clone_error_as(stderr, key, "git@github.com:Org/app.git", Some("me-on-github"));
+        assert!(e.contains("signs in as me-on-github") && e.contains("restricts third-party apps") && e.contains("add it again by hand") && e.contains("me-on-github has no access"), "{e}");
+        assert!(e.contains("invitation was never accepted") && e.contains("approve GitSwitch") && e.contains("add a profile for that account") && e.contains("Clone as"), "{e}");
+        let unknown = explain_clone_error(stderr, key, "git@github.com:Org/app.git");
+        assert!(unknown.contains("isn't there for its account") && unknown.contains("restricts third-party apps") && !unknown.contains("signs in as"), "{unknown}");
+        let push = explain_transport_error_as(stderr, key, "git@github.com:Org/app.git", false, Some("me-on-github"));
+        assert!(push.contains("signs in as me-on-github") && push.contains("Profiles") && !push.contains("Clone as"), "{push}");
+    }
+
+    #[test]
+    fn a_repository_missing_from_its_own_account_is_called_missing_not_hidden() {
+        let stderr = "ERROR: Repository not found.\nfatal: Could not read from remote repository.";
+        let key = Some("C:/Users/me/.ssh/id_ed25519_me");
+        let url = "git@github.com:Me-On-GitHub/Subtitle_Maker.git";
+        let push = explain_transport_error_as(stderr, key, url, false, Some("me-on-github"));
+        assert!(push.contains("There's no repository Me-On-GitHub/Subtitle_Maker on GitHub") && push.contains("signs in as me-on-github") && push.contains("create it on GitHub") && push.contains("id_ed25519_me"), "{push}");
+        assert!(!push.contains("third-party") && !push.contains("invitation"), "an account's own repository is never hidden from it: {push}");
+        let clone = explain_clone_error_as(stderr, key, url, Some("me-on-github"));
+        assert!(clone.contains("There's no repository") && clone.contains("address is wrong") && !clone.contains("create it"), "{clone}");
+        // Someone else's (or an organization's) keeps every way out, the address first.
+        let other = explain_transport_error_as(stderr, key, "git@github.com:Org/app.git", false, Some("me-on-github"));
+        assert!(other.contains("doesn't exist (check the address)") && other.contains("restricts third-party apps") && !other.contains("There's no repository"), "{other}");
+        // Without the account, nothing is claimed about existence.
+        let unknown = explain_transport_error_as(stderr, key, url, false, None);
+        assert!(!unknown.contains("There's no repository") && unknown.contains("isn't there for its account"), "{unknown}");
+        // A server that isn't GitHub is neither called GitHub nor given GitHub's organizations.
+        let other_server = explain_transport_error_as("ERROR: The project you were looking for could not be found.\nfatal: Could not read from remote repository.", key, "git@gitlab.com:me/app.git", false, None);
+        assert!(other_server.contains("The server accepted") && !other_server.contains("third-party"), "{other_server}");
+        // No repository at a folder's path.
+        let local = explain_transport_error("fatal: 'C:/repos/x.git' does not appear to be a git repository\nfatal: Could not read from remote repository.", None, "C:/repos/x.git", false);
+        assert!(local.contains("There's no repository at this address") && !local.contains("GitHub"), "{local}");
+    }
+
+    #[test]
+    fn the_new_repository_form_is_filled_in_only_for_plain_github_names() {
+        assert_eq!(github_create_url("git@github.com:Kshitijkb28/Subtitle_Maker.git").as_deref(), Some("https://github.com/new?owner=Kshitijkb28&name=Subtitle_Maker&visibility=private"));
+        assert_eq!(github_create_url("https://github.com/me/app").as_deref(), Some("https://github.com/new?owner=me&name=app&visibility=private"));
+        assert_eq!(github_create_url("ssh://git@ssh.github.com:443/me/app.git").as_deref(), Some("https://github.com/new?owner=me&name=app&visibility=private"));
+        assert_eq!(github_create_url("git@gitlab.com:me/app.git"), None);
+        assert_eq!(github_create_url("git@github.com:me/a&b=c.git"), None, "nothing that could add a parameter");
+        assert_eq!(github_create_url("C:/repos/app.git"), None);
+    }
+
+    #[test]
+    fn a_wrong_address_is_told_from_other_failures() {
+        assert!(address_may_be_wrong("ERROR: Repository not found.\nfatal: Could not read from remote repository."));
+        assert!(address_may_be_wrong("fatal: '/x/y.git' does not appear to be a git repository"));
+        assert!(address_may_be_wrong("ssh: Could not resolve hostname githb.com: No such host is known."));
+        assert!(address_may_be_wrong("remote: Not Found\nfatal: repository 'https://example.com/x.git/' not found"));
+        assert!(!address_may_be_wrong("git@github.com: Permission denied (publickey)."));
+        assert!(!address_may_be_wrong(" ! [rejected]        main -> main (fetch first)"));
     }
 
     #[test]

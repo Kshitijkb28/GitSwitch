@@ -43,7 +43,9 @@ start_server() { # <args> -> PORT PID CHILD
     local pyw; pyw="$("$PY" -c 'import os,sys;print(os.path.join(os.path.dirname(sys.executable),"pythonw.exe"))')"
     probe term_run "$SB/proj/work" "start \"\" /B \"$pyw\" $SB/server.py $1 > $SB/server.out" >/dev/null 2>&1
   else
-    probe term_run "$SB/proj/work" "nohup $PY $SB/server.py $1 > $SB/server.out 2>&1 & disown" >/dev/null 2>&1
+    # Input from /dev/null: GNU nohup on a terminal's input says "nohup:
+    # ignoring input" first, into the very file the port is read from.
+    probe term_run "$SB/proj/work" "nohup $PY $SB/server.py $1 < /dev/null > $SB/server.out 2>&1 & disown" >/dev/null 2>&1
   fi
   for i in $(seq 1 40); do [ -s "$SB/server.out" ] && break; sleep 0.25; done
   cat "$SB/server.out"

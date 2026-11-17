@@ -368,8 +368,9 @@ pub struct Resolved {
 }
 
 fn sync_git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = crate::spawn::command("git").arg("-C").arg(dir).args(args).output().ok()?;
-    if !out.status.success() {
+    // The one runner, on its read clock.
+    let out = GitCmd::at(dir).args(args.iter().copied()).run_blocking().ok()?;
+    if !out.ok() {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).to_string())
@@ -429,16 +430,23 @@ fn read_keys(top: &Path) -> HashMap<String, String> {
 }
 
 fn write_key(top: &Path, key: &str, value: &str) -> Result<(), String> {
-    let out = crate::spawn::command("git").arg("-C").arg(top).args(["config", "--local", key, value]).output().map_err(|e| e.to_string())?;
-    if out.status.success() {
+    let out = GitCmd::at(top)
+        .args(["config", "--local", key, value])
+        .timeout(crate::git_exec::LOCAL_TIMEOUT)
+        .run_blocking()
+        .map_err(|e| match e {
+            AppError::Command(said) => said,
+            other => other.to_string(),
+        })?;
+    if out.ok() {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        Err(out.stderr)
     }
 }
 
 fn unset_key(top: &Path, key: &str) {
-    let _ = crate::spawn::command("git").arg("-C").arg(top).args(["config", "--local", "--unset", key]).output();
+    let _ = GitCmd::at(top).args(["config", "--local", "--unset", key]).timeout(crate::git_exec::LOCAL_TIMEOUT).run_blocking();
 }
 
 /// The keys of one checkout: (id, offset, compose). A worktree's offset and
@@ -785,6 +793,13 @@ pub async fn groups() -> Vec<Group> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The workspace runner is the one runner.
+    #[test]
+    fn the_workspace_runner_goes_through_gitcmd() {
+        let env = sync_git(&std::env::temp_dir(), &crate::git_exec::test_support::SHOW_ENV).expect("git runs");
+        crate::git_exec::test_support::assert_hardened(&env);
+    }
 
     #[test]
     fn ids_are_short_and_ignore_a_trailing_slash() {

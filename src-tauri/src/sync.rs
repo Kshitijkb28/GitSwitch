@@ -821,6 +821,12 @@ pub struct SyncState {
     /// none). `None` in a state an older build wrote.
     #[serde(default)]
     pub stash_before: Option<String>,
+    /// Where the superproject's rebase left HEAD, read the moment it finished:
+    /// Abort moves the branch back only from there, so a commit made during a
+    /// pause is never stranded by its `reset --hard`. `None` until then, and
+    /// in a state an older build wrote.
+    #[serde(default)]
+    pub head_after: Option<String>,
     /// What git last printed while rebasing here — shown when it stops
     /// without a conflict (a hook, a signing failure), so the reason is on
     /// the page and not only in the command log.
@@ -943,8 +949,47 @@ async fn state_path(repo: &Path) -> Result<PathBuf, AppError> {
 pub async fn read_state(repo: &Path) -> Option<SyncState> {
     let p = state_path(repo).await.ok()?;
     let text = std::fs::read_to_string(p).ok()?;
-    serde_json::from_str(&text).ok()
+    serde_json::from_str(&text).ok().filter(state_is_plain)
 }
+
+/// The state file sits in the git directory, so whoever made the repository
+/// could have written it, and Continue and Abort pass what it holds to git
+/// (`reset --hard <head_before>`, `branch -f <branch> <at>`, `branch -D
+/// <backup>`): commits must be object ids, names must not read as options,
+/// the upstream must be a remote-tracking ref. A state that is not is not
+/// one this app wrote, and is not acted on.
+fn state_is_plain(st: &SyncState) -> bool {
+    let oid = |s: &str| s.is_empty() || crate::git_exec::is_object_id(s);
+    let name = |s: &str| !s.starts_with('-');
+    st.upstream_ref.starts_with("refs/remotes/")
+        && oid(&st.upstream_oid)
+        && oid(&st.head_before)
+        && st.head_after.as_deref().is_none_or(oid)
+        && st.backup.as_deref().is_none_or(name)
+        && st.subs.iter().all(|s| {
+            // Joined onto the repository by Continue and Abort: an absolute
+            // path or one with `..` would point them at another repository.
+            crate::paths::is_plain_relative(&s.path)
+                && oid(&s.head_before)
+                && oid(&s.target)
+                && s.head_after.as_deref().is_none_or(oid)
+                && [&s.backup, &s.branch_before, &s.reattach_to, &s.remote].iter().all(|n| n.as_deref().is_none_or(name))
+                && s.reattached.as_ref().is_none_or(|(b, at)| name(b) && oid(at))
+        })
+}
+
+/// A folder the state file names (a submodule's path, a repository of the
+/// large-file plan), joined onto the repository: only when it is plain names
+/// and none of its names that exist is a link — a link there (a junction on
+/// Windows) to another repository would point Continue and Abort at that
+/// one. A folder not made yet is still inside (`paths::lies_inside`).
+fn state_dir(repo: &Path, path: &str) -> Option<PathBuf> {
+    let dir = repo.join(path);
+    (crate::paths::is_plain_relative(path) && crate::paths::lies_inside(&dir, repo)).then_some(dir)
+}
+
+/// What the result says of such a folder, after its path.
+const LEADS_OUT: &str = "its folder leads outside the repository (a link), so it was left alone";
 
 fn write_state_at(path: &Path, st: &SyncState) -> Result<(), AppError> {
     let tmp = path.with_extension("json.tmp");
@@ -1166,7 +1211,14 @@ async fn lfs_after_update(repo: &Path, st: &SyncState) -> String {
         }
     }
     for (path, complete_before) in &targets {
-        let dir = if path.is_empty() { repo.to_path_buf() } else { repo.join(path) };
+        let dir = if path.is_empty() {
+            repo.to_path_buf()
+        } else {
+            match state_dir(repo, path) {
+                Some(d) => d,
+                None => continue,
+            }
+        };
         if !dir.is_dir() {
             continue;
         }
@@ -1514,18 +1566,31 @@ fn some_of(names: &[String]) -> String {
     }
 }
 
-/// Tracked paths with uncommitted changes, and untracked paths.
-async fn dirty_sets(repo: &Path) -> (Vec<String>, Vec<String>) {
+/// Every entry of the working tree's status, or why git could not give it.
+/// A status git refused is not an empty one: a submodule whose download was
+/// interrupted makes git refuse the whole status, and a timeout says nothing
+/// either. A caller about to throw work away needs "not known to be clean"
+/// told apart from "clean".
+async fn status_entries(repo: &Path) -> Result<Vec<git_status::ChangeEntry>, String> {
     let out = GitCmd::at(repo)
         .top_flag("--no-optional-locks")
         .args(["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=none"])
         .run()
-        .await;
-    let Ok(out) = out else { return (Vec::new(), Vec::new()) };
-    let parsed = git_status::parse_porcelain_v2(&out.stdout);
+        .await
+        .map_err(|e| e.to_string())?;
+    if !out.ok() {
+        let said = out.stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string();
+        return Err(if said.is_empty() { format!("git status exited with code {}", out.code) } else { said });
+    }
+    Ok(git_status::parse_porcelain_v2(&out.stdout).entries)
+}
+
+/// Tracked paths with uncommitted changes, and untracked paths.
+async fn dirty_sets(repo: &Path) -> (Vec<String>, Vec<String>) {
+    let Ok(entries) = status_entries(repo).await else { return (Vec::new(), Vec::new()) };
     let mut tracked = Vec::new();
     let mut untracked = Vec::new();
-    for e in parsed.entries {
+    for e in entries {
         if e.kind == "untracked" {
             untracked.push(e.path);
         } else if !e.is_submodule {
@@ -2306,8 +2371,13 @@ async fn drive(repo: &Path, st: &mut SyncState, state_file: &Path) -> Result<(),
             return Err(AppError::Command(format!("rebase --continue failed: {}", out.stderr.trim())));
         }
     }
-    // The rebase finished. A failed autostash pop leaves unmerged paths and
-    // an "autostash" stash entry with no operation marker.
+    // The rebase finished: this is where it left the branch. Only the first
+    // time: a later call must not adopt a commit made during a pause.
+    if st.head_after.is_none() {
+        st.head_after = oid(repo, "HEAD").await;
+    }
+    // A failed autostash pop leaves unmerged paths and an "autostash" stash
+    // entry with no operation marker.
     let leftovers = unmerged(repo).await;
     if !leftovers.is_empty() || autostash_left(repo, st.stash_before.as_deref()).await {
         st.needs_user = Some(NeedsUser {
@@ -2599,7 +2669,12 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
             continue;
         }
         let path = st.subs[i].path.clone();
-        let sub = repo.join(&path);
+        let Some(sub) = state_dir(repo, &path) else {
+            st.subs[i].note = LEADS_OUT.into();
+            st.subs[i].aligned = true;
+            write_state_at(state_file, st)?;
+            continue;
+        };
         if let Some(u) = st.subs[i].url_change.clone().filter(|_| st.subs[i].url_note.is_none()) {
             let to = crate::repo_scan::mask_token(&u.to);
             let remote = st.subs[i].remote.clone().unwrap_or_else(|| "origin".into());
@@ -2705,7 +2780,10 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
     // abort never undoes a download (there was nothing there before).
     let fresh: Vec<String> = st.plan.superproject.new_submodules.iter().filter(|p| !st.subs.iter().any(|s| &s.path == *p)).cloned().collect();
     for path in fresh {
-        let sub = repo.join(&path);
+        // The plan's list is the state file's text too: a path that is not
+        // plain names, or that leads out through a link, is not one upstream
+        // added here, and nothing is set up in it.
+        let Some(sub) = state_dir(repo, &path) else { continue };
         let recorded = gitlink_at(repo, "HEAD", &path).await.unwrap_or_default();
         let (ok, note) = if sub.join(".git").exists() {
             (true, "new upstream; already downloaded".to_string())
@@ -2782,7 +2860,8 @@ async fn align_submodules(repo: &Path, st: &mut SyncState, state_file: &Path) ->
 /// Where a sub's rebase is mid-flight.
 async fn sub_rebase_in_progress(repo: &Path, st: &SyncState) -> Option<String> {
     for s in &st.subs {
-        if rebase_in_progress(&repo.join(&s.path)).await {
+        let Some(dir) = state_dir(repo, &s.path) else { continue };
+        if rebase_in_progress(&dir).await {
             return Some(s.path.clone());
         }
     }
@@ -3110,16 +3189,58 @@ fn unmatched<'a>(originals: &'a [Replayed], copies: &mut Copies, certain: &dyn F
 
 /// Would replaying this commit onto HEAD change nothing — is everything it
 /// did already there? Asked of git itself: a merge of the commit onto HEAD
-/// with its parent as the base, compared with HEAD's own tree. A conflict, a
-/// root commit, or a git too old to answer (before 2.40) all mean "cannot
-/// say", which is no.
+/// with its parent as the base, compared with HEAD's own tree. A conflict or
+/// a root commit means "cannot say", which is no. A git too old for that
+/// merge (before 2.40) is asked the other way round (`already_in_head`).
 async fn adds_nothing(repo: &Path, commit: &str) -> bool {
     let Ok(out) = g(repo).args(["merge-tree", "--write-tree", &format!("--merge-base={}^", commit), "HEAD", commit]).run().await else { return false };
+    // Before 2.40 git doesn't know `--merge-base` (before 2.38, `--write-tree`
+    // either) and answers with its usage, exit code 129.
+    if out.code == 129 {
+        return already_in_head(repo, commit).await;
+    }
     if !out.ok() {
         return false;
     }
     let tree = out.text().lines().next().unwrap_or("").trim().to_string();
     !tree.is_empty() && oid(repo, "HEAD^{tree}").await.as_deref() == Some(tree.as_str())
+}
+
+/// For a git too old for `merge-tree --merge-base` (Ubuntu 22.04 ships
+/// 2.34): does the commit's own change come back out of HEAD cleanly? If
+/// git can take every hunk of it back out, HEAD already holds everything it
+/// did. Checked in a throwaway index, never the work tree. A root commit, a
+/// commit that changed nothing, or anything git can't apply means "cannot
+/// say", which is no.
+async fn already_in_head(repo: &Path, commit: &str) -> bool {
+    // A plain patch whatever the person's diff settings: prefixes, colour,
+    // external tools and renames all as `git apply` reads them.
+    let Ok(patch) = g(repo)
+        .args(["diff", "--binary", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/", &format!("{}^", commit), commit])
+        .run()
+        .await
+    else {
+        return false;
+    };
+    if !patch.ok() || patch.stdout.is_empty() {
+        return false;
+    }
+    let Some(index) = g(repo).args(["rev-parse", "--path-format=absolute", "--git-path", &format!("gitswitch-check-{}.index", std::process::id())]).ok_text().await else {
+        return false;
+    };
+    let with_index = |cmd: GitCmd| cmd.cfg("core.splitIndex", "false").env("GIT_INDEX_FILE", index.clone());
+    let read = with_index(g(repo)).args(["read-tree", "HEAD"]).run().await;
+    let answer = match read {
+        Ok(r) if r.ok() => with_index(g(repo))
+            .args(["apply", "--cached", "-R", "--check", "--whitespace=nowarn", "-"])
+            .stdin_bytes(patch.stdout)
+            .run()
+            .await
+            .is_ok_and(|o| o.ok()),
+        _ => false,
+    };
+    let _ = std::fs::remove_file(&index);
+    answer
 }
 
 /// Which of the commits the plan listed are no longer on top by subject, each
@@ -3283,7 +3404,19 @@ async fn build_outcome(repo: &Path, st: &SyncState) -> SyncOutcome {
     let mut aligned_all = true;
     let mut unrecorded = Vec::new();
     for s in &st.subs {
-        let sub = repo.join(&s.path);
+        let Some(sub) = state_dir(repo, &s.path) else {
+            aligned_all = false;
+            subs.push(SubOutcome {
+                path: s.path.clone(),
+                action: outcome_action(s, st.plan.submodules.iter().find(|p| p.path == s.path).map(|p| p.action.as_str()), &st.phase),
+                head_before: Some(s.head_before.clone()),
+                head_after: None,
+                recorded_after: None,
+                ok: false,
+                note: LEADS_OUT.into(),
+            });
+            continue;
+        };
         if let Some(b) = &s.backup {
             backups.push(BackupRef { repo: sub.to_string_lossy().to_string(), branch: b.clone(), oid: s.head_before.clone(), recovery: recovery(&sub, b) });
         }
@@ -3442,6 +3575,7 @@ pub async fn sync_run(repo_path: &str, opts: RunOptions) -> Result<OpResult, App
         dropped_by_git: Vec::new(),
         emptied: Vec::new(),
         stash_before: None,
+        head_after: None,
         git_said: String::new(),
         handed_over: Vec::new(),
         pointer_upstreams: Vec::new(),
@@ -3593,7 +3727,7 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
             return Ok(OpResult::refused(Refusal { code: "unmerged-paths".into(), message: format!("{} still has conflicted files. Resolve and stage them inside it first.", path) }, status));
         }
         // The stash entry it left is theirs to drop; the rebase itself is done.
-        if let Some(ss) = st.subs.iter_mut().find(|s| s.path == path) {
+        if let Some(ss) = st.subs.iter_mut().find(|s| s.path == path && state_dir(&repo, &s.path).is_some()) {
             let new_head = oid(&sub, "HEAD").await.unwrap_or_default();
             reattach(&sub, ss).await;
             ss.head_after = Some(new_head);
@@ -3669,6 +3803,14 @@ pub async fn sync_continue(repo_path: &str, allow_markers: bool) -> Result<OpRes
             r.detail = r.detail.replacen("Everything is back where it was, except what is named below.", &notes.join(" "), 1);
         }
         return Ok(r);
+    }
+    // Finished in a terminal: where the person finished it is where the
+    // update's rebase ended — but only while nothing came after the finish.
+    // A commit made in the terminal since would otherwise count as part of
+    // the update, and Abort would reset it away. Not adopted, Abort leaves
+    // the superproject rebased and names the backup.
+    if st.head_after.is_none() {
+        st.head_after = finished_here(&repo, &st.plan.superproject.branch).await;
     }
     Box::pin(align_submodules(&repo, &mut st, &state_file)).await?;
     Box::pin(finish(repo_path, &st, &state_file)).await
@@ -3751,7 +3893,12 @@ async fn put_back_urls(repo: &Path, st: &mut SyncState) -> Vec<String> {
     let mut notes = Vec::new();
     for s in st.subs.iter_mut() {
         let Some(u) = s.url_change.clone().filter(|_| s.url_synced) else { continue };
-        let sub = repo.join(&s.path);
+        // `submodule sync` writes the address into the submodule's own config.
+        let Some(sub) = state_dir(repo, &s.path) else {
+            s.url_note = Some(LEADS_OUT.into());
+            notes.push(format!("{}: {}", s.path, LEADS_OUT));
+            continue;
+        };
         let remote = s.remote.clone().unwrap_or_else(|| "origin".into());
         let ok = g(repo).args(["submodule", "sync", "--", &s.path]).timeout(LOCAL_TIMEOUT).run().await.map(|o| o.ok()).unwrap_or(false);
         clear_parked(&sub, &remote).await;
@@ -3774,12 +3921,16 @@ async fn put_back_submodules(repo: &Path, st: &mut SyncState) -> Vec<String> {
     let mut notes: Vec<String> = Vec::new();
     let handed_over = st.handed_over.clone();
     for s in st.subs.iter_mut() {
-        let sub = repo.join(&s.path);
         // Downloaded by the update because upstream added it: there was nothing
         // there before, and nothing is taken away.
         if s.head_before.is_empty() {
             continue;
         }
+        let Some(sub) = state_dir(repo, &s.path) else {
+            s.note = LEADS_OUT.into();
+            notes.push(format!("{}: {}", s.path, s.note));
+            continue;
+        };
         if rebase_in_progress(&sub).await {
             let _ = rewrite_cmd(&sub, repo, modes.get(&s.path).copied().unwrap_or_default(), LOCAL_TIMEOUT).args(["rebase", "--abort"]).run().await;
         }
@@ -3858,6 +4009,46 @@ async fn put_back_submodules(repo: &Path, st: &mut SyncState) -> Vec<String> {
     notes
 }
 
+/// HEAD, when it is where a rebase of `branch` was finished outside the app
+/// and nothing has happened to the branch since: the branch's newest reflog
+/// entry is that finish, and HEAD is its commit. git words the entry
+/// `rebase (finish): refs/heads/<branch> onto <oid>` (2.26 and later, 2.34
+/// included; checked on 2.52), `rebase -i (finish): …` before 2.26, when the
+/// machinery the merge backend runs on was called that. A commit made after
+/// the finish, another branch, or no reflog at all: `None`.
+async fn finished_here(repo: &Path, branch: &str) -> Option<String> {
+    crate::git_exec::validate_branch_name(branch).ok()?;
+    let line = g(repo).args(["log", "-g", "-1", "--format=%H%x1f%gs", "--end-of-options", &format!("refs/heads/{}", branch)]).ok_text().await?;
+    let (at, subject) = line.trim().split_once('\x1f')?;
+    let finish = subject.starts_with("rebase (finish): ") || subject.starts_with("rebase -i (finish): ");
+    let head = oid(repo, "HEAD").await?;
+    (finish && same_oid(at, &head)).then_some(head)
+}
+
+/// Why Abort must leave the superproject where it is instead of moving it
+/// back with `reset --hard` (which asks nothing), worded to follow "the
+/// superproject was left": `None` when the reset is safe. Safe means the
+/// branch the update rebased is the one checked out, it still sits where the
+/// update's rebase left it (a commit made during the pause would be stranded),
+/// and git said the tree holds no uncommitted change. `dirty` is that answer:
+/// `Err` when git could not give it, which is never taken for clean.
+fn superproject_stays(branch_planned: &str, branch_now: &str, head_after: Option<&str>, head_now: &str, dirty: &Result<bool, String>) -> Option<String> {
+    if branch_now != branch_planned {
+        let now = if branch_now.is_empty() { "no branch (a detached HEAD)".to_string() } else { format!("branch {}", branch_now) };
+        return Some(format!("as it is: {} is checked out now, not {}, which the update rebased", now, branch_planned));
+    }
+    match head_after {
+        None => return Some("as rebased: the update did not record where its rebase ended, so GitSwitch cannot tell whether commits were made since".to_string()),
+        Some(h) if !same_oid(h, head_now) => return Some(format!("as it is: {} holds commits made since the update", short(head_now))),
+        Some(_) => {}
+    }
+    match dirty {
+        Err(said) => Some(format!("as rebased: GitSwitch could not check it for uncommitted changes (git said: {})", said)),
+        Ok(true) => Some("as rebased because it has uncommitted changes".to_string()),
+        Ok(false) => None,
+    }
+}
+
 /// Undo: inner rebase first, then the superproject's (git restores the
 /// autostash), then every submodule the sync rebased goes back to its
 /// pre-sync tip — only when clean, never at the cost of uncommitted work.
@@ -3878,13 +4069,46 @@ pub async fn sync_abort(repo_path: &str) -> Result<OpResult, AppError> {
         if !out.ok() {
             notes.push(format!("the superproject rebase could not be aborted: {}", out.stderr.trim()));
         }
-    } else if oid(&repo, "HEAD").await.as_deref() != Some(st.head_before.as_str()) {
-        let (dirty, _) = dirty_sets(&repo).await;
-        if dirty.is_empty() && unmerged(&repo).await.is_empty() && !autostash_left(&repo, st.stash_before.as_deref()).await {
-            let _ = rw(&st, &repo, "", LOCAL_TIMEOUT).args(["reset", "--hard", &st.head_before]).run().await;
-            notes.push(format!("the superproject was put back at {}", short(&st.head_before)));
-        } else {
-            notes.push(format!("the superproject was left as rebased because it has uncommitted changes; its pre-update tip is branch {}", st.backup.clone().unwrap_or_default()));
+    } else {
+        let kept = match &st.backup {
+            Some(b) => format!("its pre-update tip is branch {}", b),
+            None => format!("it stood at {} before the update", short(&st.head_before)),
+        };
+        match oid(&repo, "HEAD").await {
+            // Not read is not "back where it was": say so instead.
+            None => notes.push(format!("the superproject was left as it is: GitSwitch could not read its HEAD; {}", kept)),
+            Some(head_now) if head_now == st.head_before => {}
+            Some(head_now) => {
+                // `reset --hard` guards nothing, so each thing it could destroy is
+                // checked first, and anything git cannot vouch for leaves it alone.
+                let branch_now = g(&repo).args(["symbolic-ref", "-q", "--short", "HEAD"]).ok_text().await.unwrap_or_default();
+                let tree = match status_entries(&repo).await {
+                    Ok(entries) => Ok(entries.iter().any(|e| e.kind == "conflicted" || (e.kind != "untracked" && !e.is_submodule)) || autostash_left(&repo, st.stash_before.as_deref()).await),
+                    Err(e) => Err(e),
+                };
+                // Nor does it spare an untracked or ignored file at a path the old
+                // commit has and the rebased one does not (a file upstream deleted).
+                let stays = match superproject_stays(&st.plan.superproject.branch, branch_now.trim(), st.head_after.as_deref(), &head_now, &tree) {
+                    Some(why) => Some(why),
+                    None => match Box::pin(crate::tree::untracked_in_the_way(repo_path, &st.head_before)).await {
+                        Err(said) => Some(format!("as rebased: GitSwitch could not check which untracked files the reset would overwrite (git said: {})", said)),
+                        Ok(files) if !files.is_empty() => {
+                            let shown: Vec<&str> = files.iter().take(5).map(String::as_str).collect();
+                            let more = if files.len() > shown.len() { format!(" and {} more", files.len() - shown.len()) } else { String::new() };
+                            Some(format!("as rebased: going back would overwrite {}{}, which git isn't tracking", shown.join(", "), more))
+                        }
+                        Ok(_) => None,
+                    },
+                };
+                match stays {
+                    Some(why) => notes.push(format!("the superproject was left {}; {}", why, kept)),
+                    None => match rw(&st, &repo, "", LOCAL_TIMEOUT).args(["reset", "--hard", &st.head_before]).run().await {
+                        Ok(out) if out.ok() => notes.push(format!("the superproject was put back at {}", short(&st.head_before))),
+                        Ok(out) => notes.push(format!("the superproject could not be put back ({}); {}", out.stderr.trim(), kept)),
+                        Err(e) => notes.push(format!("the superproject could not be put back ({}); {}", e, kept)),
+                    },
+                }
+            }
         }
     }
     // After the superproject, whose .gitmodules decides where they point.
@@ -4027,6 +4251,7 @@ mod lfs_mode_tests {
             dropped_by_git: vec![],
             emptied: vec![],
             stash_before: None,
+            head_after: None,
             git_said: String::new(),
             handed_over: vec![],
             pointer_upstreams: vec![],
@@ -4050,6 +4275,88 @@ mod lfs_mode_tests {
         assert!(!all.downloads_inside());
         let none = state(false, None);
         assert_eq!(none.lfs_mode(""), LfsMode::Plain);
+    }
+
+    // (Here for the `state` helper.)
+    #[test]
+    fn a_state_file_that_names_options_is_not_acted_on() {
+        let (h, t) = ("a".repeat(40), "b".repeat(40));
+        let sub = SubState {
+            path: "lib".into(),
+            branch_before: Some("main".into()),
+            reattach_to: None,
+            head_before: h.clone(),
+            backup: Some("gitswitch-before-update-1".into()),
+            target: t.clone(),
+            rebased: false,
+            head_after: Some(t.clone()),
+            aligned: false,
+            note: String::new(),
+            stash_before: Some(String::new()),
+            reattached: Some(("main".into(), h.clone())),
+            url_change: None,
+            url_synced: false,
+            url_note: None,
+            remote: Some("origin".into()),
+        };
+        let good = SyncState { upstream_ref: "refs/remotes/origin/main".into(), upstream_oid: t.clone(), head_before: h.clone(), backup: Some("gitswitch-before-update-1".into()), subs: vec![sub.clone()], ..state(false, None) };
+        assert!(state_is_plain(&good));
+        assert!(state_is_plain(&SyncState { head_before: String::new(), subs: vec![SubState { head_before: String::new(), target: String::new(), ..sub.clone() }], ..good.clone() }), "not known yet");
+        let bad: Vec<SyncState> = vec![
+            SyncState { head_before: "--recurse-submodules".into(), ..good.clone() },
+            SyncState { head_before: "HEAD~3".into(), ..good.clone() },
+            SyncState { upstream_ref: "--output=x".into(), ..good.clone() },
+            SyncState { backup: Some("--list".into()), ..good.clone() },
+            SyncState { subs: vec![SubState { branch_before: Some("--orphan".into()), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { reattached: Some(("--delete".into(), h.clone())), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { reattached: Some(("main".into(), "--x".into())), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { head_before: "-x".into(), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { target: "--output=y".into(), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { path: "../other".into(), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { path: "/etc".into(), ..sub.clone() }], ..good.clone() },
+            SyncState { subs: vec![SubState { path: "C:/Windows".into(), ..sub.clone() }], ..good.clone() },
+            SyncState { head_after: Some("--hard".into()), ..good.clone() },
+        ];
+        assert!(state_is_plain(&SyncState { head_after: Some(t.clone()), ..good.clone() }));
+        for st in &bad {
+            assert!(!state_is_plain(st), "{:?} must not be acted on", (&st.head_before, &st.head_after, &st.upstream_ref, &st.backup, &st.subs.first().map(|s| (&s.path, &s.head_before, &s.target, &s.branch_before, &s.reattached))));
+        }
+    }
+
+    /// A folder the state file names is acted in only when the disk puts it
+    /// inside the repository: a link (a junction on Windows) to another
+    /// repository is not, nor anything below one; a folder not made yet is.
+    #[test]
+    fn a_folder_the_state_names_through_a_link_is_left_alone() {
+        let base = std::env::temp_dir().join(format!("gitswitch-sync-statedir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("lib")).unwrap();
+        std::fs::create_dir_all(base.join("other").join(".git")).unwrap();
+        crate::paths::test_link_dir(&base.join("other"), &repo.join("linked"));
+        assert_eq!(state_dir(&repo, "lib"), Some(repo.join("lib")));
+        assert_eq!(state_dir(&repo, "new/sub"), Some(repo.join("new/sub")), "not there yet: the repository holds it");
+        assert_eq!(state_dir(&repo, "linked"), None);
+        assert_eq!(state_dir(&repo, "linked/x"), None);
+        assert_eq!(state_dir(&repo, "../other"), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn abort_moves_the_superproject_back_only_when_nothing_can_be_lost() {
+        let (after, other) = ("a".repeat(40), "b".repeat(40));
+        let clean: Result<bool, String> = Ok(false);
+        assert_eq!(superproject_stays("main", "main", Some(&after), &after, &clean), None, "the same branch, where the rebase left it, clean");
+        assert_eq!(superproject_stays("main", "main", Some(&after.to_uppercase()), &after, &clean), None, "ids compare without case");
+        // Each of these would lose something to `reset --hard`.
+        let why = |planned: &str, now: &str, head_after: Option<&str>, head_now: &str, dirty: Result<bool, String>| superproject_stays(planned, now, head_after, head_now, &dirty).unwrap_or_default();
+        assert!(why("main", "topic", Some(&after), &after, Ok(false)).contains("branch topic is checked out now, not main"));
+        assert!(why("main", "", Some(&after), &after, Ok(false)).contains("detached HEAD"));
+        assert!(why("main", "main", Some(&after), &other, Ok(false)).contains("bbbbbbb holds commits made since the update"));
+        assert!(why("main", "main", None, &after, Ok(false)).contains("cannot tell whether commits were made since"));
+        assert!(why("main", "main", Some(&after), &after, Ok(true)).contains("because it has uncommitted changes"));
+        // A status git refused is not a clean one.
+        assert!(why("main", "main", Some(&after), &after, Err("fatal: not a git repository: D/../.git/modules/D".into())).contains("could not check it for uncommitted changes (git said: fatal: not a git repository"));
     }
 }
 
@@ -4464,6 +4771,7 @@ mod tests {
             dropped_by_git: vec![],
             emptied: vec![],
             stash_before: None,
+            head_after: None,
             git_said: String::new(),
             handed_over: vec![],
             pointer_upstreams: vec![],
@@ -4697,6 +5005,7 @@ mod tests {
             dropped_by_git: vec!["d".repeat(40)],
             emptied: vec![],
             stash_before: Some(String::new()),
+            head_after: None,
             git_said: "error: hook declined".into(),
             handed_over: vec!["A".into()],
             pointer_upstreams: vec![],

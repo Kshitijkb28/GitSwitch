@@ -113,6 +113,8 @@ interface Props {
   visible: boolean;
   /** Bumped by the page when the repository moved (a fetch, a pull, any operation). */
   reloadKey: number;
+  /** Bumped with `reloadKey` when Refresh was pressed: read again at once, even while hidden. */
+  refreshKey?: number;
   onOpenChanges: () => void;
   /** This tab moved the repository (a fetch, a detach, a reset…): the strip must re-read it. */
   onRepoChanged: () => void;
@@ -146,7 +148,7 @@ function isBot(a: api.AuthorCount): boolean {
  * History page, minus its picker, Fetch and Check GitHub, which now sit above
  * the tabs.
  */
-export function HistoryTab({ repo, account, accountEmail, accountsReady, visible, reloadKey: outerReload, onOpenChanges, onRepoChanged, hasSubmodules }: Props) {
+export function HistoryTab({ repo, account, accountEmail, accountsReady, visible, reloadKey: outerReload, refreshKey = 0, onOpenChanges, onRepoChanged, hasSubmodules }: Props) {
   const toast = useToast();
   const [onlyMine, setOnlyMine] = usePersistedState("history.onlyMine", false);
   // The people filter: an author email, "" for everyone. It beats "only this
@@ -242,13 +244,33 @@ export function HistoryTab({ repo, account, accountEmail, accountsReady, visible
 
   // The page above says when the repository moved (a fetch, a pull, any
   // operation on the Changes tab): re-read everything that could have changed.
+  // While the tab is hidden that waits until it is shown — a commit on the
+  // Changes tab would otherwise re-read the whole history behind it — unless
+  // Refresh was pressed, which reads everything again at once.
+  const owedReload = useRef(false);
+  const lastRefresh = useRef(refreshKey);
   useEffect(() => {
     if (!outerReload || !repo) return;
+    const pressed = refreshKey !== lastRefresh.current;
+    lastRefresh.current = refreshKey;
+    if (!visible && !pressed) {
+      owedReload.current = true;
+      return;
+    }
+    owedReload.current = false;
     loadBranches(repo);
     loadSync(repo, rev);
     loadMergeInfo(repo, rev);
     setReloadKey((k) => k + 1);
   }, [outerReload]);
+  useEffect(() => {
+    if (!visible || !owedReload.current || !repo) return;
+    owedReload.current = false;
+    loadBranches(repo);
+    loadSync(repo, rev);
+    loadMergeInfo(repo, rev);
+    setReloadKey((k) => k + 1);
+  }, [visible]);
 
   const loadBranches = useCallback(async (path: string) => {
     if (!path) return;

@@ -4,6 +4,10 @@ import { ChevronDown, Check, Search } from "lucide-react";
 export interface SelectOption {
   value: string;
   label: string;
+  /** A few muted words after the label ("not a repository yet"). */
+  note?: string;
+  /** This option's own icon, instead of the list's `optionIcon`. */
+  icon?: ReactNode;
 }
 
 interface SelectProps {
@@ -152,8 +156,9 @@ export function Select({
         } text-zinc-100 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer`}
       >
         <span className={`flex items-center gap-2 truncate ${selected ? "text-zinc-100" : "text-zinc-500"}`}>
-          {selected && optionIcon}
+          {selected && (selected.icon ?? optionIcon)}
           <span className="truncate">{selected ? selected.label : placeholder}</span>
+          {selected?.note && <span className="shrink-0 text-xs text-zinc-500">{selected.note}</span>}
         </span>
         <ChevronDown
           size={16}
@@ -219,12 +224,13 @@ export function Select({
                           : "text-zinc-200 hover:bg-zinc-800"
                     }`}
                   >
-                    {optionIcon && (
+                    {(opt.icon ?? optionIcon) && (
                       <span className={active ? "text-emerald-400" : "text-zinc-400"}>
-                        {optionIcon}
+                        {opt.icon ?? optionIcon}
                       </span>
                     )}
                     <span className="truncate flex-1">{opt.label}</span>
+                    {opt.note && <span className="shrink-0 text-xs text-zinc-500" data-option-note>{opt.note}</span>}
                     {active && <Check size={15} className="shrink-0 text-emerald-400" />}
                   </button>
                 );

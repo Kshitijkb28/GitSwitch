@@ -118,6 +118,11 @@ pub fn manual_includeif_rules(gitconfig: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 async fn command_exists(bin: &str) -> bool {
+    // git, like every git the app starts, goes through the one runner — still
+    // found the way a newly opened terminal would find it.
+    if bin == "git" {
+        return crate::git_exec::GitCmd::without_repo().with_program(crate::spawn::program(bin)).arg("--version").run().await.is_ok_and(|o| o.ok());
+    }
     crate::spawn::async_command(crate::spawn::program(bin))
         .arg("--version")
         .output()
@@ -211,9 +216,9 @@ pub async fn check_environment() -> Result<Vec<Finding>, AppError> {
                     "gh-not-authenticated",
                     "info",
                     "GitHub CLI has no signed-in accounts",
-                    "Sign in to the GitHub CLI on the GitHub page (or run `gh auth login` in a terminal) so GitSwitch can verify repo access and register keys.",
+                    "Sign in to the GitHub CLI on the GitHub Auth page (or run `gh auth login` in a terminal) so GitSwitch can verify repo access and register keys.",
                 )
-                .with_fix("nav:/github", "Sign in on the GitHub page"),
+                .with_fix("nav:/github", "Sign in on the GitHub Auth page"),
             ),
         }
     }
@@ -444,9 +449,9 @@ pub async fn check_repo_access() -> Result<Vec<Finding>, AppError> {
                 "access-unchecked",
                 "info",
                 "Repository access wasn't checked",
-                "The GitHub CLI has no signed-in account to ask GitHub with. Sign in to it on the GitHub page (or run `gh auth login`), then check again.",
+                "The GitHub CLI has no signed-in account to ask GitHub with. Sign in to it on the GitHub Auth page (or run `gh auth login`), then check again.",
             )
-            .with_fix("nav:/github", "Sign in on the GitHub page"),
+            .with_fix("nav:/github", "Sign in on the GitHub Auth page"),
         );
         return Ok(out);
     }
@@ -933,7 +938,7 @@ pub async fn unset_local(repo_path: &str, key: &str) -> Result<String, AppError>
 
 /// "2.50.1" from `git --version` ("git version 2.50.1 (Apple Git-155)").
 async fn git_version() -> Option<String> {
-    let out = crate::spawn::async_command("git").arg("--version").output().await.ok()?;
+    let out = crate::git_exec::GitCmd::without_repo().arg("--version").run().await.ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.split_whitespace().nth(2).map(|v| v.to_string())
 }

@@ -7,6 +7,8 @@ mod error;
 mod find_clones;
 mod gh_api;
 mod gh_cli;
+mod gh_hosts;
+mod repo_admin;
 mod gh_repo;
 mod pulls;
 mod git_advice;
@@ -35,6 +37,7 @@ mod sparse;
 mod spawn;
 mod ssh_config;
 mod push_identity;
+mod publish;
 
 /// sha256 hex of a secret, for cache keys that must not hold the secret itself.
 pub(crate) fn lfs_sha(secret: &str) -> String {
@@ -103,9 +106,14 @@ pub fn run() {
     let builder = tauri::Builder::default();
     // First of all: a second launch — a gitswitch:// link opened while the
     // app runs — hands its link over (the deep-link plugin routes it) and
-    // brings this window forward instead of starting another app.
+    // brings this window forward instead of starting another app. A start at
+    // sign-in finding GitSwitch already running changes nothing.
     #[cfg(desktop)]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| tray::show_main(app)));
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        if !netspeed::autostart::launched_at_login(&argv) {
+            tray::show_main(app)
+        }
+    }));
     builder
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
@@ -146,6 +154,19 @@ pub fn run() {
             commands::changes_discard,
             commands::changes_commit,
             commands::changes_push,
+            commands::changes_add_remote,
+            commands::changes_change_remote,
+            commands::changes_create_github_repo,
+            commands::github_publish_accounts,
+            commands::github_repo_facts,
+            commands::github_set_visibility,
+            commands::github_delete_repo,
+            commands::github_delete_grant_start,
+            commands::github_delete_grant_wait,
+            commands::github_delete_grant_cancel,
+            commands::github_publish_push_login,
+            commands::github_publish_context,
+            commands::github_owners,
             commands::changes_pull,
             commands::changes_submodules,
             commands::changes_submodule_update,
@@ -244,6 +265,8 @@ pub fn run() {
             commands::clone_progress,
             commands::clone_size_estimate,
             commands::history_list_repos,
+            commands::folder_state,
+            commands::repo_init,
             commands::history_branches,
             commands::history_page,
             commands::history_commit_detail,
@@ -326,6 +349,13 @@ pub fn run() {
         .setup(|app| {
             tray::setup_tray(app.handle())?;
             netspeed::start(app.handle());
+            // The window is made hidden (tauri.conf.json) and shown here, unless
+            // GitSwitch was started at sign-in to show the net speed: then it
+            // stays in the tray until asked for.
+            let at_login = netspeed::autostart::launched_at_login(&std::env::args().collect::<Vec<_>>());
+            if !netspeed::autostart::start_hidden(at_login, netspeed::keeps_running()) {
+                tray::show_main(app.handle());
+            }
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 let handle = app.handle().clone();

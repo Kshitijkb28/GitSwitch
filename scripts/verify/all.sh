@@ -47,6 +47,8 @@ run "Changes sandbox"     bash "$HERE/sandbox.sh"
 run "Regression"          bash "$HERE/regression.sh"
 run "Identity (gitconfig round-trip)" bash "$HERE/identity.sh"
 run "Find repositories"   bash "$HERE/findrepos.sh"
+run "Folders without a repository" bash "$HERE/folders.sh"
+run "Hostile repositories" bash "$HERE/hostile.sh"
 run "Uninstalling GitSwitch" bash "$HERE/uninstall.sh"
 run "Uninstall tab (apps and leftovers)" bash "$HERE/apps.sh"
 run "GitHub pull requests" bash "$HERE/github.sh"
@@ -60,10 +62,28 @@ run "Push lock"           bash "$HERE/lock.sh"
 run "Terminal"            bash "$HERE/console.sh"
 run "Ports"               bash "$HERE/ports.sh"
 run "Workspaces"          bash "$HERE/workspace.sh"
+run "Net speed (start at sign-in)" bash "$HERE/netspeed.sh"
 if [ -d "$HERE/harness/node_modules/puppeteer-core" ] && [ -n "$JS" ]; then
   # One run each: the log's tail is the summary, its exit code the verdict
   # (running twice for the two doubled the time and the exposure to a flaky Chrome start).
-  harness() { local out; out="$(mktemp)"; (cd "$HERE/harness" && $JS "$1" >"$out" 2>&1); local rc=$?; tail -n "$([ $rc -eq 0 ] && echo 1 || echo 12)" "$out"; rm -f "$out"; return $rc; }
+  # A harness prints a line per check. A pass keeps its result line. A failure
+  # keeps every failing line (red: FAIL, OVERFLOW, CSP, WHITE; or "link not
+  # found") with the detail lines under it, the last lines, and the whole
+  # output in a file: the last 12 lines alone once lost the one error that
+  # explained 38 failures.
+  harness() {
+    local out rc keep tmp="${TMPDIR:-${TEMP:-/tmp}}"
+    keep="${GITSWITCH_VERIFY_TMP:-${tmp%/}/gitswitch-verify}/harness-${1%.mjs}.log"
+    out="$(mktemp)"
+    (cd "$HERE/harness" && $JS "$1" >"$out" 2>&1); rc=$?
+    if [ $rc -eq 0 ]; then tail -n 1 "$out"; rm -f "$out" "$keep"; return 0; fi
+    mkdir -p "$(dirname "$keep")" 2>/dev/null && mv -f "$out" "$keep" 2>/dev/null || keep="$out"
+    awk '/\033\[31m|link not found/ { print; more = 1; next } more && /^       / { print; next } { more = 0 }' "$keep" | head -n 150
+    echo "…"
+    tail -n 12 "$keep"
+    echo "the whole output: $keep"
+    return $rc
+  }
   run "Headless UI"           harness ui.mjs
   run "Headless UI (History)" harness history.mjs
   run "Layout sweep"          harness sweep.mjs

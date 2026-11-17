@@ -855,8 +855,10 @@ for world in tj tk; do
   if [ "$world" = tj ]; then git -C "$W/upstream" config -f .gitmodules submodule.A.ignore all; git -C "$W/upstream" add .gitmodules; fi
   git -C "$W/upstream" add A >/dev/null; git -C "$W/upstream" commit -qm "super: A at two"; git -C "$W/upstream" push -q origin main 2>/dev/null
   git -C "$W/local" pull -q --ff-only 2>/dev/null; git -C "$W/local/A" fetch -q origin 2>/dev/null; git -C "$W/local/A" merge -q --ff-only "$TWO"
-  [ "$world" = tk ] && git -C "$W/local" config diff.ignoreSubmodules all
   git -C "$W/local/A" reset -q --hard "$ONE"; git -C "$W/local" add A; git -C "$W/local" commit -qm "pin A back to one"
+  # Set once the commit is made: an older git (2.34) lets this setting hide
+  # the staged pointer from `git commit` itself, and no commit would be made.
+  [ "$world" = tk ] && git -C "$W/local" config diff.ignoreSubmodules all
   printf 'u\n' > "$W/upstream/up.txt"; git -C "$W/upstream" add up.txt; git -C "$W/upstream" commit -qm "super: unrelated"; git -C "$W/upstream" push -q origin main 2>/dev/null
   OUT=$(probe sync_plan "$W/local")
   ok "($world) my pin is previewed as kept" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(c['subject'],c['already_upstream']) for c in d['superproject']['own_commits']])")" "[('pin A back to one', False)]"
@@ -1653,9 +1655,11 @@ ok "  and its large file is content" "$(wc -c < "$LS/r/model.bin" | tr -d ' ')" 
 LFS_BIN="$(command -v git-lfs)"; mkdir -p "$LS/wrap"
 cat > "$LS/wrap/git-lfs" <<WRAP
 #!/bin/sh
-if [ "\$1" = "filter-process" ]; then
-  case "\$(ps -o args= -p \$PPID 2>/dev/null)" in
+if [ "\$1" = "filter-process" ] || [ "\$1" = "smudge" ]; then
+  parent="\$(ps -o args= -p \$PPID 2>/dev/null)"
+  case "\$parent" in
     *" rebase "*) echo "rebase progress=\${GIT_LFS_PROGRESS:-none}" >> "$LS/lfs-env.log" ;;
+    *) echo "other(\$(printf '%s' "\$parent" | cut -c1-90)) \$1 progress=\${GIT_LFS_PROGRESS:-none}" >> "$LS/lfs-other.log" ;;
   esac
 fi
 exec "$LFS_BIN" "\$@"
@@ -1665,12 +1669,13 @@ chmod +x "$LS/wrap/git-lfs"
 printf 'd\n' > "$LS/d/mine.txt"; git -C "$LS/d" add mine.txt >/dev/null; git -C "$LS/d" commit -qm "mine: d"
 head -c 6000 /dev/urandom > "$LS/d/other.bin"
 head -c 5500 /dev/urandom > "$LS/author/model.bin"; git -C "$LS/author" commit -qam "upstream: another model"; git -C "$LS/author" push -q origin main 2>/dev/null
-rm -f "$LS/lfs-env.log"
+rm -f "$LS/lfs-env.log" "$LS/lfs-other.log"
 probe sync_plan "$LS/d" >/dev/null; OUT=$(PATH="$LS/wrap:$PATH" probe sync_run "$LS/d")
 ok "(an uncommitted large file: git downloads inside the rebase, and the update still finishes)" "$(printf '%s' "$OUT" | jqf ok)" "True"
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*) echo "  SKIP the git-lfs inside the rebase writes its progress where the page reads it (Git Bash's ps cannot name the caller)" ;;
-  *) ok "  the git-lfs inside the rebase writes its progress where the page reads it" "$(sort -u "$LS/lfs-env.log" 2>/dev/null | tr '\\' '/' | tr '\n' '|')" "rebase progress=$LS/d/.git/gitswitch-lfs.progress|" ;;
+  # The other git-lfs runs follow, so a failure shows what git ran it from.
+  *) ok "  the git-lfs inside the rebase writes its progress where the page reads it" "$(sort -u "$LS/lfs-env.log" 2>/dev/null | tr '\\' '/' | tr '\n' '|') [others: $(sort -u "$LS/lfs-other.log" 2>/dev/null | tr '\n' '|')]" "rebase progress=$LS/d/.git/gitswitch-lfs.progress|" ;;
 esac
 ok "  and upstream's new large file arrived as content" "$(wc -c < "$LS/d/model.bin" | tr -d ' ')" "5500"
 
@@ -1691,5 +1696,112 @@ ok "  and says so" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load
 OUT=$(probe sync_run "$W/local")
 ok "the update finishes: A at upstream's pointer, nothing of mine left to replay" "$(printf '%s' "$OUT" | jqf ok):$(head_of "$W/local/A"):$(subjects "$W/local" origin/main..HEAD)" "True:$THREE:"
 ok "  nothing is off its recorded commit" "$(git -C "$W/local" submodule status | grep -c '^[+-]' || true)" "0"
+
+
+section "Abort moves the superproject back only when nothing is lost by it"
+# The update rebased the superproject, then paused inside C. Abort's way back
+# for the superproject is `reset --hard`, which asks nothing: a commit made
+# during the pause, another branch checked out, or a tree whose status git
+# refuses must each leave it where it is.
+mini sz B C
+W="$SB/sz"
+# config.json is in my pre-update commit and upstream stops tracking it, so
+# the way back writes it again: over whatever sits there untracked by then.
+printf '{"local": false}\n' > "$W/upstream/config.json"; git -C "$W/upstream" add config.json; git -C "$W/upstream" commit -qm "super: a config file"; git -C "$W/upstream" push -q origin main 2>/dev/null
+git -C "$W/local" pull -q --ff-only origin main 2>/dev/null
+printf 'C v1, rewritten\nline2\nline3\n' > "$W/upstream/C/C.txt"; git -C "$W/upstream/C" commit -q --amend -am "C: initial, rewritten"; git -C "$W/upstream/C" push -q -f origin main 2>/dev/null
+git -C "$W/upstream" rm -q config.json; git -C "$W/upstream" add C >/dev/null; git -C "$W/upstream" commit -qm "super: rewrite C, stop tracking config.json"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'mine\n' > "$W/local/mine.txt"; git -C "$W/local" add mine.txt; git -C "$W/local" commit -qm "super: mine"
+S0="$(head_of "$W/local")"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+S1="$(head_of "$W/local")"
+ok "(control: the update pauses inside C, with the superproject rebased)" "$(printf '%s' "$OUT" | jqf headline):$([ "$S1" != "$S0" ] && echo rebased || echo not)" "Update paused inside C.:rebased"
+rm -rf "$W/paused"; cp -R "$W/local" "$W/paused"
+replay() { rm -rf "$W/local"; cp -R "$W/paused" "$W/local"; }
+OUT=$(probe sync_abort "$W/local")
+ok "(control: with nothing in the way, abort puts the superproject back)" "$(printf '%s' "$OUT" | jqf detail):$(head_of "$W/local")" "the superproject was put back at $(printf '%s' "$S0" | cut -c1-7)"
+ok "  at the commit it stood on" "$(head_of "$W/local")" "$S0"
+ok "  with the file upstream stopped tracking back too" "$(cat "$W/local/config.json" 2>&1)" '{"local": false}'
+
+replay
+printf 'during the pause\n' > "$W/local/extra.txt"; git -C "$W/local" add extra.txt; git -C "$W/local" commit -qm "super: during the pause"
+SX="$(head_of "$W/local")"
+OUT=$(probe sync_abort "$W/local")
+ok "a commit made during the pause: abort leaves the superproject, saying why" "$(printf '%s' "$OUT" | jqf detail)" "the superproject was left as it is: $(printf '%s' "$SX" | cut -c1-7) holds commits made since the update"
+ok "  and where its pre-update tip is" "$(printf '%s' "$OUT" | jqf detail)" "its pre-update tip is branch gitswitch-before-update-"
+ok "  the commit is still on main" "$(head_of "$W/local"):$(git -C "$W/local" rev-parse main)" "$SX:$SX"
+ok "  and C is still put back" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "('C', 'put-back')"
+
+replay
+git -C "$W/local" switch -q -c elsewhere
+OUT=$(probe sync_abort "$W/local")
+ok "another branch checked out during the pause: abort does not move it" "$(printf '%s' "$OUT" | jqf detail)" "the superproject was left as it is: branch elsewhere is checked out now, not main, which the update rebased"
+ok "  elsewhere still points where it was made" "$(git -C "$W/local" rev-parse elsewhere):$(on_branch "$W/local")" "$S1:elsewhere"
+
+replay
+# A submodule whose download was interrupted: git refuses the whole status
+# with --ignore-submodules=none, and a refused status listed no changes.
+printf 'readme, edited during the pause\n' > "$W/local/README.md"
+printf 'gitdir: ../.git/modules/nowhere\n' > "$W/local/B/.git"
+ok "(control: git refuses the status the clean check runs)" "$(git -C "$W/local" status --porcelain=v2 -z --untracked-files=all --ignore-submodules=none >/dev/null 2>&1; echo rc=$?)" "rc=128"
+OUT=$(probe sync_abort "$W/local")
+ok "a status git refuses is not a clean tree: abort leaves the superproject, saying why" "$(printf '%s' "$OUT" | jqf detail)" "the superproject was left as rebased: GitSwitch could not check it for uncommitted changes (git said: fatal: not a git repository"
+ok "  the uncommitted edit survives" "$(cat "$W/local/README.md")" "readme, edited during the pause"
+ok "  and the superproject is where the update left it" "$(head_of "$W/local")" "$S1"
+
+replay
+printf '{"local": true}\n' > "$W/local/config.json"
+ok "(control: config.json is untracked now, and the commit abort goes back to tracks it)" "$(git -C "$W/local" status --porcelain -- config.json):$(git -C "$W/local" cat-file -t "$S0:config.json")" "?? config.json:blob"
+OUT=$(probe sync_abort "$W/local")
+ok "an untracked file the way back would overwrite: abort leaves the superproject, saying why" "$(printf '%s' "$OUT" | jqf detail)" "the superproject was left as rebased: going back would overwrite config.json, which git isn't tracking"
+ok "  the file is kept as it was" "$(cat "$W/local/config.json")" '{"local": true}'
+ok "  and the superproject is where the update left it" "$(head_of "$W/local")" "$S1"
+replay
+printf 'config.json\n' >> "$W/local/.git/info/exclude"
+printf '{"local": true}\n' > "$W/local/config.json"
+OUT=$(probe sync_abort "$W/local")
+ok "an ignored file there is kept the same way" "$(printf '%s' "$OUT" | jqf detail):$(cat "$W/local/config.json")" "going back would overwrite config.json, which git isn't tracking"
+ok "  its content untouched" "$(cat "$W/local/config.json")" '{"local": true}'
+
+section "A commit made in a terminal after finishing the rebase there is not taken for the update's"
+# The update stops on a conflict in the superproject. In a terminal the
+# person finishes the rebase, then commits X; Continue goes on and pauses
+# inside C. Where the update's rebase ended is the rebase's own finish, so
+# Abort must not reset X away (it is in neither the backup nor upstream).
+mini tq B C
+W="$SB/tq"
+printf 'readme (upstream)\n' > "$W/upstream/README.md"; git -C "$W/upstream" commit -qam "super: upstream readme"
+printf 'C v1, rewritten\nline2\nline3\n' > "$W/upstream/C/C.txt"; git -C "$W/upstream/C" commit -q --amend -am "C: initial, rewritten"; git -C "$W/upstream/C" push -q -f origin main 2>/dev/null
+git -C "$W/upstream" add C >/dev/null; git -C "$W/upstream" commit -qm "super: rewrite C"; git -C "$W/upstream" push -q origin main 2>/dev/null
+printf 'readme (mine)\n' > "$W/local/README.md"; git -C "$W/local" commit -qam "super: my readme"
+S0="$(head_of "$W/local")"
+probe sync_plan "$W/local" >/dev/null
+OUT=$(probe sync_run "$W/local")
+ok "(control: the update pauses on README.md in the superproject)" "$(printf '%s' "$OUT" | jqf headline)" "Update paused: conflicts to resolve."
+rm -rf "$W/paused"; cp -R "$W/local" "$W/paused"
+replay() { rm -rf "$W/local"; cp -R "$W/paused" "$W/local"; }
+finish_in_terminal() {
+  printf 'readme (both)\n' > "$W/local/README.md"; git -C "$W/local" add README.md
+  GIT_EDITOR=true git -C "$W/local" rebase --continue >/dev/null 2>&1      # in a terminal
+}
+finish_in_terminal
+ok "(the branch's newest reflog entry is that rebase's finish)" "$(git -C "$W/local" log -g -1 --format=%gs refs/heads/main)" "rebase (finish): refs/heads/main onto "
+OUT=$(probe sync_continue "$W/local")
+ok "(control: Continue carries on and pauses inside C)" "$(printf '%s' "$OUT" | jqf headline)" "Update paused inside C."
+OUT=$(probe sync_abort "$W/local")
+ok "(control: with nothing made since the finish, Abort puts the superproject back)" "$(printf '%s' "$OUT" | jqf detail):$(head_of "$W/local")" ":$S0"
+
+replay
+finish_in_terminal
+printf 'x\n' > "$W/local/x.txt"; git -C "$W/local" add x.txt; git -C "$W/local" commit -qm "super: X, after the finish"      # in a terminal
+SX="$(head_of "$W/local")"
+OUT=$(probe sync_continue "$W/local")
+ok "X committed after the terminal finish: Continue still pauses inside C" "$(printf '%s' "$OUT" | jqf headline)" "Update paused inside C."
+OUT=$(probe sync_abort "$W/local")
+ok "  Abort leaves the superproject, saying why" "$(printf '%s' "$OUT" | jqf detail)" "the superproject was left as rebased: the update did not record where its rebase ended"
+ok "  and where its pre-update tip is" "$(printf '%s' "$OUT" | jqf detail)" "its pre-update tip is branch gitswitch-before-update-"
+ok "  X is still on main" "$(head_of "$W/local"):$(git -C "$W/local" rev-parse main)" "$SX:$SX"
+ok "  and C is put back" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(s['path'],s['action']) for s in d['sync']['submodules']])")" "('C', 'put-back')"
 
 verify_result

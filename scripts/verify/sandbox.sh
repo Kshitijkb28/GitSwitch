@@ -328,6 +328,67 @@ ok "  and HEAD is upstream's commit" "$(git -C "$SB/work" log -1 --format=%s)" "
 OUT=$(probe continue "$SB/work")
 ok "with nothing in progress, continue is refused by name" "$(printf '%s' "$OUT" | jqf refusal.code)" "nothing-to-continue"
 
+section "Continue never skips a rebase stop over unstaged edits: the skip resets the tree"
+# `git rebase --skip` resets the working tree hard, where `--continue` would
+# have refused over unstaged edits to tracked files.
+git -C "$SB/work" push -q origin main 2>/dev/null
+cd "$SB/other"; git pull -q --rebase origin main 2>/dev/null; printf 'THEIRS-4\n' > conflict.txt; git add -A >/dev/null; git commit -qm "their fourth"; git push -q origin main 2>/dev/null
+cd "$SB/work"; printf 'MINE-4\n' > conflict.txt; git add -A >/dev/null; git commit -qm "my fourth"
+OUT=$(probe pull "$SB/work" "rebase")
+printf 'THEIRS-4\n' > "$SB/work/conflict.txt"; git -C "$SB/work" add conflict.txt
+printf 'unsaved edit\n' >> "$SB/work/keep.txt"
+ok "(control: the stop resolved to upstream's side has nothing staged, so only a skip goes on)" "$(git -C "$SB/work" diff --cached --quiet HEAD; echo rc=$?):$(probe status "$SB/work" | jqf operation.kind)" "rc=0:rebase"
+OUT=$(probe continue "$SB/work")
+ok "with an unstaged edit, continue refuses to skip" "$(printf '%s' "$OUT" | jqf refusal.code)" "skip-would-discard"
+ok "  saying the skip would throw the edits away" "$(printf '%s' "$OUT" | jqf refusal.message)" "would throw away your unstaged changes"
+ok "  the edit is still there" "$(tail -n1 "$SB/work/keep.txt")" "unsaved edit"
+ok "  and the rebase still waits" "$(probe status "$SB/work" | jqf operation.kind)" "rebase"
+# Set aside as the refusal says. (`git stash` resets the tree, which also
+# closes the stop: git then continues without needing a skip.)
+git -C "$SB/work" stash -q
+OUT=$(probe continue "$SB/work")
+ok "set aside, the same continue finishes the rebase" "$(printf '%s' "$OUT" | jqf headline)" "Finished the rebase"
+ok "  leaving out the pick that became empty" "$(git -C "$SB/work" log -1 --format=%s)" "their fourth"
+git -C "$SB/work" stash pop -q
+ok "  and the edit comes back from the stash" "$(tail -n1 "$SB/work/keep.txt")" "unsaved edit"
+git -C "$SB/work" checkout -q -- keep.txt
+
+section "Discard and Unstage of a staged rename act on both of its names"
+# status reports a rename as one entry under its new name; the index holds a
+# deletion of the old name and an addition of the new one.
+porc() { local p; p="$(git -C "$SB/work" status --porcelain | LC_ALL=C sort | tr '\n' '|')"; echo "${p:-clean}"; }
+printf 'moved content\n' > "$SB/work/ren-old.txt"; git -C "$SB/work" add ren-old.txt; git -C "$SB/work" commit -qm "a file to rename"
+git -C "$SB/work" mv ren-old.txt ren-new.txt
+OUT=$(probe status "$SB/work")
+ok "(control: one staged rename entry, under the new name)" "$(printf '%s' "$OUT" | "$PY" -c "import sys,json;d=json.load(sys.stdin);print([(e['path'],e['orig_path'],e['staged']) for e in d['entries']])")" "[('ren-new.txt', 'ren-old.txt', 'R')]"
+OUT=$(probe unstage "$SB/work" "ren-new.txt")
+STAGED="$(git -C "$SB/work" diff --cached --name-only | tr '\n' '|')"
+ok "unstaging it leaves nothing staged under either name" "${STAGED:-nothing}" "nothing"
+ok "  the old name is back in the index (missing from disk), the new one untracked" "$(porc)" " D ren-old.txt|?? ren-new.txt|"
+git -C "$SB/work" add -A ren-old.txt ren-new.txt
+ok "(control: staged as a rename again)" "$(porc)" "R  ren-old.txt -> ren-new.txt|"
+OUT=$(probe discard "$SB/work" "ren-new.txt")
+ok "discarding it undoes the rename: nothing is left changed" "$(porc)" "clean"
+ok "  the file is back under its old name" "$(cat "$SB/work/ren-old.txt" 2>&1)" "moved content"
+ok "  and the new name is gone" "$([ -e "$SB/work/ren-new.txt" ] && echo present || echo gone)" "gone"
+git -C "$SB/work" mv ren-old.txt ren-new.txt
+printf 'another file, unsaved\n' > "$SB/work/ren-old.txt"
+ok "(control: the rename is staged and a new file sits at the old name)" "$(porc)" "?? ren-old.txt|R  ren-old.txt -> ren-new.txt|"
+OUT=$(probe discard "$SB/work" "ren-new.txt")
+ok "a file now at the old name is not overwritten: the old name returns to the index only" "$(cat "$SB/work/ren-old.txt" 2>&1)" "another file, unsaved"
+ok "  so the old name shows that file as its change, and nothing is staged" "$(porc)" " M ren-old.txt|"
+git -C "$SB/work" checkout -q -- ren-old.txt
+# A rename that changes only the case. Where the disk ignores case (Windows,
+# macOS) the old name is "on disk": it is the renamed file itself, and the
+# restore of the new name deletes that one file.
+printf 'cased content\n' > "$SB/work/Case.txt"; git -C "$SB/work" add Case.txt; git -C "$SB/work" commit -qm "a file to rename by case"
+git -C "$SB/work" mv Case.txt case.txt
+printf 'edited after the rename\n' >> "$SB/work/case.txt"
+ok "(control: a case-only rename, staged, with an unstaged edit)" "$(porc)" "RM Case.txt -> case.txt|"
+OUT=$(probe discard "$SB/work" "case.txt")
+ok "discarding a case-only rename undoes it: nothing is left changed" "$(porc)" "clean"
+ok "  the file is there under its old name, as last committed" "$(git -C "$SB/work" ls-files Case.txt case.txt | tr '\n' '|'):$(cat "$SB/work/Case.txt" 2>&1)" "Case.txt|:cased content"
+
 section "Diff viewer"
 printf 'diffline\n' >> "$SB/work/a.txt"
 OUT=$(probe diff "$SB/work" "a.txt,unstaged")
@@ -413,7 +474,9 @@ git -C "$SB/work" remote set-url --push origin https://github.com/acme/thing.git
 OUT=$(who)
 ok "an HTTPS remote with no stored credential says the push would fail" "$(printf '%s' "$OUT" | jqf value.via):$(printf '%s' "$OUT" | jqf value.login)" "https-credential:None"
 ok "  and why" "$(printf '%s' "$OUT" | jqf value.detail)" "No credential is stored"
-git -C "$SB/work" config credential.helper '!f() { echo username=hthelper; echo password=not-a-real-secret; }; f'
+# The helper is the person's own (global, in the sandbox's HOME): the push card
+# never runs a helper the repository's own config names (hostile.sh).
+git config --global credential.helper '!f() { echo username=hthelper; echo password=not-a-real-secret; }; f'
 OUT=$(who)
 # For github.com the account comes from GitHub's answer to the token, never from
 # the stored user name (a name is whatever was typed when it was saved). The
@@ -421,14 +484,14 @@ OUT=$(who)
 ok "a stored GitHub credential is named, but not trusted as the account" "$(printf '%s' "$OUT" | jqf value.account):$(printf '%s' "$OUT" | jqf value.login)" "hthelper:None"
 ok "  and says GitHub could not be asked" "$(printf '%s' "$OUT" | jqf value.detail)" "could not be reached"
 ok "  without the secret anywhere in the answer" "$(printf '%s' "$OUT" | grep -c "not-a-real-secret" || true)" "0"
-git -C "$SB/work" config credential.helper '!f() { echo username=ghp_000000000000000000000000000000000000; echo password=x-oauth-basic; }; f'
+git config --global credential.helper '!f() { echo username=ghp_000000000000000000000000000000000000; echo password=x-oauth-basic; }; f'
 OUT=$(who)
 ok "a token travelling as the user name is treated as the secret, not shown" "$(printf '%s' "$OUT" | grep -c "ghp_0000" || true)" "0"
 git -C "$SB/work" remote set-url --push origin https://gitlab.example.com/acme/thing.git
-git -C "$SB/work" config credential.helper '!f() { echo username=hthelper; echo password=not-a-real-secret; }; f'
+git config --global credential.helper '!f() { echo username=hthelper; echo password=not-a-real-secret; }; f'
 OUT=$(who)
 ok "for a host that is not GitHub, the stored user name is the best available answer" "$(printf '%s' "$OUT" | jqf value.login)" "hthelper"
-git -C "$SB/work" config --unset credential.helper
+git config --global --unset credential.helper
 # A block rewrites the remote's URL, never an explicit pushurl (git's rule, and
 # the guard's documented gap that the hook covers), so the URL itself moves here.
 git -C "$SB/work" config --unset remote.origin.pushurl
@@ -506,8 +569,10 @@ git clone -q "file://$SB/net.git" "$SB/net-history" 2>/dev/null
 # A repository whose own housekeeping becomes due with the pull's fetch (its
 # second pack), cannot detach (as on Windows) and is slow: its pre-auto-gc
 # hook sleeps longer than the silence window. Cloned before upstream moves.
+# Its plan is git's classic gc: since 2.54 git repacks geometrically by
+# default, and two packs that far apart in size are nothing to do there.
 git clone -q "file://$SB/net.git" "$SB/net-gc" 2>/dev/null
-git -C "$SB/net-gc" config gc.autoDetach false; git -C "$SB/net-gc" config gc.autoPackLimit 1
+git -C "$SB/net-gc" config gc.autoDetach false; git -C "$SB/net-gc" config gc.autoPackLimit 1; git -C "$SB/net-gc" config maintenance.strategy gc
 GC_HOOK="$(git -C "$SB/net-gc" rev-parse --path-format=absolute --git-path hooks)/pre-auto-gc"
 printf '#!/bin/sh\necho ran >> "%s"\nsleep 6\n' "$SB/gc-hook.log" > "$GC_HOOK"; chmod +x "$GC_HOOK"
 # A second remote, as a fork and its original are: with two remotes `fetch

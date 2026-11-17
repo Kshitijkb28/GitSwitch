@@ -567,12 +567,16 @@ async fn detached_unique(repo: &str) -> usize {
     count(repo, &["HEAD", "--not", "--branches", "--remotes", "--tags"]).await
 }
 
+/// Object ids only, after `--end-of-options`: the ids are read back from git
+/// output, where a field that follows commit text can be anything that text
+/// says (`--output=<file>` once reached `git log` this way).
 async fn commit_refs(repo: &str, oids: &[String]) -> Vec<CommitRef> {
+    let oids: Vec<String> = oids.iter().filter(|o| crate::git_exec::is_object_id(o)).cloned().collect();
     if oids.is_empty() {
         return Vec::new();
     }
-    let mut args = vec!["log".to_string(), "--no-walk=unsorted".into(), "--format=%H%x1f%h%x1f%s".into()];
-    args.extend(oids.iter().cloned());
+    let mut args = vec!["log".to_string(), "--no-walk=unsorted".into(), "--format=%H%x1f%h%x1f%s".into(), "--end-of-options".into()];
+    args.extend(oids);
     parse_refs(&g(repo).args(args).ok_text().await.unwrap_or_default())
 }
 
@@ -601,10 +605,10 @@ fn parse_refs(out: &str) -> Vec<CommitRef> {
 /// The parents of one commit, in order.
 async fn parents_of(repo: &str, oid: &str) -> Vec<String> {
     g(repo)
-        .args(["rev-list", "--parents", "-n1", oid])
+        .args(["rev-list", "--parents", "-n1", "--end-of-options", oid])
         .ok_text()
         .await
-        .map(|s| s.split_whitespace().skip(1).map(|p| p.to_string()).collect())
+        .map(|s| s.split_whitespace().skip(1).filter(|p| crate::git_exec::is_object_id(p)).map(|p| p.to_string()).collect())
         .unwrap_or_default()
 }
 
@@ -1023,29 +1027,38 @@ pub async fn undo_commit(repo_path: &str) -> Result<OpResult, AppError> {
 /// being in the index — untracked or ignored. `git switch` refuses to clobber
 /// those itself; `git reset --hard` does not, so this is the check it lacks.
 /// A STAGED new file is in the index and is left out: the caller's dialog has
-/// already said staged changes are thrown away (or stashed first).
-async fn untracked_in_the_way(repo: &str, target: &str) -> Vec<String> {
-    let nul_list = |out: Result<crate::git_exec::GitOutput, AppError>| -> Vec<String> {
-        out.ok()
-            .filter(|o| o.ok())
-            .map(|o| o.text().split('\0').filter(|p| !p.is_empty()).map(String::from).collect())
-            .unwrap_or_default()
+/// already said staged changes are thrown away (or stashed first). `Err` when
+/// git could not answer: then nobody knows what the reset would overwrite.
+pub(crate) async fn untracked_in_the_way(repo: &str, target: &str) -> Result<Vec<String>, String> {
+    let nul_list = |out: Result<crate::git_exec::GitOutput, AppError>| -> Result<Vec<String>, String> {
+        match out {
+            Ok(o) if o.ok() => Ok(o.text().split('\0').filter(|p| !p.is_empty()).map(String::from).collect()),
+            Ok(o) => Err(o.stderr.trim().to_string()),
+            Err(e) => Err(e.to_string()),
+        }
     };
+    // `--no-renames`: a path the target reaches by renaming a file HEAD has is
+    // a new path on disk all the same, and diff.renames (on by default) would
+    // report it as a rename and hide it from the filter.
     let added = nul_list(
         g(repo)
-            .args(["diff", "--name-only", "-z", "--diff-filter=A", "HEAD", target, "--"])
+            .args(["diff", "--no-renames", "--name-only", "-z", "--diff-filter=A", "HEAD", target, "--"])
             .run()
             .await,
-    );
+    )?;
     let on_disk: Vec<String> = added
         .into_iter()
         .filter(|p| std::fs::symlink_metadata(Path::new(repo).join(p)).is_ok())
         .collect();
     if on_disk.is_empty() {
-        return on_disk;
+        return Ok(on_disk);
     }
-    let indexed: std::collections::HashSet<String> = nul_list(g(repo).args(["ls-files", "-z"]).run().await).into_iter().collect();
-    on_disk.into_iter().filter(|p| !indexed.contains(p)).collect()
+    // Where the disk ignores case, a rename that changes only the case finds
+    // the tracked file itself at the new name: that is not a file in the way.
+    let ignore_case = g(repo).args(["config", "--bool", "--get", "core.ignorecase"]).ok_text().await.is_some_and(|s| s.trim() == "true");
+    let fold = |p: &str| if ignore_case { p.to_lowercase() } else { p.to_string() };
+    let indexed: std::collections::HashSet<String> = nul_list(g(repo).args(["ls-files", "-z"]).run().await)?.iter().map(|p| fold(p)).collect();
+    Ok(on_disk.into_iter().filter(|p| !indexed.contains(&fold(p))).collect())
 }
 
 fn untracked_in_the_way_message(files: &[String]) -> String {
@@ -1089,7 +1102,15 @@ pub async fn reset_to(repo_path: &str, target: &str, mode: ResetMode, stash_firs
     // has and HEAD does not, already on disk untracked, is overwritten without
     // a word. The dialog promised untracked files are left alone, so keep it.
     if mode == ResetMode::Hard {
-        let in_the_way = untracked_in_the_way(repo_path, &oid).await;
+        let in_the_way = match untracked_in_the_way(repo_path, &oid).await {
+            Ok(files) => files,
+            Err(said) => {
+                return Ok(OpResult::refused(
+                    refuse("untracked-unknown", format!("GitSwitch could not check which untracked files a hard reset would overwrite (git said: {}), so nothing was changed.", said)),
+                    before,
+                ))
+            }
+        };
         if !in_the_way.is_empty() {
             return Ok(OpResult::refused(refuse("untracked-in-the-way", untracked_in_the_way_message(&in_the_way)), before));
         }
@@ -1703,6 +1724,33 @@ pub async fn discard_all(repo_path: &str, include_untracked: bool, stash_first: 
 // Commit lookup
 // ---------------------------------------------------------------------------
 
+/// What git can print for a commit only (ids, the committer date) comes
+/// first, its author's and its own text last: a 0x1F inside a subject or an
+/// author name can then move nothing but that text. With the parents after
+/// the subject, a subject holding three of them put its own words where the
+/// parents were read, and they reached `git log` as options.
+const TARGET_FORMAT: &str = "%h%x1f%P%x1f%cI%x1f%an%x1f%s";
+
+struct TargetLine {
+    short: String,
+    parents: Vec<String>,
+    date: String,
+    author: String,
+    subject: String,
+}
+
+fn parse_target_line(line: &str) -> TargetLine {
+    let f: Vec<&str> = line.trim_end_matches(['\n', '\r']).splitn(5, '\x1f').collect();
+    let field = |i: usize| f.get(i).copied().unwrap_or_default().to_string();
+    TargetLine {
+        short: field(0),
+        parents: f.get(1).copied().unwrap_or_default().split_whitespace().filter(|p| crate::git_exec::is_object_id(p)).map(str::to_string).collect(),
+        date: field(2),
+        author: field(3),
+        subject: field(4),
+    }
+}
+
 /// What the user typed, resolved, with what a reset to it would do. `None`
 /// when git knows no such commit; malformed text is an error.
 pub async fn resolve_commit(repo_path: &str, text: &str) -> Result<Option<CommitTarget>, AppError> {
@@ -1711,12 +1759,12 @@ pub async fn resolve_commit(repo_path: &str, text: &str) -> Result<Option<Commit
         return Ok(None);
     };
     let line = g(repo_path)
-        .args(["log", "-1", "--format=%H%x1f%h%x1f%s%x1f%an%x1f%cI%x1f%P", &oid])
+        .args(["log", "-1", &format!("--format={}", TARGET_FORMAT), "--end-of-options", &oid])
         .ok_text()
         .await
         .unwrap_or_default();
-    let f: Vec<&str> = line.split('\x1f').collect();
-    let parent_oids: Vec<String> = f.get(5).copied().unwrap_or_default().split_whitespace().map(|s| s.to_string()).collect();
+    let t = parse_target_line(&line);
+    let parent_oids = t.parents;
     let parents = commit_refs(repo_path, &parent_oids).await;
     let repo = Path::new(repo_path);
     let head = sync::oid(repo, "HEAD").await;
@@ -1728,10 +1776,10 @@ pub async fn resolve_commit(repo_path: &str, text: &str) -> Result<Option<Commit
     Ok(Some(CommitTarget {
         input: text.to_string(),
         oid: oid.clone(),
-        short: f.get(1).copied().unwrap_or_default().to_string(),
-        subject: f.get(2).copied().unwrap_or_default().to_string(),
-        author: f.get(3).copied().unwrap_or_default().to_string(),
-        date: f.get(4).copied().unwrap_or_default().to_string(),
+        short: t.short,
+        subject: t.subject,
+        author: t.author,
+        date: t.date,
         is_merge: parent_oids.len() > 1,
         parents,
         is_head,
@@ -2019,6 +2067,25 @@ pub(crate) async fn probe(op: &str, repo: &str, args: &[String]) {
 mod tests {
     use super::*;
     use TreeIntent::*;
+
+    #[test]
+    fn a_commits_own_text_cannot_become_its_parents() {
+        let (p1, p2) = ("1".repeat(40), "2".repeat(40));
+        let plain = parse_target_line(&format!("abc1234\x1f{} {}\x1f2026-01-01T00:00:00+00:00\x1fAnn\x1fMerge it\n", p1, p2));
+        assert_eq!((plain.short.as_str(), plain.parents.clone(), plain.author.as_str(), plain.subject.as_str()), ("abc1234", vec![p1.clone(), p2.clone()], "Ann", "Merge it"));
+        // The subject of PARSE-R2-01: three 0x1F and the words the old
+        // format read as parents. They stay the subject.
+        let hostile = format!("a\x1fb\x1fc\x1f--output=.git/config --format=%B {}", p2);
+        let t = parse_target_line(&format!("abc1234\x1f{}\x1f2026-01-01T00:00:00+00:00\x1fMallory\x1f{}", p1, hostile));
+        assert_eq!(t.parents, vec![p1.clone()]);
+        assert_eq!(t.subject, hostile);
+        assert_eq!(t.author, "Mallory");
+        // An author name with a separator moves only text into the subject.
+        let t = parse_target_line(&format!("abc1234\x1f{}\x1fdate\x1fMal\x1f--output=x\x1fsubject", p1));
+        assert_eq!(t.parents, vec![p1.clone()]);
+        // Whatever the line says, only object ids come out as parents.
+        assert!(parse_target_line("abc1234\x1f--output=x HEAD\x1fdate\x1fa\x1fs").parents.is_empty());
+    }
 
     fn clean() -> StatusFacts {
         StatusFacts { identity_matches: true, upstream: Some("origin/main".into()), can_amend: true, ..Default::default() }

@@ -148,6 +148,91 @@ pub fn parse_ls_json(out: &str) -> Option<Vec<LfsFile>> {
     Some(list)
 }
 
+/// The size a Git LFS pointer names (`size 12345`), read from the pointer's
+/// own text. None for anything that is not a pointer.
+pub fn pointer_size(pointer: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(pointer).ok()?;
+    if !text.starts_with("version https://git-lfs.github.com/spec/") {
+        return None;
+    }
+    text.lines().find_map(|l| l.strip_prefix("size ")).and_then(|n| n.trim().parse().ok())
+}
+
+/// `git ls-files -s -z`: each path and the blob the index holds for it.
+/// A conflict's sides (stages 1–3) are left out: the file has no one blob.
+pub fn parse_staged(out: &[u8]) -> std::collections::HashMap<String, String> {
+    out.split(|b| *b == 0)
+        .filter_map(|entry| {
+            let entry = std::str::from_utf8(entry).ok()?;
+            let (meta, path) = entry.split_once('\t')?;
+            let mut m = meta.split(' ');
+            let (_mode, oid, stage) = (m.next()?, m.next()?, m.next()?);
+            (stage == "0").then(|| (path.to_string(), oid.to_string()))
+        })
+        .collect()
+}
+
+/// `git cat-file --batch`: each object's content, in the order asked; None
+/// for one git reports missing.
+pub fn parse_batch(out: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let mut objects = Vec::new();
+    let mut at = 0;
+    while at < out.len() {
+        let Some(nl) = out[at..].iter().position(|b| *b == b'\n') else { break };
+        let header = String::from_utf8_lossy(&out[at..at + nl]).to_string();
+        at += nl + 1;
+        let fields: Vec<&str> = header.split(' ').collect();
+        match fields.as_slice() {
+            [_, _, size] => {
+                let Ok(size) = size.parse::<usize>() else { break };
+                if at + size > out.len() {
+                    break;
+                }
+                objects.push(Some(out[at..at + size].to_vec()));
+                // The content's own closing newline.
+                at += size + 1;
+            }
+            _ => objects.push(None),
+        }
+    }
+    objects
+}
+
+/// The sizes of these large files, from their pointers as the index holds
+/// them: for a git-lfs without `ls-files --json` (Ubuntu 22.04 ships 3.0.2),
+/// which reports none. A pointer is never over 1 KiB, so a bigger blob (a
+/// file committed before it was tracked) is not read.
+async fn pointer_sizes(repo: &Path, paths: &[&str]) -> std::collections::HashMap<String, u64> {
+    let mut sizes = std::collections::HashMap::new();
+    let Some(staged) = GitCmd::at(repo).args(["ls-files", "-s", "-z"]).timeout(NET_TIMEOUT).run().await.ok().filter(|o| o.ok()) else { return sizes };
+    let index = parse_staged(&staged.stdout);
+    let asked: Vec<(&str, &str)> = paths.iter().filter_map(|p| index.get(*p).map(|oid| (*p, oid.as_str()))).collect();
+    if asked.is_empty() {
+        return sizes;
+    }
+    let list = |of: &[(&str, &str)]| of.iter().map(|(_, oid)| format!("{}\n", oid)).collect::<String>().into_bytes();
+    let Some(check) = GitCmd::at(repo).args(["cat-file", "--batch-check"]).stdin_bytes(list(&asked)).timeout(NET_TIMEOUT).run().await.ok().filter(|o| o.ok()) else { return sizes };
+    let small: std::collections::HashSet<String> = check
+        .text()
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(' ').collect();
+            (f.len() == 3 && f[1] == "blob" && f[2].parse::<u64>().is_ok_and(|n| n <= 1024)).then(|| f[0].to_string())
+        })
+        .collect();
+    let pointers: Vec<(&str, &str)> = asked.into_iter().filter(|(_, oid)| small.contains(*oid)).collect();
+    if pointers.is_empty() {
+        return sizes;
+    }
+    let Some(batch) = GitCmd::at(repo).args(["cat-file", "--batch"]).stdin_bytes(list(&pointers)).timeout(NET_TIMEOUT).run().await.ok().filter(|o| o.ok()) else { return sizes };
+    for ((path, _), content) in pointers.iter().zip(parse_batch(&batch.stdout)) {
+        if let Some(size) = content.as_deref().and_then(pointer_size) {
+            sizes.insert(path.to_string(), size);
+        }
+    }
+    sizes
+}
+
 /// The folder part of a root-relative path; "" for a file at the root.
 pub fn parent_dir(path: &str) -> &str {
     match path.rfind('/') {
@@ -584,10 +669,19 @@ async fn scan_files(repo: &Path) -> (Vec<LfsFile>, bool) {
                         downloaded: present,
                     })
                 })
-                .collect()
+                .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    (fallback, false)
+    // This git-lfs names no sizes; every pointer does.
+    let mut files = fallback;
+    let sizes = pointer_sizes(repo, &files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>()).await;
+    for f in &mut files {
+        if let Some(size) = sizes.get(&f.path) {
+            f.size = *size;
+        }
+    }
+    let known = !files.is_empty() && files.iter().all(|f| sizes.contains_key(&f.path));
+    (files, known)
 }
 
 /// Every large file in the checkout, with folder totals — what the browser
@@ -718,6 +812,24 @@ pub async fn lfs_status(repo_path: &str) -> Result<LfsStatus, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_come_from_the_pointers_when_git_lfs_names_none() {
+        let pointer = b"version https://git-lfs.github.com/spec/v1\noid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\nsize 12345\n";
+        assert_eq!(pointer_size(pointer), Some(12345));
+        assert_eq!(pointer_size(b"just a file\nsize 5\n"), None, "not a pointer");
+        assert_eq!(pointer_size(&[0xff, 0xfe, 0x00]), None);
+
+        let staged = b"100644 aaaa 0\tmedia/a b.bin\x00100644 bbbb 0\tmodel.bin\x00100644 cccc 1\tboth.bin\x00100644 dddd 2\tboth.bin\x00";
+        let index = parse_staged(staged);
+        assert_eq!(index.get("media/a b.bin").map(String::as_str), Some("aaaa"), "a space in the path");
+        assert_eq!(index.get("model.bin").map(String::as_str), Some("bbbb"));
+        assert!(!index.contains_key("both.bin"), "a conflict has no one blob");
+
+        let mut batch = b"aaaa blob 5\nhello\nbbbb missing\ncccc blob 0\n\n".to_vec();
+        batch.extend_from_slice(b"dddd blob 3\n\x00\n\x01\n");
+        assert_eq!(parse_batch(&batch), vec![Some(b"hello".to_vec()), None, Some(Vec::new()), Some(vec![0, b'\n', 1])], "sizes, not lines: content may hold newlines");
+    }
 
     #[test]
     fn the_progress_file_is_read_from_its_tail() {

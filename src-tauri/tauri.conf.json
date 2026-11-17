@@ -17,7 +17,8 @@
         "height": 650,
         "minWidth": 700,
         "minHeight": 500,
-        "center": true
+        "center": true,
+        "visible": false
       }
     ],
     "security": {
@@ -54,7 +55,8 @@
     },
     "windows": {
       "nsis": {
-        "installMode": "perMachine"
+        "installMode": "perMachine",
+        "installerHooks": "./windows/hooks.nsh"
       }
     }
   },

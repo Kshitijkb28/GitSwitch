@@ -328,6 +328,24 @@ export interface RepoRef {
   profile_id: string;
   profile_name: string;
   profile_email: string;
+  /** A repository, or a profile folder that holds none (listed so it doesn't vanish). */
+  kind?: "repo" | "folder";
+  /** A folder entry inside a repository: that repository's top folder. */
+  inside?: string | null;
+}
+
+/** What a folder is to git. */
+export type FolderState =
+  | { kind: "missing" }
+  | { kind: "repo" }
+  | { kind: "inside-repo"; top: string }
+  | { kind: "contains-repos"; count: number }
+  | { kind: "no-repo" };
+
+/** What making a folder a repository made. */
+export interface InitOutcome {
+  path: string;
+  branch: string;
 }
 
 export interface BranchInfo {
@@ -505,6 +523,16 @@ export interface MergedBy {
 
 export async function historyListRepos(): Promise<RepoRef[]> {
   return invoke("history_list_repos");
+}
+
+/** What a folder is to git. Read only. */
+export async function folderState(path: string): Promise<FolderState> {
+  return invoke("folder_state", { path });
+}
+
+/** Make a folder that holds no repository one (`git init`). */
+export async function repoInit(path: string): Promise<InitOutcome> {
+  return invoke("repo_init", { path });
 }
 
 export async function historyBranches(repoPath: string): Promise<BranchInfo[]> {
@@ -1613,6 +1641,12 @@ export interface Advice {
   headline: string;
   guidance: string;
   action: string | null;
+  /** The page the action's button opens (GitHub's new-repository form, filled in). */
+  link?: string | null;
+  /** The remote the action acts on. */
+  remote?: string | null;
+  /** "owner/name" of a repository that doesn't exist on GitHub yet: what the create form starts from. */
+  repo?: string | null;
   git_said: string;
 }
 
@@ -2316,6 +2350,137 @@ export async function changesCommit(
   return invoke("changes_commit", { repoPath, message, amend });
 }
 
+/** What Publish's address check found: saved, or why not. */
+export interface RemoteCheck {
+  saved: boolean;
+  problem: string;
+  /** GitHub's new-repository form, filled in: the repository doesn't exist yet under the folder's account. */
+  create_url: string | null;
+  /** A non-empty repository's branches, when this branch isn't one of them: "Publish there anyway" is offered. */
+  existing_branches: string[];
+  /** "owner/name" of the missing repository: what the create form starts from. */
+  repo: string | null;
+}
+
+/** Connect a repository that has no remote yet to `url`, as origin, once the address is checked (Publish's "Add a remote…"). */
+export async function changesAddRemote(repoPath: string, url: string, allowExisting = false): Promise<RemoteCheck> {
+  return invoke("changes_add_remote", { repoPath, url, allowExisting });
+}
+
+/** A new address for `remote`, which still has the address `from` and was never reached (Publish's "Change the address…"); checked before it is saved. */
+export async function changesChangeRemote(repoPath: string, remote: string, from: string, url: string, allowExisting = false): Promise<RemoteCheck> {
+  return invoke("changes_change_remote", { repoPath, remote, from, url, allowExisting });
+}
+
+/** An account that can create a repository on GitHub ("gh:<login>" or "signin:<login>"). */
+export interface PublishAccount {
+  account: string;
+  login: string;
+  source: string;
+}
+
+/**
+ * Where a new repository would be connected: "add" origin, "change" a remote
+ * never reached, or "none" (the push goes to a remote already reached).
+ * "again" is never sent by the backend: the Publish dialog marks so a "none"
+ * whose address names the very repository GitHub lost, to make it again
+ * there, the address unchanged.
+ */
+export interface PublishTarget {
+  kind: "add" | "change" | "none" | "again";
+  remote: string | null;
+  url: string | null;
+  repo: string | null;
+}
+
+/** What the "Create on GitHub" form starts from. */
+export interface PublishContext {
+  accounts: PublishAccount[];
+  /** The account this folder pushes as, when GitSwitch has it. */
+  suggested: string | null;
+  /** The GitHub login this folder pushes as (its profile's account, else its key's). */
+  push_login: string | null;
+  target: PublishTarget;
+  /** The folder's name, as GitHub takes it. */
+  default_name: string;
+  branch: string | null;
+  /** Why the folder can't be published now (blocked, no commits, …). */
+  blocked: string | null;
+}
+
+export interface RepoOwner {
+  login: string;
+  kind: "user" | "org";
+}
+
+export interface RepoOwners {
+  owners: RepoOwner[];
+  /** Organizations hidden because single sign-on hasn't been authorized. */
+  sso_hidden: number;
+}
+
+/**
+ * Where to connect the new repository, as the dialog saw it: "again" makes it
+ * under exactly the owner/name the remote's address `from` names, and that
+ * address is kept (the backend refuses anything else before asking GitHub).
+ */
+export type CreateTarget = { kind: "add" } | { kind: "change"; remote: string; from: string } | { kind: "again"; remote: string; from: string };
+
+/** What creating the repository did. `problem` is empty when it is ready to publish. */
+export interface Published {
+  saved: "added" | "changed" | "kept" | "no";
+  full_name: string;
+  html_url: string;
+  private: boolean;
+  renamed: boolean;
+  remote: string;
+  url: string;
+  problem: string;
+}
+
+/** The Publish dialog's accounts, read from local files only (gh's hosts.yml, the sign-ins, the profiles). */
+export interface PublishAccounts {
+  accounts: PublishAccount[];
+  suggested: string | null;
+  /** The login this folder pushes as, when known without asking github.com. */
+  push_login: string | null;
+  /** Its profile has a key nobody asked github.com about lately: `githubPublishPushLogin` can tell. */
+  push_login_pending: boolean;
+}
+
+/** The accounts that can create the repository, at once: no network, no git. */
+export async function githubPublishAccounts(repoPath: string): Promise<PublishAccounts> {
+  return invoke("github_publish_accounts", { repoPath });
+}
+
+/** Who this folder pushes as, asking github.com about its key when nothing local says (can take seconds). */
+export async function githubPublishPushLogin(repoPath: string): Promise<string | null> {
+  return invoke("github_publish_push_login", { repoPath });
+}
+
+/** Publishing a repository made here: the accounts, the folder's own, the target and a name. */
+export async function githubPublishContext(repoPath: string): Promise<PublishContext> {
+  return invoke("github_publish_context", { repoPath });
+}
+
+/** Where `account` can create a repository: itself and its organizations. */
+export async function githubOwners(account: string): Promise<RepoOwners> {
+  return invoke("github_owners", { account });
+}
+
+/** Create the repository on GitHub as `account` and connect it to this folder, ready to publish. */
+export async function changesCreateGithubRepo(
+  repoPath: string,
+  account: string,
+  owner: string,
+  name: string,
+  description: string,
+  isPrivate: boolean,
+  target: CreateTarget
+): Promise<Published> {
+  return invoke("changes_create_github_repo", { repoPath, account, owner, name, description, private: isPrivate, target });
+}
+
 /** `allowUnpushedSubmodules`: push although a submodule's recorded commit is on none of that submodule's remotes. */
 export async function changesPush(repoPath: string, setUpstream: boolean, allowUnpushedSubmodules = false): Promise<OpResult> {
   return invoke("changes_push", { repoPath, setUpstream, allowUnpushedSubmodules });
@@ -2658,6 +2823,89 @@ export async function githubInvitationCancel(account: string, owner: string, nam
   return invoke("github_invitation_cancel", { account, owner, name, id });
 }
 
+// --- GitHub: who can see a repository, and deleting it ---
+// Both act only on the repository the dialog showed: `expectId` is its id as
+// read when the dialog opened, and the backend refuses if it changed.
+
+/** A repository as GitHub has it now, with what a change would cost. */
+export interface RepoFacts {
+  id: number;
+  owner: string;
+  name: string;
+  full_name: string;
+  owner_kind: "user" | "org";
+  private: boolean;
+  visibility: "public" | "private" | "internal";
+  fork: boolean;
+  /** "owner/name" of the repository it was forked from. */
+  parent: string | null;
+  archived: boolean;
+  /** This account may change who can see it, and delete it. */
+  admin: boolean;
+  stars: number;
+  watchers: number;
+  forks: number;
+  has_pages: boolean;
+  html_url: string;
+  /** True: it can delete now; false: GitHub wants the person's approval first; null: GitHub didn't say. */
+  can_delete: boolean | null;
+  /** Branches on GitHub whose last commit the folder on this computer lacks. */
+  missing_here: string[];
+  /** A folder on this computer was named and compared. */
+  local_checked: boolean;
+  /** GitHub has more than 1,000 branches: only the first 1,000 were compared with that folder. */
+  branches_capped: boolean;
+}
+
+/** "needs-permission": GitHub wants the person's approval first, and nothing was sent. */
+export interface DeleteOutcome {
+  outcome: "deleted" | "needs-permission";
+  message: string;
+  /**
+   * Deleted: its owner's Deleted repositories page on github.com, read from
+   * the same answer as `message`; null when it can't be restored from
+   * settings (a fork network), or nothing was deleted.
+   */
+  restore_url?: string | null;
+}
+
+/** The code to enter on github.com to approve deleting, and where. */
+export interface GrantPrompt {
+  user_code: string;
+  verification_uri: string;
+  expires_in: number;
+}
+
+/** What the visibility and delete dialogs show first; with `repoPath`, also which branches that folder lacks. */
+export async function githubRepoFacts(account: string, owner: string, name: string, repoPath: string | null = null): Promise<RepoFacts> {
+  return invoke("github_repo_facts", { account, owner, name, repoPath });
+}
+
+/** Make it private (`isPrivate`) or public; GitHub's answer comes back. */
+export async function githubSetVisibility(account: string, owner: string, name: string, isPrivate: boolean, expectId: number): Promise<RepoFacts> {
+  return invoke("github_set_visibility", { account, owner, name, private: isPrivate, expectId });
+}
+
+/** Delete it on GitHub. `confirm` is exactly what the person typed. */
+export async function githubDeleteRepo(account: string, owner: string, name: string, confirm: string, expectId: number): Promise<DeleteOutcome> {
+  return invoke("github_delete_repo", { account, owner, name, confirm, expectId });
+}
+
+/** Ask GitHub for a code the person enters on github.com to approve deleting as `account`'s login. */
+export async function githubDeleteGrantStart(account: string): Promise<GrantPrompt> {
+  return invoke("github_delete_grant_start", { account });
+}
+
+/** Resolves once the person approved on github.com (a sentence saying so); rejects with the reason otherwise. */
+export async function githubDeleteGrantWait(): Promise<string> {
+  return invoke("github_delete_grant_wait");
+}
+
+/** Stop waiting for the approval. */
+export async function githubDeleteGrantCancel(): Promise<void> {
+  return invoke("github_delete_grant_cancel");
+}
+
 /** One of the account's repositories on the Pull requests page, with its counts. */
 export interface PullRepo {
   /** "owner/name" */
@@ -2709,6 +2957,8 @@ export interface UninstallPlan {
   lock_helper: boolean;
   locks: string[];
   signins: string[];
+  /** GitSwitch starts when the person signs in (the Net speed tab's choice). */
+  startup: boolean;
   data: string[];
 }
 
@@ -2874,6 +3124,19 @@ export interface NetSettings {
   interval_ms: number;
   /** "auto", "all" or an adapter's id. */
   source: string;
+  /** Start GitSwitch at sign-in, without a window, to show the speed (only while it is shown). */
+  start_at_login: boolean;
+}
+
+/** Starting at sign-in: the choice, and what the system has. */
+export interface NetStartup {
+  on: boolean;
+  /** The system's entry is there and starts this GitSwitch. */
+  active: boolean;
+  /** The system has it turned off (Windows' Startup apps). */
+  blocked: string | null;
+  /** Writing or removing the entry failed. */
+  error: string | null;
 }
 
 export interface NetSnapshot {
@@ -2888,6 +3151,7 @@ export interface NetSnapshot {
   interfaces: NetIface[];
   usage: { today: [number, number]; month: [number, number]; session: [number, number]; since: number };
   settings: NetSettings;
+  startup: NetStartup;
 }
 
 export interface NetBar {
@@ -2927,8 +3191,8 @@ export async function netspeedBarReset(): Promise<void> {
   return invoke("netspeed_bar_reset");
 }
 
-/** The system's settings page: the taskbar's icons (Windows) or location access. */
-export async function netspeedOpenSettings(which: "taskbar" | "location"): Promise<void> {
+/** The system's settings page: the taskbar's icons (Windows), location access, or the apps that start at sign-in. */
+export async function netspeedOpenSettings(which: "taskbar" | "location" | "startupapps" | "loginitems"): Promise<void> {
   return invoke("netspeed_open_settings", { which });
 }
 

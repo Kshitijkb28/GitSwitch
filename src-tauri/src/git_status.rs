@@ -448,6 +448,29 @@ fn blank_entry(path: String) -> ChangeEntry {
     }
 }
 
+/// `git version 2.34.1` (or `2.45.2.windows.1`, `2.39.5 (Apple Git-154)`)
+/// at least `major.minor`? None when the line names no version.
+pub(crate) fn git_version_at_least(version_line: &str, major: u32, minor: u32) -> Option<bool> {
+    let v = version_line.split_whitespace().find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut parts = v.split('.');
+    let ma: u32 = parts.next()?.parse().ok()?;
+    let mi: u32 = parts.next()?.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()?;
+    Some((ma, mi) >= (major, minor))
+}
+
+/// `git status --porcelain=v2 --show-stash` names the stash count only from
+/// git 2.35 on. Before that (Ubuntu 22.04 ships 2.34) the line is never there,
+/// every repository would read as having no stash, and a stash just made would
+/// look like it had failed. Asked once: the git on PATH doesn't change while
+/// the app runs. A version that can't be read is trusted to name them.
+fn status_names_stashes() -> bool {
+    static NAMES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NAMES.get_or_init(|| {
+        let line = crate::git_exec::GitCmd::without_repo().arg("--version").run_blocking().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        git_version_at_least(&line, 2, 35).unwrap_or(true)
+    })
+}
+
 /// Parse `git status --porcelain=v2 -z --branch --show-stash`.
 ///
 /// The one trap in this format: with `-z`, a rename record's original path is a
@@ -1041,6 +1064,15 @@ async fn repo_status_with(repo_path: &str, measure_push: bool) -> Result<RepoSta
         )));
     }
     let mut parsed = parse_porcelain_v2(&status_out.stdout);
+    // Before git 2.35 the porcelain never names the stashes: counted here.
+    if !status_names_stashes() {
+        parsed.stash_count = GitCmd::at(&repo)
+            .args(["stash", "list", "--format=%gd"])
+            .ok_text()
+            .await
+            .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+    }
 
     // Line counts come from diff, which status does not provide.
     let unstaged_stats = GitCmd::at(&repo)
@@ -1339,7 +1371,12 @@ pub async fn file_diff(repo_path: &str, path: &str, staged: bool, untracked: boo
         if staged {
             cmd = cmd.arg("--cached");
         }
-        cmd.args(["--", path]).run().await?
+        // The path is the repository's text (a file or submodule may be
+        // named `--cached` or `*`): `:(literal)`, as the History and stash
+        // diffs pass theirs, so it matches only itself. An inherited
+        // `GIT_LITERAL_PATHSPECS=1` would take the magic as part of the name.
+        let literal = format!(":(literal){}", path);
+        cmd.env("GIT_LITERAL_PATHSPECS", "0").args(["--", &literal]).run().await?
     };
 
     if !out.ok() && out.stdout.is_empty() && !out.stderr.is_empty() {
@@ -1616,6 +1653,13 @@ mod tests {
     #[test]
     fn stash_header_is_read_and_defaults_to_zero() {
         assert_eq!(parse_porcelain_v2(&z(&["# stash 4"])).stash_count, 4);
+        // Which git names the stashes in its porcelain (2.35 on).
+        assert_eq!(git_version_at_least("git version 2.34.1", 2, 35), Some(false));
+        assert_eq!(git_version_at_least("git version 2.35.0", 2, 35), Some(true));
+        assert_eq!(git_version_at_least("git version 2.45.2.windows.1", 2, 35), Some(true));
+        assert_eq!(git_version_at_least("git version 2.39.5 (Apple Git-154)", 2, 40), Some(false));
+        assert_eq!(git_version_at_least("git version 3.0.0", 2, 35), Some(true));
+        assert_eq!(git_version_at_least("not git at all", 2, 35), None);
         assert_eq!(parse_porcelain_v2(&z(&["# branch.head main"])).stash_count, 0);
     }
 

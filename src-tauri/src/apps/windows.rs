@@ -172,6 +172,16 @@ pub(crate) fn clean_dir(raw: &str) -> Option<PathBuf> {
     Some(long_path(Path::new(t)))
 }
 
+/// `clean_dir`, for the entry of the program being removed: only a
+/// plainly written InstallLocation (checked before `GetLongPathNameW`, which
+/// may fold a `..` into a folder that then looks plain).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn clean_dir_plain(raw: &str) -> Option<PathBuf> {
+    let t = expand(raw.trim().trim_matches('"').trim());
+    plain_windows_path(t.trim_end_matches(['\\', '/'])).ok()?;
+    clean_dir(raw)
+}
+
 fn long_path(p: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -201,11 +211,88 @@ fn known_folders() -> Vec<PathBuf> {
     if let Ok(l) = std::env::var("LOCALAPPDATA") {
         v.push(PathBuf::from(l).join("Programs"));
     }
+    // What Windows itself says these folders are (the variables above can be
+    // anything a process was started with): more refusals, never fewer.
+    #[cfg(windows)]
+    v.extend(sys::known_folder_paths());
     v
 }
 
 fn lower(p: &Path) -> String {
     p.to_string_lossy().to_lowercase().replace('/', "\\").trim_end_matches('\\').to_string()
+}
+
+/// A path the administrator's run may act on is written plainly: a drive,
+/// its root, then names, each meaning what it says. Refused: `..` and `.`,
+/// device and verbatim prefixes (`\\?\`, `\\.\`, `\??\`) and network paths,
+/// drive-relative and relative paths, an empty name (a doubled or trailing
+/// separator), a name ending in a dot or a space (Windows drops those, so
+/// `X.` opens `X`), `:` inside a name (a data stream), and `* ? " < > |` or
+/// control characters. Pure (and not `Path::components`, which drops `.` in
+/// the middle on Windows), so it is tested on every platform.
+pub(crate) fn plain_windows_path(s: &str) -> Result<(), String> {
+    let odd = |what: &str| Err(format!("It is not where it says ({} on the way).", what));
+    if s.starts_with(r"\\") || s.starts_with("//") || s.starts_with(r"\??\") {
+        return odd("a device or network path");
+    }
+    let b = s.as_bytes();
+    if b.len() < 4 || !b[0].is_ascii_alphabetic() || b[1] != b':' || !(b[2] == b'\\' || b[2] == b'/') {
+        return odd("a path that doesn't start at a drive's root");
+    }
+    for name in s[3..].split(['\\', '/']) {
+        if name.is_empty() {
+            return odd("an empty name");
+        }
+        if name == "." || name == ".." {
+            return odd("a . or ..");
+        }
+        if name.ends_with('.') || name.ends_with(' ') {
+            return odd("a name ending in a dot or a space");
+        }
+        if name.chars().any(|c| matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|') || c.is_control()) {
+            return odd("a character Windows reads differently");
+        }
+    }
+    Ok(())
+}
+
+/// A path as Windows opens it, by its text alone: `.` and `..` folded, and
+/// the trailing dots and spaces Windows drops taken off each name. Used to
+/// see through odd spellings when deciding what another program claims.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn lexical_normal(p: &str) -> String {
+    let p = p.replace('/', "\\");
+    let (prefix, rest) = if p.len() >= 2 && p.as_bytes()[1] == b':' { (&p[..2], &p[2..]) } else { ("", p.as_str()) };
+    let mut out: Vec<&str> = Vec::new();
+    for name in rest.split('\\') {
+        match name {
+            "" | "." => continue,
+            ".." => {
+                out.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let n = name.trim_end_matches(['.', ' ']);
+        if !n.is_empty() {
+            out.push(n);
+        }
+    }
+    if prefix.is_empty() {
+        out.join("\\")
+    } else {
+        format!("{}\\{}", prefix, out.join("\\"))
+    }
+}
+
+/// Windows' own folder as Windows says it (`GetSystemWindowsDirectoryW`), not
+/// the SystemRoot variable, which a process can be started with any value of.
+fn windows_dir() -> String {
+    #[cfg(windows)]
+    if let Some(d) = sys::windows_dir() {
+        return d.to_lowercase().replace('/', "\\").trim_end_matches('\\').to_string();
+    }
+    std::env::var("SystemRoot").map(|s| s.to_lowercase()).unwrap_or_else(|_| r"c:\windows".into())
 }
 
 /// An install folder that may be offered: two levels below its drive or
@@ -307,6 +394,80 @@ pub(crate) fn install_dir_of(file: &Path, names: &[String]) -> Option<PathBuf> {
     named.then_some(dir)
 }
 
+/// A recorded install folder (an entry's InstallLocation, or a folder kept in
+/// a session file) may be offered or deleted only if it is written plainly,
+/// not an installer's cache or a personal folder, not one of Windows' own,
+/// inside a place programs are installed in, and either named like the app
+/// (`names`: never the folder's own name) or holding one of the files its
+/// entry names (`files`: its icon or uninstaller), directly or below one
+/// generic folder.
+pub(crate) fn install_folder_ok(dir: &Path, names: &[String], files: &[PathBuf]) -> Result<(), &'static str> {
+    if plain_windows_path(&dir.to_string_lossy()).is_err() {
+        return Err("its path isn't written plainly");
+    }
+    if cache_like(dir) {
+        return Err("it is an installer's cache or a personal folder");
+    }
+    if !safe_install_dir(dir) {
+        return Err("it is one of Windows' own folders");
+    }
+    if !in_install_root(dir) {
+        return Err("it is not in a place programs are installed in");
+    }
+    let n = dir.file_name().map(|x| x.to_string_lossy().trim().to_lowercase()).unwrap_or_default();
+    let named = names.iter().filter(|x| matcher::usable_name(x)).any(|x| {
+        let x = x.trim().to_lowercase();
+        n == x || n.replace(' ', "") == x.replace(' ', "")
+    });
+    let same = |a: &Path| lower(a) == lower(dir);
+    let holds = files.iter().any(|f| {
+        f.parent().is_some_and(|p| same(p) || (p.file_name().is_some_and(|g| generic_dir(&g.to_string_lossy())) && p.parent().is_some_and(same)))
+    });
+    if named || holds {
+        Ok(())
+    } else {
+        Err("it is not named like the app, and none of the files its entry names is in it")
+    }
+}
+
+/// The files an entry names: its icon's file and its uninstaller.
+fn entry_files(uninstall: &str, icon: Option<&str>) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = icon.and_then(icon_file).into_iter().collect();
+    if let Some((prog, _)) = split_command(uninstall, &|p| Path::new(p).is_file()) {
+        v.push(PathBuf::from(prog));
+    }
+    v
+}
+
+/// What the gate for a recorded folder weighs: the app's names (its display
+/// name, without its version, its programs' names; never a folder's own name)
+/// and the files its entry names.
+fn gate_of(app_name: &str, rec: &Record) -> Option<(Vec<String>, Vec<PathBuf>)> {
+    let Record::WinEntry { uninstall, icon, exes, .. } = rec else { return None };
+    let files = entry_files(uninstall, icon.as_deref());
+    let mut names = base_names(app_name, icon.as_deref());
+    names.extend(files.iter().filter_map(|f| f.file_stem()).map(|s| s.to_string_lossy().to_string()));
+    names.extend(exes.iter().cloned());
+    Some((names, files))
+}
+
+/// The recorded InstallLocation, when it passes the gate (what is sized).
+pub(crate) fn gated_install_dir(app_name: &str, rec: &Record) -> Option<PathBuf> {
+    let Record::WinEntry { install_dir: Some(d), .. } = rec else { return None };
+    let (names, files) = gate_of(app_name, rec)?;
+    install_folder_ok(d, &names, &files).is_ok().then(|| d.clone())
+}
+
+/// The recorded folders the gate turns away, and why: said in the scan's
+/// notes when they are still there.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn ungated_dirs(app_name: &str, rec: &Record) -> Vec<(PathBuf, &'static str)> {
+    let Record::WinEntry { install_dir, dirs, .. } = rec else { return vec![] };
+    let Some((names, files)) = gate_of(app_name, rec) else { return vec![] };
+    let raw: Vec<PathBuf> = if dirs.is_empty() { install_dir.iter().cloned().collect() } else { dirs.clone() };
+    raw.into_iter().filter_map(|d| install_folder_ok(&d, &names, &files).err().map(|why| (d, why))).collect()
+}
+
 /// Add a folder unless it, or a folder holding it, is already there; drop
 /// those inside it.
 pub(crate) fn push_dir(dirs: &mut Vec<PathBuf>, d: PathBuf) {
@@ -331,14 +492,17 @@ pub(crate) fn command_program(cmd: &str) -> Option<PathBuf> {
 /// or (an older session) what its entry itself points at.
 pub(crate) fn recorded_dirs(app_name: &str, rec: &Record) -> Vec<PathBuf> {
     let Record::WinEntry { uninstall, install_dir, icon, dirs, exes, .. } = rec else { return vec![] };
+    let Some((gate_names, files)) = gate_of(app_name, rec) else { return vec![] };
+    let ok = |d: &Path| install_folder_ok(d, &gate_names, &files).is_ok();
     if !dirs.is_empty() {
-        return dirs.clone();
+        // A session file is the person's to edit: each folder in it passes the gate again.
+        return dirs.iter().filter(|d| ok(d)).cloned().collect();
     }
-    let mut names = names_of(app_name, install_dir.as_deref(), icon.as_deref());
+    let mut names = names_of(app_name, install_dir.as_deref(), icon.as_deref(), &files);
     names.extend(exes.iter().cloned());
     let mut out = Vec::new();
-    if let Some(d) = install_dir {
-        push_dir(&mut out, d.clone());
+    if let Some(d) = install_dir.as_deref().filter(|d| ok(d)) {
+        push_dir(&mut out, d.to_path_buf());
     }
     if let Some(f) = icon.as_deref().and_then(icon_file) {
         if let Some(d) = install_dir_of(&f, &names) {
@@ -357,9 +521,9 @@ pub(crate) fn recorded_dirs(app_name: &str, rec: &Record) -> Vec<PathBuf> {
 /// names and what starts it with Windows — from its entry, App Paths, its
 /// shortcuts and the Run keys — kept in the session for later.
 pub fn enrich(app: &InstalledApp, rec: &Record) -> Record {
-    let Record::WinEntry { view, key, install_dir, icon, .. } = rec else { return rec.clone() };
+    let Record::WinEntry { view, key, uninstall, install_dir, icon, .. } = rec else { return rec.clone() };
     let removed = format!("{}:{}", view, key);
-    let names = names_of(&app.name, install_dir.as_deref(), icon.as_deref());
+    let names = names_of(&app.name, install_dir.as_deref(), icon.as_deref(), &entry_files(uninstall, icon.as_deref()));
     let mut found = recorded_dirs(&app.name, rec);
     let mut exes: Vec<String> = Vec::new();
     #[allow(unused_mut)]
@@ -447,6 +611,9 @@ pub(crate) fn force_plan(app: &InstalledApp, rec: &Record) -> (Option<ForcePlan>
         let (size, done) = super::size_of(d, std::time::Duration::from_secs(2));
         folders.push(ForceFolder { path: d.to_string_lossy().to_string(), size: Some(size), size_complete: done, admin: !can_delete(d) });
     }
+    if let Some(why) = per_user_refusal(view, folders.iter().any(|f| f.admin), startup.iter().any(|s| s.view != "HKCU")) {
+        return (None, Some(why));
+    }
     let entry_admin = view != "HKCU";
     let admin = entry_admin || folders.iter().any(|f| f.admin) || startup.iter().any(|s| s.view != "HKCU");
     let plan = ForcePlan {
@@ -457,6 +624,15 @@ pub(crate) fn force_plan(app: &InstalledApp, rec: &Record) -> (Option<ForcePlan>
         admin,
     };
     (Some(plan), None)
+}
+
+/// A program installed for one person (its entry in HKCU) never gets the
+/// administrator: when it names a folder only the administrator can change, or
+/// a start-up value for everyone, its files aren't deleted directly (step 7b,
+/// owner decision 2: strict).
+pub(crate) fn per_user_refusal(view: &str, folder_needs_admin: bool, startup_for_everyone: bool) -> Option<String> {
+    (view == "HKCU" && (folder_needs_admin || startup_for_everyone))
+        .then(|| "It was installed for you only, yet it names something only the administrator can change, so its files aren't deleted directly. Use Uninstall.".to_string())
 }
 
 /// What deleting a program's files directly does, in order — each with
@@ -488,15 +664,19 @@ pub(crate) fn force_items(s: &Session) -> Result<Vec<(JobItem, bool)>, String> {
     Ok(items)
 }
 
-/// What the administrator's cleanup may touch: inside Program Files,
-/// ProgramData, the shared Desktop, the person's app-data folders, or a
-/// program's own folder elsewhere — never Windows itself, a folder Windows
-/// uses, or one of the folders shared by many programs.
+/// What the administrator's cleanup may touch: a plainly written path inside
+/// Program Files, ProgramData, the shared Desktop or the person's app-data
+/// folders — never Windows itself, a folder Windows uses, or one of the
+/// folders shared by many programs. A program's folder anywhere else (D:\Games\X)
+/// is left to the person's own run, which acts with their own rights.
 pub(crate) fn elevated_path_ok(path: &Path) -> Result<(), String> {
+    plain_windows_path(&path.to_string_lossy())?;
     let p = lower(path);
-    let system_root = std::env::var("SystemRoot").map(|s| s.to_lowercase()).unwrap_or_else(|_| r"c:\windows".into());
-    if p == system_root || p.starts_with(&format!("{}\\", system_root)) {
-        return Err("It is inside Windows' own folder.".into());
+    let from_env = std::env::var("SystemRoot").map(|s| s.to_lowercase()).unwrap_or_else(|_| r"c:\windows".into());
+    for system_root in [windows_dir(), from_env] {
+        if p == system_root || p.starts_with(&format!("{}\\", system_root)) {
+            return Err("It is inside Windows' own folder.".into());
+        }
     }
     if known_folders().iter().map(|k| lower(k)).any(|k| k == p || k.starts_with(&format!("{}\\", p))) {
         return Err("It is a folder Windows itself uses.".into());
@@ -507,12 +687,30 @@ pub(crate) fn elevated_path_ok(path: &Path) -> Result<(), String> {
     let parts: Vec<&str> = p.split('\\').filter(|x| !x.is_empty()).collect();
     // The shared Desktop's shortcuts.
     let public_shortcut = parts.len() == 5 && parts[1] == "users" && parts[2] == "public" && parts[3] == "desktop" && parts[4].ends_with(".lnk");
-    // A program's own folder on another drive or outside the profiles (D:\Games\X).
-    let elsewhere = parts.get(1).is_some_and(|s| *s != "users") && safe_install_dir(path);
-    if in_install_root(path) || public_shortcut || elsewhere {
+    if in_install_root(path) || public_shortcut {
         Ok(())
     } else {
         Err("It is not in a place programs are installed in.".into())
+    }
+}
+
+/// In the administrator's run, a path under X:\Users\ counts only inside the
+/// asking person's own AppData (Local or Roaming) — not anyone else's, nor the
+/// approving administrator's. The shared Desktop's shortcuts are
+/// `elevated_path_ok`'s to judge. No profile known: refused (fails closed).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn profile_ok(path: &Path, profile: Option<&Path>) -> Result<(), String> {
+    let p = lower(path);
+    let parts: Vec<&str> = p.split('\\').filter(|x| !x.is_empty()).collect();
+    if parts.get(1) != Some(&"users") || parts.get(2) == Some(&"public") {
+        return Ok(());
+    }
+    let Some(profile) = profile else { return Err("Whose folder it is in couldn't be told.".into()) };
+    let base = lower(profile);
+    if ["appdata\\local\\", "appdata\\roaming\\"].iter().any(|sub| p.starts_with(&format!("{}\\{}", base, sub))) {
+        Ok(())
+    } else {
+        Err("It is in another person's folder, not the one who asked.".into())
     }
 }
 
@@ -531,7 +729,7 @@ pub(crate) fn entry_app(e: &RegEntry) -> Option<(InstalledApp, Record)> {
     }
     let name = e.name.clone()?.trim().to_string();
     let msi = msi_guid(e);
-    let install_dir = e.install_location.as_deref().and_then(clean_dir);
+    let install_dir = e.install_location.as_deref().and_then(clean_dir_plain);
     let mut notes = Vec::new();
     if e.view == "HKCU" {
         notes.push("Installed for you only.".to_string());
@@ -777,13 +975,44 @@ pub fn list() -> Result<super::Listing, AppError> {
 }
 
 /// The names a program's folders are made with.
-fn names_of(name: &str, install_dir: Option<&Path>, icon: Option<&str>) -> Vec<String> {
+/// An app's own names: its display name, without its version, its icon's program.
+fn base_names(name: &str, icon: Option<&str>) -> Vec<String> {
     let mut v = vec![name.to_string(), strip_version(name)];
-    if let Some(d) = install_dir.and_then(|d| d.file_name()) {
-        v.push(d.to_string_lossy().to_string());
-    }
     if let Some(s) = icon.and_then(exe_stem) {
         v.push(s);
+    }
+    v.retain(|n| !n.trim().is_empty());
+    v.dedup();
+    v
+}
+
+/// The names the program being removed answers to: its own, and its
+/// InstallLocation's folder name only when that folder passes the gate.
+/// Otherwise a made-up entry could name any folder in Program Files and have
+/// the matcher offer it as sure.
+fn names_of(name: &str, install_dir: Option<&Path>, icon: Option<&str>, files: &[PathBuf]) -> Vec<String> {
+    let mut v = base_names(name, icon);
+    if let Some(d) = install_dir {
+        let mut gate = v.clone();
+        gate.extend(files.iter().filter_map(|f| f.file_stem()).map(|s| s.to_string_lossy().to_string()));
+        if install_folder_ok(d, &gate, files).is_ok() {
+            if let Some(n) = d.file_name() {
+                v.push(n.to_string_lossy().to_string());
+            }
+        }
+    }
+    v.retain(|n| !n.trim().is_empty());
+    v.dedup();
+    v
+}
+
+/// Another installed program's names, its InstallLocation's folder name
+/// included as it is: for the others, more names only keep more of theirs.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn others_names(name: &str, install_dir: Option<&Path>, icon: Option<&str>) -> Vec<String> {
+    let mut v = base_names(name, icon);
+    if let Some(d) = install_dir.and_then(|d| d.file_name()) {
+        v.push(d.to_string_lossy().to_string());
     }
     v.retain(|n| !n.trim().is_empty());
     v.dedup();
@@ -795,7 +1024,7 @@ pub fn prepare(app: &InstalledApp, rec: &Record) -> Result<(Prepared, Evidence, 
     let ev;
     match rec {
         Record::WinEntry { view, key, uninstall, msi, install_dir, icon, exes, .. } => {
-            let mut names = names_of(&app.name, install_dir.as_deref(), icon.as_deref());
+            let mut names = names_of(&app.name, install_dir.as_deref(), icon.as_deref(), &entry_files(uninstall, icon.as_deref()));
             for x in exes {
                 if !names.iter().any(|n| n.eq_ignore_ascii_case(x)) {
                     names.push(x.clone());
@@ -999,7 +1228,7 @@ pub fn others(s: &Session) -> Others {
             }
             let Some(name) = e.name.clone() else { continue };
             let dir = e.install_location.as_deref().and_then(clean_dir);
-            o.add_app(&[], &names_of(&name, dir.as_deref(), e.icon.as_deref()), e.publisher.as_deref(), &[]);
+            o.add_app(&[], &others_names(&name, dir.as_deref(), e.icon.as_deref()), e.publisher.as_deref(), &[]);
             // "VS Revo Group, Ltd." also answers to "VS Revo Group".
             if let Some(p) = e.publisher.as_deref() {
                 o.add_app(&[], &[], Some(&matcher::company_stem(p)), &[]);
@@ -1061,6 +1290,11 @@ pub fn leftovers(s: &Session, others: &Others, registry: bool) -> (Vec<Candidate
             Record::WinEntry { view, key, .. } => format!("{}:{}", view, key),
             _ => String::new(),
         };
+        for (dir, why) in ungated_dirs(&s.app.name, &s.record) {
+            if dir.is_dir() {
+                notes.push(format!("{} is still there, but {}, so it is not offered.", dir.display(), why));
+            }
+        }
         // Its own folders: not shared, not another installed program's.
         let mut own: Vec<PathBuf> = Vec::new();
         for dir in recorded_dirs(&s.app.name, &s.record) {
@@ -1362,6 +1596,117 @@ pub fn recycle_refusal(path: &Path) -> Option<String> {
     sys::recycle_refusal(path)
 }
 
+/// The folders above an item, held open by the administrator's run until it
+/// has moved the item (see `pin_for_elevated`); closed when dropped.
+#[cfg(windows)]
+pub(crate) struct Pinned {
+    handles: Vec<windows_sys::Win32::Foundation::HANDLE>,
+    /// The item's folder as Windows opened it: normalized, long names.
+    pub final_parent: PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        for h in self.handles.drain(..) {
+            sys::close_handle(h);
+        }
+    }
+}
+
+/// A process's token, kept open: the asking GitSwitch's (the elevated run's
+/// parent), or this process's own (tests). Closed when dropped.
+#[cfg(windows)]
+pub(crate) struct ParentToken {
+    token: windows_sys::Win32::Foundation::HANDLE,
+    /// The account's SID, as bytes.
+    pub user_sid: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl std::fmt::Debug for ParentToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ParentToken")
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ParentToken {
+    fn drop(&mut self) {
+        sys::close_handle(self.token);
+    }
+}
+
+/// This process runs with an administrator's full token.
+#[cfg(windows)]
+pub(crate) fn is_elevated() -> bool {
+    sys::is_elevated()
+}
+
+/// The parent, when it is GitSwitch itself: the same program file as this
+/// process, started before it. Its token (whose account it is).
+#[cfg(windows)]
+pub(crate) fn gitswitch_parent() -> Result<ParentToken, String> {
+    sys::gitswitch_parent()
+}
+
+/// This process's own token: the test mode's stand-in for the asking GitSwitch.
+#[cfg(windows)]
+pub(crate) fn own_token() -> Result<ParentToken, String> {
+    sys::own_token()
+}
+
+/// The job, opened once (never through a link at its end): a plain file,
+/// owned by `who`'s account, its bytes read from that same handle.
+#[cfg(windows)]
+pub(crate) fn read_own_job(job: &Path, who: &ParentToken) -> Result<Vec<u8>, String> {
+    sys::read_own_job(job, who)
+}
+
+/// Could `who` delete `path`, change its permissions or owner, or delete it
+/// from its folder? Windows' own AccessCheck with an impersonation copy of
+/// their token, so groups, deny entries, entries for children only, owner
+/// rights and CREATOR OWNER count as Windows counts them. Not told: true.
+#[cfg(windows)]
+pub(crate) fn person_can_change(path: &Path, who: &ParentToken) -> bool {
+    sys::person_can_change(path, who)
+}
+
+/// What a delete at the next restart queues for `path`, in order: its files,
+/// then its folders from the deepest up (a link as itself).
+#[cfg(windows)]
+pub(crate) fn restart_names(path: &Path) -> Vec<PathBuf> {
+    sys::restart_names(path)
+}
+
+/// Queue exactly `names` for deletion when Windows next starts.
+#[cfg(windows)]
+pub(crate) fn schedule_at_restart(names: &[PathBuf]) -> (&'static str, String) {
+    sys::schedule_at_restart(names)
+}
+
+/// Paths Windows deletes at the next restart.
+#[cfg(all(windows, test))]
+pub(crate) fn pending_renames() -> Vec<String> {
+    sys::pending_renames()
+}
+
+/// `who`'s profile folder, as the machine records it (ProfileList, which only
+/// an administrator can change).
+#[cfg(windows)]
+pub(crate) fn profile_of(who: &ParentToken) -> Option<PathBuf> {
+    sys::profile_of(&who.user_sid)
+}
+
+/// Hold every folder from the drive's root down to `path`'s folder still for
+/// the administrator's run: open without share-delete (so none of them can be
+/// renamed or replaced while it works), none a link, junction or mount point,
+/// and the folder Windows opens the one the path names.
+#[cfg(windows)]
+pub(crate) fn pin_for_elevated(path: &Path) -> Result<Pinned, String> {
+    sys::pin_for_elevated(path)
+}
+
 #[cfg(windows)]
 mod sys {
     use super::*;
@@ -1464,6 +1809,299 @@ $j = ConvertTo-Json -InputObject $out -Compress
             return None;
         }
         run_ps(SIGNER, &[("GS_FILE", &file.to_string_lossy())]).ok().filter(|s| !s.is_empty())
+    }
+
+    pub fn known_folder_paths() -> Vec<PathBuf> {
+        static PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+        PATHS
+            .get_or_init(|| {
+                use windows_sys::Win32::System::Com::CoTaskMemFree;
+                use windows_sys::Win32::UI::Shell::{
+                    SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_LocalAppData, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
+                    FOLDERID_ProgramFilesX86, FOLDERID_Public, FOLDERID_PublicDesktop, FOLDERID_PublicDocuments, FOLDERID_RoamingAppData, FOLDERID_SkyDrive, FOLDERID_UserProgramFiles, FOLDERID_Videos, FOLDERID_Windows,
+                };
+                let ids = [
+                    FOLDERID_Profile, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Pictures, FOLDERID_Music, FOLDERID_Videos, FOLDERID_Public, FOLDERID_PublicDesktop, FOLDERID_PublicDocuments, FOLDERID_RoamingAppData,
+                    FOLDERID_LocalAppData, FOLDERID_UserProgramFiles, FOLDERID_SkyDrive, FOLDERID_Windows, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_ProgramData,
+                ];
+                let mut out = Vec::new();
+                for id in ids {
+                    let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
+                    // SAFETY: a valid folder id; on success `p` is a string Windows
+                    // allocated, freed below either way. A folder not set up is skipped.
+                    let hr = unsafe { SHGetKnownFolderPath(&id, 0, std::ptr::null_mut(), &mut p) };
+                    if hr >= 0 && !p.is_null() {
+                        // SAFETY: Windows returns a NUL-terminated string.
+                        let len = (0..).take_while(|&i| unsafe { *p.add(i) } != 0).count();
+                        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) });
+                        out.push(PathBuf::from(format!("{}\\", s.trim_end_matches('\\'))));
+                    }
+                    if !p.is_null() {
+                        // SAFETY: the string SHGetKnownFolderPath allocated, freed once.
+                        unsafe { CoTaskMemFree(p as *const _) };
+                    }
+                }
+                out
+            })
+            .clone()
+    }
+
+    pub fn windows_dir() -> Option<String> {
+        use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+        let mut buf = vec![0u16; 512];
+        // SAFETY: the buffer is valid for its length.
+        let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        (n > 0 && n < buf.len()).then(|| String::from_utf16_lossy(&buf[..n]))
+    }
+
+    pub fn is_elevated() -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut tok: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        // SAFETY: the pseudo-handle of this process; the token is closed below.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) } == 0 {
+            return false;
+        }
+        let mut e = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0u32;
+        // SAFETY: a valid token; the struct is the size given.
+        let ok = unsafe { GetTokenInformation(tok, TokenElevation, &mut e as *mut _ as *mut _, std::mem::size_of::<TOKEN_ELEVATION>() as u32, &mut len) } != 0;
+        // SAFETY: opened above, closed once.
+        unsafe { CloseHandle(tok) };
+        ok && e.TokenIsElevated != 0
+    }
+
+    /// The id of the process that started `pid`.
+    fn parent_pid(pid: u32) -> Option<u32> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+        // SAFETY: the snapshot handle is checked and closed; the entry is sized.
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut e: PROCESSENTRY32W = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut ok = Process32FirstW(snap, &mut e) != 0;
+            let mut found = None;
+            while ok {
+                if e.th32ProcessID == pid {
+                    found = Some(e.th32ParentProcessID);
+                    break;
+                }
+                ok = Process32NextW(snap, &mut e) != 0;
+            }
+            CloseHandle(snap);
+            found
+        }
+    }
+
+    fn token_user_sid(tok: windows_sys::Win32::Foundation::HANDLE) -> Option<Vec<u8>> {
+        use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, TokenUser, TOKEN_USER};
+        let mut len = 0u32;
+        // SAFETY: asks for the size only.
+        unsafe { GetTokenInformation(tok, TokenUser, std::ptr::null_mut(), 0, &mut len) };
+        if len == 0 {
+            return None;
+        }
+        // u64s, so the TOKEN_USER read from it is aligned.
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        // SAFETY: the buffer is at least `len` bytes.
+        if unsafe { GetTokenInformation(tok, TokenUser, buf.as_mut_ptr() as *mut _, len, &mut len) } == 0 {
+            return None;
+        }
+        // SAFETY: GetTokenInformation filled a TOKEN_USER at the buffer's start;
+        // its SID points into the same buffer, valid for GetLengthSid bytes.
+        unsafe {
+            let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+            let n = GetLengthSid(tu.User.Sid) as usize;
+            Some(std::slice::from_raw_parts(tu.User.Sid as *const u8, n).to_vec())
+        }
+    }
+
+    fn token_of(process: windows_sys::Win32::Foundation::HANDLE) -> Result<super::ParentToken, String> {
+        use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::OpenProcessToken;
+        let mut tok: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        // SAFETY: a valid process handle; the token is kept in ParentToken, which closes it.
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut tok) } == 0 {
+            return Err("The asking program's account couldn't be read.".into());
+        }
+        let user_sid = token_user_sid(tok);
+        let t = super::ParentToken { token: tok, user_sid: user_sid.unwrap_or_default() };
+        if t.user_sid.is_empty() {
+            return Err("The asking program's account couldn't be read.".into());
+        }
+        Ok(t)
+    }
+
+    pub fn own_token() -> Result<super::ParentToken, String> {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: the pseudo-handle of this process.
+        token_of(unsafe { GetCurrentProcess() })
+    }
+
+    pub fn gitswitch_parent() -> Result<super::ParentToken, String> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        let me = std::env::current_exe().map_err(|e| format!("GitSwitch couldn't find itself: {}", e))?;
+        let my_file = file_id(&me).ok_or("GitSwitch couldn't read its own program file.")?;
+        // SAFETY: no arguments.
+        let my_pid = unsafe { GetCurrentProcessId() };
+        let parent = parent_pid(my_pid).ok_or("The program that started this couldn't be found.")?;
+        let (my_start, _) = created_and_path(my_pid).ok_or("This process couldn't be read.")?;
+        let (its_start, its_path) = created_and_path(parent).ok_or("The program that started this is gone.")?;
+        // Started after this one: its id was reused by another process.
+        if its_start >= my_start {
+            return Err("The program that started this is gone.".into());
+        }
+        if its_path.as_deref().and_then(file_id) != Some(my_file) {
+            return Err("It wasn't started by GitSwitch itself.".into());
+        }
+        // SAFETY: the handle is checked and closed below.
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent) };
+        if h.is_null() {
+            return Err("The program that started this couldn't be opened.".into());
+        }
+        let t = token_of(h);
+        // SAFETY: opened above, closed once.
+        unsafe { CloseHandle(h) };
+        t
+    }
+
+    pub fn read_own_job(job: &Path, who: &super::ParentToken) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{GetLengthSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        let mut f = std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(job).map_err(|e| format!("The job couldn't be opened: {}", e))?;
+        let md = f.metadata().map_err(|e| format!("The job couldn't be read: {}", e))?;
+        const REPARSE_POINT: u32 = 0x400;
+        if !md.is_file() || md.file_attributes() & REPARSE_POINT != 0 {
+            return Err("The job isn't a plain file.".into());
+        }
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: an open file handle; the descriptor Windows allocates is freed below.
+        let rc = unsafe { GetSecurityInfo(f.as_raw_handle() as _, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &mut owner, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut sd) };
+        let theirs = if rc == 0 && !owner.is_null() {
+            // SAFETY: `owner` points into `sd`, valid for GetLengthSid bytes until it is freed.
+            Some(unsafe { std::slice::from_raw_parts(owner as *const u8, GetLengthSid(owner) as usize) }.to_vec())
+        } else {
+            None
+        };
+        if !sd.is_null() {
+            // SAFETY: allocated by GetSecurityInfo, freed once.
+            unsafe { LocalFree(sd as _) };
+        }
+        match theirs {
+            Some(sid) if sid == who.user_sid => {}
+            Some(_) => return Err("The job belongs to another account.".into()),
+            None => return Err("The job's owner couldn't be read.".into()),
+        }
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).map_err(|e| format!("The job couldn't be read: {}", e))?;
+        Ok(bytes)
+    }
+
+    pub fn profile_of(sid: &[u8]) -> Option<PathBuf> {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        // u32s, so the SID handed to Windows is aligned.
+        let mut aligned = vec![0u32; sid.len().div_ceil(4)];
+        // SAFETY: the buffer holds at least sid.len() bytes.
+        unsafe { std::ptr::copy_nonoverlapping(sid.as_ptr(), aligned.as_mut_ptr() as *mut u8, sid.len()) };
+        let mut s: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: a valid SID; the string Windows allocates is freed below.
+        if unsafe { ConvertSidToStringSidW(aligned.as_ptr() as *mut _, &mut s) } == 0 || s.is_null() {
+            return None;
+        }
+        // SAFETY: a NUL-terminated string from Windows.
+        let len = (0..).take_while(|&i| unsafe { *s.add(i) } != 0).count();
+        let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(s, len) });
+        // SAFETY: allocated by ConvertSidToStringSidW, freed once.
+        unsafe { LocalFree(s as _) };
+        let key = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{}", text), KEY_READ).ok()?;
+        let raw: String = key.get_value("ProfileImagePath").ok()?;
+        Some(PathBuf::from(expand(&raw)))
+    }
+
+    pub fn close_handle(h: windows_sys::Win32::Foundation::HANDLE) {
+        // SAFETY: a handle `pin_for_elevated` opened, closed once (Pinned's drop).
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(h);
+        }
+    }
+
+    pub fn pin_for_elevated(path: &Path) -> Result<super::Pinned, String> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+            FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, VOLUME_NAME_DOS,
+        };
+        let text = path.to_string_lossy().replace('/', "\\");
+        super::plain_windows_path(&text)?;
+        let parent = match text.rfind('\\') {
+            Some(i) if i >= 2 => text[..i].to_string(),
+            _ => return Err("It has no folder above it.".into()),
+        };
+        let mut pinned = super::Pinned { handles: Vec::new(), final_parent: PathBuf::new() };
+        let mut at = String::new();
+        for (i, name) in parent.split('\\').enumerate() {
+            if i == 0 {
+                at = format!("{}\\", name);
+            } else {
+                if !at.ends_with('\\') {
+                    at.push('\\');
+                }
+                at.push_str(name);
+            }
+            let w = wide(OsStr::new(&at));
+            // Listing access makes the share mode count: a handle that only
+            // reads attributes takes no part in sharing, and then anyone could
+            // still rename the folder. Without FILE_SHARE_DELETE, nobody may
+            // rename or delete it while this handle is open.
+            // SAFETY: a valid wide path; the handle goes into `pinned`, which closes it.
+            let h = unsafe {
+                CreateFileW(w.as_ptr(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut())
+            };
+            if h == INVALID_HANDLE_VALUE {
+                return Err("A folder on the way to it couldn't be held still (something has it open to move it); try again.".into());
+            }
+            pinned.handles.push(h);
+            // SAFETY: zeroed is a valid BY_HANDLE_FILE_INFORMATION; a valid handle.
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { GetFileInformationByHandle(h, &mut info) } == 0 {
+                return Err("A folder on the way to it couldn't be read.".into());
+            }
+            if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err("A folder on the way to it is a link, a junction or a mount point, which the administrator's run never follows.".into());
+            }
+        }
+        let last = *pinned.handles.last().ok_or("It has no folder above it.")?;
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: a valid handle; the buffer is valid for its length.
+        let n = unsafe { GetFinalPathNameByHandleW(last, buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) } as usize;
+        if n == 0 || n >= buf.len() {
+            return Err("The folder above it couldn't be read.".into());
+        }
+        let opened = String::from_utf16_lossy(&buf[..n]);
+        if opened.starts_with(r"\\?\UNC\") {
+            return Err("It is on a network share.".into());
+        }
+        let opened = opened.trim_start_matches(r"\\?\").trim_end_matches('\\').to_string();
+        // Against the long form, so an 8.3 temp path (C:\Users\RUNNER~1\...) still matches.
+        let named = if parent.len() == 2 { parent.clone() } else { long_path(Path::new(&parent)).to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_string() };
+        if opened.to_lowercase() != named.to_lowercase() {
+            return Err("It is not where it says: the folder above it opens as somewhere else.".into());
+        }
+        pinned.final_parent = PathBuf::from(opened);
+        Ok(pinned)
     }
 
     pub fn long_path(p: &Path) -> PathBuf {
@@ -1635,14 +2273,27 @@ $j = ConvertTo-Json -InputObject $out -Compress
     /// entry, a service or driver, a shared DLL. `removed` is the
     /// `view:key` of the program being removed.
     pub fn install_dir_claimed(dir: &Path, removed: &str) -> Option<String> {
-        let d = format!("{}\\", lower(dir));
-        let inside = |p: &Path| lower(p).starts_with(&d) || lower(p) == lower(dir);
+        // Another program's paths count in every spelling (DEST-B-13): as
+        // written, with . and .. folded, and resolved on disk. Unusual
+        // spellings count toward "claimed", the safe direction.
+        let resolved = |p: &Path| std::fs::canonicalize(p).ok().map(|c| lower(Path::new(c.to_string_lossy().trim_start_matches(r"\\?\"))));
+        let forms = |p: &Path, deep: bool| -> Vec<String> {
+            let mut v = vec![lower(p), lexical_normal(&lower(p))];
+            if deep {
+                v.extend(resolved(p));
+            }
+            v
+        };
+        let mine = forms(dir, true);
+        let under = |f: &str| mine.iter().any(|d| f == d || f.starts_with(&format!("{}\\", d)));
+        let inside = |p: &Path| forms(p, false).iter().any(|f| under(f));
+        let inside_deep = |p: &Path| forms(p, true).iter().any(|f| under(f));
         for e in read_entries() {
             if format!("{}:{}", e.view, e.key) == removed {
                 continue;
             }
             let paths = [e.install_location.as_deref().and_then(clean_dir), e.icon.as_deref().map(|i| PathBuf::from(i.split(',').next().unwrap_or(i).trim_matches('"'))), e.uninstall.as_deref().and_then(command_path)];
-            if paths.iter().flatten().any(|p| inside(p)) {
+            if paths.iter().flatten().any(|p| inside_deep(p)) {
                 return Some(format!("another program ({}) is installed there", e.name.unwrap_or(e.key)));
             }
         }
@@ -1913,9 +2564,65 @@ $j = ConvertTo-Json -InputObject $out -Compress
         names
     }
 
+    pub fn person_can_change(path: &Path, who: &super::ParentToken) -> bool {
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER};
+        let any = |p: &Path, rights: &[u32]| rights.iter().any(|r| access_allowed(p, who, *r).unwrap_or(true));
+        any(path, &[DELETE, WRITE_DAC, WRITE_OWNER]) || path.parent().is_some_and(|parent| any(parent, &[FILE_DELETE_CHILD]))
+    }
+
+    /// May `who` have `right` on `path`? None: it couldn't be told.
+    fn access_allowed(path: &Path, who: &super::ParentToken, right: u32) -> Option<bool> {
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            AccessCheck, DuplicateToken, MapGenericMask, SecurityImpersonation, DACL_SECURITY_INFORMATION, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PSECURITY_DESCRIPTOR,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+        let w = wide(path.as_os_str());
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a valid wide path; the descriptor Windows allocates is freed below.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                w.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != 0 || sd.is_null() {
+            return None;
+        }
+        let mut imp: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        // SAFETY: the person's token, opened with TOKEN_DUPLICATE; the copy is closed below.
+        let out = if unsafe { DuplicateToken(who.token, SecurityImpersonation, &mut imp) } != 0 {
+            let mapping = GENERIC_MAPPING { GenericRead: FILE_GENERIC_READ, GenericWrite: FILE_GENERIC_WRITE, GenericExecute: FILE_GENERIC_EXECUTE, GenericAll: FILE_ALL_ACCESS };
+            let mut desired = right;
+            // SAFETY: plain values; the privilege set is the size given.
+            unsafe { MapGenericMask(&mut desired, &mapping) };
+            let mut privileges: PRIVILEGE_SET = unsafe { std::mem::zeroed() };
+            let mut privileges_len = std::mem::size_of::<PRIVILEGE_SET>() as u32;
+            let (mut granted, mut status) = (0u32, 0i32);
+            let ok = unsafe { AccessCheck(sd, imp, desired, &mapping, &mut privileges, &mut privileges_len, &mut granted, &mut status) } != 0;
+            // SAFETY: duplicated above, closed once.
+            unsafe { CloseHandle(imp) };
+            ok.then_some(status != 0)
+        } else {
+            None
+        };
+        // SAFETY: allocated by GetNamedSecurityInfoW, freed once.
+        unsafe { LocalFree(sd as _) };
+        out
+    }
+
     pub fn delete_at_restart(path: &Path) -> (&'static str, String) {
-        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED};
-        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+        schedule_at_restart(&restart_names(path))
+    }
+
+    pub fn restart_names(path: &Path) -> Vec<PathBuf> {
         // Files first, then folders from the deepest up: Windows works the
         // list in order when it starts. A link is removed as itself.
         fn walk(p: &Path, files: &mut Vec<PathBuf>, dirs: &mut Vec<PathBuf>) {
@@ -1934,8 +2641,15 @@ $j = ConvertTo-Json -InputObject $out -Compress
         let (mut files, mut dirs) = (Vec::new(), Vec::new());
         walk(path, &mut files, &mut dirs);
         dirs.reverse();
+        files.extend(dirs);
+        files
+    }
+
+    pub fn schedule_at_restart(names: &[PathBuf]) -> (&'static str, String) {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED};
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
         let (mut failed, mut denied) = (0usize, false);
-        for p in files.iter().chain(dirs.iter()) {
+        for p in names {
             let w = wide(p.as_os_str());
             // SAFETY: a valid wide path; no new name (delete).
             if unsafe { MoveFileExW(w.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) } == 0 {
@@ -1948,7 +2662,7 @@ $j = ConvertTo-Json -InputObject $out -Compress
         } else if denied {
             ("needs-admin", "Only the administrator can have Windows delete it at the next restart.".into())
         } else {
-            ("failed", format!("{} of its {} files and folders could not be scheduled for the next restart.", failed, files.len() + dirs.len()))
+            ("failed", format!("{} of its {} files and folders could not be scheduled for the next restart.", failed, names.len()))
         }
     }
 
@@ -2279,6 +2993,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_administrators_run_keeps_to_the_asking_persons_own_appdata() {
+        let me = Path::new(r"C:\Users\me");
+        assert!(profile_ok(Path::new(r"C:\Users\other\AppData\Roaming\X"), Some(me)).is_err(), "someone else's");
+        assert!(profile_ok(Path::new(r"C:\Users\me\AppData\Roaming\X"), Some(me)).is_ok());
+        assert!(profile_ok(Path::new(r"C:\Users\me\AppData\Local\Programs\X"), Some(me)).is_ok());
+        assert!(profile_ok(Path::new(r"C:\Users\me\Documents\X"), Some(me)).is_err(), "not AppData");
+        assert!(profile_ok(Path::new(r"C:\Users\me\AppData\Roaming\X"), None).is_err(), "no profile known: refused");
+        assert!(profile_ok(Path::new(r"C:\Program Files\X"), None).is_ok(), "not a person's folder");
+        assert!(profile_ok(Path::new(r"C:\Users\Public\Desktop\X.lnk"), Some(me)).is_ok(), "the shared Desktop is elevated_path_ok's to judge");
+    }
+
+    #[test]
+    fn spellings_fold_to_what_windows_opens() {
+        assert_eq!(lexical_normal(r"C:\a\x\..\b"), r"C:\a\b");
+        assert_eq!(lexical_normal(r"C:\a\.\b\"), r"C:\a\b");
+        assert_eq!(lexical_normal(r"C:\Program Files\X. "), r"C:\Program Files\X");
+        assert_eq!(lexical_normal(r"C:\..\x"), r"C:\x");
+        assert_eq!(lexical_normal("C:/a//b"), r"C:\a\b");
+        assert_eq!(lexical_normal(r"c:\program files\..\users\public\gs-marker"), r"c:\users\public\gs-marker");
+    }
+
+    #[test]
+    fn a_program_installed_for_one_person_never_gets_the_administrator() {
+        assert!(per_user_refusal("HKCU", true, false).unwrap().contains("installed for you only"));
+        assert!(per_user_refusal("HKCU", false, true).is_some(), "a start-up value for everyone");
+        assert!(per_user_refusal("HKCU", false, false).is_none());
+        assert!(per_user_refusal("HKLM64", true, true).is_none(), "a machine-wide program may get the administrator");
+    }
+
+    #[test]
+    fn only_a_plainly_written_path_reaches_the_administrators_run() {
+        for bad in [
+            r"C:\Program Files\..\Windows\System32",
+            r"C:\ProgramData\X\..",
+            r"C:\Program Files\.\X",
+            r"C:\Program Files\X.",
+            "C:\\Program Files\\X ",
+            r"\\?\C:\X\Y",
+            r"\\.\C:\X",
+            r"\??\C:\X",
+            r"\\srv\share\x\y",
+            r"C:\X\Y:s",
+            r"C:X\Y",
+            r"C:\X\\Y",
+            r"C:\X\Y\",
+            r"X\Y",
+            r"C:\",
+            r"C:\X\a*b",
+        ] {
+            assert!(plain_windows_path(bad).is_err(), "{bad}");
+        }
+        for good in [r"C:\Program Files\7-Zip", "C:/Program Files/X", r"D:\Program Files\Acme Studio", r"C:\Users\RUNNER~1\AppData\Local\Temp\x"] {
+            assert!(plain_windows_path(good).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
     fn product_codes_come_from_the_entry_never_from_an_install_command() {
         let g = "{23170F69-40C1-2702-2301-000001000000}";
         let e = RegEntry { key: g.into(), windows_installer: true, uninstall: Some(format!("MsiExec.exe /I{}", g)), ..Default::default() };
@@ -2468,6 +3239,53 @@ mod tests {
         assert_eq!(v, vec![PathBuf::from(r"C:\Program Files\Foo")], "the outer folder only, once");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_recorded_install_folder_counts_only_where_programs_live_named_like_the_app() {
+        let names = |n: &str| base_names(n, None);
+        for bad in [r"C:\Users\me\Documents", r"C:\Users\me\Desktop", r"C:\Users\me\Downloads", r"C:\Users\Public\Documents", r"D:\Projects\All", r"C:\Program Files\..\Users\Public\gs-marker"] {
+            assert!(install_folder_ok(Path::new(bad), &names("All Projects"), &[]).is_err(), "{bad}");
+        }
+        assert!(install_folder_ok(Path::new(r"C:\Program Files\Vendor"), &names("Another App"), &[]).is_err(), "not named like the app, nothing of it inside");
+        assert!(install_folder_ok(Path::new(r"C:\Program Files\7-Zip"), &names("7-Zip 23.01 (x64)"), &[]).is_ok());
+        let py = Path::new(r"C:\Users\me\AppData\Local\Programs\Python\Python312");
+        assert!(install_folder_ok(py, &names("Python 3.12.1 (64-bit)"), &[py.join("uninstall.exe")]).is_ok(), "its uninstaller is inside");
+        assert!(install_folder_ok(py, &names("Python 3.12.1 (64-bit)"), &[py.join("bin").join("python.exe")]).is_ok(), "below one generic folder");
+        assert!(install_folder_ok(py, &names("Python 3.12.1 (64-bit)"), &[]).is_err());
+        // Where it is used: an entry's InstallLocation, and a session file's folders.
+        let rec = |install_dir: Option<&str>, dirs: Vec<&str>| Record::WinEntry {
+            view: "HKLM64".into(),
+            key: "suite".into(),
+            uninstall: String::new(),
+            msi: None,
+            install_dir: install_dir.map(PathBuf::from),
+            icon: None,
+            dirs: dirs.into_iter().map(PathBuf::from).collect(),
+            exes: vec![],
+            startup: vec![],
+            bundle: false,
+        };
+        assert!(recorded_dirs("Office Tools", &rec(Some(r"C:\Apps\Suite"), vec![])).is_empty(), "outside the install places");
+        assert!(recorded_dirs("Office Tools", &rec(None, vec![r"C:\Users\me\Documents"])).is_empty(), "a session file's folder is gated too");
+        assert_eq!(recorded_dirs("Suite 2.0", &rec(None, vec![r"C:\Program Files\Suite"])), vec![PathBuf::from(r"C:\Program Files\Suite")]);
+        assert_eq!(ungated_dirs("Office Tools", &rec(Some(r"C:\Apps\Suite"), vec![])), vec![(PathBuf::from(r"C:\Apps\Suite"), "it is not in a place programs are installed in")]);
+    }
+
+    /// DEST-B-13: what GetLongPathNameW makes of a `..` (the open question),
+    /// and that the gate refuses the spelling either way.
+    #[cfg(windows)]
+    #[test]
+    fn a_dot_dot_spelling_of_an_install_folder_is_refused() {
+        let t = std::env::temp_dir().join(format!("gitswitch-7b-{}", std::process::id()));
+        std::fs::create_dir_all(t.join("a").join("b")).unwrap();
+        std::fs::create_dir_all(t.join("a").join("x")).unwrap();
+        let spelled = PathBuf::from(format!(r"{}\a\x\..\b", t.display()));
+        eprintln!("long_path({}) = {}", spelled.display(), long_path(&spelled).display());
+        assert!(install_folder_ok(&spelled, &[String::from("b")], &[]).is_err());
+        assert_eq!(lexical_normal(&lower(&spelled)), lower(&t.join("a").join("b")));
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
     // Backslash paths only split into folders on Windows, where this code runs.
     #[cfg(windows)]
     #[test]
@@ -2515,7 +3333,13 @@ mod tests {
         for bad in [r"C:\", r"C:\Program Files", r"C:\Windows\System32\drivers", r"C:\Program Files\Common Files", r"C:\Program Files\Microsoft Office", r"C:\Program Files\WindowsApps"] {
             assert!(elevated_path_ok(Path::new(bad)).is_err(), "{bad}");
         }
-        assert!(elevated_path_ok(Path::new(r"D:\Games\Some Game")).is_ok(), "a program's own folder on another drive");
+        // A program's folder outside the install places is the person's own
+        // run's, never the administrator's (step 7a, owner decision 1).
+        assert!(elevated_path_ok(Path::new(r"D:\Games\Some Game")).is_err(), "a folder outside the install places");
+        // The audit's proof steps: each passed on the text before.
+        for bad in ["C:/Program Files/../Windows/System32", "C:/ProgramData/X/..", r"C:\Program Files\X\..\..\Windows\System32\drivers\etc"] {
+            assert!(elevated_path_ok(Path::new(bad)).is_err(), "{bad}");
+        }
         for bad in [r"C:\Users\me\Documents\Taxes", r"C:\Users\other\AppData", r"C:\Users\Public\Desktop\Notes.txt", r"C:\Users\me\Desktop\Projects"] {
             assert!(elevated_path_ok(Path::new(bad)).is_err(), "{bad}: a person's own files");
         }
@@ -2538,9 +3362,12 @@ mod tests {
         let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&file).unwrap();
         let users = users_of(&dir);
         assert!(!users.is_empty(), "this test process holds it");
-        let (outcome, why) = crate::apps::failed_move_for_test(&dir, "Unknown { description: \"Some operations were aborted\" }");
+        let (outcome, why) = crate::apps::failed_move_for_test(&dir, "Unknown { description: \"Some operations were aborted\" }", true);
         assert_eq!(outcome, "in-use", "{why}");
         assert!(why.starts_with("In use by ") && why.contains("delete it at the next restart"), "{why}");
+        // The person's own run: their folder never gets a delete at restart (7d).
+        let (outcome, why) = crate::apps::failed_move_for_test(&dir, "Unknown { description: \"Some operations were aborted\" }", false);
+        assert!(outcome == "in-use" && why.ends_with("then look again.") && !why.contains("next restart"), "{why}");
         drop(held);
         // Scheduling a delete at the next restart is the administrator's; as
         // a person nothing is scheduled and nothing goes now.
@@ -2563,13 +3390,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_program_whose_files_are_already_gone_can_still_be_removed_from_the_list() {
-        let gone = PathBuf::from(r"C:\Program Files\GitSwitch Test Program That Is Not There");
+        // Named like the app and in an install place, as the gate (step 7b) wants.
+        let gone = PathBuf::from(r"C:\Program Files\GitSwitch Test Program");
         let rec = Record::WinEntry { view: "HKCU".into(), key: "GitSwitchTestNothing".into(), uninstall: String::new(), msi: None, install_dir: Some(gone.clone()), icon: None, dirs: vec![gone], exes: vec![], startup: vec![], bundle: false };
         let app = InstalledApp { name: "GitSwitch Test Program".into(), ..Default::default() };
         let (plan, why) = force_plan(&app, &rec);
         let plan = plan.unwrap_or_else(|| panic!("{why:?}"));
         assert!(plan.folders.is_empty() && plan.entry.ends_with(r"\GitSwitchTestNothing"), "only its entry is left to remove");
-        let unplugged = PathBuf::from(r"Q:\Games\Gone");
+        let unplugged = PathBuf::from(r"Q:\Program Files\GitSwitch Test Program");
         if !Path::new(r"Q:\").exists() {
             let rec = Record::WinEntry { view: "HKCU".into(), key: "k".into(), uninstall: String::new(), msi: None, install_dir: Some(unplugged.clone()), icon: None, dirs: vec![unplugged], exes: vec![], startup: vec![], bundle: false };
             assert!(force_plan(&app, &rec).1.unwrap().contains("can't be reached"), "a drive that isn't there");
