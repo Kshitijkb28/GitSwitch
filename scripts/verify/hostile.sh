@@ -543,8 +543,10 @@ git -C "$F" config core.askPass "$(mk fetchaskpass)"
 # The housekeeping after the fetch asks pre-auto-gc only once there is
 # something to tidy: more packs than gc.autoPackLimit allows. The fetch keeps
 # what arrives as a pack, so one fetch crosses a limit of 1; no detaching, so
-# what housekeeping did is on disk when it returns.
-git -C "$F" config gc.autoPackLimit 1; git -C "$F" config fetch.unpackLimit 1; git -C "$F" config gc.autoDetach false
+# what housekeeping did is on disk when it returns. The plan is git's classic
+# gc: since 2.54 git repacks geometrically by default, which never reads
+# gc.autoPackLimit.
+git -C "$F" config gc.autoPackLimit 1; git -C "$F" config fetch.unpackLimit 1; git -C "$F" config gc.autoDetach false; git -C "$F" config maintenance.strategy gc
 for h in reference-transaction pre-auto-gc post-index-change; do
   printf '#!/bin/sh\necho "hook-fetch-%s" >> "%s"\nexit 0\n' "$h" "$MARK" > "$F/.git/hooks/$h"; chmod +x "$F/.git/hooks/$h"
 done

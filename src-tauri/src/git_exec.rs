@@ -36,10 +36,13 @@ pub const HOUSEKEEPING_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// git's own housekeeping, run after a fetch that held it back (`for_fetch`):
 /// `maintenance run --auto` (or `gc --auto` for a git that predates it). It
-/// is quick when there is nothing to do and detaches where git can detach
-/// it; where it cannot (Windows, `gc.autoDetach=false`) it runs here, on a
-/// generous clock and no silence clock. Best effort: it never changes the
-/// fetch's outcome.
+/// is quick when there is nothing to do. When there is, it runs here, on a
+/// generous clock and no silence clock — always with git 2.47 and later,
+/// which never detach a `maintenance run` that was not given `--detach`; an
+/// older git's `gc --auto` detached where it could (not on Windows, not with
+/// `gc.autoDetach=false`). What is due is git's own choice: since 2.54 its
+/// default plan is geometric repacking, not `gc`. Best effort: it never
+/// changes the fetch's outcome.
 pub async fn housekeeping(repo: impl AsRef<Path>) {
     housekeeping_as(repo.as_ref(), false).await
 }
@@ -556,6 +559,10 @@ impl GitCmd {
         // With a stall window the command is stopped only after that long of
         // silence; otherwise after the total ceiling.
         let waited: Result<std::io::Result<std::process::ExitStatus>, ()> = match self.stall {
+            // A clock that has already run out stops the command. `timeout`
+            // looks at git before the clock, and a quick git that is already
+            // done by then would answer.
+            None if self.timeout.is_zero() => Err(()),
             None => tokio::time::timeout(self.timeout, child.wait()).await.map_err(|_| ()),
             Some(stall) => loop {
                 tokio::select! {
@@ -2222,6 +2229,17 @@ mod tests {
     async fn the_blocking_entry_point_works_inside_a_runtime() {
         let out = super::GitCmd::without_repo().arg("--version").run_blocking().expect("git runs");
         assert!(out.text().starts_with("git version"), "{}", out.text());
+    }
+
+    /// A clock that has already run out stops the command every time, however
+    /// quick git is: `timeout` used to look at git first, and on Linux CI a
+    /// walk of two commits was once already done by then.
+    #[tokio::test]
+    async fn a_command_with_no_time_left_is_stopped_never_answered() {
+        for _ in 0..20 {
+            let err = super::GitCmd::without_repo().arg("--version").timeout(std::time::Duration::ZERO).run().await.err().expect("stopped, not answered");
+            assert!(super::was_stopped(&err), "{}", err);
+        }
     }
 
     #[test]

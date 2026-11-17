@@ -569,8 +569,10 @@ git clone -q "file://$SB/net.git" "$SB/net-history" 2>/dev/null
 # A repository whose own housekeeping becomes due with the pull's fetch (its
 # second pack), cannot detach (as on Windows) and is slow: its pre-auto-gc
 # hook sleeps longer than the silence window. Cloned before upstream moves.
+# Its plan is git's classic gc: since 2.54 git repacks geometrically by
+# default, and two packs that far apart in size are nothing to do there.
 git clone -q "file://$SB/net.git" "$SB/net-gc" 2>/dev/null
-git -C "$SB/net-gc" config gc.autoDetach false; git -C "$SB/net-gc" config gc.autoPackLimit 1
+git -C "$SB/net-gc" config gc.autoDetach false; git -C "$SB/net-gc" config gc.autoPackLimit 1; git -C "$SB/net-gc" config maintenance.strategy gc
 GC_HOOK="$(git -C "$SB/net-gc" rev-parse --path-format=absolute --git-path hooks)/pre-auto-gc"
 printf '#!/bin/sh\necho ran >> "%s"\nsleep 6\n' "$SB/gc-hook.log" > "$GC_HOOK"; chmod +x "$GC_HOOK"
 # A second remote, as a fork and its original are: with two remotes `fetch
