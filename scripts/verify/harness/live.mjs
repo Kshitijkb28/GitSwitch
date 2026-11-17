@@ -152,6 +152,10 @@ async function onInvoke(cmd, args) {
 // ONE http server: dist/ with an SPA fallback, plus POST /invoke.
 // ---------------------------------------------------------------------------
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon" };
+// Answers by request id. The page sends a request again when the network
+// dropped it (Chrome's ERR_NETWORK_CHANGED, when this PC's network moves); the
+// second copy gets the first one's answer, so a git command never runs twice.
+const answered = new Map();
 function serveLive() {
   const server = http.createServer((req, res) => {
     if (req.method === "POST" && req.url === "/invoke") {
@@ -160,8 +164,16 @@ function serveLive() {
       req.on("end", async () => {
         let reply;
         try {
-          const { cmd, args } = JSON.parse(body);
-          reply = await onInvoke(cmd, args ?? {});
+          const { cmd, args, id } = JSON.parse(body);
+          let run = id ? answered.get(id) : undefined;
+          if (!run) {
+            run = onInvoke(cmd, args ?? {});
+            if (id) {
+              answered.set(id, run);
+              setTimeout(() => answered.delete(id), 10 * 60 * 1000).unref();
+            }
+          }
+          reply = await run;
         } catch (e) {
           reply = { ok: false, error: `harness: ${e}` };
         }
@@ -211,6 +223,18 @@ async function waitGone(page, needle, timeout = WAIT) {
   } catch {
     return false;
   }
+}
+/**
+ * The page reports `file` resolved: its "1 file(s) resolved." result, or,
+ * since a later refresh may replace that result, the state it leaves (git has
+ * nothing unmerged and the page no longer lists the conflict).
+ */
+async function resolvedShown(file, timeout = WAIT) {
+  return waitUntilAsync(async () => {
+    const s = (await text(page)).replace(/\s+/g, " ");
+    if (s.includes("1 file(s) resolved.")) return true;
+    return git(WORK, "diff", "--name-only", "--diff-filter=U") === "" && !(s.includes(file) && s.includes("both modified"));
+  }, timeout);
 }
 /** Poll an asynchronous predicate until true or the timeout. */
 async function waitUntilAsync(fn, timeout = WAIT) {
@@ -294,7 +318,9 @@ async function clickInRow(page, rowText, pick) {
           pick.title !== undefined
             ? buttons.find((x) => x.title === pick.title || x.title.startsWith(pick.title))
             : pick.text !== undefined
-              ? buttons.find((x) => x.innerText.trim() === pick.text)
+              ? // The label exactly, else with a count after it: "Pull inside" is
+                // "Pull inside (1)" once the page knows the submodule is behind.
+                buttons.find((x) => x.innerText.trim() === pick.text) ?? buttons.find((x) => x.innerText.trim().startsWith(`${pick.text} (`))
               : buttons[pick.index];
         if (b) {
           b.click();
@@ -430,23 +456,39 @@ await page.evaluateOnNewDocument((repo) => {
     invoke: (cmd, args) => {
       window.__CALLS__.push({ cmd, args });
       if (cmd.startsWith("plugin:")) return Promise.resolve(null); // Tauri runtime, not a backend command
-      return fetch("/invoke", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ cmd, args: args ?? {} }),
-      })
-        .then((r) => r.json())
-        .then((j) => (j.ok ? j.value : Promise.reject(new Error(j.error))));
+      // One id per call: sent again after a network error, it is answered from
+      // the first run (see `answered` in the harness), never run twice.
+      const id = `${Date.now()}-${(window.__INVOKE_SEQ__ = (window.__INVOKE_SEQ__ || 0) + 1)}`;
+      const once = () =>
+        fetch("/invoke", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cmd, args: args ?? {}, id }),
+        }).then((r) => r.json());
+      const send = (tries) =>
+        once().catch((e) => (tries > 0 ? new Promise((r) => setTimeout(r, 400)).then(() => send(tries - 1)) : Promise.reject(e)));
+      return send(8).then((j) => (j.ok ? j.value : Promise.reject(new Error(j.error))));
     },
   };
 }, WORK);
 
+/** page.goto, again when this PC's network moved under it (ERR_NETWORK_CHANGED). */
+async function gotoSteady(url) {
+  for (let i = 0; ; i++) {
+    try {
+      return await page.goto(url, { waitUntil: "networkidle0", timeout: WAIT });
+    } catch (e) {
+      if (i >= 3 || !/ERR_NETWORK_CHANGED|ERR_NETWORK_IO_SUSPENDED|ERR_INTERNET_DISCONNECTED/.test(String(e))) throw e;
+      await sleep(1000);
+    }
+  }
+}
 async function openChanges() {
-  await page.goto(`${server.url}/repo/changes`, { waitUntil: "networkidle0", timeout: WAIT });
+  await gotoSteady(`${server.url}/repo/changes`);
   if (!(await waitText(page, "Committing as"))) throw new Error("the Changes page never showed the repository: " + (await text(page)).slice(0, 400));
 }
 async function openHistory() {
-  await page.goto(`${server.url}/repo/history`, { waitUntil: "networkidle0", timeout: WAIT });
+  await gotoSteady(`${server.url}/repo/history`);
   await page.waitForFunction(() => /showing \d/.test(document.body.innerText), { timeout: WAIT });
 }
 /** "Go to commit" → the detail panel for `hash`. */
@@ -719,7 +761,7 @@ try {
     ok("  the row offers Keep mine and Take theirs", row !== null && row.buttons.some((b) => b.text === "Keep mine") && row.buttons.some((b) => b.text === "Take theirs"), JSON.stringify(row?.buttons));
     ok("  and Commit is blocked while the conflict remains", (await buttonState(page, "Commit"))?.disabled === true);
     ok("Take theirs", await clickInRow(page, "c.txt", { text: "Take theirs" }));
-    ok("  the page reports the file resolved", await waitText(page, "1 file(s) resolved."));
+    ok("  the page shows the file resolved", await resolvedShown("c.txt"));
     ok("  c.txt holds their content", fs.readFileSync(`${WORK}/c.txt`, "utf8") === "theirs\n");
     ok("  and is staged, no conflict left", git(WORK, "diff", "--cached", "--name-only") === "c.txt" && git(WORK, "diff", "--name-only", "--diff-filter=U") === "");
     s = await text(page);
@@ -729,7 +771,9 @@ try {
     const commit = await buttonState(page, "Commit");
     ok("  and Commit enabled", commit?.disabled === false, JSON.stringify(commit));
     ok("Commit", await click(page, "Commit"));
-    const settled = await Promise.race([waitText(page, "Committed ", 15000), waitText(page, "A commit needs a message", 15000)]);
+    // WAIT, not 15 s: on a loaded PC the page's refresh ran first and the
+    // commit only started after a shorter wait had given up (H3's run).
+    const settled = await Promise.race([waitText(page, "Committed "), waitText(page, "A commit needs a message")]);
     s = await text(page);
     ok("  the merge is concluded (no MERGE_HEAD)", settled && !exists(`${WORK}/.git/MERGE_HEAD`), s.includes("A commit needs a message") ? "the page sent an empty message: 'A commit needs a message.'" : "");
     ok("  git: HEAD is a merge commit with the right subject", git(WORK, "rev-list", "--parents", "-1", "HEAD").split(" ").length === 3 && subjectOf(WORK, "HEAD") === "Merge remote-tracking branch 'origin/main'");
@@ -901,7 +945,7 @@ try {
     ok("  the conflict list names it with the sides", await waitText(page, "both modified"));
     ok("  Continue update waits", (await buttonState(page, "Continue update"))?.disabled === true);
     ok("Keep mine", await clickInRowWhen(page, "c.txt", { text: "Keep mine" }));
-    ok("  the page reports the file resolved", await waitText(page, "1 file(s) resolved."));
+    ok("  the page shows the file resolved", await resolvedShown("c.txt"));
     ok("  c.txt holds my content", fs.readFileSync(`${WORK}/c.txt`, "utf8") === "mine again\n");
     ok("  Continue update is enabled once nothing is unmerged", await waitUntilAsync(async () => (await buttonState(page, "Continue update"))?.disabled === false));
     ok("Continue update", await click(page, "Continue update"));

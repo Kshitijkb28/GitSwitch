@@ -31,8 +31,9 @@ COPY --chown=tester:tester package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY --chown=tester:tester vscode-extension/package.json vscode-extension/package-lock.json vscode-extension/
 RUN cd vscode-extension && npm ci --no-audit --no-fund
-COPY --chown=tester:tester scripts/verify/harness/package.json scripts/verify/harness/
-RUN cd scripts/verify/harness && npm install --no-audit --no-fund
+# The harness's own lockfile, as CI and this PC use it: the same puppeteer.
+COPY --chown=tester:tester scripts/verify/harness/package.json scripts/verify/harness/package-lock.json scripts/verify/harness/
+RUN cd scripts/verify/harness && npm ci --no-audit --no-fund
 COPY --chown=tester:tester . .
 # Built once, here: the sidecars, the frontend, and every test binary (the
 # crates fetched now, so the live harness can build offline later).

@@ -7,6 +7,9 @@
 #   bash scripts/docker/verify.sh bash scripts/verify/netspeed.sh
 #   VERIFY_EXCLUDE="my-notes other-dir" bash scripts/docker/verify.sh   # untracked folders to leave out
 #
+# Left out unless VERIFY_EXCLUDE says otherwise: windows-kit (an untracked
+# folder on the Windows PC holding a claude-home/ that must not be copied).
+#
 # The image build log goes to dist-linux/verify-build.log.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -15,7 +18,7 @@ list="$(mktemp)"
 trap 'rm -f "$list"' EXIT
 git ls-files -co --exclude-standard | while IFS= read -r f; do
   keep=1
-  for e in ${VERIFY_EXCLUDE:-}; do
+  for e in ${VERIFY_EXCLUDE-windows-kit}; do
     case "$f" in "$e" | "$e"/*) keep=0 ;; esac
   done
   if [ "$keep" = 1 ] && [ -e "$f" ]; then printf '%s\n' "$f"; fi
