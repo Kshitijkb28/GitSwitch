@@ -1358,7 +1358,7 @@ fn failed_move(path: &Path, m: &str, elevated: bool) -> (&'static str, String) {
         }
     }
     #[cfg(not(windows))]
-    let _ = path;
+    let _ = (path, elevated);
     ("failed", format!("Couldn't move it to the {}: {}", trash_word(), m))
 }
 

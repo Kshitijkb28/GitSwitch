@@ -2957,7 +2957,10 @@ mod tests {
             (out.status.success(), fired(&mark))
         };
         let hooks = format!("core.hooksPath={}", hook.parent().unwrap().to_string_lossy());
-        assert_eq!(with(&hooks), (true, "hook\n".to_string()), "control: the hook runs from its own folder");
+        // How often git runs reference-transaction for one commit depends on its
+        // version (CI's git ran it 7 times), so the control only asks that it ran.
+        let (made, fired_by) = with(&hooks);
+        assert!(made && fired_by.contains("hook"), "control: the hook runs from its own folder: {:?}", fired_by);
         assert_eq!(with("core.hooksPath=/dev/null"), (true, String::new()), "no hook below /dev/null, and the commit is made");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2974,8 +2977,10 @@ mod tests {
         let git_dir = dir.join(".git");
         std::fs::write(git_dir.join("inc.cfg"), "[filter \"inc\"]\n\tclean = /tmp/from-include\n").unwrap();
         std::fs::write(git_dir.join("incif.cfg"), "[gpg]\n\tprogram = /tmp/from-includeif\n").unwrap();
-        // `gitdir:<work tree>/` covers `<work tree>/.git`.
-        let gitdir_rule = dir.to_string_lossy().replace('\\', "/");
+        // `gitdir:**/<folder>/` covers `<folder>/.git` wherever the temp folder
+        // really is: on CI it is reached through an 8.3 short name (Windows) or a
+        // symlink (/var is /private/var on macOS), which a full-path rule misses.
+        let gitdir_rule = format!("**/{}", dir.file_name().unwrap().to_string_lossy());
         let mut config = std::fs::read_to_string(git_dir.join("config")).unwrap();
         config.push_str(&format!("[include]\n\tpath = inc.cfg\n[includeIf \"gitdir:{}/\"]\n\tpath = incif.cfg\n", gitdir_rule));
         std::fs::write(git_dir.join("config"), config).unwrap();
