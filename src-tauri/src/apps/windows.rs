@@ -172,6 +172,16 @@ pub(crate) fn clean_dir(raw: &str) -> Option<PathBuf> {
     Some(long_path(Path::new(t)))
 }
 
+/// `clean_dir`, for the entry of the program being removed: only a
+/// plainly written InstallLocation (checked before `GetLongPathNameW`, which
+/// may fold a `..` into a folder that then looks plain).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn clean_dir_plain(raw: &str) -> Option<PathBuf> {
+    let t = expand(raw.trim().trim_matches('"').trim());
+    plain_windows_path(t.trim_end_matches(['\\', '/'])).ok()?;
+    clean_dir(raw)
+}
+
 fn long_path(p: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -201,6 +211,10 @@ fn known_folders() -> Vec<PathBuf> {
     if let Ok(l) = std::env::var("LOCALAPPDATA") {
         v.push(PathBuf::from(l).join("Programs"));
     }
+    // What Windows itself says these folders are (the variables above can be
+    // anything a process was started with): more refusals, never fewer.
+    #[cfg(windows)]
+    v.extend(sys::known_folder_paths());
     v
 }
 
@@ -240,6 +254,35 @@ pub(crate) fn plain_windows_path(s: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A path as Windows opens it, by its text alone: `.` and `..` folded, and
+/// the trailing dots and spaces Windows drops taken off each name. Used to
+/// see through odd spellings when deciding what another program claims.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn lexical_normal(p: &str) -> String {
+    let p = p.replace('/', "\\");
+    let (prefix, rest) = if p.len() >= 2 && p.as_bytes()[1] == b':' { (&p[..2], &p[2..]) } else { ("", p.as_str()) };
+    let mut out: Vec<&str> = Vec::new();
+    for name in rest.split('\\') {
+        match name {
+            "" | "." => continue,
+            ".." => {
+                out.pop();
+                continue;
+            }
+            _ => {}
+        }
+        let n = name.trim_end_matches(['.', ' ']);
+        if !n.is_empty() {
+            out.push(n);
+        }
+    }
+    if prefix.is_empty() {
+        out.join("\\")
+    } else {
+        format!("{}\\{}", prefix, out.join("\\"))
+    }
 }
 
 /// Windows' own folder as Windows says it (`GetSystemWindowsDirectoryW`), not
@@ -351,6 +394,80 @@ pub(crate) fn install_dir_of(file: &Path, names: &[String]) -> Option<PathBuf> {
     named.then_some(dir)
 }
 
+/// A recorded install folder (an entry's InstallLocation, or a folder kept in
+/// a session file) may be offered or deleted only if it is written plainly,
+/// not an installer's cache or a personal folder, not one of Windows' own,
+/// inside a place programs are installed in, and either named like the app
+/// (`names`: never the folder's own name) or holding one of the files its
+/// entry names (`files`: its icon or uninstaller), directly or below one
+/// generic folder.
+pub(crate) fn install_folder_ok(dir: &Path, names: &[String], files: &[PathBuf]) -> Result<(), &'static str> {
+    if plain_windows_path(&dir.to_string_lossy()).is_err() {
+        return Err("its path isn't written plainly");
+    }
+    if cache_like(dir) {
+        return Err("it is an installer's cache or a personal folder");
+    }
+    if !safe_install_dir(dir) {
+        return Err("it is one of Windows' own folders");
+    }
+    if !in_install_root(dir) {
+        return Err("it is not in a place programs are installed in");
+    }
+    let n = dir.file_name().map(|x| x.to_string_lossy().trim().to_lowercase()).unwrap_or_default();
+    let named = names.iter().filter(|x| matcher::usable_name(x)).any(|x| {
+        let x = x.trim().to_lowercase();
+        n == x || n.replace(' ', "") == x.replace(' ', "")
+    });
+    let same = |a: &Path| lower(a) == lower(dir);
+    let holds = files.iter().any(|f| {
+        f.parent().is_some_and(|p| same(p) || (p.file_name().is_some_and(|g| generic_dir(&g.to_string_lossy())) && p.parent().is_some_and(same)))
+    });
+    if named || holds {
+        Ok(())
+    } else {
+        Err("it is not named like the app, and none of the files its entry names is in it")
+    }
+}
+
+/// The files an entry names: its icon's file and its uninstaller.
+fn entry_files(uninstall: &str, icon: Option<&str>) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = icon.and_then(icon_file).into_iter().collect();
+    if let Some((prog, _)) = split_command(uninstall, &|p| Path::new(p).is_file()) {
+        v.push(PathBuf::from(prog));
+    }
+    v
+}
+
+/// What the gate for a recorded folder weighs: the app's names (its display
+/// name, without its version, its programs' names; never a folder's own name)
+/// and the files its entry names.
+fn gate_of(app_name: &str, rec: &Record) -> Option<(Vec<String>, Vec<PathBuf>)> {
+    let Record::WinEntry { uninstall, icon, exes, .. } = rec else { return None };
+    let files = entry_files(uninstall, icon.as_deref());
+    let mut names = base_names(app_name, icon.as_deref());
+    names.extend(files.iter().filter_map(|f| f.file_stem()).map(|s| s.to_string_lossy().to_string()));
+    names.extend(exes.iter().cloned());
+    Some((names, files))
+}
+
+/// The recorded InstallLocation, when it passes the gate (what is sized).
+pub(crate) fn gated_install_dir(app_name: &str, rec: &Record) -> Option<PathBuf> {
+    let Record::WinEntry { install_dir: Some(d), .. } = rec else { return None };
+    let (names, files) = gate_of(app_name, rec)?;
+    install_folder_ok(d, &names, &files).is_ok().then(|| d.clone())
+}
+
+/// The recorded folders the gate turns away, and why: said in the scan's
+/// notes when they are still there.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn ungated_dirs(app_name: &str, rec: &Record) -> Vec<(PathBuf, &'static str)> {
+    let Record::WinEntry { install_dir, dirs, .. } = rec else { return vec![] };
+    let Some((names, files)) = gate_of(app_name, rec) else { return vec![] };
+    let raw: Vec<PathBuf> = if dirs.is_empty() { install_dir.iter().cloned().collect() } else { dirs.clone() };
+    raw.into_iter().filter_map(|d| install_folder_ok(&d, &names, &files).err().map(|why| (d, why))).collect()
+}
+
 /// Add a folder unless it, or a folder holding it, is already there; drop
 /// those inside it.
 pub(crate) fn push_dir(dirs: &mut Vec<PathBuf>, d: PathBuf) {
@@ -375,14 +492,17 @@ pub(crate) fn command_program(cmd: &str) -> Option<PathBuf> {
 /// or (an older session) what its entry itself points at.
 pub(crate) fn recorded_dirs(app_name: &str, rec: &Record) -> Vec<PathBuf> {
     let Record::WinEntry { uninstall, install_dir, icon, dirs, exes, .. } = rec else { return vec![] };
+    let Some((gate_names, files)) = gate_of(app_name, rec) else { return vec![] };
+    let ok = |d: &Path| install_folder_ok(d, &gate_names, &files).is_ok();
     if !dirs.is_empty() {
-        return dirs.clone();
+        // A session file is the person's to edit: each folder in it passes the gate again.
+        return dirs.iter().filter(|d| ok(d)).cloned().collect();
     }
-    let mut names = names_of(app_name, install_dir.as_deref(), icon.as_deref());
+    let mut names = names_of(app_name, install_dir.as_deref(), icon.as_deref(), &files);
     names.extend(exes.iter().cloned());
     let mut out = Vec::new();
-    if let Some(d) = install_dir {
-        push_dir(&mut out, d.clone());
+    if let Some(d) = install_dir.as_deref().filter(|d| ok(d)) {
+        push_dir(&mut out, d.to_path_buf());
     }
     if let Some(f) = icon.as_deref().and_then(icon_file) {
         if let Some(d) = install_dir_of(&f, &names) {
@@ -401,9 +521,9 @@ pub(crate) fn recorded_dirs(app_name: &str, rec: &Record) -> Vec<PathBuf> {
 /// names and what starts it with Windows — from its entry, App Paths, its
 /// shortcuts and the Run keys — kept in the session for later.
 pub fn enrich(app: &InstalledApp, rec: &Record) -> Record {
-    let Record::WinEntry { view, key, install_dir, icon, .. } = rec else { return rec.clone() };
+    let Record::WinEntry { view, key, uninstall, install_dir, icon, .. } = rec else { return rec.clone() };
     let removed = format!("{}:{}", view, key);
-    let names = names_of(&app.name, install_dir.as_deref(), icon.as_deref());
+    let names = names_of(&app.name, install_dir.as_deref(), icon.as_deref(), &entry_files(uninstall, icon.as_deref()));
     let mut found = recorded_dirs(&app.name, rec);
     let mut exes: Vec<String> = Vec::new();
     #[allow(unused_mut)]
@@ -491,6 +611,9 @@ pub(crate) fn force_plan(app: &InstalledApp, rec: &Record) -> (Option<ForcePlan>
         let (size, done) = super::size_of(d, std::time::Duration::from_secs(2));
         folders.push(ForceFolder { path: d.to_string_lossy().to_string(), size: Some(size), size_complete: done, admin: !can_delete(d) });
     }
+    if let Some(why) = per_user_refusal(view, folders.iter().any(|f| f.admin), startup.iter().any(|s| s.view != "HKCU")) {
+        return (None, Some(why));
+    }
     let entry_admin = view != "HKCU";
     let admin = entry_admin || folders.iter().any(|f| f.admin) || startup.iter().any(|s| s.view != "HKCU");
     let plan = ForcePlan {
@@ -501,6 +624,15 @@ pub(crate) fn force_plan(app: &InstalledApp, rec: &Record) -> (Option<ForcePlan>
         admin,
     };
     (Some(plan), None)
+}
+
+/// A program installed for one person (its entry in HKCU) never gets the
+/// administrator: when it names a folder only the administrator can change, or
+/// a start-up value for everyone, its files aren't deleted directly (step 7b,
+/// owner decision 2: strict).
+pub(crate) fn per_user_refusal(view: &str, folder_needs_admin: bool, startup_for_everyone: bool) -> Option<String> {
+    (view == "HKCU" && (folder_needs_admin || startup_for_everyone))
+        .then(|| "It was installed for you only, yet it names something only the administrator can change, so its files aren't deleted directly. Use Uninstall.".to_string())
 }
 
 /// What deleting a program's files directly does, in order — each with
@@ -577,7 +709,7 @@ pub(crate) fn entry_app(e: &RegEntry) -> Option<(InstalledApp, Record)> {
     }
     let name = e.name.clone()?.trim().to_string();
     let msi = msi_guid(e);
-    let install_dir = e.install_location.as_deref().and_then(clean_dir);
+    let install_dir = e.install_location.as_deref().and_then(clean_dir_plain);
     let mut notes = Vec::new();
     if e.view == "HKCU" {
         notes.push("Installed for you only.".to_string());
@@ -823,13 +955,44 @@ pub fn list() -> Result<super::Listing, AppError> {
 }
 
 /// The names a program's folders are made with.
-fn names_of(name: &str, install_dir: Option<&Path>, icon: Option<&str>) -> Vec<String> {
+/// An app's own names: its display name, without its version, its icon's program.
+fn base_names(name: &str, icon: Option<&str>) -> Vec<String> {
     let mut v = vec![name.to_string(), strip_version(name)];
-    if let Some(d) = install_dir.and_then(|d| d.file_name()) {
-        v.push(d.to_string_lossy().to_string());
-    }
     if let Some(s) = icon.and_then(exe_stem) {
         v.push(s);
+    }
+    v.retain(|n| !n.trim().is_empty());
+    v.dedup();
+    v
+}
+
+/// The names the program being removed answers to: its own, and its
+/// InstallLocation's folder name only when that folder passes the gate.
+/// Otherwise a made-up entry could name any folder in Program Files and have
+/// the matcher offer it as sure.
+fn names_of(name: &str, install_dir: Option<&Path>, icon: Option<&str>, files: &[PathBuf]) -> Vec<String> {
+    let mut v = base_names(name, icon);
+    if let Some(d) = install_dir {
+        let mut gate = v.clone();
+        gate.extend(files.iter().filter_map(|f| f.file_stem()).map(|s| s.to_string_lossy().to_string()));
+        if install_folder_ok(d, &gate, files).is_ok() {
+            if let Some(n) = d.file_name() {
+                v.push(n.to_string_lossy().to_string());
+            }
+        }
+    }
+    v.retain(|n| !n.trim().is_empty());
+    v.dedup();
+    v
+}
+
+/// Another installed program's names, its InstallLocation's folder name
+/// included as it is: for the others, more names only keep more of theirs.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn others_names(name: &str, install_dir: Option<&Path>, icon: Option<&str>) -> Vec<String> {
+    let mut v = base_names(name, icon);
+    if let Some(d) = install_dir.and_then(|d| d.file_name()) {
+        v.push(d.to_string_lossy().to_string());
     }
     v.retain(|n| !n.trim().is_empty());
     v.dedup();
@@ -841,7 +1004,7 @@ pub fn prepare(app: &InstalledApp, rec: &Record) -> Result<(Prepared, Evidence, 
     let ev;
     match rec {
         Record::WinEntry { view, key, uninstall, msi, install_dir, icon, exes, .. } => {
-            let mut names = names_of(&app.name, install_dir.as_deref(), icon.as_deref());
+            let mut names = names_of(&app.name, install_dir.as_deref(), icon.as_deref(), &entry_files(uninstall, icon.as_deref()));
             for x in exes {
                 if !names.iter().any(|n| n.eq_ignore_ascii_case(x)) {
                     names.push(x.clone());
@@ -1045,7 +1208,7 @@ pub fn others(s: &Session) -> Others {
             }
             let Some(name) = e.name.clone() else { continue };
             let dir = e.install_location.as_deref().and_then(clean_dir);
-            o.add_app(&[], &names_of(&name, dir.as_deref(), e.icon.as_deref()), e.publisher.as_deref(), &[]);
+            o.add_app(&[], &others_names(&name, dir.as_deref(), e.icon.as_deref()), e.publisher.as_deref(), &[]);
             // "VS Revo Group, Ltd." also answers to "VS Revo Group".
             if let Some(p) = e.publisher.as_deref() {
                 o.add_app(&[], &[], Some(&matcher::company_stem(p)), &[]);
@@ -1107,6 +1270,11 @@ pub fn leftovers(s: &Session, others: &Others, registry: bool) -> (Vec<Candidate
             Record::WinEntry { view, key, .. } => format!("{}:{}", view, key),
             _ => String::new(),
         };
+        for (dir, why) in ungated_dirs(&s.app.name, &s.record) {
+            if dir.is_dir() {
+                notes.push(format!("{} is still there, but {}, so it is not offered.", dir.display(), why));
+            }
+        }
         // Its own folders: not shared, not another installed program's.
         let mut own: Vec<PathBuf> = Vec::new();
         for dir in recorded_dirs(&s.app.name, &s.record) {
@@ -1539,6 +1707,41 @@ $j = ConvertTo-Json -InputObject $out -Compress
         run_ps(SIGNER, &[("GS_FILE", &file.to_string_lossy())]).ok().filter(|s| !s.is_empty())
     }
 
+    pub fn known_folder_paths() -> Vec<PathBuf> {
+        static PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+        PATHS
+            .get_or_init(|| {
+                use windows_sys::Win32::System::Com::CoTaskMemFree;
+                use windows_sys::Win32::UI::Shell::{
+                    SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_LocalAppData, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
+                    FOLDERID_ProgramFilesX86, FOLDERID_Public, FOLDERID_PublicDesktop, FOLDERID_PublicDocuments, FOLDERID_RoamingAppData, FOLDERID_SkyDrive, FOLDERID_UserProgramFiles, FOLDERID_Videos, FOLDERID_Windows,
+                };
+                let ids = [
+                    FOLDERID_Profile, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Pictures, FOLDERID_Music, FOLDERID_Videos, FOLDERID_Public, FOLDERID_PublicDesktop, FOLDERID_PublicDocuments, FOLDERID_RoamingAppData,
+                    FOLDERID_LocalAppData, FOLDERID_UserProgramFiles, FOLDERID_SkyDrive, FOLDERID_Windows, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_ProgramData,
+                ];
+                let mut out = Vec::new();
+                for id in ids {
+                    let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
+                    // SAFETY: a valid folder id; on success `p` is a string Windows
+                    // allocated, freed below either way. A folder not set up is skipped.
+                    let hr = unsafe { SHGetKnownFolderPath(&id, 0, std::ptr::null_mut(), &mut p) };
+                    if hr >= 0 && !p.is_null() {
+                        // SAFETY: Windows returns a NUL-terminated string.
+                        let len = (0..).take_while(|&i| unsafe { *p.add(i) } != 0).count();
+                        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) });
+                        out.push(PathBuf::from(format!("{}\\", s.trim_end_matches('\\'))));
+                    }
+                    if !p.is_null() {
+                        // SAFETY: the string SHGetKnownFolderPath allocated, freed once.
+                        unsafe { CoTaskMemFree(p as *const _) };
+                    }
+                }
+                out
+            })
+            .clone()
+    }
+
     pub fn windows_dir() -> Option<String> {
         use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
         let mut buf = vec![0u16; 512];
@@ -1789,14 +1992,27 @@ $j = ConvertTo-Json -InputObject $out -Compress
     /// entry, a service or driver, a shared DLL. `removed` is the
     /// `view:key` of the program being removed.
     pub fn install_dir_claimed(dir: &Path, removed: &str) -> Option<String> {
-        let d = format!("{}\\", lower(dir));
-        let inside = |p: &Path| lower(p).starts_with(&d) || lower(p) == lower(dir);
+        // Another program's paths count in every spelling (DEST-B-13): as
+        // written, with . and .. folded, and resolved on disk. Unusual
+        // spellings count toward "claimed", the safe direction.
+        let resolved = |p: &Path| std::fs::canonicalize(p).ok().map(|c| lower(Path::new(c.to_string_lossy().trim_start_matches(r"\\?\"))));
+        let forms = |p: &Path, deep: bool| -> Vec<String> {
+            let mut v = vec![lower(p), lexical_normal(&lower(p))];
+            if deep {
+                v.extend(resolved(p));
+            }
+            v
+        };
+        let mine = forms(dir, true);
+        let under = |f: &str| mine.iter().any(|d| f == d || f.starts_with(&format!("{}\\", d)));
+        let inside = |p: &Path| forms(p, false).iter().any(|f| under(f));
+        let inside_deep = |p: &Path| forms(p, true).iter().any(|f| under(f));
         for e in read_entries() {
             if format!("{}:{}", e.view, e.key) == removed {
                 continue;
             }
             let paths = [e.install_location.as_deref().and_then(clean_dir), e.icon.as_deref().map(|i| PathBuf::from(i.split(',').next().unwrap_or(i).trim_matches('"'))), e.uninstall.as_deref().and_then(command_path)];
-            if paths.iter().flatten().any(|p| inside(p)) {
+            if paths.iter().flatten().any(|p| inside_deep(p)) {
                 return Some(format!("another program ({}) is installed there", e.name.unwrap_or(e.key)));
             }
         }
@@ -2433,6 +2649,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn spellings_fold_to_what_windows_opens() {
+        assert_eq!(lexical_normal(r"C:\a\x\..\b"), r"C:\a\b");
+        assert_eq!(lexical_normal(r"C:\a\.\b\"), r"C:\a\b");
+        assert_eq!(lexical_normal(r"C:\Program Files\X. "), r"C:\Program Files\X");
+        assert_eq!(lexical_normal(r"C:\..\x"), r"C:\x");
+        assert_eq!(lexical_normal("C:/a//b"), r"C:\a\b");
+        assert_eq!(lexical_normal(r"c:\program files\..\users\public\gs-marker"), r"c:\users\public\gs-marker");
+    }
+
+    #[test]
+    fn a_program_installed_for_one_person_never_gets_the_administrator() {
+        assert!(per_user_refusal("HKCU", true, false).unwrap().contains("installed for you only"));
+        assert!(per_user_refusal("HKCU", false, true).is_some(), "a start-up value for everyone");
+        assert!(per_user_refusal("HKCU", false, false).is_none());
+        assert!(per_user_refusal("HKLM64", true, true).is_none(), "a machine-wide program may get the administrator");
+    }
+
+    #[test]
     fn only_a_plainly_written_path_reaches_the_administrators_run() {
         for bad in [
             r"C:\Program Files\..\Windows\System32",
@@ -2649,6 +2883,53 @@ mod tests {
         assert_eq!(v, vec![PathBuf::from(r"C:\Program Files\Foo")], "the outer folder only, once");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_recorded_install_folder_counts_only_where_programs_live_named_like_the_app() {
+        let names = |n: &str| base_names(n, None);
+        for bad in [r"C:\Users\me\Documents", r"C:\Users\me\Desktop", r"C:\Users\me\Downloads", r"C:\Users\Public\Documents", r"D:\Projects\All", r"C:\Program Files\..\Users\Public\gs-marker"] {
+            assert!(install_folder_ok(Path::new(bad), &names("All Projects"), &[]).is_err(), "{bad}");
+        }
+        assert!(install_folder_ok(Path::new(r"C:\Program Files\Vendor"), &names("Another App"), &[]).is_err(), "not named like the app, nothing of it inside");
+        assert!(install_folder_ok(Path::new(r"C:\Program Files\7-Zip"), &names("7-Zip 23.01 (x64)"), &[]).is_ok());
+        let py = Path::new(r"C:\Users\me\AppData\Local\Programs\Python\Python312");
+        assert!(install_folder_ok(py, &names("Python 3.12.1 (64-bit)"), &[py.join("uninstall.exe")]).is_ok(), "its uninstaller is inside");
+        assert!(install_folder_ok(py, &names("Python 3.12.1 (64-bit)"), &[py.join("bin").join("python.exe")]).is_ok(), "below one generic folder");
+        assert!(install_folder_ok(py, &names("Python 3.12.1 (64-bit)"), &[]).is_err());
+        // Where it is used: an entry's InstallLocation, and a session file's folders.
+        let rec = |install_dir: Option<&str>, dirs: Vec<&str>| Record::WinEntry {
+            view: "HKLM64".into(),
+            key: "suite".into(),
+            uninstall: String::new(),
+            msi: None,
+            install_dir: install_dir.map(PathBuf::from),
+            icon: None,
+            dirs: dirs.into_iter().map(PathBuf::from).collect(),
+            exes: vec![],
+            startup: vec![],
+            bundle: false,
+        };
+        assert!(recorded_dirs("Office Tools", &rec(Some(r"C:\Apps\Suite"), vec![])).is_empty(), "outside the install places");
+        assert!(recorded_dirs("Office Tools", &rec(None, vec![r"C:\Users\me\Documents"])).is_empty(), "a session file's folder is gated too");
+        assert_eq!(recorded_dirs("Suite 2.0", &rec(None, vec![r"C:\Program Files\Suite"])), vec![PathBuf::from(r"C:\Program Files\Suite")]);
+        assert_eq!(ungated_dirs("Office Tools", &rec(Some(r"C:\Apps\Suite"), vec![])), vec![(PathBuf::from(r"C:\Apps\Suite"), "it is not in a place programs are installed in")]);
+    }
+
+    /// DEST-B-13: what GetLongPathNameW makes of a `..` (the open question),
+    /// and that the gate refuses the spelling either way.
+    #[cfg(windows)]
+    #[test]
+    fn a_dot_dot_spelling_of_an_install_folder_is_refused() {
+        let t = std::env::temp_dir().join(format!("gitswitch-7b-{}", std::process::id()));
+        std::fs::create_dir_all(t.join("a").join("b")).unwrap();
+        std::fs::create_dir_all(t.join("a").join("x")).unwrap();
+        let spelled = PathBuf::from(format!(r"{}\a\x\..\b", t.display()));
+        eprintln!("long_path({}) = {}", spelled.display(), long_path(&spelled).display());
+        assert!(install_folder_ok(&spelled, &[String::from("b")], &[]).is_err());
+        assert_eq!(lexical_normal(&lower(&spelled)), lower(&t.join("a").join("b")));
+        let _ = std::fs::remove_dir_all(&t);
+    }
+
     // Backslash paths only split into folders on Windows, where this code runs.
     #[cfg(windows)]
     #[test]
@@ -2750,13 +3031,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_program_whose_files_are_already_gone_can_still_be_removed_from_the_list() {
-        let gone = PathBuf::from(r"C:\Program Files\GitSwitch Test Program That Is Not There");
+        // Named like the app and in an install place, as the gate (step 7b) wants.
+        let gone = PathBuf::from(r"C:\Program Files\GitSwitch Test Program");
         let rec = Record::WinEntry { view: "HKCU".into(), key: "GitSwitchTestNothing".into(), uninstall: String::new(), msi: None, install_dir: Some(gone.clone()), icon: None, dirs: vec![gone], exes: vec![], startup: vec![], bundle: false };
         let app = InstalledApp { name: "GitSwitch Test Program".into(), ..Default::default() };
         let (plan, why) = force_plan(&app, &rec);
         let plan = plan.unwrap_or_else(|| panic!("{why:?}"));
         assert!(plan.folders.is_empty() && plan.entry.ends_with(r"\GitSwitchTestNothing"), "only its entry is left to remove");
-        let unplugged = PathBuf::from(r"Q:\Games\Gone");
+        let unplugged = PathBuf::from(r"Q:\Program Files\GitSwitch Test Program");
         if !Path::new(r"Q:\").exists() {
             let rec = Record::WinEntry { view: "HKCU".into(), key: "k".into(), uninstall: String::new(), msi: None, install_dir: Some(unplugged.clone()), icon: None, dirs: vec![unplugged], exes: vec![], startup: vec![], bundle: false };
             assert!(force_plan(&app, &rec).1.unwrap().contains("can't be reached"), "a drive that isn't there");

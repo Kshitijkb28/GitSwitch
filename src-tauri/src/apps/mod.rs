@@ -789,11 +789,11 @@ pub async fn list(kind: String) -> Result<AppList, AppError> {
 pub async fn size(id: String) -> Result<(u64, bool), AppError> {
     let path = {
         let st = lock();
-        let (_, rec) = st.list.get(&id).ok_or_else(|| AppError::Config("List the apps again.".into()))?;
+        let (app, rec) = st.list.get(&id).ok_or_else(|| AppError::Config("List the apps again.".into()))?;
         match rec {
             Record::MacBundle { bundle, .. } => Some(bundle.clone()),
             Record::AppImage { file, .. } => Some(file.clone()),
-            Record::WinEntry { install_dir, .. } => install_dir.clone().filter(|d| windows::safe_install_dir(d)),
+            Record::WinEntry { .. } => windows::gated_install_dir(&app.name, rec),
             _ => None,
         }
     };
@@ -982,6 +982,9 @@ fn scan_blocking(mut s: Session, registry: bool) -> Result<LeftoverScan, AppErro
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut items = Vec::new();
     let mut held = HashMap::new();
+    // Installed for one person: nothing of it gets the administrator (step 7b).
+    let per_user = matches!(&s.record, Record::WinEntry { view, .. } if view == "HKCU");
+    let mut said_per_user = false;
     for (i, c) in cands.into_iter().enumerate() {
         let file_backed = file_backed(c.kind);
         if file_backed && link_on_the_way(&c.root, &c.path) {
@@ -997,7 +1000,11 @@ fn scan_blocking(mut s: Session, registry: bool) -> Result<LeftoverScan, AppErro
             (None, false)
         };
         // Windows: GitSwitch does what needs the administrator after its prompt.
-        let elevate = c.admin && cfg!(windows) && c.action != Action::None;
+        let elevate = c.admin && cfg!(windows) && c.action != Action::None && !per_user;
+        if per_user && c.admin && !said_per_user {
+            notes.push(format!("{} was installed for you only, so nothing of it is deleted with the administrator's rights: what needs them shows its command instead.", s.app.name));
+            said_per_user = true;
+        }
         held.insert(
             id.clone(),
             ScanItem { path: c.path.clone(), root: c.root.clone(), ident: if file_backed { ident(&c.path) } else { None }, action: c.action.clone(), admin: c.admin, elevate, entry: c.entry.clone() },
@@ -1538,6 +1545,9 @@ pub async fn delete_at_restart(scan: String, ids: Vec<String>) -> Result<Vec<Del
     let s2 = s.clone();
     if let Err(why) = tokio::task::spawn_blocking(move || platform_gone(&s2)).await.map_err(|e| AppError::Command(e.to_string()))? {
         return Err(AppError::Config(format!("{} is installed again, so nothing was deleted: {}", s.app.name, why)));
+    }
+    if matches!(&s.record, Record::WinEntry { view, .. } if view == "HKCU") {
+        return Err(AppError::Config(format!("{} was installed for you only, so nothing of it is deleted with the administrator's rights at the next restart.", s.app.name)));
     }
     let ids: Vec<String> = items.iter().map(|j| j.id.clone()).collect();
     let out = match Box::pin(elevated_run(items, false)).await {
