@@ -204,7 +204,7 @@ pub(crate) struct LocalIndex {
     /// owner (lowercase) -> profile id -> number of local repos
     owner_profiles: HashMap<String, HashMap<String, usize>>,
     /// owner (lowercase) -> "org-<id>" SSH user seen in local remotes
-    org_ssh_users: HashMap<String, String>,
+    pub(crate) org_ssh_users: HashMap<String, String>,
     /// The remote (`github:owner/name`, else `url:<address>`) -> every
     /// checkout of it, in scan order: the copies a workspace is told apart from.
     pub(crate) by_remote: HashMap<String, Vec<String>>,

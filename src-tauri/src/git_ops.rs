@@ -828,7 +828,7 @@ pub(crate) async fn explain_transport_failure(repo_path: &str, op: GitOp, stderr
 
 /// Nothing was ever fetched from `remote` or pushed to it: it has no
 /// remote-tracking branch. Nothing depends on such a remote yet.
-async fn never_reached(repo_path: &str, remote: &str) -> bool {
+pub(crate) async fn never_reached(repo_path: &str, remote: &str) -> bool {
     if crate::git_exec::validate_remote_name(remote).is_err() {
         return false;
     }
@@ -1559,6 +1559,9 @@ pub struct RemoteCheck {
     /// GitHub's new-repository form, filled in, when the repository doesn't
     /// exist yet under the account the folder's key signs in as.
     pub create_url: Option<String>,
+    /// "owner/name" of that missing repository: what the form that creates
+    /// it starts from.
+    pub repo: Option<String>,
     /// The branches a repository that isn't empty already has, when this
     /// branch isn't one of them: saved only once the person says to publish
     /// there anyway.
@@ -1618,6 +1621,7 @@ async fn check_address(repo_path: &str, url: &str, allow_existing: bool) -> Resu
                 login.unwrap_or_default()
             ),
             create_url: crate::sparse::github_create_url(url),
+            repo: Some(full),
             ..Default::default()
         }));
     }
@@ -1674,6 +1678,16 @@ pub async fn add_origin(repo_path: &str, url: &str, allow_existing: bool) -> Res
         return Err(AppError::Command(problem));
     }
     let url = url.trim();
+    add_origin_guard(repo_path).await?;
+    if let Some(refused) = Box::pin(check_address(repo_path, url, allow_existing)).await? {
+        return Ok(refused);
+    }
+    save_origin(repo_path, url).await?;
+    Ok(RemoteCheck { saved: true, ..Default::default() })
+}
+
+/// What `add_origin` needs first: a repository with no remote at all.
+pub(crate) async fn add_origin_guard(repo_path: &str) -> Result<(), AppError> {
     let remotes = remote_names(repo_path).await?;
     if let Some(first) = remotes.first() {
         return Err(AppError::Command(format!(
@@ -1682,14 +1696,16 @@ pub async fn add_origin(repo_path: &str, url: &str, allow_existing: bool) -> Res
             first
         )));
     }
-    if let Some(refused) = Box::pin(check_address(repo_path, url, allow_existing)).await? {
-        return Ok(refused);
-    }
+    Ok(())
+}
+
+/// Save `url` as origin; the caller has checked the address and the guard.
+pub(crate) async fn save_origin(repo_path: &str, url: &str) -> Result<(), AppError> {
     let out = GitCmd::at(repo_path).args(["remote", "add", "--", "origin", url]).timeout(LOCAL_TIMEOUT).run().await?;
     if !out.ok() {
         return Err(AppError::Command(format!("git remote add failed: {}", out.stderr.trim())));
     }
-    Ok(RemoteCheck { saved: true, ..Default::default() })
+    Ok(())
 }
 
 /// A new address for `remote`: Publish's "Change the address…", after a push
@@ -1701,8 +1717,20 @@ pub async fn change_remote_address(repo_path: &str, remote: &str, from: &str, ur
     if let Some(problem) = remote_url_problem(url) {
         return Err(AppError::Command(problem));
     }
-    crate::git_exec::validate_remote_name(remote)?;
     let url = url.trim();
+    change_remote_guard(repo_path, remote, from).await?;
+    if let Some(refused) = Box::pin(check_address(repo_path, url, allow_existing)).await? {
+        return Ok(refused);
+    }
+    save_remote_url(repo_path, remote, url).await?;
+    Ok(RemoteCheck { saved: true, ..Default::default() })
+}
+
+/// What `change_remote_address` needs first: `remote` still has the address
+/// `from` that the person saw, no separate push address, and nothing was ever
+/// fetched from or pushed to it. Returns its current address.
+pub(crate) async fn change_remote_guard(repo_path: &str, remote: &str, from: &str) -> Result<String, AppError> {
+    crate::git_exec::validate_remote_name(remote)?;
     if !remote_names(repo_path).await?.iter().any(|r| r == remote) {
         return Err(AppError::Command(format!("This repository has no remote named {} any more.", remote)));
     }
@@ -1729,14 +1757,87 @@ pub async fn change_remote_address(repo_path: &str, remote: &str, from: &str, ur
             remote, remote
         )));
     }
-    if let Some(refused) = Box::pin(check_address(repo_path, url, allow_existing)).await? {
-        return Ok(refused);
-    }
+    Ok(current)
+}
+
+/// Save `url` as `remote`'s address; the caller has checked both.
+pub(crate) async fn save_remote_url(repo_path: &str, remote: &str, url: &str) -> Result<(), AppError> {
     let out = GitCmd::at(repo_path).args(["remote", "set-url", "--", remote, url]).timeout(LOCAL_TIMEOUT).run().await?;
     if !out.ok() {
         return Err(AppError::Command(format!("git remote set-url failed: {}", out.stderr.trim())));
     }
-    Ok(RemoteCheck { saved: true, ..Default::default() })
+    Ok(())
+}
+
+/// `current`'s form (user, host alias, port) pointed at `owner/name`: a new
+/// address for a remote keeps how it reached GitHub (`org-123@github.com:`,
+/// `git@github.com-work:`, `ssh://git@ssh.github.com:443/`); an https one
+/// loses any user name or token. None for anything but an SSH or https form.
+pub(crate) fn retarget_url(current: &str, owner: &str, name: &str) -> Option<String> {
+    let c = current.trim();
+    if let Some(rest) = c.strip_prefix("ssh://") {
+        let (authority, _) = rest.split_once('/')?;
+        return Some(format!("ssh://{}/{}/{}.git", authority, owner, name));
+    }
+    if let Some(rest) = c.strip_prefix("https://") {
+        let (authority, _) = rest.split_once('/')?;
+        let host = authority.rsplit('@').next()?;
+        return Some(format!("https://{}/{}/{}.git", host, owner, name));
+    }
+    // The scp form, [user@]host:path. One letter before the colon is a drive.
+    let (left, _) = c.split_once(':')?;
+    (left.len() > 1 && !left.contains('/') && !left.contains('\\')).then(|| format!("{}:{}/{}.git", left, owner, name))
+}
+
+/// A repository just created can take a moment to answer over git: up to
+/// three looks, two seconds apart, looking again only while GitHub says it
+/// isn't there. Err: why git still can't reach it, in words.
+pub(crate) async fn wait_reachable(repo_path: &str, url: &str) -> Result<(), String> {
+    let mut said = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        match GitCmd::at(repo_path).args(["ls-remote", "--heads", "--", url]).timeout(ADDRESS_CHECK_TIMEOUT).run().await {
+            Ok(ls) if ls.ok() => return Ok(()),
+            Ok(ls) => said = ls.stderr.trim().to_string(),
+            Err(e) => return Err(e.to_string()),
+        }
+        if !said.contains("Repository not found") {
+            break;
+        }
+    }
+    let id = if said.contains("Repository not found") {
+        Box::pin(crate::push_identity::identity_for_url(repo_path, None, url)).await.ok()
+    } else {
+        None
+    };
+    let login = id.as_ref().and_then(|i| i.login.as_deref());
+    let key = id.as_ref().and_then(|i| i.key_path.as_deref());
+    if crate::sparse::missing_own_repository(&said, url, login) {
+        return Err("GitHub hasn't shown it to git yet; wait a moment.".to_string());
+    }
+    let explained = crate::sparse::explain_transport_error_as(&said, key, url, false, login);
+    let hint = explained.split("\n\ngit said:").next().unwrap_or(&explained).trim().to_string();
+    Err(if hint.is_empty() || explained.trim() == said { format!("git said: {}", said) } else { hint })
+}
+
+/// What `resolve_push_target` reads, from git's own records
+/// (`branch.<b>.remote` / `.merge`), not parsed out of the upstream's
+/// display name, which a remote named with a slash or a branch tracking a
+/// LOCAL branch (`remote = .`) would both defeat.
+pub(crate) async fn push_inputs(repo_path: &str, status: &RepoStatus, branch: &str, set_upstream: bool) -> PushInputs {
+    let cfg = |key: String| GitCmd::at(repo_path).args(["config", "--get", key.as_str()]).ok_text();
+    PushInputs {
+        branch: branch.to_string(),
+        upstream: status.upstream.clone(),
+        branch_remote: cfg(format!("branch.{}.remote", branch)).await,
+        merge_ref: cfg(format!("branch.{}.merge", branch)).await,
+        push_remote: cfg(format!("branch.{}.pushRemote", branch)).await,
+        push_default: cfg("remote.pushDefault".to_string()).await,
+        remotes: status.push.remotes.iter().map(|r| r.name.clone()).collect(),
+        set_upstream,
+    }
 }
 
 /// Where a push goes, by the same rules as git's default (`push.default =
@@ -1931,21 +2032,8 @@ pub async fn push(repo_path: &str, set_upstream: bool, allow_unpushed_submodules
         ));
     };
 
-    // Which remote, and which branch there — from git's own records
-    // (`branch.<b>.remote` / `.merge`), not parsed out of the upstream's
-    // display name, which a remote named with a slash or a branch tracking a
-    // LOCAL branch (`remote = .`) would both defeat.
-    let cfg = |key: String| GitCmd::at(repo_path).args(["config", "--get", key.as_str()]).ok_text();
-    let inputs = PushInputs {
-        branch: branch.clone(),
-        upstream: before.upstream.clone(),
-        branch_remote: cfg(format!("branch.{}.remote", branch)).await,
-        merge_ref: cfg(format!("branch.{}.merge", branch)).await,
-        push_remote: cfg(format!("branch.{}.pushRemote", branch)).await,
-        push_default: cfg("remote.pushDefault".to_string()).await,
-        remotes: before.push.remotes.iter().map(|r| r.name.clone()).collect(),
-        set_upstream,
-    };
+    // Which remote, and which branch there.
+    let inputs = push_inputs(repo_path, &before, &branch, set_upstream).await;
     let target = match resolve_push_target(&inputs) {
         Ok(t) => t,
         Err(r) => return Ok(OpResult::refused(r, before)),
@@ -2503,6 +2591,7 @@ pub async fn submodule_update(repo_path: &str, paths: Option<Vec<String>>) -> Re
             action: None,
             link: None,
             remote: None,
+            repo: None,
             git_said: String::new(),
         };
         return Ok(OpResult { submodules: Some(report), ..OpResult::failed(advice, after) });
@@ -4182,7 +4271,18 @@ mod remote_url_tests {
 
 #[cfg(test)]
 mod remote_check_tests {
-    use super::not_empty;
+    use super::{not_empty, retarget_url};
+
+    #[test]
+    fn a_new_address_keeps_how_the_remote_reached_github() {
+        assert_eq!(retarget_url("git@github.com:me/old.git", "me", "new").as_deref(), Some("git@github.com:me/new.git"));
+        assert_eq!(retarget_url("org-123@github.com:Acme/old.git", "Acme", "new").as_deref(), Some("org-123@github.com:Acme/new.git"));
+        assert_eq!(retarget_url("git@github.com-work:me/old.git", "me", "new").as_deref(), Some("git@github.com-work:me/new.git"));
+        assert_eq!(retarget_url("ssh://git@ssh.github.com:443/me/old.git", "me", "new").as_deref(), Some("ssh://git@ssh.github.com:443/me/new.git"));
+        assert_eq!(retarget_url("https://tok@github.com/me/old.git", "me", "new").as_deref(), Some("https://github.com/me/new.git"));
+        assert_eq!(retarget_url("C:/repos/old.git", "me", "new"), None);
+        assert_eq!(retarget_url("/srv/old.git", "me", "new"), None);
+    }
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

@@ -67,6 +67,11 @@ async function openPage(browser, server, scenario, opts = {}) {
     subPushResult: opts.subPushResult ?? null,
     // Publish's address checks to answer, in order (then: saved).
     addressChecks: opts.addressChecks ?? [],
+    // Publish's create form: its context, the owners, the answer, and a delay to catch a double submit.
+    publishContext: opts.publishContext ?? null,
+    owners: opts.owners ?? null,
+    createResult: opts.createResult ?? null,
+    createDelay: opts.createDelay ?? 0,
     consoleEntries: opts.consoleEntries ?? [],
     lfsListing: opts.lfsListing ?? LFS_LISTING,
     lfsProgress: opts.lfsProgress ?? null,
@@ -572,6 +577,36 @@ async function openPage(browser, server, scenario, opts = {}) {
               // The address checks to answer, in order; then: saved.
               const queue = (window.__ADDRESS_CHECKS__ ??= [...(cfg.addressChecks ?? [])]);
               return Promise.resolve(queue.length ? queue.shift() : { saved: true, problem: "", create_url: null, existing_branches: [] });
+            }
+            case "github_publish_context": {
+              if (cfg.publishContext) return Promise.resolve(cfg.publishContext);
+              const remotes = (window.__SCENARIO__.push && window.__SCENARIO__.push.remotes) || [];
+              return Promise.resolve({
+                accounts: [{ account: "gh:me", login: "me", source: "GitHub CLI" }],
+                suggested: "gh:me",
+                push_login: "me",
+                target: remotes.length
+                  ? { kind: "change", remote: remotes[0].name, url: remotes[0].fetch_url, repo: null }
+                  : { kind: "add", remote: "origin", url: null, repo: null },
+                default_name: window.__SCENARIO__.name || "repository",
+                branch: window.__SCENARIO__.branch || "main",
+                blocked: null,
+              });
+            }
+            case "github_owners":
+              return Promise.resolve(cfg.owners ?? { owners: [{ login: String(args.account || "").split(":")[1] || "me", kind: "user" }, { login: "acme", kind: "org" }], sso_hidden: 0 });
+            case "changes_create_github_repo": {
+              const made = cfg.createResult ?? {
+                saved: "added",
+                full_name: args.owner + "/" + args.name,
+                html_url: "https://github.com/" + args.owner + "/" + args.name,
+                private: args.private,
+                renamed: false,
+                remote: "origin",
+                url: "git@github.com:" + args.owner + "/" + args.name + ".git",
+                problem: "",
+              };
+              return cfg.createDelay ? new Promise((r) => setTimeout(() => r(made), cfg.createDelay)) : Promise.resolve(made);
             }
             case "plugin:opener|open_url":
               return Promise.resolve(null);
@@ -2395,23 +2430,28 @@ try {
   // -----------------------------------------------------------------
   section("Publish: the address is checked before it is saved");
   {
-    const noRemote = { ok: false, headline: "This repository isn't on a server yet.", detail: "", refusal: { code: "no-remote", message: "This repository isn't on a server yet: it has no remote to push to. Add one (the address of an empty repository) and publish there." } };
-    const missing = { saved: false, problem: "There's no repository me/brand-new on GitHub yet: the key id_me signs in as me, who would see it even if it were private. Create it there (empty: no README, licence or .gitignore), then publish again.", create_url: "https://github.com/new?owner=me&name=brand-new&visibility=private", existing_branches: [] };
-    const notEmpty = { saved: false, problem: "That repository isn't empty: it already has a branch (dev). Publishing puts main there beside it, with a history of its own. Use an empty repository instead (no README, licence or .gitignore), or publish there anyway.", create_url: null, existing_branches: ["dev"] };
-    const page = await open(SCENARIOS.noRemote, { pushResult: noRemote, addressChecks: [missing, notEmpty] });
+    const missing = { saved: false, problem: "There's no repository me/brand-new on GitHub yet: the key id_me signs in as me, who would see it even if it were private. Create it there (empty: no README, licence or .gitignore), then publish again.", create_url: "https://github.com/new?owner=me&name=brand-new&visibility=private", existing_branches: [], repo: "me/brand-new" };
+    const notEmpty = { saved: false, problem: "That repository isn't empty: it already has a branch (dev). Publishing puts main there beside it, with a history of its own. Use an empty repository instead (no README, licence or .gitignore), or publish there anyway.", create_url: null, existing_branches: ["dev"], repo: null };
+    const page = await open(SCENARIOS.noRemote, { addressChecks: [missing, notEmpty] });
     await (await button(page, "Publish branch")).click();
-    await page.waitForFunction(() => document.body.innerText.includes("Add a remote"), { timeout: 4000 });
-    await (await button(page, "Add a remote")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Create and publish"), { timeout: 4000 });
+    const atOpen = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length);
+    ok("Publish branch with no remote opens the dialog at once, on Create on GitHub, with no refused push first", atOpen === 0, `pushes=${atOpen}`);
+    await (await button(page, "Use an address")).click();
     await page.waitForSelector('input[aria-label="Remote address"]', { timeout: 4000 });
     await page.type('input[aria-label="Remote address"]', "git@github.com:me/brand-new.git");
     await (await button(page, "Add and publish")).click();
     await page.waitForFunction(() => document.body.innerText.includes("There's no repository me/brand-new on GitHub yet"), { timeout: 4000 });
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/publish-address-problem.png` });
     const pushes = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length);
-    ok("an address with no repository behind it is not saved: the dialog says so, stays open and publishes nothing", (await text(page)).includes("Create it on GitHub") && pushes === 1, `pushes=${pushes}`);
+    ok("an address with no repository behind it is not saved: the dialog says so, stays open and publishes nothing", (await text(page)).includes("Create it on GitHub") && pushes === 0, `pushes=${pushes}`);
     await (await button(page, "Create it on GitHub")).click();
-    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"), { timeout: 4000 });
-    const opened = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "plugin:opener|open_url")?.args ?? null);
-    ok("  Create it on GitHub opens GitHub's form, filled in", JSON.stringify(opened ?? {}).includes("github.com/new?owner=me&name=brand-new&visibility=private"), JSON.stringify(opened));
+    await page.waitForSelector('input[aria-label="Repository name"]', { timeout: 4000 });
+    const named = await page.$eval('input[aria-label="Repository name"]', (el) => el.value);
+    const browsed = await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"));
+    ok("  Create it on GitHub opens the create form here, filled in from the address, not the browser", named === "brand-new" && !browsed, `name=${named} browser=${browsed}`);
+    await (await button(page, "Use an address")).click();
+    await page.waitForSelector('input[aria-label="Remote address"]', { timeout: 4000 });
     await (await button(page, "Add and publish")).click();
     await page.waitForFunction(() => document.body.innerText.includes("isn't empty"), { timeout: 4000 });
     ok("a repository that already has branches is not saved without the person's word", (await text(page)).includes("Publish there anyway"));
@@ -2419,9 +2459,22 @@ try {
     await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_add_remote").length >= 3, { timeout: 4000 });
     const adds = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_add_remote").map((c) => c.args));
     ok("  Publish there anyway sends the person's word, for the same address", adds.length === 3 && adds[2].allowExisting === true && adds[2].url === "git@github.com:me/brand-new.git" && adds[0].allowExisting === false, JSON.stringify(adds));
-    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 2, { timeout: 4000 });
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 1, { timeout: 4000 });
     const last = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").at(-1).args);
     ok("  once saved, the branch is published", last.setUpstream === true, JSON.stringify(last));
+    await page.close();
+  }
+  {
+    // A page behind the folder: it shows a remote, the push is refused as no-remote.
+    const noRemote = { ok: false, headline: "This repository isn't on a server yet.", detail: "", refusal: { code: "no-remote", message: "This repository isn't on a server yet: it has no remote to push to. Add one (the address of an empty repository) and publish there." } };
+    const page = await open(SCENARIOS.unpublished, { pushResult: noRemote, publishContext: { accounts: [{ account: "gh:me", login: "me", source: "GitHub CLI" }], suggested: "gh:me", push_login: "me", target: { kind: "add", remote: "origin", url: null, repo: null }, default_name: "gitswitch", branch: "main", blocked: null } });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("isn't on a server yet"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a no-remote refusal offers to create it on GitHub, or an address", s.includes("Create it on GitHub") && s.includes("Use an address"));
+    await (await button(page, "Use an address")).click();
+    const addressTab = await page.waitForSelector('input[aria-label="Remote address"]', { timeout: 4000 }).then(() => true, () => false);
+    ok("  Use an address opens the dialog on the address tab", addressTab);
     await page.close();
   }
   {
@@ -2450,6 +2503,77 @@ try {
     ok("  Change and publish names the remote and the address it replaces", change.remote === "origin" && change.from === "git@github.com:me/gitswitch.git" && change.url === "git@github.com:me/gitswitch-app.git" && change.allowExisting === false, JSON.stringify(change));
     const published = await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 2, { timeout: 4000 }).then(() => true, () => false);
     ok("  then publishes", published);
+    await page.close();
+  }
+  {
+    // The create form, end to end: what it starts from, what it sends, then the publish.
+    const page = await open(SCENARIOS.noRemote, { createDelay: 300 });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForSelector('input[aria-label="Repository name"]', { timeout: 4000 });
+    await page.waitForFunction(() => !document.body.innerText.includes("Loading…"), { timeout: 4000 });
+    const named = await page.$eval('input[aria-label="Repository name"]', (el) => el.value);
+    const privateBox = await page.$eval('input[aria-label="Keep this code private"]', (el) => el.checked);
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/publish-create.png` });
+    const s = await text(page);
+    ok("Create on GitHub starts from the folder's account, you as owner, the folder's name, and private", named === "gitswitch" && privateBox && s.includes("me") && s.includes("main becomes its default branch"), `name=${named} private=${privateBox}`);
+    await page.click('input[aria-label="Repository name"]', { clickCount: 3 });
+    await page.keyboard.type("Subtitle Maker!");
+    ok("  a name GitHub would rewrite shows what it will be", (await text(page)).includes("Will be created as Subtitle-Maker"));
+    await page.type('input[aria-label="Description"]', "Makes subtitles");
+    const go = await button(page, "Create and publish");
+    await go.click();
+    await go.click().catch(() => {});
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 1, { timeout: 4000 });
+    const creates = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_create_github_repo").map((c) => c.args));
+    ok("  a double click asks GitHub once", creates.length === 1, `creates=${creates.length}`);
+    const c = creates[0] || {};
+    ok("  it sends the account, owner, name, description, private and where to connect it", c.account === "gh:me" && c.owner === "me" && c.name === "Subtitle-Maker" && c.description === "Makes subtitles" && c.private === true && JSON.stringify(c.target) === '{"kind":"add"}', JSON.stringify(c));
+    const last = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").at(-1).args);
+    ok("  then the branch is published", last.setUpstream === true, JSON.stringify(last));
+    ok("  and it says what was created", (await text(page)).includes("Created me/Subtitle-Maker on GitHub (private)"));
+    await page.close();
+  }
+  {
+    // A failed push to a repository that doesn't exist: created here, filled in from the remote, never the browser.
+    const guidance = "There's no repository me/gitswitch on GitHub: the SSH key id_me signs in as me, who would see it even if it were private.";
+    const failed = {
+      ok: false,
+      headline: "GitHub has no repository at this address.",
+      detail: guidance,
+      advice: { headline: "GitHub has no repository at this address.", guidance, action: "change-remote", link: "https://github.com/new?owner=me&name=gitswitch&visibility=private", remote: "origin", repo: "me/gitswitch", git_said: "ERROR: Repository not found." },
+    };
+    const page = await open(SCENARIOS.unpublished, { pushResult: failed });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("GitHub has no repository at this address"), { timeout: 4000 });
+    await (await button(page, "Create it on GitHub")).click();
+    await page.waitForSelector('input[aria-label="Repository name"]', { timeout: 4000 });
+    const named = await page.$eval('input[aria-label="Repository name"]', (el) => el.value);
+    const browsed = await page.evaluate(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"));
+    ok("after a failed push, Create it on GitHub opens the form here, filled in from the remote", named === "gitswitch" && !browsed, `name=${named} browser=${browsed}`);
+    await page.waitForFunction(() => !document.body.innerText.includes("Loading…"), { timeout: 4000 });
+    await (await button(page, "Create and publish")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_create_github_repo"), { timeout: 4000 });
+    const c = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_create_github_repo").args);
+    ok("  and connects it in place of the address the push found nothing at", JSON.stringify(c.target) === JSON.stringify({ kind: "change", remote: "origin", from: "git@github.com:me/gitswitch.git" }), JSON.stringify(c.target));
+    await page.close();
+  }
+  {
+    // No GitHub account in GitSwitch: say so, and where to sign in.
+    const page = await open(SCENARIOS.noRemote, { publishContext: { accounts: [], suggested: null, push_login: null, target: { kind: "add", remote: "origin", url: null, repo: null }, default_name: "gitswitch", branch: "main", blocked: null } });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("no GitHub account"), { timeout: 4000 });
+    const s = await text(page);
+    ok("with no GitHub account, the create tab says so and offers the GitHub page and an address", s.includes("Go to the GitHub page") && s.includes("Use an address"));
+    await page.close();
+  }
+  {
+    // The folder pushes as another account than the one picked: warned before anything is created.
+    const page = await open(SCENARIOS.noRemote, { publishContext: { accounts: [{ account: "gh:me", login: "me", source: "GitHub CLI" }], suggested: null, push_login: "work-me", target: { kind: "add", remote: "origin", url: null, repo: null }, default_name: "gitswitch", branch: "main", blocked: null } });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForSelector('input[aria-label="Repository name"]', { timeout: 4000 });
+    await page.waitForFunction(() => document.body.innerText.includes("This folder pushes as @work-me"), { timeout: 4000 }).catch(() => {});
+    if (process.env.UI_SHOTS) await page.screenshot({ path: `${process.env.UI_SHOTS}/publish-mismatch.png` });
+    ok("an owner the folder doesn't push as is warned about", (await text(page)).includes("This folder pushes as @work-me, and a repository under @me won't accept its pushes"));
     await page.close();
   }
 

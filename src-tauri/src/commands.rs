@@ -6,6 +6,7 @@ use crate::find_clones;
 use crate::gh_api::Gh;
 use crate::gh_cli;
 use crate::gh_repo;
+use crate::publish;
 use crate::pulls;
 use crate::git_config;
 use crate::git_history::{self, BranchInfo, CommitDetail, HistoryPage, FetchResult, MergeInfo, RepoRef, SyncStatus};
@@ -1271,6 +1272,36 @@ pub async fn changes_push(repo_path: String, set_upstream: bool, allow_unpushed_
 #[tauri::command]
 pub async fn changes_add_remote(repo_path: String, url: String, allow_existing: Option<bool>) -> Result<git_ops::RemoteCheck, AppError> {
     Box::pin(git_ops::add_origin(&repo_path, &url, allow_existing.unwrap_or(false))).await
+}
+
+/// Publishing a repository made here: the accounts that could create it on
+/// GitHub, the one this folder pushes as, where it would be connected, and a
+/// name for it.
+#[tauri::command]
+pub async fn github_publish_context(repo_path: String) -> Result<publish::PublishContext, AppError> {
+    Box::pin(publish::context(&repo_path)).await
+}
+
+/// Where an account can create a repository: itself and its organizations.
+#[tauri::command]
+pub async fn github_owners(account: String) -> Result<gh_repo::Owners, AppError> {
+    gh_repo::owners(&Gh::for_account(&account).await?).await
+}
+
+/// Create the repository on GitHub as `account` and connect it to this
+/// folder (`target`: add origin, or change a never-reached remote), ready
+/// to publish.
+#[tauri::command]
+pub async fn changes_create_github_repo(
+    repo_path: String,
+    account: String,
+    owner: String,
+    name: String,
+    description: String,
+    private: bool,
+    target: publish::TargetArg,
+) -> Result<publish::Published, AppError> {
+    Box::pin(publish::create_and_connect(&repo_path, &account, &owner, &name, &description, private, target)).await
 }
 
 /// Publish's "Change the address…": a new address for a remote that a push

@@ -12,6 +12,9 @@ pub(crate) struct Gh {
     token: String,
     /// The login the account key names ("gh:alice" → "alice").
     pub login: String,
+    /// A GitSwitch sign-in ("signin:…"), not a GitHub CLI login: how its
+    /// token is renewed differs, and so does what a refusal tells the person.
+    pub signin: bool,
 }
 
 /// GitHub's answer: status, the headers worth reading, and the JSON body
@@ -64,15 +67,49 @@ pub(crate) fn check_username(u: &str) -> Result<(), AppError> {
     }
 }
 
+/// A name for a new repository: what `check_slug` allows, and nothing GitHub
+/// would refuse or rewrite (".", "..", a ".git" at the end).
+pub(crate) fn check_new_repo_name(name: &str) -> Result<(), AppError> {
+    let fine = !name.is_empty()
+        && name.len() <= 100
+        && name != "."
+        && name != ".."
+        && !name.to_ascii_lowercase().ends_with(".git")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if fine {
+        Ok(())
+    } else {
+        Err(AppError::Config(format!(
+            "\"{}\" can't be a repository name: use letters, digits, '-', '_' and '.' (at most 100), not ending in .git",
+            name
+        )))
+    }
+}
+
+/// GitHub refused because the organization restricts third-party OAuth apps
+/// (GitHub's default for new organizations) and hasn't approved this one.
+pub(crate) fn oauth_restricted(r: &Reply) -> bool {
+    r.status == 403 && github_message(&r.json).to_lowercase().contains("oauth app access restrictions")
+}
+
+/// The token's scopes include none of those the endpoint accepts.
+pub(crate) fn scope_missing(r: &Reply) -> bool {
+    let needs: Vec<&str> = r.accepted.as_deref().map(|h| h.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+    let has = |s: &str| r.scopes.as_deref().is_some_and(|h| h.split(',').map(str::trim).any(|x| x == s));
+    r.scopes.is_some() && !needs.is_empty() && needs.iter().all(|s| !has(s))
+}
+
 impl Gh {
     /// The account's token, for the real API (or the debug override).
     pub async fn for_account(account: &str) -> Result<Gh, AppError> {
         let token = crate::remote_repos::token_for(account).await?;
-        Ok(Gh::at(&crate::remote_repos::api_base(), &token, login_of(account)))
+        let mut gh = Gh::at(&crate::remote_repos::api_base(), &token, login_of(account));
+        gh.signin = account.starts_with("signin:");
+        Ok(gh)
     }
 
     pub fn at(api: &str, token: &str, login: &str) -> Gh {
-        Gh { api: api.trim_end_matches('/').to_string(), token: token.to_string(), login: login.to_string() }
+        Gh { api: api.trim_end_matches('/').to_string(), token: token.to_string(), login: login.to_string(), signin: false }
     }
 
     /// One request. Err only when GitHub could not be reached or answered
@@ -129,7 +166,7 @@ impl Gh {
 
     /// GitHub said no: why, in words, with what to do when there is something.
     pub fn refused(&self, r: &Reply, what: &str) -> AppError {
-        AppError::Command(refusal(r, what, &self.login))
+        AppError::Command(refusal_as(r, what, &self.login, self.signin))
     }
 }
 
@@ -150,8 +187,20 @@ pub(crate) fn github_message(json: &Value) -> String {
 }
 
 pub(crate) fn refusal(r: &Reply, what: &str, login: &str) -> String {
+    refusal_as(r, what, login, false)
+}
+
+/// `refusal`, worded for the kind of account: a GitSwitch sign-in is renewed
+/// on the GitHub page, a GitHub CLI login with `gh`.
+pub(crate) fn refusal_as(r: &Reply, what: &str, login: &str, signin: bool) -> String {
     let said = github_message(&r.json);
     let said_part = if said.is_empty() { String::new() } else { format!(" GitHub said: \"{}\".", said) };
+    if r.sso.is_some() && signin {
+        return format!(
+            "Couldn't {}: the organization uses single sign-on and @{}'s GitSwitch sign-in is not authorized for it. Sign in again on the GitHub page and authorize the organization when GitHub asks, then try again.",
+            what, login
+        );
+    }
     if r.sso.is_some() {
         return format!(
             "Couldn't {}: the organization uses single sign-on and @{}'s token is not authorized for it. Authorize it (GitHub › Settings › Tokens › Configure SSO, or `gh auth refresh -h github.com`) and try again.",
@@ -166,16 +215,29 @@ pub(crate) fn refusal(r: &Reply, what: &str, login: &str) -> String {
         .unwrap_or_default();
     let missing: Vec<&String> = needs.iter().filter(|s| !has_scope(s)).collect();
     match r.status {
+        401 if signin => format!("GitHub rejected @{}'s GitSwitch sign-in (expired or revoked). Sign in again on the GitHub page.", login),
         401 => format!("GitHub rejected @{}'s token (expired or revoked). Sign in again — e.g. `gh auth login`.", login),
         403 | 429 if r.rate_left.as_deref() == Some("0") || said.to_lowercase().contains("rate limit") => {
             format!("Couldn't {}: GitHub's rate limit for @{} is used up. Try again in a few minutes.", what, login)
         }
+        403 | 404 if signin && r.scopes.is_some() && !needs.is_empty() && missing.len() == needs.len() => format!(
+            "Couldn't {}: @{}'s GitSwitch sign-in lacks the {} scope. Sign in again on the GitHub page: GitSwitch asks for it.",
+            what,
+            login,
+            needs.join(" or ")
+        ),
         403 | 404 if r.scopes.is_some() && !needs.is_empty() && missing.len() == needs.len() => format!(
             "Couldn't {}: @{}'s token lacks the {} scope. Run `gh auth refresh -h github.com -s {}` and try again.",
             what,
             login,
             needs.join(" or "),
             needs[0]
+        ),
+        403 if oauth_restricted(r) => format!(
+            "Couldn't {}: the organization restricts third-party apps and hasn't approved {}. Use a GitHub CLI login for @{} (add one on the GitHub page), or ask an owner of the organization to approve it.",
+            what,
+            if signin { "GitSwitch" } else { "this login's app" },
+            login
         ),
         403 => format!("Couldn't {}: GitHub does not let @{} do that here (it needs more access to this repository).{}", what, login, said_part),
         404 => format!("Couldn't {}: GitHub shows nothing there to @{} — it doesn't exist, or this account can't see it.", what, login),
@@ -225,5 +287,92 @@ mod tests {
         assert!(refusal(&r, "send the review", "me").contains("Validation Failed: Can not approve your own pull request"));
         assert!(refusal(&reply(401, Value::Null), "x", "me").contains("rejected @me's token"));
         assert!(refusal(&reply(404, Value::Null), "x", "me").contains("doesn't exist, or this account can't see it"));
+    }
+
+    #[test]
+    fn new_repository_names_are_checked_before_github_sees_them() {
+        for good in ["app", "Subtitle_Maker", "my.site", "a-b_c.d", &"x".repeat(100)] {
+            assert!(check_new_repo_name(good).is_ok(), "{}", good);
+        }
+        for bad in ["", ".", "..", "a b", "a/b", "x.git", "X.GIT", "é", "a?b", &"x".repeat(101)] {
+            assert!(check_new_repo_name(bad).is_err(), "{}", bad);
+        }
+    }
+
+    #[test]
+    fn a_gitswitch_sign_in_is_told_to_sign_in_again_not_to_run_gh() {
+        assert!(refusal_as(&reply(401, Value::Null), "x", "me", true).contains("Sign in again on the GitHub page"));
+        let mut r = reply(403, Value::Null);
+        r.scopes = Some("read:org".into());
+        r.accepted = Some("repo".into());
+        assert!(scope_missing(&r));
+        let t = refusal_as(&r, "create me/app", "me", true);
+        assert!(t.contains("lacks the repo scope") && t.contains("GitHub page") && !t.contains("gh auth"), "{}", t);
+        let restricted = reply(403, serde_json::json!({"message": "Although you appear to have the correct authorization credentials, the `Acme` organization has enabled OAuth App access restrictions, meaning that data access to third-parties is limited."}));
+        assert!(oauth_restricted(&restricted) && !scope_missing(&restricted));
+        let t = refusal_as(&restricted, "create Acme/app", "me", true);
+        assert!(t.contains("restricts third-party apps") && t.contains("GitHub CLI login"), "{}", t);
+        assert!(!oauth_restricted(&reply(403, serde_json::json!({"message": "Must have admin rights to Repository."}))));
+    }
+}
+
+/// A local GitHub for unit tests: each connection gets the next canned reply
+/// (made knowing its own address, so paging links can point at it), and every
+/// request is recorded as it arrived. An empty reply closes the connection
+/// unanswered: an answer lost on the way.
+#[cfg(test)]
+pub(crate) mod fake_github {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    pub(crate) fn github_with(make: impl FnOnce(&str) -> Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let answers = make(&base);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for answer in answers {
+                let Ok((mut s, _)) = listener.accept() else { return };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = s.read(&mut chunk).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text[..end]
+                            .lines()
+                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                log.lock().unwrap().push(String::from_utf8_lossy(&buf).to_string());
+                let _ = s.write_all(answer.as_bytes());
+            }
+        });
+        (base, seen)
+    }
+
+    pub(crate) fn github(answers: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
+        github_with(|_| answers)
+    }
+
+    pub(crate) fn reply(status: &str, headers: &[(&str, &str)], body: &str) -> String {
+        let mut head = format!("HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n", status, body.len());
+        for (k, v) in headers {
+            head.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        format!("{}\r\n{}", head, body)
+    }
+
+    pub(crate) fn first_line(req: &str) -> String {
+        req.lines().next().unwrap_or("").to_string()
     }
 }

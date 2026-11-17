@@ -127,4 +127,106 @@ ok "  and Publish lands there" "$(printf '%s' "$OUT" | v "v['ok']") $(git -C "$C
 ok "a remote that has been pushed to is never changed here" "$(pinvoke changes_change_remote "{\"repoPath\":$(jstr "$CHG"),\"remote\":\"origin\",\"from\":$(jstr "$CHGBARE"),\"url\":$(jstr "$BARE")}" | err)" "has been fetched from or pushed to"
 ok "  (still the address it was pushed to)" "$(git -C "$CHG" remote get-url origin)" "$CHGBARE"
 
+section "Create the repository on GitHub, then publish (a fake GitHub; github.com is never reached)"
+"$PY" - "$SB/api.log" > "$SB/api-port" <<'PYAPI' &
+import http.server, json, sys
+log = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def answer(self, status, body):
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("X-OAuth-Scopes", "repo, read:org")
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def handle_any(self, method):
+        token = self.headers.get("Authorization", "").split(" ")[-1]
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n).decode() if n else ""
+        path = self.path.split("?")[0]
+        with open(log, "a") as f:
+            f.write(json.dumps({"m": method, "p": path, "t": token, "b": raw}) + "\n")
+        if token != "t-me":
+            return self.answer(401, {"message": "Bad credentials"})
+        body = json.loads(raw) if raw else {}
+        def made(owner):
+            name = body.get("name", "")
+            return {"full_name": owner + "/" + name, "ssh_url": "git@github.com:" + owner + "/" + name + ".git", "private": body.get("private", False), "size": 0}
+        if method == "GET" and path == "/user/orgs":
+            return self.answer(200, [{"login": "acme"}])
+        if method == "POST" and path == "/user/repos":
+            if body.get("name") == "taken":
+                return self.answer(422, {"message": "Repository creation failed.", "errors": [{"resource": "Repository", "code": "custom", "field": "name", "message": "name already exists on this account"}]})
+            return self.answer(201, made("me"))
+        if method == "POST" and path == "/orgs/acme/repos":
+            return self.answer(201, made("acme"))
+        if method == "POST" and path == "/orgs/closed/repos":
+            return self.answer(403, {"message": "Although you appear to have the correct authorization credentials, the `closed` organization has enabled OAuth App access restrictions, meaning that data access to third-parties is limited."})
+        return self.answer(404, {"message": "Not Found"})
+    def do_GET(self): self.handle_any("GET")
+    def do_POST(self): self.handle_any("POST")
+    def log_message(self, *a): pass
+srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PYAPI
+API_PID=$!
+trap '{ kill "$API_PID" && wait "$API_PID"; } 2>/dev/null' EXIT
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$SB/api-port" ] && break; sleep 0.5; done
+if [ ! -s "$SB/api-port" ] || [ -z "${GITSWITCH_TOKEN_DIR:-}" ]; then
+  echo "  SKIPPED: the fake GitHub didn't start (or no sandboxed token store), so nothing is asked of GitHub"
+else
+  export GITSWITCH_GITHUB_API="http://127.0.0.1:$(cat "$SB/api-port")"
+  mkdir -p "$GITSWITCH_TOKEN_DIR"
+  printf '[{"login":"me","id":1}]' > "$GITSWITCH_TOKEN_DIR/github-signins.json"
+  printf 't-me' > "$GITSWITCH_TOKEN_DIR/github_me"
+  # Every GitHub address leads to a folder that isn't there, so nothing here
+  # can reach github.com; each repository the fake makes gets a local bare one.
+  git config --global "url.$SB/no-github/.insteadOf" "git@github.com:"
+  git config --global --add "url.$SB/no-github/.insteadOf" "https://github.com/"
+  bare_for() { local b="$SB/gh-$1-$2.git"; git init -q --bare "$b"; git config --global "url.$b.insteadOf" "git@github.com:$1/$2.git"; printf '%s' "$b"; }
+  fresh() { local d="$SB/$1"; mkdir -p "$d"; git init -q -b main "$d" && printf '%s\n' "$1" > "$d/f.txt" && git -C "$d" add -A && git -C "$d" commit -qm "first" >/dev/null; printf '%s' "$d"; }
+  posts() { grep -c '"m": "POST"' "$SB/api.log" 2>/dev/null || true; }
+  lastpost() { grep '"m": "POST"' "$SB/api.log" | tail -n 1 | "$PY" -c 'import sys,json; r=json.loads(sys.stdin.read()); b=json.loads(r["b"] or "{}"); print(eval(sys.argv[1], {"r": r, "b": b}))' "$1"; }
+  create() { pinvoke changes_create_github_repo "$1" | tee -a "$SB/answers.log"; }
+  as_me() { printf '{"repoPath":%s,"account":"signin:me",%s}' "$(jstr "$1")" "$2"; }
+
+  NEW=$(fresh "made here")
+  OUT=$(pinvoke github_publish_context "{\"repoPath\":$(jstr "$NEW")}" | tee -a "$SB/answers.log")
+  ok "the form starts from the account, the target and the folder's name" "$(printf '%s' "$OUT" | v "str(v['suggested']) + ' ' + v['target']['kind'] + ' ' + v['default_name'] + ' ' + str(v['branch']) + ' ' + str(v['blocked'])")" "signin:me add made-here main None"
+  OUT=$(pinvoke github_owners '{"account":"signin:me"}' | tee -a "$SB/answers.log")
+  ok "  owners: the account, then its organizations" "$(printf '%s' "$OUT" | v "' '.join(o['login'] + ':' + o['kind'] for o in v['owners'])")" "me:user acme:org"
+  B1=$(bare_for me made-here)
+  OUT=$(create "$(as_me "$NEW" '"owner":"me","name":"made-here","description":"From  the\nsuite","private":true,"target":{"kind":"add"}')")
+  ok "Create makes it on GitHub and connects it as origin" "$(printf '%s' "$OUT" | v "v['saved'] + ' ' + v['full_name'] + ' [' + v['problem'] + ']'") | $(git -C "$NEW" config --get remote.origin.url)" "added me/made-here [] | git@github.com:me/made-here.git"
+  ok "  asked as POST /user/repos: private, empty (no auto_init), the description on one line" "$(lastpost 'r["p"] + " " + str(b.get("private")) + " " + str(b.get("auto_init")) + " " + str(b.get("description"))')" "/user/repos True False From the suite"
+  OUT=$(pinvoke changes_push "{\"repoPath\":$(jstr "$NEW"),\"setUpstream\":true}")
+  ok "  then Publish lands in it" "$(printf '%s' "$OUT" | v "v['ok']") $(git -C "$B1" rev-parse main 2>/dev/null)" "True $(git -C "$NEW" rev-parse HEAD)"
+
+  NEW2=$(fresh taken-folder)
+  OUT=$(create "$(as_me "$NEW2" '"owner":"me","name":"taken","description":"","private":true,"target":{"kind":"add"}')")
+  ok "a name already taken is GitHub's refusal, worded" "$(printf '%s' "$OUT" | err)" "There's already a repository me/taken"
+  ok "  and nothing was saved" "remotes=$(git -C "$NEW2" remote | wc -l | tr -d ' ')" "remotes=0"
+
+  NEW3=$(fresh org-folder); B3=$(bare_for acme tool)
+  OUT=$(create "$(as_me "$NEW3" '"owner":"acme","name":"tool","description":"","private":false,"target":{"kind":"add"}')")
+  ok "an organization's repository is made through the organization's endpoint" "$(printf '%s' "$OUT" | v "v['saved'] + ' ' + v['full_name']") $(lastpost 'r["p"] + " private=" + str(b.get("private"))')" "added acme/tool /orgs/acme/repos private=False"
+
+  NEW4=$(fresh closed-folder)
+  OUT=$(create "$(as_me "$NEW4" '"owner":"closed","name":"x","description":"","private":true,"target":{"kind":"add"}')")
+  ok "an organization that restricts third-party apps is named, with the way out" "$(printf '%s' "$OUT" | err)" "restricts third-party apps"
+
+  CH=$(fresh change-folder); git -C "$CH" remote add origin "git@github.com:me/typo.git"; BF=$(bare_for me fixed)
+  OUT=$(create "$(as_me "$CH" '"owner":"me","name":"fixed","description":"","private":true,"target":{"kind":"change","remote":"origin","from":"'"$(git -C "$CH" remote get-url origin)"'"}')")
+  ok "a remote never reached gets the new repository's address" "$(printf '%s' "$OUT" | v "v['saved'] + ' [' + v['problem'] + ']'") | $(git -C "$CH" config --get remote.origin.url)" "changed [] | git@github.com:me/fixed.git"
+
+  N=$(posts)
+  ok "a folder whose remote has been pushed to is refused before GitHub is asked" "$(create "$(as_me "$PUB" '"owner":"me","name":"again","description":"","private":true,"target":{"kind":"add"}')" | err | grep -c 'already has a remote') posts+$(( $(posts) - N ))" "1 posts+0"
+  UNBORN="$SB/unborn-folder"; mkdir -p "$UNBORN"; git init -q -b main "$UNBORN"
+  N=$(posts)
+  ok "a folder with no commits is refused before GitHub is asked" "$(create "$(as_me "$UNBORN" '"owner":"me","name":"empty","description":"","private":true,"target":{"kind":"add"}')" | err | grep -c 'NO ERROR') posts+$(( $(posts) - N ))" "0 posts+0"
+  ok "no answer carries the account's token" "$(grep -c 't-me' "$SB/answers.log")" "0"
+fi
+
 verify_result

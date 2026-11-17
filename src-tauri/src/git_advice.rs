@@ -70,6 +70,9 @@ pub struct Advice {
     pub link: Option<String>,
     /// The remote the action acts on.
     pub remote: Option<String>,
+    /// "owner/name" of a repository that doesn't exist on GitHub yet: what
+    /// the form that creates it starts from.
+    pub repo: Option<String>,
     pub git_said: String,
 }
 
@@ -80,6 +83,7 @@ fn advice(headline: &str, guidance: &str, action: Option<&str>, stderr: &str) ->
         action: action.map(|s| s.to_string()),
         link: None,
         remote: None,
+        repo: None,
         git_said: stderr.trim().to_string(),
     }
 }
@@ -588,6 +592,7 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
             action: None,
             link: if missing { crate::sparse::github_create_url(url) } else { None },
             remote: ctx.remote.map(String::from),
+            repo: if missing { crate::repo_scan::parse_github_owner_name(url).map(|(o, n)| format!("{}/{}", o, n)) } else { None },
             git_said: s.trim().to_string(),
         };
     }
@@ -598,6 +603,7 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
         action: None,
         link: None,
         remote: None,
+        repo: None,
         git_said: s.trim().to_string(),
     }
 }
@@ -624,6 +630,7 @@ mod tests {
         assert!(a.guidance.contains("There's no repository Me/brand-new on GitHub") && a.guidance.contains("id_me"), "{}", a.guidance);
         assert_eq!(a.link.as_deref(), Some("https://github.com/new?owner=Me&name=brand-new&visibility=private"));
         assert_eq!(a.remote.as_deref(), Some("origin"));
+        assert_eq!(a.repo.as_deref(), Some("Me/brand-new"));
         // Someone else's: refused, and no form.
         let other = explain(GitOp::Push, said, &AdviceCtx { login: Some("someone-else"), ..own.clone() });
         assert_eq!(other.headline, "The push was refused.");

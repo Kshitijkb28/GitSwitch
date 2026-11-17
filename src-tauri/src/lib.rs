@@ -35,6 +35,7 @@ mod sparse;
 mod spawn;
 mod ssh_config;
 mod push_identity;
+mod publish;
 
 /// sha256 hex of a secret, for cache keys that must not hold the secret itself.
 pub(crate) fn lfs_sha(secret: &str) -> String {
@@ -153,6 +154,9 @@ pub fn run() {
             commands::changes_push,
             commands::changes_add_remote,
             commands::changes_change_remote,
+            commands::changes_create_github_repo,
+            commands::github_publish_context,
+            commands::github_owners,
             commands::changes_pull,
             commands::changes_submodules,
             commands::changes_submodule_update,

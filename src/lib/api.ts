@@ -1645,6 +1645,8 @@ export interface Advice {
   link?: string | null;
   /** The remote the action acts on. */
   remote?: string | null;
+  /** "owner/name" of a repository that doesn't exist on GitHub yet: what the create form starts from. */
+  repo?: string | null;
   git_said: string;
 }
 
@@ -2356,6 +2358,8 @@ export interface RemoteCheck {
   create_url: string | null;
   /** A non-empty repository's branches, when this branch isn't one of them: "Publish there anyway" is offered. */
   existing_branches: string[];
+  /** "owner/name" of the missing repository: what the create form starts from. */
+  repo: string | null;
 }
 
 /** Connect a repository that has no remote yet to `url`, as origin, once the address is checked (Publish's "Add a remote…"). */
@@ -2366,6 +2370,85 @@ export async function changesAddRemote(repoPath: string, url: string, allowExist
 /** A new address for `remote`, which still has the address `from` and was never reached (Publish's "Change the address…"); checked before it is saved. */
 export async function changesChangeRemote(repoPath: string, remote: string, from: string, url: string, allowExisting = false): Promise<RemoteCheck> {
   return invoke("changes_change_remote", { repoPath, remote, from, url, allowExisting });
+}
+
+/** An account that can create a repository on GitHub ("gh:<login>" or "signin:<login>"). */
+export interface PublishAccount {
+  account: string;
+  login: string;
+  source: string;
+}
+
+/** Where a new repository would be connected: "add" origin, "change" a remote never reached, or "none" (the push goes to a remote already reached). */
+export interface PublishTarget {
+  kind: "add" | "change" | "none";
+  remote: string | null;
+  url: string | null;
+  repo: string | null;
+}
+
+/** What the "Create on GitHub" form starts from. */
+export interface PublishContext {
+  accounts: PublishAccount[];
+  /** The account this folder pushes as, when GitSwitch has it. */
+  suggested: string | null;
+  /** The GitHub login this folder pushes as (its profile's account, else its key's). */
+  push_login: string | null;
+  target: PublishTarget;
+  /** The folder's name, as GitHub takes it. */
+  default_name: string;
+  branch: string | null;
+  /** Why the folder can't be published now (blocked, no commits, …). */
+  blocked: string | null;
+}
+
+export interface RepoOwner {
+  login: string;
+  kind: "user" | "org";
+}
+
+export interface RepoOwners {
+  owners: RepoOwner[];
+  /** Organizations hidden because single sign-on hasn't been authorized. */
+  sso_hidden: number;
+}
+
+/** Where to connect the new repository, as the dialog saw it. */
+export type CreateTarget = { kind: "add" } | { kind: "change"; remote: string; from: string };
+
+/** What creating the repository did. `problem` is empty when it is ready to publish. */
+export interface Published {
+  saved: "added" | "changed" | "kept" | "no";
+  full_name: string;
+  html_url: string;
+  private: boolean;
+  renamed: boolean;
+  remote: string;
+  url: string;
+  problem: string;
+}
+
+/** Publishing a repository made here: the accounts, the folder's own, the target and a name. */
+export async function githubPublishContext(repoPath: string): Promise<PublishContext> {
+  return invoke("github_publish_context", { repoPath });
+}
+
+/** Where `account` can create a repository: itself and its organizations. */
+export async function githubOwners(account: string): Promise<RepoOwners> {
+  return invoke("github_owners", { account });
+}
+
+/** Create the repository on GitHub as `account` and connect it to this folder, ready to publish. */
+export async function changesCreateGithubRepo(
+  repoPath: string,
+  account: string,
+  owner: string,
+  name: string,
+  description: string,
+  isPrivate: boolean,
+  target: CreateTarget
+): Promise<Published> {
+  return invoke("changes_create_github_repo", { repoPath, account, owner, name, description, private: isPrivate, target });
 }
 
 /** `allowUnpushedSubmodules`: push although a submodule's recorded commit is on none of that submodule's remotes. */
