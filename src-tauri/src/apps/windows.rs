@@ -694,6 +694,26 @@ pub(crate) fn elevated_path_ok(path: &Path) -> Result<(), String> {
     }
 }
 
+/// In the administrator's run, a path under X:\Users\ counts only inside the
+/// asking person's own AppData (Local or Roaming) — not anyone else's, nor the
+/// approving administrator's. The shared Desktop's shortcuts are
+/// `elevated_path_ok`'s to judge. No profile known: refused (fails closed).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn profile_ok(path: &Path, profile: Option<&Path>) -> Result<(), String> {
+    let p = lower(path);
+    let parts: Vec<&str> = p.split('\\').filter(|x| !x.is_empty()).collect();
+    if parts.get(1) != Some(&"users") || parts.get(2) == Some(&"public") {
+        return Ok(());
+    }
+    let Some(profile) = profile else { return Err("Whose folder it is in couldn't be told.".into()) };
+    let base = lower(profile);
+    if ["appdata\\local\\", "appdata\\roaming\\"].iter().any(|sub| p.starts_with(&format!("{}\\{}", base, sub))) {
+        Ok(())
+    } else {
+        Err("It is in another person's folder, not the one who asked.".into())
+    }
+}
+
 /// Hidden from "Installed apps" too: parts, updates, entries that can't be removed.
 pub(crate) fn hidden(e: &RegEntry) -> bool {
     e.system_component || e.parent.is_some() || e.release_type.is_some() || e.no_remove || e.uninstall.as_deref().is_none_or(|u| u.trim().is_empty()) || e.name.as_deref().is_none_or(|n| n.trim().is_empty())
@@ -1594,6 +1614,55 @@ impl Drop for Pinned {
     }
 }
 
+/// A process's token, kept open: the asking GitSwitch's (the elevated run's
+/// parent), or this process's own (tests). Closed when dropped.
+#[cfg(windows)]
+pub(crate) struct ParentToken {
+    token: windows_sys::Win32::Foundation::HANDLE,
+    /// The account's SID, as bytes.
+    pub user_sid: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl Drop for ParentToken {
+    fn drop(&mut self) {
+        sys::close_handle(self.token);
+    }
+}
+
+/// This process runs with an administrator's full token.
+#[cfg(windows)]
+pub(crate) fn is_elevated() -> bool {
+    sys::is_elevated()
+}
+
+/// The parent, when it is GitSwitch itself: the same program file as this
+/// process, started before it. Its token (whose account it is).
+#[cfg(windows)]
+pub(crate) fn gitswitch_parent() -> Result<ParentToken, String> {
+    sys::gitswitch_parent()
+}
+
+/// This process's own token (the tests' stand-in for the asking GitSwitch).
+#[cfg(all(windows, test))]
+pub(crate) fn own_token() -> Result<ParentToken, String> {
+    sys::own_token()
+}
+
+/// The job, opened once (never through a link at its end): a plain file,
+/// owned by `who`'s account, its bytes read from that same handle.
+#[cfg(windows)]
+pub(crate) fn read_own_job(job: &Path, who: &ParentToken) -> Result<Vec<u8>, String> {
+    sys::read_own_job(job, who)
+}
+
+/// `who`'s profile folder, as the machine records it (ProfileList, which only
+/// an administrator can change).
+#[cfg(windows)]
+pub(crate) fn profile_of(who: &ParentToken) -> Option<PathBuf> {
+    sys::profile_of(&who.user_sid)
+}
+
 /// Hold every folder from the drive's root down to `path`'s folder still for
 /// the administrator's run: open without share-delete (so none of them can be
 /// renamed or replaced while it works), none a link, junction or mount point,
@@ -1748,6 +1817,184 @@ $j = ConvertTo-Json -InputObject $out -Compress
         // SAFETY: the buffer is valid for its length.
         let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
         (n > 0 && n < buf.len()).then(|| String::from_utf16_lossy(&buf[..n]))
+    }
+
+    pub fn is_elevated() -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut tok: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        // SAFETY: the pseudo-handle of this process; the token is closed below.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) } == 0 {
+            return false;
+        }
+        let mut e = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0u32;
+        // SAFETY: a valid token; the struct is the size given.
+        let ok = unsafe { GetTokenInformation(tok, TokenElevation, &mut e as *mut _ as *mut _, std::mem::size_of::<TOKEN_ELEVATION>() as u32, &mut len) } != 0;
+        // SAFETY: opened above, closed once.
+        unsafe { CloseHandle(tok) };
+        ok && e.TokenIsElevated != 0
+    }
+
+    /// The id of the process that started `pid`.
+    fn parent_pid(pid: u32) -> Option<u32> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+        // SAFETY: the snapshot handle is checked and closed; the entry is sized.
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return None;
+            }
+            let mut e: PROCESSENTRY32W = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            let mut ok = Process32FirstW(snap, &mut e) != 0;
+            let mut found = None;
+            while ok {
+                if e.th32ProcessID == pid {
+                    found = Some(e.th32ParentProcessID);
+                    break;
+                }
+                ok = Process32NextW(snap, &mut e) != 0;
+            }
+            CloseHandle(snap);
+            found
+        }
+    }
+
+    fn token_user_sid(tok: windows_sys::Win32::Foundation::HANDLE) -> Option<Vec<u8>> {
+        use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, TokenUser, TOKEN_USER};
+        let mut len = 0u32;
+        // SAFETY: asks for the size only.
+        unsafe { GetTokenInformation(tok, TokenUser, std::ptr::null_mut(), 0, &mut len) };
+        if len == 0 {
+            return None;
+        }
+        // u64s, so the TOKEN_USER read from it is aligned.
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        // SAFETY: the buffer is at least `len` bytes.
+        if unsafe { GetTokenInformation(tok, TokenUser, buf.as_mut_ptr() as *mut _, len, &mut len) } == 0 {
+            return None;
+        }
+        // SAFETY: GetTokenInformation filled a TOKEN_USER at the buffer's start;
+        // its SID points into the same buffer, valid for GetLengthSid bytes.
+        unsafe {
+            let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+            let n = GetLengthSid(tu.User.Sid) as usize;
+            Some(std::slice::from_raw_parts(tu.User.Sid as *const u8, n).to_vec())
+        }
+    }
+
+    fn token_of(process: windows_sys::Win32::Foundation::HANDLE) -> Result<super::ParentToken, String> {
+        use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::OpenProcessToken;
+        let mut tok: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+        // SAFETY: a valid process handle; the token is kept in ParentToken, which closes it.
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut tok) } == 0 {
+            return Err("The asking program's account couldn't be read.".into());
+        }
+        let user_sid = token_user_sid(tok);
+        let t = super::ParentToken { token: tok, user_sid: user_sid.unwrap_or_default() };
+        if t.user_sid.is_empty() {
+            return Err("The asking program's account couldn't be read.".into());
+        }
+        Ok(t)
+    }
+
+    #[cfg(test)]
+    pub fn own_token() -> Result<super::ParentToken, String> {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: the pseudo-handle of this process.
+        token_of(unsafe { GetCurrentProcess() })
+    }
+
+    pub fn gitswitch_parent() -> Result<super::ParentToken, String> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        let me = std::env::current_exe().map_err(|e| format!("GitSwitch couldn't find itself: {}", e))?;
+        let my_file = file_id(&me).ok_or("GitSwitch couldn't read its own program file.")?;
+        // SAFETY: no arguments.
+        let my_pid = unsafe { GetCurrentProcessId() };
+        let parent = parent_pid(my_pid).ok_or("The program that started this couldn't be found.")?;
+        let (my_start, _) = created_and_path(my_pid).ok_or("This process couldn't be read.")?;
+        let (its_start, its_path) = created_and_path(parent).ok_or("The program that started this is gone.")?;
+        // Started after this one: its id was reused by another process.
+        if its_start >= my_start {
+            return Err("The program that started this is gone.".into());
+        }
+        if its_path.as_deref().and_then(file_id) != Some(my_file) {
+            return Err("It wasn't started by GitSwitch itself.".into());
+        }
+        // SAFETY: the handle is checked and closed below.
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, parent) };
+        if h.is_null() {
+            return Err("The program that started this couldn't be opened.".into());
+        }
+        let t = token_of(h);
+        // SAFETY: opened above, closed once.
+        unsafe { CloseHandle(h) };
+        t
+    }
+
+    pub fn read_own_job(job: &Path, who: &super::ParentToken) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{GetLengthSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        let mut f = std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(job).map_err(|e| format!("The job couldn't be opened: {}", e))?;
+        let md = f.metadata().map_err(|e| format!("The job couldn't be read: {}", e))?;
+        const REPARSE_POINT: u32 = 0x400;
+        if !md.is_file() || md.file_attributes() & REPARSE_POINT != 0 {
+            return Err("The job isn't a plain file.".into());
+        }
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: an open file handle; the descriptor Windows allocates is freed below.
+        let rc = unsafe { GetSecurityInfo(f.as_raw_handle() as _, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &mut owner, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut sd) };
+        let theirs = if rc == 0 && !owner.is_null() {
+            // SAFETY: `owner` points into `sd`, valid for GetLengthSid bytes until it is freed.
+            Some(unsafe { std::slice::from_raw_parts(owner as *const u8, GetLengthSid(owner) as usize) }.to_vec())
+        } else {
+            None
+        };
+        if !sd.is_null() {
+            // SAFETY: allocated by GetSecurityInfo, freed once.
+            unsafe { LocalFree(sd as _) };
+        }
+        match theirs {
+            Some(sid) if sid == who.user_sid => {}
+            Some(_) => return Err("The job belongs to another account.".into()),
+            None => return Err("The job's owner couldn't be read.".into()),
+        }
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).map_err(|e| format!("The job couldn't be read: {}", e))?;
+        Ok(bytes)
+    }
+
+    pub fn profile_of(sid: &[u8]) -> Option<PathBuf> {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        // u32s, so the SID handed to Windows is aligned.
+        let mut aligned = vec![0u32; sid.len().div_ceil(4)];
+        // SAFETY: the buffer holds at least sid.len() bytes.
+        unsafe { std::ptr::copy_nonoverlapping(sid.as_ptr(), aligned.as_mut_ptr() as *mut u8, sid.len()) };
+        let mut s: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // SAFETY: a valid SID; the string Windows allocates is freed below.
+        if unsafe { ConvertSidToStringSidW(aligned.as_ptr() as *mut _, &mut s) } == 0 || s.is_null() {
+            return None;
+        }
+        // SAFETY: a NUL-terminated string from Windows.
+        let len = (0..).take_while(|&i| unsafe { *s.add(i) } != 0).count();
+        let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(s, len) });
+        // SAFETY: allocated by ConvertSidToStringSidW, freed once.
+        unsafe { LocalFree(s as _) };
+        let key = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{}", text), KEY_READ).ok()?;
+        let raw: String = key.get_value("ProfileImagePath").ok()?;
+        Some(PathBuf::from(expand(&raw)))
     }
 
     pub fn close_handle(h: windows_sys::Win32::Foundation::HANDLE) {
@@ -2647,6 +2894,18 @@ $j = ConvertTo-Json -InputObject $out -Compress
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_administrators_run_keeps_to_the_asking_persons_own_appdata() {
+        let me = Path::new(r"C:\Users\me");
+        assert!(profile_ok(Path::new(r"C:\Users\other\AppData\Roaming\X"), Some(me)).is_err(), "someone else's");
+        assert!(profile_ok(Path::new(r"C:\Users\me\AppData\Roaming\X"), Some(me)).is_ok());
+        assert!(profile_ok(Path::new(r"C:\Users\me\AppData\Local\Programs\X"), Some(me)).is_ok());
+        assert!(profile_ok(Path::new(r"C:\Users\me\Documents\X"), Some(me)).is_err(), "not AppData");
+        assert!(profile_ok(Path::new(r"C:\Users\me\AppData\Roaming\X"), None).is_err(), "no profile known: refused");
+        assert!(profile_ok(Path::new(r"C:\Program Files\X"), None).is_ok(), "not a person's folder");
+        assert!(profile_ok(Path::new(r"C:\Users\Public\Desktop\X.lnk"), Some(me)).is_ok(), "the shared Desktop is elevated_path_ok's to judge");
+    }
 
     #[test]
     fn spellings_fold_to_what_windows_opens() {
