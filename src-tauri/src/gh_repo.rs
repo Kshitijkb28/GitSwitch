@@ -131,15 +131,63 @@ pub async fn context(repo_path: Option<String>, repo: Option<String>) -> Result<
     Ok(out)
 }
 
+/// What a key signs in as, by key path, with when github.com said so: only a
+/// definite answer is kept (ten minutes), so a dialog asks once, not each time.
+fn key_logins() -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>> {
+    static K: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>> = std::sync::OnceLock::new();
+    K.get_or_init(Default::default)
+}
+
+const KEY_LOGIN_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn cached_key_login(key: &str) -> Option<String> {
+    let k = key_logins().lock().ok()?;
+    k.get(key).filter(|(at, _)| at.elapsed() < KEY_LOGIN_TTL).map(|(_, l)| l.clone())
+}
+
+fn profile_github_login(p: &crate::profiles::Profile) -> Option<String> {
+    p.github_login.as_deref().map(|l| l.trim().trim_start_matches('@').to_string()).filter(|l| !l.is_empty())
+}
+
+/// The GitHub login a folder's profile pushes as, when known without asking
+/// github.com: the profile's own `github_login`, else what its key was
+/// found to sign in as lately. The flag: it has a key nobody asked about yet
+/// (`profile_login` asks).
+pub(crate) async fn profile_login_known(repo_path: &str) -> (Option<String>, bool) {
+    let Some(p) = crate::git_status::profile_for_repo(repo_path).await else { return (None, false) };
+    if let Some(l) = profile_github_login(&p) {
+        return (Some(l), false);
+    }
+    match p.ssh_key_path.filter(|k| !k.is_empty()) {
+        Some(key) => match cached_key_login(&key) {
+            Some(l) => (Some(l), false),
+            None => (None, true),
+        },
+        None => (None, false),
+    }
+}
+
 /// The GitHub login a folder's profile pushes as: the profile's own
-/// `github_login`, else the account GitHub says its SSH key signs in as.
+/// `github_login`, else the account GitHub says its SSH key signs in as
+/// (asked over ssh at most once in ten minutes, and never longer than 25 s).
 pub(crate) async fn profile_login(repo_path: &str) -> Option<String> {
     let p = crate::git_status::profile_for_repo(repo_path).await?;
-    if let Some(l) = p.github_login.map(|l| l.trim().trim_start_matches('@').to_string()).filter(|l| !l.is_empty()) {
+    if let Some(l) = profile_github_login(&p) {
         return Some(l);
     }
     let key = p.ssh_key_path.filter(|k| !k.is_empty())?;
-    crate::ssh_keys::resolve_key_account(&key).await.ok().flatten()
+    if let Some(l) = cached_key_login(&key) {
+        return Some(l);
+    }
+    let found = tokio::time::timeout(std::time::Duration::from_secs(25), crate::ssh_keys::resolve_key_account(&key))
+        .await
+        .ok()?
+        .ok()
+        .flatten()?;
+    if let Ok(mut k) = key_logins().lock() {
+        k.insert(key, (std::time::Instant::now(), found.clone()));
+    }
+    Some(found)
 }
 
 /// Somewhere a repository can be created: the account itself, or one of

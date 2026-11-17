@@ -11,6 +11,7 @@ import { Select } from "../components/Select";
 import { PullList } from "../components/github/PullList";
 import { PullPanel } from "../components/github/PullPanel";
 import { Segmented, cleanError, openOnGitHub } from "../components/github/shared";
+import { changesSince, onRepoChange, sameRepo, type RepoChange } from "../lib/repoChanges";
 
 type Whose = "everyone" | api.PullScope;
 type RepoFilter = "open" | "review" | "all";
@@ -39,6 +40,33 @@ const known = <T extends string>(v: string, choices: readonly T[], fallback: T):
  */
 const repoCache = new Map<string, api.PullRepos>();
 const repoAsks = new Map<string, Promise<api.PullRepos>>();
+
+/**
+ * The repositories as they are after a change made in GitSwitch: one made
+ * private or public, or gone. One created in GitSwitch is left to Refresh:
+ * there is no row of it to change.
+ */
+function withChange(list: api.PullRepos, change: RepoChange): api.PullRepos {
+  if (change.kind === "created") return list;
+  if (!list.repos.some((r) => sameRepo(r.repo, change.fullName))) return list;
+  return {
+    ...list,
+    repos:
+      change.kind === "deleted"
+        ? list.repos.filter((r) => !sameRepo(r.repo, change.fullName))
+        : list.repos.map((r) => (sameRepo(r.repo, change.fullName) ? { ...r, private: change.private } : r)),
+  };
+}
+
+// Made private or public, or deleted, elsewhere in the app (the Repositories
+// page, the Repository page's GitHub tab): the kept lists say so too.
+onRepoChange((change) => {
+  for (const [account, list] of repoCache) {
+    const next = withChange(list, change);
+    if (next !== list) repoCache.set(account, next);
+  }
+});
+
 function readRepos(account: string, again: boolean): Promise<api.PullRepos> {
   if (!again) {
     const kept = repoCache.get(account);
@@ -46,9 +74,12 @@ function readRepos(account: string, again: boolean): Promise<api.PullRepos> {
     const running = repoAsks.get(account);
     if (running) return running;
   }
+  const askedAt = Date.now();
   const ask = api
     .githubPullRepos(account)
-    .then((r) => {
+    .then((answer) => {
+      // Asked for before a change made here: it may still show the old way.
+      const r = changesSince(askedAt).reduce(withChange, answer);
       repoCache.set(account, r);
       return r;
     })
@@ -124,6 +155,9 @@ export function Pulls() {
     void readAccounts();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // A repository made private or public, or deleted, while this page shows its list.
+  useEffect(() => onRepoChange((change) => setRepos((r) => (r ? withChange(r, change) : r))), []);
 
   const ready = !!accounts && accounts.some((a) => a.key === account);
   useEffect(() => {

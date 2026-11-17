@@ -29,10 +29,16 @@ interface ToastContextValue {
 /** Lines shown before "and N more". */
 const MAX_LINES = 8;
 
-/** How long a toast stays: longer with lines to read, at most 15 seconds. */
-export function toastDuration(details?: string[]): number {
+/**
+ * How long a toast stays: long enough to read. A short message gets 3.2
+ * seconds; every word past eight adds 0.3 seconds (about 200 words a
+ * minute), and every line below it 1.5 seconds; at most 15 seconds. The
+ * pointer over it pauses it.
+ */
+export function toastDuration(message: string, details?: string[]): number {
+  const words = message.trim().split(/\s+/).filter(Boolean).length;
   const lines = Math.min(details?.length ?? 0, MAX_LINES + 1);
-  return Math.min(3200 + lines * 1500, 15000);
+  return Math.min(3200 + Math.max(0, words - 8) * 300 + lines * 1500, 15000);
 }
 
 const ToastContext = createContext<ToastContextValue | null>(null);
@@ -88,7 +94,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       const id = nextId++;
       const lines = details?.filter((d) => d.trim() !== "");
       setToasts((t) => [...t, { id, message, variant, details: lines?.length ? lines : undefined }]);
-      start(id, toastDuration(lines));
+      start(id, toastDuration(message, lines));
     },
     [start]
   );

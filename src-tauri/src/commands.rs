@@ -1274,6 +1274,57 @@ pub async fn changes_add_remote(repo_path: String, url: String, allow_existing: 
     Box::pin(git_ops::add_origin(&repo_path, &url, allow_existing.unwrap_or(false))).await
 }
 
+/// A repository as GitHub has it now, for the visibility and delete dialogs;
+/// with `repo_path`, also which of its branches that folder lacks.
+#[tauri::command]
+pub async fn github_repo_facts(account: String, owner: String, name: String, repo_path: Option<String>) -> Result<crate::repo_admin::RepoFacts, AppError> {
+    let gh = crate::repo_admin::gh_for(&account).await?;
+    Box::pin(crate::repo_admin::facts(&gh, &owner, &name, repo_path.as_deref())).await
+}
+
+/// Make a repository private or public on GitHub (the one with `expect_id`).
+#[tauri::command]
+pub async fn github_set_visibility(account: String, owner: String, name: String, private: bool, expect_id: u64) -> Result<crate::repo_admin::RepoFacts, AppError> {
+    let gh = Gh::for_account(&account).await?;
+    Box::pin(crate::repo_admin::set_visibility(&gh, &owner, &name, private, expect_id)).await
+}
+
+/// Delete a repository on GitHub: `confirm` is what the person typed.
+#[tauri::command]
+pub async fn github_delete_repo(account: String, owner: String, name: String, confirm: String, expect_id: u64) -> Result<crate::repo_admin::DeleteOutcome, AppError> {
+    let gh = crate::repo_admin::gh_for(&account).await?;
+    Box::pin(crate::repo_admin::delete(&gh, &owner, &name, &confirm, expect_id)).await
+}
+
+/// Ask GitHub for the person's approval to delete repositories as `account`'s login.
+#[tauri::command]
+pub async fn github_delete_grant_start(account: String) -> Result<crate::repo_admin::GrantPrompt, AppError> {
+    crate::repo_admin::grant_start(crate::gh_api::login_of(&account)).await
+}
+
+/// Wait for that approval on github.com.
+#[tauri::command]
+pub async fn github_delete_grant_wait() -> Result<String, AppError> {
+    Box::pin(crate::repo_admin::grant_wait()).await
+}
+
+#[tauri::command]
+pub fn github_delete_grant_cancel() {
+    crate::repo_admin::grant_cancel();
+}
+
+/// The Publish dialog's accounts, from local files only: drawn at once.
+#[tauri::command]
+pub async fn github_publish_accounts(repo_path: String) -> Result<crate::publish::PublishAccounts, AppError> {
+    Ok(Box::pin(crate::publish::accounts(&repo_path)).await)
+}
+
+/// Who the folder pushes as, asking github.com about its key if need be.
+#[tauri::command]
+pub async fn github_publish_push_login(repo_path: String) -> Result<Option<String>, AppError> {
+    Ok(Box::pin(crate::publish::push_login(&repo_path)).await)
+}
+
 /// Publishing a repository made here: the accounts that could create it on
 /// GitHub, the one this folder pushes as, where it would be connected, and a
 /// name for it.

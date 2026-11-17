@@ -7,6 +7,8 @@ mod error;
 mod find_clones;
 mod gh_api;
 mod gh_cli;
+mod gh_hosts;
+mod repo_admin;
 mod gh_repo;
 mod pulls;
 mod git_advice;
@@ -155,6 +157,14 @@ pub fn run() {
             commands::changes_add_remote,
             commands::changes_change_remote,
             commands::changes_create_github_repo,
+            commands::github_publish_accounts,
+            commands::github_repo_facts,
+            commands::github_set_visibility,
+            commands::github_delete_repo,
+            commands::github_delete_grant_start,
+            commands::github_delete_grant_wait,
+            commands::github_delete_grant_cancel,
+            commands::github_publish_push_login,
             commands::github_publish_context,
             commands::github_owners,
             commands::changes_pull,

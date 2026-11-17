@@ -29,11 +29,44 @@ import type { Profile } from "../types/profile";
 import * as api from "../lib/api";
 import { RefreshButton } from "../components/RefreshButton";
 import { CopyLinkMenu } from "../components/repos/CopyLinkMenu";
+import { RepoActionsMenu } from "../components/repos/RepoActionsMenu";
+import { changesSince, onRepoChange, sameRepo, type RepoChange } from "../lib/repoChanges";
 
 const PAGE_SIZE = 25;
 
 // Listings survive navigating away and back within a session; Refresh re-fetches.
 const listingCache = new Map<string, { listing: api.RepoListing; fetchedAt: number }>();
+
+/**
+ * A listing as it is after a change made here: the row made private or
+ * public, or gone. A repository created here is left to Refresh: the listing
+ * has no row for it to change.
+ */
+function withChange(listing: api.RepoListing, change: RepoChange): api.RepoListing {
+  if (change.kind === "created") return listing;
+  if (!listing.repos.some((r) => sameRepo(r.full_name, change.fullName))) return listing;
+  return {
+    ...listing,
+    repos:
+      change.kind === "deleted"
+        ? listing.repos.filter((r) => !sameRepo(r.full_name, change.fullName))
+        : listing.repos.map((r) => (sameRepo(r.full_name, change.fullName) ? { ...r, private: change.private } : r)),
+  };
+}
+
+/** A listing asked for at `since`, with what was changed here since then. */
+const withChangesSince = (listing: api.RepoListing, since: number) => changesSince(since).reduce(withChange, listing);
+
+// A repository made private or public, or deleted, from anywhere in the app:
+// the listings kept for later visits say so too, and so do the pages of a
+// listing still arriving (a visit that joins that load is painted with them).
+onRepoChange((change) => {
+  for (const [key, entry] of listingCache) {
+    const listing = withChange(entry.listing, change);
+    if (listing !== entry.listing) listingCache.set(key, { ...entry, listing });
+  }
+  for (const e of inflight.values()) if (e.partial) e.partial = { ...e.partial, listing: withChange(e.partial.listing, change) };
+});
 // A listing can take a while for big accounts — never ask GitHub twice at once
 // for the same account (double mounts, quick account flips back and forth).
 // A visit that joins a load already running is painted too: it gets what has
@@ -107,12 +140,18 @@ function fetchListing(
     return running.promise;
   }
   const entry: InflightLoad = { promise: Promise.resolve() as unknown as Promise<api.RepoListing>, partial: null, listeners: new Set([onPartial]) };
-  entry.promise = loadProgressively(key, (listing, more) => {
+  // A row changed here while the rest was still arriving: the pages that land
+  // later were asked for before the change, so they get it applied.
+  const startedAt = Date.now();
+  entry.promise = loadProgressively(key, (arrived, more) => {
+    const listing = withChangesSince(arrived, startedAt);
     entry.partial = { listing, more };
     for (const paint of entry.listeners) paint(listing, more);
-  }).finally(() => {
-    if (inflight.get(key) === entry) inflight.delete(key);
-  });
+  })
+    .then((listing) => withChangesSince(listing, startedAt))
+    .finally(() => {
+      if (inflight.get(key) === entry) inflight.delete(key);
+    });
   inflight.set(key, entry);
   return entry.promise;
 }
@@ -257,6 +296,9 @@ export function Repositories() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account]);
 
+  // A repository made private or public, or deleted, from a row's menu: its row says so at once.
+  useEffect(() => onRepoChange((change) => setListing((l) => (l ? withChange(l, change) : l))), []);
+
   // Any filter change starts from the first page.
   useEffect(() => setPage(0), [account, search, owner, visibility, hideArchived, hideForks, notClonedOnly, sort]);
 
@@ -386,7 +428,7 @@ export function Repositories() {
           <BookMarked size={32} className="mx-auto text-zinc-600 mb-3" />
           <h3 className="text-lg font-medium text-zinc-300">No GitHub accounts signed in</h3>
           <p className="text-sm text-zinc-500 mt-1 max-w-md mx-auto">
-            Sign in on the GitHub page — with GitHub itself, or the GitHub CLI's{" "}
+            Sign in on the GitHub Auth page — with GitHub itself, or the GitHub CLI's{" "}
             <span className="font-mono">gh auth login</span> — then Refresh, and the repositories each account
             can reach show up here.
           </p>
@@ -556,8 +598,8 @@ export function Repositories() {
               const localPath = localPathOf(r);
               const cloningPath = localPath ? null : cloningPathOf(r);
               return (
-                <div key={r.full_name} className="flex items-start gap-3 py-3 min-w-0">
-                  <span className="mt-0.5 shrink-0 text-zinc-500" title={r.private ? "Private" : "Public"}>
+                <div key={r.full_name} className="flex items-start gap-3 py-3 min-w-0" data-repo-row={r.full_name}>
+                  <span className="mt-0.5 shrink-0 text-zinc-500" role="img" title={r.private ? "Private" : "Public"} aria-label={r.private ? "Private" : "Public"} data-visibility={r.private ? "private" : "public"}>
                     {r.private ? <Lock size={15} /> : <Globe size={15} />}
                   </span>
                   <div className="min-w-0 flex-1">
@@ -594,6 +636,7 @@ export function Repositories() {
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">
                     <CopyLinkMenu fullName={r.full_name} sshUrl={cloneUrlOf(r)} />
+                    {listing && <RepoActionsMenu repo={r} account={listing.account} login={listing.login} localPath={localPath} />}
                     {localPath ? (
                       <Button size="sm" variant="secondary" onClick={() => openInHistory(localPath)}>
                         <FolderOpen size={14} />

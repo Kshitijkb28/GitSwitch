@@ -148,6 +148,33 @@ pub(crate) mod tests {
     /// job's last step, a Repair), `rounds` times, in one process as in the
     /// app: the readings that called a sound lock or block broken, and what the
     /// re-applying could not write.
+    /// The delete approval and the delete, in one process as in the app (the
+    /// approval is kept in this process's memory): the code shown, how the
+    /// wait ended, and what the delete then did (null when it wasn't tried).
+    async fn delete_grant_flow(args: serde_json::Value) {
+        use crate::commands as c;
+        let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let (account, owner, name, confirm) = (get("account"), get("owner"), get("name"), get("confirm"));
+        let expect_id = args.get("expectId").and_then(|v| v.as_u64()).unwrap_or(0);
+        let prompt = match c::github_delete_grant_start(account.clone()).await {
+            Ok(p) => p,
+            Err(e) => return reply_err(e.to_string()),
+        };
+        let waited = Box::pin(c::github_delete_grant_wait()).await;
+        let outcome = match &waited {
+            Ok(_) => Some(Box::pin(c::github_delete_repo(account, owner, name, confirm, expect_id)).await.map_err(|e| e.to_string())),
+            Err(_) => None,
+        };
+        emit(&serde_json::json!({
+            "ok": true,
+            "value": {
+                "user_code": prompt.user_code,
+                "waited": waited.map_err(|e| e.to_string()),
+                "outcome": outcome,
+            }
+        }));
+    }
+
     async fn coverage_while_covering(rounds: usize) {
         let path = repo();
         let mut flagged: Vec<String> = Vec::new();
@@ -178,6 +205,7 @@ pub(crate) mod tests {
             Err(e) => return reply_err(format!("PROBE_JSON is not JSON: {}", e)),
         };
         match cmd.as_str() {
+            "github_delete_grant_flow" => Box::pin(delete_grant_flow(args)).await,
             // profiles / repositories
             "get_profiles" => reply(c::get_profiles()),
             "doctor_apply_fix" => forward!(c::doctor_apply_fix, args, fix),
@@ -226,6 +254,13 @@ pub(crate) mod tests {
             "changes_add_remote" => forward!(c::changes_add_remote, args, repo_path, url, allow_existing),
             "changes_change_remote" => forward!(c::changes_change_remote, args, repo_path, remote, from, url, allow_existing),
             "changes_create_github_repo" => forward!(c::changes_create_github_repo, args, repo_path, account, owner, name, description, private, target),
+            "github_publish_accounts" => forward!(c::github_publish_accounts, args, repo_path),
+            "github_repo_facts" => forward!(c::github_repo_facts, args, account, owner, name, repo_path),
+            "github_set_visibility" => forward!(c::github_set_visibility, args, account, owner, name, private, expect_id),
+            "github_delete_repo" => forward!(c::github_delete_repo, args, account, owner, name, confirm, expect_id),
+            "github_delete_grant_start" => forward!(c::github_delete_grant_start, args, account),
+            "github_delete_grant_wait" => forward!(c::github_delete_grant_wait, args),
+            "github_publish_push_login" => forward!(c::github_publish_push_login, args, repo_path),
             "github_publish_context" => forward!(c::github_publish_context, args, repo_path),
             "github_owners" => forward!(c::github_owners, args, account),
             "changes_pull" => forward!(c::changes_pull, args, repo_path, mode, with_lfs, autostash, source),

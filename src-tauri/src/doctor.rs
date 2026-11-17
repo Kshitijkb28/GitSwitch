@@ -216,9 +216,9 @@ pub async fn check_environment() -> Result<Vec<Finding>, AppError> {
                     "gh-not-authenticated",
                     "info",
                     "GitHub CLI has no signed-in accounts",
-                    "Sign in to the GitHub CLI on the GitHub page (or run `gh auth login` in a terminal) so GitSwitch can verify repo access and register keys.",
+                    "Sign in to the GitHub CLI on the GitHub Auth page (or run `gh auth login` in a terminal) so GitSwitch can verify repo access and register keys.",
                 )
-                .with_fix("nav:/github", "Sign in on the GitHub page"),
+                .with_fix("nav:/github", "Sign in on the GitHub Auth page"),
             ),
         }
     }
@@ -449,9 +449,9 @@ pub async fn check_repo_access() -> Result<Vec<Finding>, AppError> {
                 "access-unchecked",
                 "info",
                 "Repository access wasn't checked",
-                "The GitHub CLI has no signed-in account to ask GitHub with. Sign in to it on the GitHub page (or run `gh auth login`), then check again.",
+                "The GitHub CLI has no signed-in account to ask GitHub with. Sign in to it on the GitHub Auth page (or run `gh auth login`), then check again.",
             )
-            .with_fix("nav:/github", "Sign in on the GitHub page"),
+            .with_fix("nav:/github", "Sign in on the GitHub Auth page"),
         );
         return Ok(out);
     }

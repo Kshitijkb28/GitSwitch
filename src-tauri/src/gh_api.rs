@@ -35,6 +35,12 @@ impl Reply {
         (200..300).contains(&self.status)
     }
 
+    /// Whether the token has scope `s`: None when GitHub didn't list the
+    /// token's scopes (a fine-grained token, or an app's).
+    pub(crate) fn has_scope(&self, s: &str) -> Option<bool> {
+        self.scopes.as_deref().map(|h| h.split(',').map(str::trim).any(|x| x == s))
+    }
+
     /// GitHub's `X-GitHub-SSO` header: single sign-on withheld something.
     pub fn sso(&self) -> Option<&str> {
         self.sso.as_deref()
@@ -115,7 +121,8 @@ impl Gh {
     /// One request. Err only when GitHub could not be reached or answered
     /// something that is not JSON; a refusal comes back as a `Reply`.
     pub async fn call(&self, method: Method, path: &str, query: &[(&str, String)], body: Option<&Value>) -> Result<Reply, AppError> {
-        let client = crate::github::http_client()?;
+        // A request that changes something never follows a redirect.
+        let client = if method == Method::GET || method == Method::HEAD { crate::github::http_client()? } else { crate::github::http_client_for_writes()? };
         let mut req = client
             .request(method, format!("{}{}", self.api, path))
             .header("Authorization", format!("Bearer {}", self.token))
@@ -191,13 +198,13 @@ pub(crate) fn refusal(r: &Reply, what: &str, login: &str) -> String {
 }
 
 /// `refusal`, worded for the kind of account: a GitSwitch sign-in is renewed
-/// on the GitHub page, a GitHub CLI login with `gh`.
+/// on the GitHub Auth page, a GitHub CLI login with `gh`.
 pub(crate) fn refusal_as(r: &Reply, what: &str, login: &str, signin: bool) -> String {
     let said = github_message(&r.json);
     let said_part = if said.is_empty() { String::new() } else { format!(" GitHub said: \"{}\".", said) };
     if r.sso.is_some() && signin {
         return format!(
-            "Couldn't {}: the organization uses single sign-on and @{}'s GitSwitch sign-in is not authorized for it. Sign in again on the GitHub page and authorize the organization when GitHub asks, then try again.",
+            "Couldn't {}: the organization uses single sign-on and @{}'s GitSwitch sign-in is not authorized for it. Sign in again on the GitHub Auth page and authorize the organization when GitHub asks, then try again.",
             what, login
         );
     }
@@ -215,13 +222,13 @@ pub(crate) fn refusal_as(r: &Reply, what: &str, login: &str, signin: bool) -> St
         .unwrap_or_default();
     let missing: Vec<&String> = needs.iter().filter(|s| !has_scope(s)).collect();
     match r.status {
-        401 if signin => format!("GitHub rejected @{}'s GitSwitch sign-in (expired or revoked). Sign in again on the GitHub page.", login),
+        401 if signin => format!("GitHub rejected @{}'s GitSwitch sign-in (expired or revoked). Sign in again on the GitHub Auth page.", login),
         401 => format!("GitHub rejected @{}'s token (expired or revoked). Sign in again — e.g. `gh auth login`.", login),
         403 | 429 if r.rate_left.as_deref() == Some("0") || said.to_lowercase().contains("rate limit") => {
             format!("Couldn't {}: GitHub's rate limit for @{} is used up. Try again in a few minutes.", what, login)
         }
         403 | 404 if signin && r.scopes.is_some() && !needs.is_empty() && missing.len() == needs.len() => format!(
-            "Couldn't {}: @{}'s GitSwitch sign-in lacks the {} scope. Sign in again on the GitHub page: GitSwitch asks for it.",
+            "Couldn't {}: @{}'s GitSwitch sign-in lacks the {} scope. Sign in again on the GitHub Auth page: GitSwitch asks for it.",
             what,
             login,
             needs.join(" or ")
@@ -234,13 +241,14 @@ pub(crate) fn refusal_as(r: &Reply, what: &str, login: &str, signin: bool) -> St
             needs[0]
         ),
         403 if oauth_restricted(r) => format!(
-            "Couldn't {}: the organization restricts third-party apps and hasn't approved {}. Use a GitHub CLI login for @{} (add one on the GitHub page), or ask an owner of the organization to approve it.",
+            "Couldn't {}: the organization restricts third-party apps and hasn't approved {}. Use a GitHub CLI login for @{} (add one on the GitHub Auth page), or ask an owner of the organization to approve it.",
             what,
             if signin { "GitSwitch" } else { "this login's app" },
             login
         ),
         403 => format!("Couldn't {}: GitHub does not let @{} do that here (it needs more access to this repository).{}", what, login, said_part),
         404 => format!("Couldn't {}: GitHub shows nothing there to @{} — it doesn't exist, or this account can't see it.", what, login),
+        301 | 302 | 303 | 307 | 308 => format!("Couldn't {}: GitHub says it was renamed or moved. Nothing was changed. Refresh and try again.", what),
         s => format!("Couldn't {}: GitHub answered {}.{}", what, s, said_part),
     }
 }
@@ -301,13 +309,13 @@ mod tests {
 
     #[test]
     fn a_gitswitch_sign_in_is_told_to_sign_in_again_not_to_run_gh() {
-        assert!(refusal_as(&reply(401, Value::Null), "x", "me", true).contains("Sign in again on the GitHub page"));
+        assert!(refusal_as(&reply(401, Value::Null), "x", "me", true).contains("Sign in again on the GitHub Auth page"));
         let mut r = reply(403, Value::Null);
         r.scopes = Some("read:org".into());
         r.accepted = Some("repo".into());
         assert!(scope_missing(&r));
         let t = refusal_as(&r, "create me/app", "me", true);
-        assert!(t.contains("lacks the repo scope") && t.contains("GitHub page") && !t.contains("gh auth"), "{}", t);
+        assert!(t.contains("lacks the repo scope") && t.contains("GitHub Auth page") && !t.contains("gh auth"), "{}", t);
         let restricted = reply(403, serde_json::json!({"message": "Although you appear to have the correct authorization credentials, the `Acme` organization has enabled OAuth App access restrictions, meaning that data access to third-parties is limited."}));
         assert!(oauth_restricted(&restricted) && !scope_missing(&restricted));
         let t = refusal_as(&restricted, "create Acme/app", "me", true);

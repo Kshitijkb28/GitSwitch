@@ -18,6 +18,25 @@ pub(crate) fn http_client() -> Result<reqwest::Client, AppError> {
         .map_err(|e| AppError::Command(format!("Failed to build HTTP client: {}", e)))
 }
 
+/// The client for requests that change something (POST, PUT, PATCH, DELETE):
+/// it never follows a redirect. GitHub answers a renamed or transferred
+/// repository's old address with a 307 that repeats the same method at the
+/// new one, so a delete aimed at one repository could land on whatever now
+/// answers there. The caller sees the redirect and says so instead.
+pub(crate) fn http_client_for_writes() -> Result<reqwest::Client, AppError> {
+    static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .clone()
+        .map_err(|e| AppError::Command(format!("Failed to build HTTP client: {}", e)))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GitHubUser {
     pub id: u64,

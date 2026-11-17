@@ -1730,6 +1730,58 @@ pub async fn change_remote_address(repo_path: &str, remote: &str, from: &str, ur
 /// `from` that the person saw, no separate push address, and nothing was ever
 /// fetched from or pushed to it. Returns its current address.
 pub(crate) async fn change_remote_guard(repo_path: &str, remote: &str, from: &str) -> Result<String, AppError> {
+    let current = remote_as_seen(repo_path, remote, from).await?;
+    if !never_reached(repo_path, remote).await {
+        return Err(AppError::Command(format!(
+            "{} has been fetched from or pushed to, so GitSwitch leaves its address alone. To change it anyway, in the terminal: `git remote set-url {} <url>`.",
+            remote, remote
+        )));
+    }
+    Ok(current)
+}
+
+/// What making a repository again needs first (Publish, after GitHub lost
+/// the one this folder pushed to): `remote` still has the address `from`
+/// that the person saw, no separate push address, and that address names
+/// exactly `owner/name` on GitHub — as configured, or as git uses it once an
+/// insteadOf rule has rewritten it. The repository made again sits where the
+/// address already points, so the address never changes, and the remote may
+/// have been fetched from and pushed to: nothing that depends on it moves.
+/// Returns the address as configured (as git uses it when none is set).
+pub(crate) async fn again_guard(repo_path: &str, remote: &str, from: &str, owner: &str, name: &str) -> Result<String, AppError> {
+    let current = remote_as_seen(repo_path, remote, from).await?;
+    let configured = GitCmd::at(repo_path)
+        .args(["config", "--get", &format!("remote.{}.url", remote)])
+        .timeout(LOCAL_TIMEOUT)
+        .ok_text()
+        .await
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| current.clone());
+    let mut named = None;
+    for url in [configured.as_str(), current.as_str()] {
+        if let Some((o, n)) = crate::peek::github_slug_resolved(url).await {
+            if o.eq_ignore_ascii_case(owner) && n.eq_ignore_ascii_case(name) {
+                return Ok(configured.clone());
+            }
+            named.get_or_insert((o, n));
+        }
+    }
+    match named {
+        Some((o, n)) => Err(AppError::Command(format!(
+            "This folder's address names {}/{}, not {}/{}: GitSwitch makes a repository again only under the name its address already has.",
+            o, n, owner, name
+        ))),
+        None => Err(AppError::Command(format!(
+            "The address of {} isn't a GitHub repository's, so GitSwitch can't make it again on GitHub.",
+            remote
+        ))),
+    }
+}
+
+/// `remote` still has the address `from` that the person saw (tokens
+/// masked as the status shows them) and no separate push address. Returns
+/// its current address.
+async fn remote_as_seen(repo_path: &str, remote: &str, from: &str) -> Result<String, AppError> {
     crate::git_exec::validate_remote_name(remote)?;
     if !remote_names(repo_path).await?.iter().any(|r| r == remote) {
         return Err(AppError::Command(format!("This repository has no remote named {} any more.", remote)));
@@ -1748,12 +1800,6 @@ pub(crate) async fn change_remote_guard(repo_path: &str, remote: &str, from: &st
     if current_push != current {
         return Err(AppError::Command(format!(
             "{} has a separate address for pushes, so GitSwitch leaves it alone. Change it in the terminal: `git remote set-url --push {} <url>`.",
-            remote, remote
-        )));
-    }
-    if !never_reached(repo_path, remote).await {
-        return Err(AppError::Command(format!(
-            "{} has been fetched from or pushed to, so GitSwitch leaves its address alone. To change it anyway, in the terminal: `git remote set-url {} <url>`.",
             remote, remote
         )));
     }
@@ -1787,6 +1833,12 @@ pub(crate) fn retarget_url(current: &str, owner: &str, name: &str) -> Option<Str
     // The scp form, [user@]host:path. One letter before the colon is a drive.
     let (left, _) = c.split_once(':')?;
     (left.len() > 1 && !left.contains('/') && !left.contains('\\')).then(|| format!("{}:{}/{}.git", left, owner, name))
+}
+
+/// One look, as the folder itself reaches it (its own identity): does git
+/// reach `url` now?
+pub(crate) async fn reachable_now(repo_path: &str, url: &str) -> bool {
+    matches!(GitCmd::at(repo_path).args(["ls-remote", "--heads", "--", url]).timeout(ADDRESS_CHECK_TIMEOUT).run().await, Ok(ls) if ls.ok())
 }
 
 /// A repository just created can take a moment to answer over git: up to

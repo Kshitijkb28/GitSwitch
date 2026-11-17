@@ -84,13 +84,29 @@ pub(crate) fn parse_auth_status(text: &str) -> Vec<GhAccount> {
     out
 }
 
+/// How long a gh that only reads may take before GitSwitch stops waiting:
+/// `gh auth status` checks each login over HTTPS and `gh auth token` may
+/// refresh one, so a slow network or proxy once held a dialog for as long.
+const GH_READ_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// A gh run's output, or a refusal once `GH_READ_LIMIT` has passed; the
+/// child is ended when the wait gives up.
+async fn gh_read(mut cmd: tokio::process::Command) -> Result<std::process::Output, AppError> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(GH_READ_LIMIT, cmd.output()).await {
+        Ok(r) => r.map_err(gh_error),
+        Err(_) => Err(AppError::Command(format!(
+            "The GitHub CLI did not answer within {} seconds. Check the network, then try again.",
+            GH_READ_LIMIT.as_secs()
+        ))),
+    }
+}
+
 /// `gh auth status`, both streams: gh writes it to stderr in some versions.
 pub async fn gh_auth_status() -> Result<Vec<GhAccount>, AppError> {
-    let output = crate::spawn::async_command(crate::spawn::program("gh"))
-        .args(["auth", "status"])
-        .output()
-        .await
-        .map_err(gh_error)?;
+    let mut cmd = crate::spawn::async_command(crate::spawn::program("gh"));
+    cmd.args(["auth", "status"]);
+    let output = gh_read(cmd).await?;
     Ok(parse_auth_status(&format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -109,9 +125,13 @@ fn logins(accounts: &[GhAccount]) -> Vec<String> {
     out
 }
 
-/// List the GitHub accounts the local `gh` CLI is authenticated with.
+/// List the GitHub accounts the local `gh` CLI is authenticated with: from
+/// gh's own hosts.yml (no process, no network), else from `gh auth status`.
 pub async fn gh_list_accounts() -> Result<Vec<String>, AppError> {
-    let accounts = logins(&gh_auth_status().await?);
+    let accounts = match crate::gh_hosts::logins() {
+        Some(l) => l,
+        None => logins(&gh_auth_status().await?),
+    };
     if accounts.is_empty() {
         return Err(AppError::Command(
             "No gh accounts found. Run `gh auth login` first.".into(),
@@ -182,11 +202,9 @@ pub async fn gh_logout(account: &str) -> Result<String, AppError> {
 
 /// Get an OAuth token for a specific gh account without switching the active one.
 pub async fn gh_get_token(account: &str) -> Result<String, AppError> {
-    let output = crate::spawn::async_command(crate::spawn::program("gh"))
-        .args(["auth", "token", "--user", account])
-        .output()
-        .await
-        .map_err(gh_error)?;
+    let mut cmd = crate::spawn::async_command(crate::spawn::program("gh"));
+    cmd.args(["auth", "token", "--user", account]);
+    let output = gh_read(cmd).await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

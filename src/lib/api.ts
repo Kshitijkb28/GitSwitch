@@ -2379,9 +2379,15 @@ export interface PublishAccount {
   source: string;
 }
 
-/** Where a new repository would be connected: "add" origin, "change" a remote never reached, or "none" (the push goes to a remote already reached). */
+/**
+ * Where a new repository would be connected: "add" origin, "change" a remote
+ * never reached, or "none" (the push goes to a remote already reached).
+ * "again" is never sent by the backend: the Publish dialog marks so a "none"
+ * whose address names the very repository GitHub lost, to make it again
+ * there, the address unchanged.
+ */
 export interface PublishTarget {
-  kind: "add" | "change" | "none";
+  kind: "add" | "change" | "none" | "again";
   remote: string | null;
   url: string | null;
   repo: string | null;
@@ -2413,8 +2419,12 @@ export interface RepoOwners {
   sso_hidden: number;
 }
 
-/** Where to connect the new repository, as the dialog saw it. */
-export type CreateTarget = { kind: "add" } | { kind: "change"; remote: string; from: string };
+/**
+ * Where to connect the new repository, as the dialog saw it: "again" makes it
+ * under exactly the owner/name the remote's address `from` names, and that
+ * address is kept (the backend refuses anything else before asking GitHub).
+ */
+export type CreateTarget = { kind: "add" } | { kind: "change"; remote: string; from: string } | { kind: "again"; remote: string; from: string };
 
 /** What creating the repository did. `problem` is empty when it is ready to publish. */
 export interface Published {
@@ -2426,6 +2436,26 @@ export interface Published {
   remote: string;
   url: string;
   problem: string;
+}
+
+/** The Publish dialog's accounts, read from local files only (gh's hosts.yml, the sign-ins, the profiles). */
+export interface PublishAccounts {
+  accounts: PublishAccount[];
+  suggested: string | null;
+  /** The login this folder pushes as, when known without asking github.com. */
+  push_login: string | null;
+  /** Its profile has a key nobody asked github.com about lately: `githubPublishPushLogin` can tell. */
+  push_login_pending: boolean;
+}
+
+/** The accounts that can create the repository, at once: no network, no git. */
+export async function githubPublishAccounts(repoPath: string): Promise<PublishAccounts> {
+  return invoke("github_publish_accounts", { repoPath });
+}
+
+/** Who this folder pushes as, asking github.com about its key when nothing local says (can take seconds). */
+export async function githubPublishPushLogin(repoPath: string): Promise<string | null> {
+  return invoke("github_publish_push_login", { repoPath });
 }
 
 /** Publishing a repository made here: the accounts, the folder's own, the target and a name. */
@@ -2791,6 +2821,89 @@ export async function githubCollaboratorRemove(account: string, owner: string, n
 
 export async function githubInvitationCancel(account: string, owner: string, name: string, id: number): Promise<void> {
   return invoke("github_invitation_cancel", { account, owner, name, id });
+}
+
+// --- GitHub: who can see a repository, and deleting it ---
+// Both act only on the repository the dialog showed: `expectId` is its id as
+// read when the dialog opened, and the backend refuses if it changed.
+
+/** A repository as GitHub has it now, with what a change would cost. */
+export interface RepoFacts {
+  id: number;
+  owner: string;
+  name: string;
+  full_name: string;
+  owner_kind: "user" | "org";
+  private: boolean;
+  visibility: "public" | "private" | "internal";
+  fork: boolean;
+  /** "owner/name" of the repository it was forked from. */
+  parent: string | null;
+  archived: boolean;
+  /** This account may change who can see it, and delete it. */
+  admin: boolean;
+  stars: number;
+  watchers: number;
+  forks: number;
+  has_pages: boolean;
+  html_url: string;
+  /** True: it can delete now; false: GitHub wants the person's approval first; null: GitHub didn't say. */
+  can_delete: boolean | null;
+  /** Branches on GitHub whose last commit the folder on this computer lacks. */
+  missing_here: string[];
+  /** A folder on this computer was named and compared. */
+  local_checked: boolean;
+  /** GitHub has more than 1,000 branches: only the first 1,000 were compared with that folder. */
+  branches_capped: boolean;
+}
+
+/** "needs-permission": GitHub wants the person's approval first, and nothing was sent. */
+export interface DeleteOutcome {
+  outcome: "deleted" | "needs-permission";
+  message: string;
+  /**
+   * Deleted: its owner's Deleted repositories page on github.com, read from
+   * the same answer as `message`; null when it can't be restored from
+   * settings (a fork network), or nothing was deleted.
+   */
+  restore_url?: string | null;
+}
+
+/** The code to enter on github.com to approve deleting, and where. */
+export interface GrantPrompt {
+  user_code: string;
+  verification_uri: string;
+  expires_in: number;
+}
+
+/** What the visibility and delete dialogs show first; with `repoPath`, also which branches that folder lacks. */
+export async function githubRepoFacts(account: string, owner: string, name: string, repoPath: string | null = null): Promise<RepoFacts> {
+  return invoke("github_repo_facts", { account, owner, name, repoPath });
+}
+
+/** Make it private (`isPrivate`) or public; GitHub's answer comes back. */
+export async function githubSetVisibility(account: string, owner: string, name: string, isPrivate: boolean, expectId: number): Promise<RepoFacts> {
+  return invoke("github_set_visibility", { account, owner, name, private: isPrivate, expectId });
+}
+
+/** Delete it on GitHub. `confirm` is exactly what the person typed. */
+export async function githubDeleteRepo(account: string, owner: string, name: string, confirm: string, expectId: number): Promise<DeleteOutcome> {
+  return invoke("github_delete_repo", { account, owner, name, confirm, expectId });
+}
+
+/** Ask GitHub for a code the person enters on github.com to approve deleting as `account`'s login. */
+export async function githubDeleteGrantStart(account: string): Promise<GrantPrompt> {
+  return invoke("github_delete_grant_start", { account });
+}
+
+/** Resolves once the person approved on github.com (a sentence saying so); rejects with the reason otherwise. */
+export async function githubDeleteGrantWait(): Promise<string> {
+  return invoke("github_delete_grant_wait");
+}
+
+/** Stop waiting for the approval. */
+export async function githubDeleteGrantCancel(): Promise<void> {
+  return invoke("github_delete_grant_cancel");
 }
 
 /** One of the account's repositories on the Pull requests page, with its counts. */
