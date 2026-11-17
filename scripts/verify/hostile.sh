@@ -385,6 +385,15 @@ ok "control: plain git diff -- 'x[y]' shows xy too" "$(git -C "$G" diff -- 'x[y]
 out="$(GIT_LITERAL_PATHSPECS=1 pcall changes_file_diff "{\"repoPath\":$PG,\"path\":\"a.txt\",\"staged\":false,\"untracked\":false}")"
 ok "GIT_LITERAL_PATHSPECS=1 inherited: the Changes diff of a changed file still shows the change" "$out" "a-change"
 ok "control: GIT_LITERAL_PATHSPECS=1 git diff -- ':(literal)a.txt' is empty" "$([ -z "$(GIT_LITERAL_PATHSPECS=1 git -C "$G" diff -- ':(literal)a.txt')" ] && echo empty || echo shown)" "empty"
+# L2: the switch is removed from every command, not only the Changes diff.
+GFILES="$(git -C "$G" rev-parse HEAD)"
+ok "GIT_LITERAL_PATHSPECS=1 inherited: History's diff of a file in a commit shows it" "$(GIT_LITERAL_PATHSPECS=1 pcall history_commit_file_diff "{\"repoPath\":$PG,\"hash\":\"$GFILES\",\"path\":\"a.txt\"}")" "+one"
+GIT_LITERAL_PATHSPECS=1 pcall changes_stage "{\"repoPath\":$PG,\"paths\":[\"x[y]\"]}" >/dev/null
+ok "  and Stage of x[y] stages that file, not xy" "$(git -C "$G" diff --cached --name-only | tr '\n' ' ')" "x[y] "
+git -C "$G" reset -q
+printf 'u\n' > "$G/new.txt"; git -C "$G" stash -u -q
+ok "  and a stashed new file's diff shows it" "$(GIT_LITERAL_PATHSPECS=1 pcall changes_stash_file_diff "{\"repoPath\":$PG,\"index\":0,\"path\":\"new.txt\"}")" "+u"
+ok "control: with GIT_ICASE_PATHSPECS=1, git --literal-pathspecs dies" "$(GIT_ICASE_PATHSPECS=1 git -C "$G" --literal-pathspecs ls-files -- a.txt 2>&1)" "incompatible"
 
 # A submodule folder git cannot open as a repository of its own (an empty
 # .git folder): git's own status says so, and the check of the submodules

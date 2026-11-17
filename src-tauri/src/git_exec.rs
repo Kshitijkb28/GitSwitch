@@ -124,6 +124,11 @@ pub fn hardened_env() -> Vec<(&'static str, Option<&'static str>)> {
     ]
 }
 
+/// Global pathspec switches git reads from the environment. Removed from every
+/// command GitSwitch runs (`GitCmd::prepare`), never from the person's own
+/// terminal (`inherited_git_env_to_strip` is that list's).
+pub(crate) const PATHSPEC_SWITCHES: [&str; 4] = ["GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"];
+
 /// Variables an inherited shell environment could use to redirect what the
 /// app's own git reads or measures — `npm run tauri dev` from a terminal
 /// inherits them all. None is something the app wants; `GIT_CONFIG_*` in
@@ -408,6 +413,14 @@ impl GitCmd {
             cmd.env_remove(key);
         }
         for key in &self.unset {
+            cmd.env_remove(key);
+        }
+        // Global pathspec switches a shell may export: the app marks its own
+        // paths (`:(literal)`, `:/`, `--literal-pathspecs`), and git reads
+        // `:(literal)` as part of the name under GIT_LITERAL_PATHSPECS=1, and
+        // dies on `--literal-pathspecs` with GIT_GLOB_ or GIT_ICASE_PATHSPECS=1.
+        // Always removed, set or not; a caller's own value (`env`) still comes last.
+        for key in PATHSPEC_SWITCHES {
             cmd.env_remove(key);
         }
         // A passive read never takes the optional index lock, so it never
@@ -2819,6 +2832,22 @@ mod tests {
         assert!(msg.contains("terminal") && msg.contains("profile"), "{}", msg);
         // The profile's own (global) ssh command is not a reason.
         assert!(transport_programs(&entries[..1]).is_empty());
+    }
+
+    /// L2: an inherited pathspec switch never reaches git; a caller's own
+    /// value still does. (Never set in this process: other tests run plain git.)
+    #[test]
+    fn inherited_pathspec_switches_never_reach_git() {
+        let env_of = |c: GitCmd| -> Vec<(String, Option<String>)> {
+            let (cmd, _) = c.prepare();
+            cmd.as_std().get_envs().map(|(k, v)| (k.to_string_lossy().to_string(), v.map(|v| v.to_string_lossy().to_string()))).collect()
+        };
+        let env = env_of(GitCmd::at("r").args(["rev-parse", "HEAD"]));
+        for key in PATHSPEC_SWITCHES {
+            assert!(env.contains(&(key.to_string(), None)), "{key} is removed: {env:?}");
+        }
+        let env = env_of(GitCmd::at("r").args(["rev-parse", "HEAD"]).env("GIT_LITERAL_PATHSPECS", "0"));
+        assert!(env.contains(&("GIT_LITERAL_PATHSPECS".to_string(), Some("0".to_string()))), "{env:?}");
     }
 
     #[test]
