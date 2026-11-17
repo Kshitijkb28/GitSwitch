@@ -544,6 +544,8 @@ export const SCENARIOS = {
   }),
 
   unpublished: status({ upstream: null, ahead: 2, last_fetch_secs: null }),
+  // A repository made here: no remote at all, so Publish asks for an address.
+  noRemote: status({ upstream: null, ahead: 0, last_fetch_secs: null, push: push({ remotes: [] }) }),
 
   truncated: status({
     entries: [entry({ path: "junk.txt", kind: "untracked", staged: ".", unstaged: "?" })],

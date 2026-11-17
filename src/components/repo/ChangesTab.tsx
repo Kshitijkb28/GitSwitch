@@ -25,6 +25,7 @@ import { ResetConfirmModal } from "../changes/ResetConfirmModal";
 import { DiscardAllModal } from "../changes/DiscardAllModal";
 import { AddRemoteModal } from "../changes/AddRemoteModal";
 import { cleanError } from "../github/shared";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { usePersistedState } from "../../lib/persist";
 import { canonicalJoin } from "../../lib/paths";
 import { useRefreshOnFocus } from "../../lib/focus";
@@ -107,6 +108,8 @@ export function ChangesTab({
   const [discardAllOpen, setDiscardAllOpen] = useState(false);
   /** Publish was refused for want of any remote: the address to add as origin. */
   const [addRemoteOpen, setAddRemoteOpen] = useState(false);
+  // Publish's "Change the address…": the remote a push found nothing at, and the address it had.
+  const [changeRemote, setChangeRemote] = useState<{ remote: string; from: string } | null>(null);
   const [tick, setTick] = useState(0);
   const [subRefresh, setSubRefresh] = useState(0);
   // Bumped by Refresh only: the pushing identity may ask github.com, which
@@ -630,6 +633,22 @@ export function ChangesTab({
     refusalCode === "no-remote" && status?.branch
       ? { label: "Add a remote…", primary: true, onClick: () => setAddRemoteOpen(true) }
       : undefined;
+  // A push or fetch that found no repository at the address: GitHub's form to
+  // create it (under the account's own name), and, while nothing was ever
+  // fetched from or pushed to that remote, a corrected address.
+  const createRepoUrl = result && !result.inside ? (result.advice?.link ?? null) : null;
+  const changeFrom =
+    result && !result.inside && result.advice?.action === "change-remote" && result.advice.remote
+      ? status?.push.remotes.find((r) => r.name === result.advice?.remote)
+      : undefined;
+  const missingRepoActions = [
+    ...(createRepoUrl
+      ? [{ label: "Create it on GitHub", primary: true, onClick: () => void openUrl(createRepoUrl).catch(() => toast.error(`Couldn't open the browser: open ${createRepoUrl} yourself.`)) }]
+      : []),
+    ...(changeFrom
+      ? [{ label: "Change the address…", primary: !createRepoUrl, onClick: () => setChangeRemote({ remote: changeFrom.name, from: changeFrom.fetch_url }) }]
+      : []),
+  ];
 
   return (
     <>
@@ -757,7 +776,7 @@ export function ChangesTab({
                 else void runLong("submodules", `Checking out the recorded commit${paths.length === 1 ? "" : "s"}…`, () => api.changesSubmoduleAlign(repoPath, paths));
               }}
               extraAction={markersAction ?? syncHandOff ?? movedAction ?? historyAction ?? publishAction ?? addRemoteAction}
-              extraActions={subPushActions}
+              extraActions={subPushActions ?? (missingRepoActions.length > 0 ? missingRepoActions : undefined)}
             />
           )}
 
@@ -939,15 +958,25 @@ export function ChangesTab({
             }
           />
           <AddRemoteModal
-            open={addRemoteOpen}
-            onCancel={() => setAddRemoteOpen(false)}
-            onConfirm={async (url) => {
-              try {
-                await api.changesAddRemote(repoPath, url);
-              } catch (e) {
-                return cleanError(e);
-              }
+            open={addRemoteOpen || changeRemote !== null}
+            mode={changeRemote ? "change" : "add"}
+            initialUrl={changeRemote?.from ?? ""}
+            onCancel={() => {
               setAddRemoteOpen(false);
+              setChangeRemote(null);
+            }}
+            onConfirm={async (url, allowExisting) => {
+              let check: api.RemoteCheck;
+              try {
+                check = changeRemote
+                  ? await api.changesChangeRemote(repoPath, changeRemote.remote, changeRemote.from, url, allowExisting)
+                  : await api.changesAddRemote(repoPath, url, allowExisting);
+              } catch (e) {
+                return { text: cleanError(e) };
+              }
+              if (!check.saved) return { text: check.problem, createUrl: check.create_url, existingBranches: check.existing_branches };
+              setAddRemoteOpen(false);
+              setChangeRemote(null);
               void runLong("push", "Publishing…", () => api.changesPush(repoPath, true));
               return null;
             }}

@@ -152,6 +152,7 @@ pub fn run() {
             commands::changes_commit,
             commands::changes_push,
             commands::changes_add_remote,
+            commands::changes_change_remote,
             commands::changes_pull,
             commands::changes_submodules,
             commands::changes_submodule_update,

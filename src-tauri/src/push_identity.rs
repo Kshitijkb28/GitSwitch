@@ -202,12 +202,27 @@ pub async fn push_identity(repo: &str, refresh: bool) -> Result<PushIdentity, Ap
             ..Default::default()
         });
     };
-    let masked = crate::cmdlog::redact(&url);
+    identity_for_url(repo, Some(remote), &url).await
+}
+
+/// Who a push to `remote` authenticates as (its push address), the way
+/// `push_identity` finds out; None when the remote has no address.
+pub async fn identity_of_remote(repo: &str, remote: &str) -> Option<PushIdentity> {
+    crate::git_exec::validate_remote_name(remote).ok()?;
+    let url = GitCmd::at(repo).args(["remote", "get-url", "--push", remote]).ok_text().await?;
+    identity_for_url(repo, Some(remote.to_string()), &url).await.ok()
+}
+
+/// Who `url` authenticates as from `repo`: for SSH, the key git names
+/// (core.sshCommand) or ssh's own choice, and what github.com says to it;
+/// for HTTPS, what the credential helpers hand out.
+pub async fn identity_for_url(repo: &str, remote: Option<String>, url: &str) -> Result<PushIdentity, AppError> {
+    let masked = crate::cmdlog::redact(url);
     // The profile that applies here — by folder, or by the remote rule that
     // git actually applied (seen in where user.email comes from).
     let expected_login = crate::git_status::profile_for_repo(repo).await.and_then(|p| p.github_login);
     let mut id = PushIdentity {
-        remote: Some(remote),
+        remote,
         url: Some(masked),
         expected_login,
         ..Default::default()
@@ -219,8 +234,8 @@ pub async fn push_identity(repo: &str, refresh: bool) -> Result<PushIdentity, Ap
         return Ok(id);
     }
     if url.starts_with("https://") || url.starts_with("http://") {
-        via_https(repo, &url, id).await
-    } else if let Some(remote) = crate::ssh_config::ssh_host_of_url(&url) {
+        via_https(repo, url, id).await
+    } else if let Some(remote) = crate::ssh_config::ssh_host_of_url(url) {
         via_ssh(repo, &remote, id).await
     } else {
         id.via = "local".into();

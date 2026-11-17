@@ -792,7 +792,52 @@ pub(crate) fn advice_ctx<'a>(status: &'a RepoStatus) -> AdviceCtx<'a> {
         url: status.push.remotes.first().map(|r| r.fetch_url.as_str()),
         branch: status.branch.as_deref(),
         remote: status.push.remotes.first().map(|r| r.name.as_str()),
+        login: None,
     }
+}
+
+/// A push or fetch that failed, explained. When GitHub answered "Repository
+/// not found" (its words both for a repository that doesn't exist and for
+/// one the account can't see), with the key used and the account it signs in
+/// as, asked only after such a failure and then cached: under that account's
+/// own name it means the repository doesn't exist. And when the address may
+/// be wrong while nothing was ever fetched from or pushed to that remote (so
+/// nothing depends on it yet), "Change the address…".
+pub(crate) async fn explain_transport_failure(repo_path: &str, op: GitOp, stderr: &str, remote: &str, after: &RepoStatus) -> Advice {
+    let id = if stderr.contains("Repository not found") {
+        Box::pin(crate::push_identity::identity_of_remote(repo_path, remote)).await
+    } else {
+        None
+    };
+    let mut ctx = advice_ctx(after);
+    ctx.remote = Some(remote);
+    if let Some(id) = &id {
+        ctx.key_path = id.key_path.as_deref();
+        ctx.login = id.login.as_deref();
+        if id.url.is_some() {
+            ctx.url = id.url.as_deref();
+        }
+    }
+    let mut a = git_advice::explain(op, stderr, &ctx);
+    if crate::sparse::address_may_be_wrong(stderr) && never_reached(repo_path, remote).await {
+        a.action = Some("change-remote".to_string());
+        a.remote = Some(remote.to_string());
+    }
+    a
+}
+
+/// Nothing was ever fetched from `remote` or pushed to it: it has no
+/// remote-tracking branch. Nothing depends on such a remote yet.
+async fn never_reached(repo_path: &str, remote: &str) -> bool {
+    if crate::git_exec::validate_remote_name(remote).is_err() {
+        return false;
+    }
+    GitCmd::at(repo_path)
+        .args(["for-each-ref", "--count=1", "--format=%(refname)", &format!("refs/remotes/{}/", remote)])
+        .timeout(LOCAL_TIMEOUT)
+        .ok_text()
+        .await
+        .is_some_and(|s| s.is_empty())
 }
 
 // --- Staging -------------------------------------------------------------
@@ -1503,19 +1548,133 @@ pub(crate) fn remote_url_problem(url: &str) -> Option<String> {
     Some("That doesn't look like a repository address. Use the HTTPS or SSH address from GitHub's green Code button, like git@github.com:you/repo.git.".into())
 }
 
-/// Connect a repository that has no remote yet to `url`, as `origin`: what
-/// Publish needs, without the terminal. Only for a repository with no remote
-/// at all; one that has some is never changed here.
-pub async fn add_origin(repo_path: &str, url: &str) -> Result<String, AppError> {
-    if let Some(problem) = remote_url_problem(url) {
-        return Err(AppError::Command(problem));
-    }
-    let url = url.trim();
+/// What Publish's address check found, for "Add and publish" and "Change
+/// and publish".
+#[derive(Debug, Serialize, Clone, Default, PartialEq)]
+pub struct RemoteCheck {
+    /// The address is saved: origin added, or the remote's address changed.
+    pub saved: bool,
+    /// Why it wasn't, in words. Empty when it was.
+    pub problem: String,
+    /// GitHub's new-repository form, filled in, when the repository doesn't
+    /// exist yet under the account the folder's key signs in as.
+    pub create_url: Option<String>,
+    /// The branches a repository that isn't empty already has, when this
+    /// branch isn't one of them: saved only once the person says to publish
+    /// there anyway.
+    pub existing_branches: Vec<String>,
+}
+
+/// How long the address check may take: a dialog is waiting for it.
+const ADDRESS_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// The names of this repository's remotes.
+async fn remote_names(repo_path: &str) -> Result<Vec<String>, AppError> {
     let listed = GitCmd::at(repo_path).args(["remote"]).timeout(LOCAL_TIMEOUT).run().await?;
     if !listed.ok() {
         return Err(AppError::Command(format!("GitSwitch couldn't read this repository's remotes: {}", listed.stderr.trim())));
     }
-    let remotes: Vec<String> = listed.text().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    Ok(listed.text().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+}
+
+/// Before an address is saved: is there a repository at it that this
+/// folder's key or sign-in can reach, and is it empty? `git ls-remote` from
+/// the folder, so the profile's key is the one asked; it writes nothing.
+/// None: go ahead.
+async fn check_address(repo_path: &str, url: &str, allow_existing: bool) -> Result<Option<RemoteCheck>, AppError> {
+    let ls = GitCmd::at(repo_path).args(["ls-remote", "--heads", "--", url]).timeout(ADDRESS_CHECK_TIMEOUT).run().await?;
+    if ls.ok() {
+        let branches: Vec<String> = ls
+            .text()
+            .lines()
+            .filter_map(|l| l.split('\t').nth(1))
+            .filter_map(|r| r.trim().strip_prefix("refs/heads/"))
+            .map(String::from)
+            .collect();
+        if branches.is_empty() || allow_existing {
+            return Ok(None);
+        }
+        let mine = GitCmd::at(repo_path).args(["symbolic-ref", "-q", "--short", "HEAD"]).timeout(LOCAL_TIMEOUT).ok_text().await.unwrap_or_default();
+        return Ok(Some(not_empty(&branches, &mine)));
+    }
+    let said = ls.stderr.trim().to_string();
+    // "Repository not found": the key, and the account it signs in as, tell
+    // a repository that doesn't exist from one out of this account's reach.
+    let id = if said.contains("Repository not found") {
+        Box::pin(crate::push_identity::identity_for_url(repo_path, None, url)).await.ok()
+    } else {
+        None
+    };
+    let login = id.as_ref().and_then(|i| i.login.as_deref());
+    let key = id.as_ref().and_then(|i| i.key_path.as_deref());
+    if crate::sparse::missing_own_repository(&said, url, login) {
+        let full = crate::repo_scan::parse_github_owner_name(url).map(|(o, n)| format!("{}/{}", o, n)).unwrap_or_default();
+        let the_key = key.map(|k| format!("the key {}", crate::paths::base_name(k))).unwrap_or_else(|| "this folder's key".to_string());
+        return Ok(Some(RemoteCheck {
+            problem: format!(
+                "There's no repository {} on GitHub yet: {} signs in as {}, who would see it even if it were private. Create it there (empty: no README, licence or .gitignore), then publish again.",
+                full,
+                the_key,
+                login.unwrap_or_default()
+            ),
+            create_url: crate::sparse::github_create_url(url),
+            ..Default::default()
+        }));
+    }
+    let explained = crate::sparse::explain_transport_error_as(&said, key, url, false, login);
+    let hint = explained.split("\n\ngit said:").next().unwrap_or(&explained).trim().to_string();
+    let problem = if explained.trim() == said || hint.is_empty() {
+        format!("GitSwitch couldn't reach a repository at that address. git said: {}", said)
+    } else {
+        hint
+    };
+    Ok(Some(RemoteCheck { problem, ..Default::default() }))
+}
+
+/// The words for a repository that already has branches. With this branch
+/// among them a publish would be refused, so nothing is offered.
+fn not_empty(branches: &[String], mine: &str) -> RemoteCheck {
+    if !mine.is_empty() && branches.iter().any(|b| b == mine) {
+        let others = match branches.len() - 1 {
+            0 => String::new(),
+            1 => " (and one more)".to_string(),
+            n => format!(" (and {} more)", n),
+        };
+        return RemoteCheck {
+            problem: format!(
+                "That repository isn't empty: it already has a branch {}{} with commits of its own, so publishing {} there would be refused. Use an empty repository instead (no README, licence or .gitignore).",
+                mine, others, mine
+            ),
+            ..Default::default()
+        };
+    }
+    let shown = if branches.len() <= 4 { branches.join(", ") } else { format!("{}, and {} more", branches[..3].join(", "), branches.len() - 3) };
+    let has = if branches.len() == 1 { format!("a branch ({})", shown) } else { format!("{} branches ({})", branches.len(), shown) };
+    let this = if mine.is_empty() { "this branch" } else { mine };
+    RemoteCheck {
+        problem: format!(
+            "That repository isn't empty: it already has {}. Publishing puts {} there beside {}, with a history of its own. Use an empty repository instead (no README, licence or .gitignore), or publish there anyway.",
+            has,
+            this,
+            if branches.len() == 1 { "it" } else { "them" }
+        ),
+        existing_branches: branches.to_vec(),
+        ..Default::default()
+    }
+}
+
+/// Connect a repository that has no remote yet to `url`, as `origin`: what
+/// Publish needs, without the terminal. Only for a repository with no remote
+/// at all; one that has some is never changed here. The address is checked
+/// first, and nothing is saved unless a repository is there that this
+/// folder's key or sign-in can reach (and, when it has branches already,
+/// only on the person's word: `allow_existing`).
+pub async fn add_origin(repo_path: &str, url: &str, allow_existing: bool) -> Result<RemoteCheck, AppError> {
+    if let Some(problem) = remote_url_problem(url) {
+        return Err(AppError::Command(problem));
+    }
+    let url = url.trim();
+    let remotes = remote_names(repo_path).await?;
     if let Some(first) = remotes.first() {
         return Err(AppError::Command(format!(
             "This repository already has a remote ({}), so Publish uses it. If its address is wrong, change it in the terminal: `git remote set-url {} <url>`.",
@@ -1523,11 +1682,61 @@ pub async fn add_origin(repo_path: &str, url: &str) -> Result<String, AppError> 
             first
         )));
     }
+    if let Some(refused) = Box::pin(check_address(repo_path, url, allow_existing)).await? {
+        return Ok(refused);
+    }
     let out = GitCmd::at(repo_path).args(["remote", "add", "--", "origin", url]).timeout(LOCAL_TIMEOUT).run().await?;
     if !out.ok() {
         return Err(AppError::Command(format!("git remote add failed: {}", out.stderr.trim())));
     }
-    Ok(format!("Connected to {} as origin.", url))
+    Ok(RemoteCheck { saved: true, ..Default::default() })
+}
+
+/// A new address for `remote`: Publish's "Change the address…", after a push
+/// found nothing at the old one. Only while the remote still has the address
+/// `from` that the person saw, has no separate push address, and was never
+/// fetched from or pushed to: a remote that something depends on is never
+/// changed here. The new address is checked first, as `add_origin` does.
+pub async fn change_remote_address(repo_path: &str, remote: &str, from: &str, url: &str, allow_existing: bool) -> Result<RemoteCheck, AppError> {
+    if let Some(problem) = remote_url_problem(url) {
+        return Err(AppError::Command(problem));
+    }
+    crate::git_exec::validate_remote_name(remote)?;
+    let url = url.trim();
+    if !remote_names(repo_path).await?.iter().any(|r| r == remote) {
+        return Err(AppError::Command(format!("This repository has no remote named {} any more.", remote)));
+    }
+    let current = GitCmd::at(repo_path).args(["remote", "get-url", remote]).timeout(LOCAL_TIMEOUT).ok_text().await.unwrap_or_default();
+    let current_push = GitCmd::at(repo_path).args(["remote", "get-url", "--push", remote]).timeout(LOCAL_TIMEOUT).ok_text().await.unwrap_or_default();
+    // What the person saw is the address as the status shows it: tokens masked.
+    let from = from.trim();
+    if current != from && crate::repo_scan::mask_token(&current) != from {
+        return Err(AppError::Command(format!(
+            "The address of {} has changed meanwhile (it is now {}). Close this and try again.",
+            remote,
+            crate::repo_scan::mask_token(&current)
+        )));
+    }
+    if current_push != current {
+        return Err(AppError::Command(format!(
+            "{} has a separate address for pushes, so GitSwitch leaves it alone. Change it in the terminal: `git remote set-url --push {} <url>`.",
+            remote, remote
+        )));
+    }
+    if !never_reached(repo_path, remote).await {
+        return Err(AppError::Command(format!(
+            "{} has been fetched from or pushed to, so GitSwitch leaves its address alone. To change it anyway, in the terminal: `git remote set-url {} <url>`.",
+            remote, remote
+        )));
+    }
+    if let Some(refused) = Box::pin(check_address(repo_path, url, allow_existing)).await? {
+        return Ok(refused);
+    }
+    let out = GitCmd::at(repo_path).args(["remote", "set-url", "--", remote, url]).timeout(LOCAL_TIMEOUT).run().await?;
+    if !out.ok() {
+        return Err(AppError::Command(format!("git remote set-url failed: {}", out.stderr.trim())));
+    }
+    Ok(RemoteCheck { saved: true, ..Default::default() })
 }
 
 /// Where a push goes, by the same rules as git's default (`push.default =
@@ -1788,9 +1997,7 @@ pub async fn push(repo_path: &str, set_upstream: bool, allow_unpushed_submodules
 
     let after = snapshot(repo_path).await?;
     if !out.ok() {
-        let mut ctx = advice_ctx(&after);
-        ctx.remote = Some(&remote);
-        let a = git_advice::explain(GitOp::Push, &out.stderr, &ctx);
+        let a = Box::pin(explain_transport_failure(repo_path, GitOp::Push, &out.stderr, &remote, &after)).await;
         return Ok(OpResult::failed(a, after));
     }
 
@@ -1935,7 +2142,7 @@ async fn pull_integrate(repo_path: &str, before: RepoStatus, mode: PullMode, wit
     }
     if !fetched.ok() {
         let after = snapshot(repo_path).await?;
-        let a = git_advice::explain(GitOp::Fetch, &fetched.stderr, &advice_ctx(&after));
+        let a = Box::pin(explain_transport_failure(repo_path, GitOp::Fetch, &fetched.stderr, &remote, &after)).await;
         return Ok(OpResult::failed(a, after));
     }
 
@@ -2294,6 +2501,8 @@ pub async fn submodule_update(repo_path: &str, paths: Option<Vec<String>>) -> Re
             headline: "Not every submodule reached the commit this repository records.".to_string(),
             guidance: format!("Not moved: {}. {}", stuck.join("; "), detail).trim().to_string(),
             action: None,
+            link: None,
+            remote: None,
             git_said: String::new(),
         };
         return Ok(OpResult { submodules: Some(report), ..OpResult::failed(advice, after) });
@@ -3968,5 +4177,31 @@ mod remote_url_tests {
             let p = remote_url_problem(bad).unwrap_or_else(|| panic!("{bad:?} should be refused"));
             assert!(p.contains(says), "{bad:?}: {p}");
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_check_tests {
+    use super::not_empty;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_repository_with_other_branches_is_offered_only_on_the_persons_word() {
+        let r = not_empty(&names(&["dev"]), "main");
+        assert!(!r.saved && r.existing_branches == names(&["dev"]), "{r:?}");
+        assert!(r.problem.contains("a branch (dev)") && r.problem.contains("puts main there beside it") && r.problem.contains("publish there anyway"), "{}", r.problem);
+        let many = not_empty(&names(&["a", "b", "c", "d", "e"]), "main");
+        assert!(many.problem.contains("5 branches (a, b, c, and 2 more)") && many.problem.contains("beside them"), "{}", many.problem);
+    }
+
+    #[test]
+    fn a_repository_that_has_this_branch_already_is_refused_with_nothing_to_offer() {
+        let r = not_empty(&names(&["main"]), "main");
+        assert!(r.existing_branches.is_empty() && r.problem.contains("a branch main with commits of its own") && r.problem.contains("would be refused"), "{r:?}");
+        let r = not_empty(&names(&["dev", "main", "x"]), "main");
+        assert!(r.existing_branches.is_empty() && r.problem.contains("a branch main (and 2 more)"), "{}", r.problem);
     }
 }

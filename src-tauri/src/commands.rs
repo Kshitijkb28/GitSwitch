@@ -1266,10 +1266,19 @@ pub async fn changes_push(repo_path: String, set_upstream: bool, allow_unpushed_
 
 /// Connect a repository that has no remote yet to an address, as origin:
 /// Publish's "Add a remote…", so a repository made here can be published
-/// without the terminal.
+/// without the terminal. The address is checked before anything is saved;
+/// `allow_existing`: save it although the repository there has branches.
 #[tauri::command]
-pub async fn changes_add_remote(repo_path: String, url: String) -> Result<String, AppError> {
-    git_ops::add_origin(&repo_path, &url).await
+pub async fn changes_add_remote(repo_path: String, url: String, allow_existing: Option<bool>) -> Result<git_ops::RemoteCheck, AppError> {
+    Box::pin(git_ops::add_origin(&repo_path, &url, allow_existing.unwrap_or(false))).await
+}
+
+/// Publish's "Change the address…": a new address for a remote that a push
+/// found nothing at, while it still has the address `from` and was never
+/// fetched from or pushed to. Checked before it is saved, as above.
+#[tauri::command]
+pub async fn changes_change_remote(repo_path: String, remote: String, from: String, url: String, allow_existing: Option<bool>) -> Result<git_ops::RemoteCheck, AppError> {
+    Box::pin(git_ops::change_remote_address(&repo_path, &remote, &from, &url, allow_existing.unwrap_or(false))).await
 }
 
 /// `mode` is one of "ff-only", "merge", "rebase" — chosen by the user, never

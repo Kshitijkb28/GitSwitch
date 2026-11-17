@@ -1641,6 +1641,10 @@ export interface Advice {
   headline: string;
   guidance: string;
   action: string | null;
+  /** The page the action's button opens (GitHub's new-repository form, filled in). */
+  link?: string | null;
+  /** The remote the action acts on. */
+  remote?: string | null;
   git_said: string;
 }
 
@@ -2344,9 +2348,24 @@ export async function changesCommit(
   return invoke("changes_commit", { repoPath, message, amend });
 }
 
-/** Connect a repository that has no remote yet to `url`, as origin (Publish's "Add a remote…"). */
-export async function changesAddRemote(repoPath: string, url: string): Promise<string> {
-  return invoke("changes_add_remote", { repoPath, url });
+/** What Publish's address check found: saved, or why not. */
+export interface RemoteCheck {
+  saved: boolean;
+  problem: string;
+  /** GitHub's new-repository form, filled in: the repository doesn't exist yet under the folder's account. */
+  create_url: string | null;
+  /** A non-empty repository's branches, when this branch isn't one of them: "Publish there anyway" is offered. */
+  existing_branches: string[];
+}
+
+/** Connect a repository that has no remote yet to `url`, as origin, once the address is checked (Publish's "Add a remote…"). */
+export async function changesAddRemote(repoPath: string, url: string, allowExisting = false): Promise<RemoteCheck> {
+  return invoke("changes_add_remote", { repoPath, url, allowExisting });
+}
+
+/** A new address for `remote`, which still has the address `from` and was never reached (Publish's "Change the address…"); checked before it is saved. */
+export async function changesChangeRemote(repoPath: string, remote: string, from: string, url: string, allowExisting = false): Promise<RemoteCheck> {
+  return invoke("changes_change_remote", { repoPath, remote, from, url, allowExisting });
 }
 
 /** `allowUnpushedSubmodules`: push although a submodule's recorded commit is on none of that submodule's remotes. */

@@ -65,6 +65,8 @@ async function openPage(browser, server, scenario, opts = {}) {
     repairLockResult: opts.repairLockResult ?? null,
     pushResult: opts.pushResult ?? null,
     subPushResult: opts.subPushResult ?? null,
+    // Publish's address checks to answer, in order (then: saved).
+    addressChecks: opts.addressChecks ?? [],
     consoleEntries: opts.consoleEntries ?? [],
     lfsListing: opts.lfsListing ?? LFS_LISTING,
     lfsProgress: opts.lfsProgress ?? null,
@@ -564,6 +566,12 @@ async function openPage(browser, server, scenario, opts = {}) {
               const gh = (window.__GH__ ??= JSON.parse(JSON.stringify(cfg.gh)));
               gh.people.invitations = gh.people.invitations.filter((i) => i.id !== args.id);
               return Promise.resolve(null);
+            }
+            case "changes_add_remote":
+            case "changes_change_remote": {
+              // The address checks to answer, in order; then: saved.
+              const queue = (window.__ADDRESS_CHECKS__ ??= [...(cfg.addressChecks ?? [])]);
+              return Promise.resolve(queue.length ? queue.shift() : { saved: true, problem: "", create_url: null, existing_branches: [] });
             }
             case "plugin:opener|open_url":
               return Promise.resolve(null);
@@ -2381,6 +2389,67 @@ try {
     const page = await open(SCENARIOS.submodules, { submodules: [] });
     await sleep(300);
     ok("no submodule card when the repo has no gitlinks", !(await text(page)).includes("Submodules"));
+    await page.close();
+  }
+
+  // -----------------------------------------------------------------
+  section("Publish: the address is checked before it is saved");
+  {
+    const noRemote = { ok: false, headline: "This repository isn't on a server yet.", detail: "", refusal: { code: "no-remote", message: "This repository isn't on a server yet: it has no remote to push to. Add one (the address of an empty repository) and publish there." } };
+    const missing = { saved: false, problem: "There's no repository me/brand-new on GitHub yet: the key id_me signs in as me, who would see it even if it were private. Create it there (empty: no README, licence or .gitignore), then publish again.", create_url: "https://github.com/new?owner=me&name=brand-new&visibility=private", existing_branches: [] };
+    const notEmpty = { saved: false, problem: "That repository isn't empty: it already has a branch (dev). Publishing puts main there beside it, with a history of its own. Use an empty repository instead (no README, licence or .gitignore), or publish there anyway.", create_url: null, existing_branches: ["dev"] };
+    const page = await open(SCENARIOS.noRemote, { pushResult: noRemote, addressChecks: [missing, notEmpty] });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("Add a remote"), { timeout: 4000 });
+    await (await button(page, "Add a remote")).click();
+    await page.waitForSelector('input[aria-label="Remote address"]', { timeout: 4000 });
+    await page.type('input[aria-label="Remote address"]', "git@github.com:me/brand-new.git");
+    await (await button(page, "Add and publish")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("There's no repository me/brand-new on GitHub yet"), { timeout: 4000 });
+    const pushes = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length);
+    ok("an address with no repository behind it is not saved: the dialog says so, stays open and publishes nothing", (await text(page)).includes("Create it on GitHub") && pushes === 1, `pushes=${pushes}`);
+    await (await button(page, "Create it on GitHub")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "plugin:opener|open_url"), { timeout: 4000 });
+    const opened = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "plugin:opener|open_url")?.args ?? null);
+    ok("  Create it on GitHub opens GitHub's form, filled in", JSON.stringify(opened ?? {}).includes("github.com/new?owner=me&name=brand-new&visibility=private"), JSON.stringify(opened));
+    await (await button(page, "Add and publish")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("isn't empty"), { timeout: 4000 });
+    ok("a repository that already has branches is not saved without the person's word", (await text(page)).includes("Publish there anyway"));
+    await (await button(page, "Publish there anyway")).click();
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_add_remote").length >= 3, { timeout: 4000 });
+    const adds = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_add_remote").map((c) => c.args));
+    ok("  Publish there anyway sends the person's word, for the same address", adds.length === 3 && adds[2].allowExisting === true && adds[2].url === "git@github.com:me/brand-new.git" && adds[0].allowExisting === false, JSON.stringify(adds));
+    await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 2, { timeout: 4000 });
+    const last = await page.evaluate(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").at(-1).args);
+    ok("  once saved, the branch is published", last.setUpstream === true, JSON.stringify(last));
+    await page.close();
+  }
+  {
+    // A push that found no repository at an address nothing was ever fetched from or pushed to.
+    const guidance = "There's no repository me/gitswitch on GitHub: the SSH key id_me signs in as me, who would see it even if it were private. If it's new, create it on GitHub (empty: no README, licence or .gitignore), then try again; otherwise the address is wrong, or the repository was deleted.";
+    const failed = {
+      ok: false,
+      headline: "GitHub has no repository at this address.",
+      detail: guidance,
+      advice: { headline: "GitHub has no repository at this address.", guidance, action: "change-remote", link: "https://github.com/new?owner=me&name=gitswitch&visibility=private", remote: "origin", git_said: "ERROR: Repository not found." },
+    };
+    const page = await open(SCENARIOS.unpublished, { pushResult: failed });
+    await (await button(page, "Publish branch")).click();
+    await page.waitForFunction(() => document.body.innerText.includes("GitHub has no repository at this address"), { timeout: 4000 });
+    const s = await text(page);
+    ok("a push that found no repository offers to create it and to correct the address", s.includes("Create it on GitHub") && s.includes("Change the address"));
+    await (await button(page, "Change the address")).click();
+    await page.waitForSelector('input[aria-label="Remote address"]', { timeout: 4000 });
+    const prefilled = await page.$eval('input[aria-label="Remote address"]', (el) => el.value);
+    ok("  the dialog starts from the remote's current address", prefilled === "git@github.com:me/gitswitch.git", prefilled);
+    await page.click('input[aria-label="Remote address"]', { clickCount: 3 });
+    await page.keyboard.type("git@github.com:me/gitswitch-app.git");
+    await (await button(page, "Change and publish")).click();
+    await page.waitForFunction(() => window.__CALLS__.some((c) => c.cmd === "changes_change_remote"), { timeout: 4000 });
+    const change = await page.evaluate(() => window.__CALLS__.find((c) => c.cmd === "changes_change_remote").args);
+    ok("  Change and publish names the remote and the address it replaces", change.remote === "origin" && change.from === "git@github.com:me/gitswitch.git" && change.url === "git@github.com:me/gitswitch-app.git" && change.allowExisting === false, JSON.stringify(change));
+    const published = await page.waitForFunction(() => window.__CALLS__.filter((c) => c.cmd === "changes_push").length >= 2, { timeout: 4000 }).then(() => true, () => false);
+    ok("  then publishes", published);
     await page.close();
   }
 

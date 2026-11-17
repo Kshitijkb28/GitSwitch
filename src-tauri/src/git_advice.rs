@@ -54,6 +54,9 @@ pub struct AdviceCtx<'a> {
     pub url: Option<&'a str>,
     pub branch: Option<&'a str>,
     pub remote: Option<&'a str>,
+    /// The GitHub account the key signs in as, when it was asked (after
+    /// GitHub answered "Repository not found").
+    pub login: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq)]
@@ -62,6 +65,11 @@ pub struct Advice {
     pub guidance: String,
     /// Stable id the UI maps to a button. `None` means there is nothing to offer.
     pub action: Option<String>,
+    /// The page the action's button opens (GitHub's new-repository form,
+    /// filled in), when there is one.
+    pub link: Option<String>,
+    /// The remote the action acts on.
+    pub remote: Option<String>,
     pub git_said: String,
 }
 
@@ -70,6 +78,8 @@ fn advice(headline: &str, guidance: &str, action: Option<&str>, stderr: &str) ->
         headline: headline.to_string(),
         guidance: guidance.to_string(),
         action: action.map(|s| s.to_string()),
+        link: None,
+        remote: None,
         git_said: stderr.trim().to_string(),
     }
 }
@@ -554,7 +564,8 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
 
     // --- Transport: reuse the clone explainer rather than restate it, in
     // this operation's words (no "Clone as" here: the folder's profile decides) ---
-    let delegated = crate::sparse::explain_transport_error(s, ctx.key_path, ctx.url.unwrap_or(""), false);
+    let url = ctx.url.unwrap_or("");
+    let delegated = crate::sparse::explain_transport_error_as(s, ctx.key_path, url, false, ctx.login);
     if delegated.trim() != s.trim() {
         // It recognised the failure; it already ends with "git said: …".
         let hint = delegated
@@ -562,14 +573,21 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
             .next()
             .unwrap_or(&delegated)
             .to_string();
+        // No repository under the account's own name: GitHub's form to
+        // create it, filled in.
+        let missing = crate::sparse::missing_own_repository(s, url, ctx.login);
         return Advice {
             headline: if crate::sparse::network_failure(s).is_some() {
                 format!("The {} couldn't reach the server.", op.noun())
+            } else if missing {
+                "GitHub has no repository at this address.".to_string()
             } else {
                 format!("The {} was refused.", op.noun())
             },
             guidance: hint,
             action: None,
+            link: if missing { crate::sparse::github_create_url(url) } else { None },
+            remote: ctx.remote.map(String::from),
             git_said: s.trim().to_string(),
         };
     }
@@ -578,6 +596,8 @@ pub fn explain(op: GitOp, stderr: &str, ctx: &AdviceCtx) -> Advice {
         headline: format!("The {} failed.", op.noun()),
         guidance: String::new(),
         action: None,
+        link: None,
+        remote: None,
         git_said: s.trim().to_string(),
     }
 }
@@ -593,6 +613,21 @@ mod tests {
 
     fn ctx() -> AdviceCtx<'static> {
         AdviceCtx::default()
+    }
+
+    #[test]
+    fn a_push_to_a_repository_its_own_account_lacks_offers_to_create_it() {
+        let said = "ERROR: Repository not found.\nfatal: Could not read from remote repository.";
+        let own = AdviceCtx { url: Some("git@github.com:Me/brand-new.git"), login: Some("me"), key_path: Some("/k/id_me"), remote: Some("origin"), ..Default::default() };
+        let a = explain(GitOp::Push, said, &own);
+        assert_eq!(a.headline, "GitHub has no repository at this address.");
+        assert!(a.guidance.contains("There's no repository Me/brand-new on GitHub") && a.guidance.contains("id_me"), "{}", a.guidance);
+        assert_eq!(a.link.as_deref(), Some("https://github.com/new?owner=Me&name=brand-new&visibility=private"));
+        assert_eq!(a.remote.as_deref(), Some("origin"));
+        // Someone else's: refused, and no form.
+        let other = explain(GitOp::Push, said, &AdviceCtx { login: Some("someone-else"), ..own.clone() });
+        assert_eq!(other.headline, "The push was refused.");
+        assert!(other.link.is_none() && other.guidance.contains("doesn't exist (check the address)"), "{}", other.guidance);
     }
 
     #[test]

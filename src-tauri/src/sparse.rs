@@ -1589,22 +1589,46 @@ pub(crate) fn explain_transport_error_as(stderr: &str, key: Option<&str>, url: &
         } else {
             format!("GitHub refused {}. Either it isn't registered on the GitHub account, or the organization doesn't accept it (see below). Register it from SSH Keys, or check in Profiles which profile this folder belongs to — its key is the one used here.", the_key)
         }
-    } else if stderr.contains("Repository not found") || stderr.contains("Could not read from remote repository") {
-        // Named, the account is most often the answer: the access is on
-        // another account of the person's, or an invitation to this one was
-        // never accepted.
-        let who = match login {
-            Some(l) => format!("GitHub accepted {}, which signs in as {}, but said this repository isn't there for it.", the_key, l),
-            None => format!("GitHub accepted {}, but said this repository isn't there for its account.", the_key),
-        };
-        let invited = match login {
-            Some(l) => format!("The usual reason: an app added this key to your GitHub account (GitSwitch does when it registers a key for you), and the repository's organization restricts third-party apps, which GitHub does by default for new organizations, so it hides its private repositories from such keys. Fix it on GitHub: in Settings → SSH and GPG keys, delete this key and add it again by hand (New SSH key, paste the .pub file), or ask the organization to approve GitSwitch. Otherwise {} has no access to it: the address is wrong, or an invitation was never accepted (accept it while signed in as {}).", l, l),
-            None => "The usual reason: an app added this key to your GitHub account (GitSwitch does when it registers a key for you), and the repository's organization restricts third-party apps, which GitHub does by default for new organizations, so it hides its private repositories from such keys. Fix it on GitHub: in Settings → SSH and GPG keys, delete this key and add it again by hand (New SSH key, paste the .pub file), or ask the organization to approve GitSwitch. Otherwise the account has no access to it: the address is wrong, or an invitation was never accepted.".to_string(),
-        };
+    } else if stderr.contains("does not appear to be a git repository") {
+        format!("There's no repository at this address. Check it for a typo; for a folder, it must be the repository's own folder. Then {}.", then)
+    } else if missing_own_repository(stderr, url, login) {
+        // An account sees its own repositories, private ones included, and no
+        // organization's app restriction applies to them: GitHub saying one
+        // isn't there for its owner means it doesn't exist (not yet, or not
+        // any more), not that access is missing.
+        let full = crate::repo_scan::parse_github_owner_name(url).map(|(o, n)| format!("{}/{}", o, n)).unwrap_or_default();
+        let l = login.unwrap_or_default();
         if for_clone {
-            format!("{} {} If your access is on another GitHub account, add a profile for that account (with an SSH key registered on it), then pick it under \"Clone as\".", who, invited)
+            format!("There's no repository {} on GitHub: {} signs in as {}, who would see it even if it were private. The address is wrong, or the repository was deleted: copy the address again from its page (the green Code button).", full, the_key, l)
         } else {
-            format!("{} {} Or check in Profiles that this folder belongs to the profile whose account has access.", who, invited)
+            format!("There's no repository {} on GitHub: {} signs in as {}, who would see it even if it were private. If it's new, create it on GitHub (empty: no README, licence or .gitignore), then {}; otherwise the address is wrong, or the repository was deleted.", full, the_key, l, then)
+        }
+    } else if stderr.contains("Repository not found") || stderr.contains("Could not read from remote repository") {
+        // Not the account's own: the address, the access, or (on GitHub) an
+        // organization that hides its private repositories from keys an app
+        // added. The address comes first: GitHub says the same words for a
+        // repository that doesn't exist.
+        let on_github = crate::repo_scan::parse_github_owner_name(url).is_some();
+        let server = if on_github { "GitHub" } else { "The server" };
+        let who = match login {
+            Some(l) => format!("{} accepted {}, which signs in as {}, but said this repository isn't there for it.", server, the_key, l),
+            None => format!("{} accepted {}, but said this repository isn't there for its account.", server, the_key),
+        };
+        let account = login.map(String::from).unwrap_or_else(|| "the account".to_string());
+        let invitation = match login {
+            Some(l) => format!("the invitation was never accepted (accept it while signed in as {})", l),
+            None => "the invitation was never accepted".to_string(),
+        };
+        let apps = if on_github {
+            ", or the repository belongs to an organization that restricts third-party apps (GitHub's default for new organizations), which hides its private repositories from keys an app added to the account (GitSwitch used to, when it registered a key with its own sign-in). For that one, on GitHub: in Settings → SSH and GPG keys, delete this key and add it again by hand (New SSH key, paste the .pub file), or ask the organization to approve GitSwitch."
+        } else {
+            "."
+        };
+        let why = format!("Either it doesn't exist (check the address), or {} has no access to it: {}{}", account, invitation, apps);
+        if for_clone {
+            format!("{} {} If your access is on another GitHub account, add a profile for that account (with an SSH key registered on it), then pick it under \"Clone as\".", who, why)
+        } else {
+            format!("{} {} Or check in Profiles that this folder belongs to the profile whose account has access.", who, why)
         }
     } else if stderr.contains("could not read Username") || stderr.contains("terminal prompts disabled") {
         "This HTTPS URL needs a username and password, which GitSwitch can't type in for you. Use the SSH URL (git@github.com:owner/repo.git) instead.".to_string()
@@ -1632,6 +1656,36 @@ pub(crate) fn explain_transport_error_as(stderr: &str, key: Option<&str>, url: &
     } else {
         format!("{}\n\ngit said: {}", hint.trim_start(), stderr.trim())
     }
+}
+
+/// GitHub said a repository under `login`'s own account isn't there: it
+/// doesn't exist. An account sees its own repositories, private ones
+/// included, and no organization's app restriction applies to them.
+pub(crate) fn missing_own_repository(stderr: &str, url: &str, login: Option<&str>) -> bool {
+    stderr.contains("Repository not found")
+        && match (crate::repo_scan::parse_github_owner_name(url), login) {
+            (Some((owner, _)), Some(l)) => owner.eq_ignore_ascii_case(l),
+            _ => false,
+        }
+}
+
+/// GitHub's new-repository form, filled in with `url`'s owner and name and
+/// set to private (the person can change both there), or None when `url`
+/// isn't a GitHub address with a plain owner and name.
+pub(crate) fn github_create_url(url: &str) -> Option<String> {
+    let (owner, name) = crate::repo_scan::parse_github_owner_name(url)?;
+    let plain = |s: &str| !s.is_empty() && s.len() <= 100 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    (plain(&owner) && plain(&name)).then(|| format!("https://github.com/new?owner={}&name={}&visibility=private", owner, name))
+}
+
+/// A failure that can mean the address itself is wrong: no repository
+/// there, or no such server.
+pub(crate) fn address_may_be_wrong(stderr: &str) -> bool {
+    stderr.contains("Repository not found")
+        || stderr.contains("does not appear to be a git repository")
+        || stderr.contains("Could not resolve hostname")
+        || stderr.contains("Could not resolve host:")
+        || (stderr.contains("fatal: repository '") && stderr.contains("' not found"))
 }
 
 #[derive(Debug, Serialize)]
@@ -2154,6 +2208,50 @@ mod tests {
         assert!(unknown.contains("isn't there for its account") && unknown.contains("restricts third-party apps") && !unknown.contains("signs in as"), "{unknown}");
         let push = explain_transport_error_as(stderr, key, "git@github.com:Org/app.git", false, Some("me-on-github"));
         assert!(push.contains("signs in as me-on-github") && push.contains("Profiles") && !push.contains("Clone as"), "{push}");
+    }
+
+    #[test]
+    fn a_repository_missing_from_its_own_account_is_called_missing_not_hidden() {
+        let stderr = "ERROR: Repository not found.\nfatal: Could not read from remote repository.";
+        let key = Some("C:/Users/me/.ssh/id_ed25519_me");
+        let url = "git@github.com:Me-On-GitHub/Subtitle_Maker.git";
+        let push = explain_transport_error_as(stderr, key, url, false, Some("me-on-github"));
+        assert!(push.contains("There's no repository Me-On-GitHub/Subtitle_Maker on GitHub") && push.contains("signs in as me-on-github") && push.contains("create it on GitHub") && push.contains("id_ed25519_me"), "{push}");
+        assert!(!push.contains("third-party") && !push.contains("invitation"), "an account's own repository is never hidden from it: {push}");
+        let clone = explain_clone_error_as(stderr, key, url, Some("me-on-github"));
+        assert!(clone.contains("There's no repository") && clone.contains("address is wrong") && !clone.contains("create it"), "{clone}");
+        // Someone else's (or an organization's) keeps every way out, the address first.
+        let other = explain_transport_error_as(stderr, key, "git@github.com:Org/app.git", false, Some("me-on-github"));
+        assert!(other.contains("doesn't exist (check the address)") && other.contains("restricts third-party apps") && !other.contains("There's no repository"), "{other}");
+        // Without the account, nothing is claimed about existence.
+        let unknown = explain_transport_error_as(stderr, key, url, false, None);
+        assert!(!unknown.contains("There's no repository") && unknown.contains("isn't there for its account"), "{unknown}");
+        // A server that isn't GitHub is neither called GitHub nor given GitHub's organizations.
+        let other_server = explain_transport_error_as("ERROR: The project you were looking for could not be found.\nfatal: Could not read from remote repository.", key, "git@gitlab.com:me/app.git", false, None);
+        assert!(other_server.contains("The server accepted") && !other_server.contains("third-party"), "{other_server}");
+        // No repository at a folder's path.
+        let local = explain_transport_error("fatal: 'C:/repos/x.git' does not appear to be a git repository\nfatal: Could not read from remote repository.", None, "C:/repos/x.git", false);
+        assert!(local.contains("There's no repository at this address") && !local.contains("GitHub"), "{local}");
+    }
+
+    #[test]
+    fn the_new_repository_form_is_filled_in_only_for_plain_github_names() {
+        assert_eq!(github_create_url("git@github.com:Kshitijkb28/Subtitle_Maker.git").as_deref(), Some("https://github.com/new?owner=Kshitijkb28&name=Subtitle_Maker&visibility=private"));
+        assert_eq!(github_create_url("https://github.com/me/app").as_deref(), Some("https://github.com/new?owner=me&name=app&visibility=private"));
+        assert_eq!(github_create_url("ssh://git@ssh.github.com:443/me/app.git").as_deref(), Some("https://github.com/new?owner=me&name=app&visibility=private"));
+        assert_eq!(github_create_url("git@gitlab.com:me/app.git"), None);
+        assert_eq!(github_create_url("git@github.com:me/a&b=c.git"), None, "nothing that could add a parameter");
+        assert_eq!(github_create_url("C:/repos/app.git"), None);
+    }
+
+    #[test]
+    fn a_wrong_address_is_told_from_other_failures() {
+        assert!(address_may_be_wrong("ERROR: Repository not found.\nfatal: Could not read from remote repository."));
+        assert!(address_may_be_wrong("fatal: '/x/y.git' does not appear to be a git repository"));
+        assert!(address_may_be_wrong("ssh: Could not resolve hostname githb.com: No such host is known."));
+        assert!(address_may_be_wrong("remote: Not Found\nfatal: repository 'https://example.com/x.git/' not found"));
+        assert!(!address_may_be_wrong("git@github.com: Permission denied (publickey)."));
+        assert!(!address_may_be_wrong(" ! [rejected]        main -> main (fetch first)"));
     }
 
     #[test]

@@ -87,11 +87,44 @@ ok "a transport-helper address is refused" "$(pinvoke changes_add_remote "{\"rep
 ok "  nothing ran and no remote was added" "ran=$([ -e "$SB/pwned" ] && echo yes || echo no) remotes=$(git -C "$PUB" remote | wc -l | tr -d ' ')" "ran=no remotes=0"
 ok "an address git could read as an option is refused" "$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":\"--upload-pack=touch x\"}" | err)" "isn't a repository address"
 ok "a token written into an https address is refused" "$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":\"https://me:ghp_x@github.com/me/app.git\"}" | err)" "token out of the address"
+OUT=$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":$(jstr "$SB/nothing-here.git")}")
+ok "an address with no repository behind it is checked first and not saved" "saved=$(printf '%s' "$OUT" | v "v['saved']") remotes=$(git -C "$PUB" remote | wc -l | tr -d ' ')" "saved=False remotes=0"
+ok "  saying there is no repository there" "$(printf '%s' "$OUT" | v "v['problem']")" "no repository at this address"
+FULL="$SB/publish-full.git"; git init -q --bare "$FULL"; git -C "$PUB" push -q "$FULL" main:dev 2>/dev/null
+OUT=$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":$(jstr "$FULL")}")
+ok "a repository that already has branches is not saved without the person's word" "saved=$(printf '%s' "$OUT" | v "v['saved']") branches=$(printf '%s' "$OUT" | v "','.join(v['existing_branches'])") remotes=$(git -C "$PUB" remote | wc -l | tr -d ' ')" "saved=False branches=dev remotes=0"
+SAME="$SB/publish-same.git"; git init -q --bare "$SAME"; git -C "$PUB" push -q "$SAME" main:main 2>/dev/null
+OUT=$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":$(jstr "$SAME")}")
+ok "  and one that has this branch already is refused, with nothing to publish anyway" "$(printf '%s' "$OUT" | v "str(v['saved']) + ' ' + str(len(v['existing_branches'])) + ' ' + str('would be refused' in v['problem'])")" "False 0 True"
+PUB2="$SB/publish2"; mkdir -p "$PUB2"
+git init -q -b main "$PUB2" && printf 'z\n' > "$PUB2/c.txt" && git -C "$PUB2" add -A && git -C "$PUB2" commit -qm "first" >/dev/null
+OUT=$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB2"),\"url\":$(jstr "$FULL"),\"allowExisting\":true}")
+ok "  on the person's word it is saved" "saved=$(printf '%s' "$OUT" | v "v['saved']") | $(git -C "$PUB2" remote get-url origin)" "saved=True | $FULL"
 OUT=$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":$(jstr "$BARE")}")
-ok "the address of an empty repository is added as origin" "$(printf '%s' "$OUT" | v "v") | $(git -C "$PUB" remote get-url origin)" "as origin. | $BARE"
+ok "the address of an empty repository is added as origin" "saved=$(printf '%s' "$OUT" | v "v['saved']") | $(git -C "$PUB" remote get-url origin)" "saved=True | $BARE"
 OUT=$(pinvoke changes_push "{\"repoPath\":$(jstr "$PUB"),\"setUpstream\":true}")
 ok "  then Publish lands there" "$(printf '%s' "$OUT" | v "v['ok']") $(git -C "$BARE" rev-parse main 2>/dev/null)" "True $(git -C "$PUB" rev-parse HEAD)"
 ok "  and main tracks origin/main from now on" "upstream=$(git -C "$PUB" rev-parse --abbrev-ref 'main@{upstream}')" "upstream=origin/main"
 ok "a repository that has a remote is never changed here" "$(pinvoke changes_add_remote "{\"repoPath\":$(jstr "$PUB"),\"url\":\"git@github.com:me/other.git\"}" | err | grep -c 'already has a remote') | $(git -C "$PUB" remote get-url origin)" "1 | $BARE"
+
+section "Change the address of a remote that was never reached"
+CHG="$SB/change"; mkdir -p "$CHG"
+git init -q -b main "$CHG" && printf 'y\n' > "$CHG/b.txt" && git -C "$CHG" add -A && git -C "$CHG" commit -qm "first" >/dev/null
+git -C "$CHG" remote add origin "$SB/typo.git"
+CHGBARE="$SB/change-remote.git"; git init -q --bare "$CHGBARE"
+OUT=$(pinvoke changes_push "{\"repoPath\":$(jstr "$CHG"),\"setUpstream\":true}")
+ok "a push to an address with no repository says so" "$(printf '%s' "$OUT" | v "str(v['ok']) + ' ' + str('no repository at this address' in v['advice']['guidance'])")" "False True"
+ok "  and offers to change the address of that remote, never reached" "$(printf '%s' "$OUT" | v "str(v['advice']['action']) + ' ' + str(v['advice']['remote'])")" "change-remote origin"
+CUR=$(git -C "$CHG" remote get-url origin)
+ok "an address that changed meanwhile is never overwritten" "$(pinvoke changes_change_remote "{\"repoPath\":$(jstr "$CHG"),\"remote\":\"origin\",\"from\":\"git@github.com:someone/else.git\",\"url\":$(jstr "$CHGBARE")}" | err) | $(git -C "$CHG" remote get-url origin)" "changed meanwhile"
+ok "  (still the old one)" "$(git -C "$CHG" remote get-url origin)" "$CUR"
+OUT=$(pinvoke changes_change_remote "{\"repoPath\":$(jstr "$CHG"),\"remote\":\"origin\",\"from\":$(jstr "$CUR"),\"url\":$(jstr "$SB/typo-again.git")}")
+ok "a new address with no repository behind it is not saved" "saved=$(printf '%s' "$OUT" | v "v['saved']") | $(git -C "$CHG" remote get-url origin)" "saved=False | $CUR"
+OUT=$(pinvoke changes_change_remote "{\"repoPath\":$(jstr "$CHG"),\"remote\":\"origin\",\"from\":$(jstr "$CUR"),\"url\":$(jstr "$CHGBARE")}")
+ok "an empty repository's address replaces it" "saved=$(printf '%s' "$OUT" | v "v['saved']") | $(git -C "$CHG" remote get-url origin)" "saved=True | $CHGBARE"
+OUT=$(pinvoke changes_push "{\"repoPath\":$(jstr "$CHG"),\"setUpstream\":true}")
+ok "  and Publish lands there" "$(printf '%s' "$OUT" | v "v['ok']") $(git -C "$CHGBARE" rev-parse main 2>/dev/null)" "True $(git -C "$CHG" rev-parse HEAD)"
+ok "a remote that has been pushed to is never changed here" "$(pinvoke changes_change_remote "{\"repoPath\":$(jstr "$CHG"),\"remote\":\"origin\",\"from\":$(jstr "$CHGBARE"),\"url\":$(jstr "$BARE")}" | err)" "has been fetched from or pushed to"
+ok "  (still the address it was pushed to)" "$(git -C "$CHG" remote get-url origin)" "$CHGBARE"
 
 verify_result
